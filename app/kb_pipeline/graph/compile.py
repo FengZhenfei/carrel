@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import prompts
-from .facts import comparable_number, conditions_text, values_text, when_text
+from .facts import comparable_number, conditions_text, symbol_only_value, values_text, when_text
 from .llm import ChatClient, LLMCallError
 from .reconcile import fact_axis, series_of, unit_of
 from .temporal import axis_sort_key
@@ -193,6 +193,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
     docs = list(dict.fromkeys([str(d) for d in (entity.get("doc_ids") or [])] + [str(f.get("doc_id") or "") for f in facts if f.get("doc_id")]))
     meta.append(f"{len(docs)} {L['docs']} · {len(facts)} {L['facts_n']} · {len(relations)} {L['relations_n']}")
     lines += [" · ".join(meta), "", f"## {L['overview']}", "", str(entity.get("description") or "").strip() or "-", ""]
+    narrate_lines = list(lines)          # input for the narration model: the page text minus facts whose value is only a symbol
 
     by_concept: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for f in facts:
@@ -201,6 +202,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
     series_lines: list[str] = []
     if by_concept:
         lines += [f"## {L['facts']}", ""]
+        narrate_lines += [f"## {L['facts']}", ""]
         # flagged (out-of-range) concepts first, then those with the most facts: the subject page leads with what
         # deserves attention
         ordered = sorted(by_concept.items(), key=lambda kv: (-sum(1 for r in kv[1] if str(r.get("flag") or "").strip()), -len(kv[1]), kv[0]))
@@ -210,20 +212,26 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
             if ck and ck not in concept_keys:
                 concept_keys.append(ck)
             unit = next((str(r.get("unit") or "") for r in rows if r.get("unit")), "")
-            lines += [f"### {label}" + (f" ({unit})" if unit else ""), ""]
+            head = [f"### {label}" + (f" ({unit})" if unit else ""), "",
+                    f"| {L['when']} | {L['value']} | {L['flag']} | {L['ref']} | {L['conditions']} | {L['source']} |",
+                    "|---|---|---|---|---|---|"]
             if len({fact_axis(r) for r in rows if fact_axis(r)}) >= 2:
                 line = _series_line(rows, L)
                 flagged = sum(1 for r in rows if str(r.get("flag") or "").strip())
                 series_lines.append(line + ("," + L["out_of_range"].format(n=flagged) if flagged else ""))
-            lines += [f"| {L['when']} | {L['value']} | {L['flag']} | {L['ref']} | {L['conditions']} | {L['source']} |",
-                      "|---|---|---|---|---|---|"]
-            lines += [_fact_row(r, rel_paths=rel_paths) for r in rows[:ROWS_PER_CONCEPT]]
-            if len(rows) > ROWS_PER_CONCEPT:
-                lines.append(L["more"].format(n=len(rows) - ROWS_PER_CONCEPT))
-            lines.append("")
+            shown = rows[:ROWS_PER_CONCEPT]
+            more = [L["more"].format(n=len(rows) - ROWS_PER_CONCEPT)] if len(rows) > ROWS_PER_CONCEPT else []
+            lines += head + [_fact_row(r, rel_paths=rel_paths) for r in shown] + more + [""]
+            # facts whose value is only a symbol stay out of the narration input: the summary model reads a lone "-"
+            # as a positive finding; the page text and the specs keep them
+            kept = [r for r in shown if not symbol_only_value(r)]
+            if kept:
+                narrate_lines += head + [_fact_row(r, rel_paths=rel_paths) for r in kept] + more + [""]
         if len(ordered) > CONCEPTS_PER_PAGE:
             lines += [L["more"].format(n=len(ordered) - CONCEPTS_PER_PAGE), ""]
+            narrate_lines += [L["more"].format(n=len(ordered) - CONCEPTS_PER_PAGE), ""]
 
+    tail_start = len(lines)              # relations, extensions and sources after the facts are the same in both inputs
     ext = {str(p).casefold() for p in (profile.get("extension_predicates") or [])}
     rels = sorted(relations, key=lambda r: -float(r.get("weight") or 0))
     ext_rows = [r for r in rels if str(r.get("predicate") or "").casefold() in ext]
@@ -257,6 +265,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
     point_ids = list(dict.fromkeys(list(mention_points.get(key) or []) + [p for f in facts for p in (f.get("point_ids") or [])]))[:POINT_IDS_PER_PAGE]
     return {
         "id": page_id("subject", key), "kind": "subject", "title": title, "summary": summary, "text": "\n".join(lines).strip() + "\n",
+        "narrate_text": "\n".join(narrate_lines + lines[tail_start:]).strip() + "\n",     # for narrate_pages only, never persisted
         "path": f"subjects/{_slug(title)}--{_path_tag(key)}.md", "entity_keys": [key], "concept_keys": concept_keys, "doc_ids": docs,
         "point_ids": point_ids, "spec_ids": [str(f.get("id")) for f in facts if f.get("id")][:200],
         "facts": len(facts), "relations": len(relations), "series": series_lines,
@@ -366,7 +375,7 @@ def narrate_pages(client: ChatClient, pages: list[dict[str, Any]], *, language: 
 
     def work(page: dict[str, Any]) -> str:
         prompt = prompts.PAGE_NARRATE_PROMPT.format(language=language or "English", title=page["title"],
-                                                    page=page["text"][:NARRATE_INPUT_CHARS])
+                                                    page=str(page.get("narrate_text") or page["text"])[:NARRATE_INPUT_CHARS])
         return client.chat(prompt, max_tokens=700).strip()
 
     for page, text, error in client.run_parallel(todo, work, progress=progress):
@@ -474,5 +483,5 @@ def write_pages(out_dir: Path, pages: list[dict[str, Any]]) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(p["text"]), encoding="utf-8")
     (out_dir / "pages.json").write_text(json.dumps(
-        [{k: v for k, v in p.items() if k != "text"} for p in pages], ensure_ascii=False, indent=1), encoding="utf-8")
+        [{k: v for k, v in p.items() if k not in ("text", "narrate_text")} for p in pages], ensure_ascii=False, indent=1), encoding="utf-8")
     return len(pages)

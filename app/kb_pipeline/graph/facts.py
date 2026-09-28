@@ -485,6 +485,20 @@ def conditions_text(conditions: dict[str, Any] | None) -> str:
     return "; ".join(f"{k}: {v}" for k, v in (conditions or {}).items())
 
 
+_SYMBOL_ONLY_RE = re.compile(r"^[\s\-—–―/\\_.·•~～＿－]+$")
+
+
+def symbol_only_value(fact: dict[str, Any]) -> bool:
+    """A fact whose value is only a symbol ("-", "—", "/") or N/A: a table placeholder, "not applicable" or "none",
+    with a meaning that depends on the document. Such facts stay in the facts layer for retrieval but are kept out
+    of the subject page's narration input: the summary model reads a lone dash as a positive finding (a spot check
+    found an assessment marked "-" for both eyes narrated as "shows ... abnormality")."""
+    value = str(fact.get("value") or "").strip()
+    if not value:
+        return False
+    return bool(_SYMBOL_ONLY_RE.match(value)) or value.casefold() in {"n/a", "na", "n.a.", "none", "null"}
+
+
 def values_text(fact: dict[str, Any]) -> str:
     """Readable form of the values: a single value or min / typ / max, with unit."""
     unit = str(fact.get("unit") or "")

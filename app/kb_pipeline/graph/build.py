@@ -1163,7 +1163,7 @@ def build_graph(
                                              narrate=not _env_flag("KB_GRAPH_VIEWS_NO_NARRATE"))
             finally:
                 cache.close()
-            graph["pages"] = pages
+            graph["pages"] = [{k: v for k, v in p.items() if k != "narrate_text"} for p in pages]     # the narration input is not persisted
             graph.setdefault("stats", {})["compile"] = stats
             paths.graph_file.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
             return stats

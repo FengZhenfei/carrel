@@ -617,6 +617,48 @@ class ViewLayerTests(unittest.TestCase):
         u2.text = "异常结果汇总:总胆固醇偏高,建议复查。"
         return graph, [u1, u2]
 
+    def test_symbol_only_facts_stay_in_the_page_but_not_in_the_narration_input(self) -> None:
+        """A spot check found an assessment marked "-" for both eyes narrated as a positive finding. Facts whose value is
+        only a symbol stay in the page and in the specs but not in the narration input; a concept with nothing but
+        symbol values drops out of it entirely; relations and sources after the facts are the same in both inputs."""
+        from kb_pipeline.graph.compile import compile_pages, narrate_pages
+        from kb_pipeline.graph.facts import symbol_only_value
+
+        for value, expect in (("-", True), (" — ", True), ("/", True), ("N/A", True), ("-1.5", False), ("无", False), ("", False), ("0", False)):
+            self.assertEqual(symbol_only_value({"value": value}), expect, value)
+        graph, units = self._graph()
+        base = graph["specs"][2]
+        graph["specs"].append({**base, "id": "f4", "property": "眼底评估 类似", "concept": "眼底评估 类似", "concept_key": "c3",
+                               "value": "-", "value_num": None, "unit": "", "ref_min": "", "ref_max": ""})
+        graph["specs"].append({**base, "id": "f5", "value": "-", "value_num": None, "doc_id": "d1", "rel_path": "d1.pdf",
+                               "valid_from": "2024-03-01", "axis": "2024-03-01"})
+        pages, _ = compile_pages(graph, units, out_dir=None, language="Chinese")
+        subject = next(p for p in pages if p["kind"] == "subject")
+        self.assertIn("### 眼底评估 类似", subject["text"])
+        self.assertIn("| 2025-03-01 | - |", subject["text"])
+        self.assertNotIn("眼底评估", subject["narrate_text"])                     # a concept with only symbol values drops out of the narration
+        self.assertIn("### 血糖", subject["narrate_text"])                        # a concept with real values stays, minus its symbol rows
+        self.assertIn("| 2025-03-01 | 4.4 mmol/L |", subject["narrate_text"])
+        self.assertNotIn("| 2024-03-01 | - |", subject["narrate_text"])
+        self.assertIn("## 关系\n\n- related_to ← 某医院", subject["narrate_text"])
+        prompts: list[str] = []
+
+        class Client:
+            stats: dict = {}
+
+            def chat(self, prompt, **kw):
+                prompts.append(prompt)
+                return "叙述"
+
+            def run_parallel(self, items, work, progress=None):
+                return [(it, work(it), None) for it in items]
+
+        narrate_pages(Client(), pages, language="Chinese")
+        self.assertTrue(prompts)
+        self.assertNotIn("眼底评估", prompts[0])
+        self.assertIn("血糖", prompts[0])
+        self.assertEqual(subject["summary"].split("\n")[0], "叙述")
+
     def test_pages_are_projected_from_the_structure_layer(self) -> None:
         from kb_pipeline.graph.compile import compile_pages, labels_for
 
@@ -757,7 +799,7 @@ class ViewLayerTests(unittest.TestCase):
         self.assertEqual(GRAPH_PHASE_LABELS["compile"], "Compiling view pages")
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
         self.assertIn('run_phase("compile", compile_views', src)
-        self.assertIn('graph["pages"] = pages', src)
+        self.assertIn('graph["pages"] = [{k: v for k, v in p.items() if k != "narrate_text"} for p in pages]', src)   # narration input is not persisted
         self.assertIn('paths.work_dir / "wiki"', src)
         js = (Path(__file__).resolve().parents[1] / "kb_server" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn('"Compiling view pages"', js)
