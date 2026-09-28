@@ -2,6 +2,8 @@
 
 [English](README.md) | 中文
 
+[![tests](https://github.com/FengZhenfei/carrel/actions/workflows/tests.yml/badge.svg)](https://github.com/FengZhenfei/carrel/actions/workflows/tests.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **面向 AI 智能体的本体增强生成（Ontology-Augmented Generation）。**
 
 Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解析、索引和检索，并支持可选的知识图谱。智能体通过 API 获取原文、图像和关联事实，再据此组织回答。

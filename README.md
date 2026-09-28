@@ -2,6 +2,8 @@
 
 English | [中文](README.zh-CN.md)
 
+[![tests](https://github.com/FengZhenfei/carrel/actions/workflows/tests.yml/badge.svg)](https://github.com/FengZhenfei/carrel/actions/workflows/tests.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Ontology-Augmented Generation for AI agents.**
 
 Carrel is a self-hosted knowledge base for AI agents. It automates document

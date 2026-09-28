@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/pyproject.toml
+      - name: Install the app with the optional pdf-images extra
+        run: python -m pip install -e "app[pdf-images]" pytest
+      - name: Run the test suite
+        working-directory: app
+        run: python -m pytest -q
