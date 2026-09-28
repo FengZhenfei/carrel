@@ -62,7 +62,7 @@ resort against a hung parse.
 journalctl --user -u carrel-worker -f
 journalctl --user -u carrel-graph-rebuild --since -3h
 journalctl --user -u carrel-web --since -5min
-systemctl --user list-timers 'knowledge-base*'
+systemctl --user list-timers 'carrel-*'
 ```
 
 Restarting `carrel-web.service` kills label extraction and chunk

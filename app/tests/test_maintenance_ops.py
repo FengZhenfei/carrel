@@ -457,8 +457,9 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
             self.assertEqual(str(row["inactive_reason"]), "delete_failed")
 
     def test_side_notes_readme_and_retention(self) -> None:
-        self.assertNotIn("每 30 分钟", _repo_file("README.zh-CN.md"))
-        self.assertIn("每 2 小时", _repo_file("README.zh-CN.md"))
+        # The schedule table moved from the README into the operations guide (2026-09-28 restructure).
+        self.assertNotIn("每 30 分钟", _repo_file("docs/operations.zh-CN.md"))
+        self.assertIn("每 2 小时", _repo_file("docs/operations.zh-CN.md"))
         self.assertIn('os.getenv("GRAPH_GC_KEEP_VERSIONS", "2")', _repo_file("app/kb_pipeline/config.py"))
         self.assertIn("GRAPH_GC_KEEP_VERSIONS=2", _repo_file("config/knowledge-base.env.example"))
 

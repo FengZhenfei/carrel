@@ -324,5 +324,42 @@ class DeploymentAssetTests(unittest.TestCase):
                 self.assertEqual(private_patterns(), [])
 
 
+class SearchTemplateDefaultsTests(unittest.TestCase):
+    """The search block of config/knowledge-base.env.example carries the code defaults of
+    app/kb_search/config.py. deploy.sh copies the template into the live env file, so a value that
+    drifted there would silently override a tuned default (the fourth review of 2026-09-28 found five
+    such keys); the deliberate exception is documented in the template itself."""
+
+    def test_template_search_values_are_the_code_defaults(self) -> None:
+        template: dict[str, str] = {}
+        for line in _read("config/knowledge-base.env.example").splitlines():
+            m = re.match(r"^(KB_SEARCH_[A-Z0-9_]+)=(.*)$", line)
+            if m:
+                template[m.group(1)] = m.group(2).strip()
+        source = _read("app/kb_search/config.py")
+        defaults: dict[str, tuple[str, str]] = {}
+        for m in re.finditer(r"_(int|float|bool)\(\"(KB_SEARCH_[A-Z0-9_]+)\",\s*([^)]+)\)", source):
+            defaults[m.group(2)] = (m.group(1), m.group(3).strip())
+        for m in re.finditer(r"os\.getenv\(\"(KB_SEARCH_[A-Z0-9_]+)\",\s*\"([^\"]*)\"", source):
+            defaults[m.group(1)] = ("str", m.group(2))
+        self.assertGreaterEqual(len(template), 10)
+        self.assertEqual(sorted(k for k in template if k not in defaults), [],
+                         "the template names search keys the code never reads")
+        drift = []
+        for key, raw in template.items():
+            kind, default = defaults[key]
+            if kind == "int":
+                same = int(raw) == int(default)
+            elif kind == "float":
+                same = abs(float(raw) - float(default)) < 1e-9
+            elif kind == "bool":
+                same = (raw.lower() not in ("0", "false", "no", "off")) == (default == "True")
+            else:
+                same = raw == default
+            if not same:
+                drift.append(f"{key}: template={raw!r} code={default!r}")
+        self.assertEqual(drift, [])
+
+
 if __name__ == "__main__":
     unittest.main()
