@@ -638,7 +638,7 @@ class ViewLayerTests(unittest.TestCase):
         self.assertIn("| 2025-03-01 | - |", subject["text"])
         self.assertNotIn("眼底评估", subject["narrate_text"])                     # a concept with only symbol values drops out of the narration
         self.assertIn("### 血糖", subject["narrate_text"])                        # a concept with real values stays, minus its symbol rows
-        self.assertIn("| 2025-03-01 | 4.4 mmol/L |", subject["narrate_text"])
+        self.assertIn(f"| 2025-03-01 | {base['value']} mmol/L |", subject["narrate_text"])   # the fixture's real value stays
         self.assertNotIn("| 2024-03-01 | - |", subject["narrate_text"])
         self.assertIn("## 关系\n\n- related_to ← 某医院", subject["narrate_text"])
         prompts: list[str] = []
