@@ -1064,6 +1064,51 @@ class DeterministicBuilderTests(unittest.TestCase):
                       ("main", "calls", "Engine"), ("Engine", "inherits", "Base"), ("Engine.run", "calls", "Base.ping"), ("app/index.js", "calls", "main")]:
                 self.assertIn(t, triples, t)
 
+    def test_python_submodule_imports_resolve_call_edges(self) -> None:
+        """Imports of submodules (`from .. import db`, `from .graph import build`) must resolve to module aliases so
+        that `db.claim()` and `build.build_graph()` get calls edges (the repository's own worker -> claim edge was
+        lost this way); class-method calls on imported and local classes (Store.open(), Local.make()) get edges too."""
+        from kb_pipeline.graph.deterministic import DeterministicExtractor
+        from kb_pipeline.graph.units import ChunkRef, build_units
+        from kb_pipeline.parsers.router import parse_native
+
+        repo = {
+            "app/pkg/__init__.py": '"""pkg"""\n',
+            "app/pkg/db.py": "def claim(con):\n    return 1\n\n\nclass Store:\n    @classmethod\n    def open(cls):\n        return cls()\n",
+            "app/pkg/graph/__init__.py": '"""graph"""\n',
+            "app/pkg/graph/build.py": "def build_graph():\n    return 2\n",
+            "app/pkg/pipeline/__init__.py": "",
+            "app/pkg/pipeline/worker.py": ("from .. import db\nfrom ..graph import build\nfrom ..db import Store\n\n\n"
+                                           "class Local:\n    @classmethod\n    def make(cls):\n        return cls()\n\n\n"
+                                           "def run(con):\n    job = db.claim(con)\n    build.build_graph()\n    Store.open()\n    Local.make()\n    return job\n"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            refs = []
+            for i, (rel, text) in enumerate(repo.items(), 1):
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                refs += [ChunkRef(point_id=f"p{i}-{k}", chunk_uid=f"c{i}-{k}", doc_id=f"kb_x:{i}", content_version="v", chunk_index=k,
+                                  block_id=b.block_id, block_type=b.block_type, section_path=list(b.metadata.get("section_path") or []),
+                                  text=b.text, n_tokens=max(1, len(b.text) // 4), rel_path=rel, filename=rel.rsplit("/", 1)[-1])
+                         for k, b in enumerate(parse_native(path, ""))]
+            units = build_units(refs, kb_id="kb_x", unit_chunks=3)
+            det = DeterministicExtractor(units, file_for=lambda rel: root / rel, kb_id="kb_x")
+            imports = det._import_map("app/pkg/pipeline/worker.py")
+            self.assertEqual(imports["db"], ("app/pkg/db.py", None, None))                 # submodule -> module alias
+            self.assertEqual(imports["build"], ("app/pkg/graph/build.py", None, None))     # no longer graph/__init__.py
+            self.assertEqual(imports["Store"], ("app/pkg/db.py", "Store", None))           # a real symbol import is unchanged
+            rels = []
+            for u in units:
+                if u.rel_path == "app/pkg/pipeline/worker.py":
+                    rels += det.extract(u).relations
+            triples = {(r["source"], r["predicate"], r["target"]) for r in rels}
+            for t in [("run", "calls", "claim"), ("run", "calls", "build_graph"), ("run", "calls", "Store.open"), ("run", "calls", "Local.make"),
+                      ("app/pkg/pipeline/worker.py", "imports", "app/pkg/db.py"), ("app/pkg/pipeline/worker.py", "imports", "app/pkg/graph/build.py")]:
+                self.assertIn(t, triples, t)
+            self.assertNotIn(("app/pkg/pipeline/worker.py", "imports", "app/pkg/graph/__init__.py"), triples)
+
     def test_extraction_fingerprint_only_changes_with_deterministic_units(self) -> None:
         from kb_pipeline.graph.build import extraction_fingerprint
 

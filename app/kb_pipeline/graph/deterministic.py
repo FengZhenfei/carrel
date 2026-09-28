@@ -26,7 +26,7 @@ from .extract import ExtractionResult
 from .facts import fact_id, normalize_fact
 from .units import Unit
 
-VERSION = "det-v4"
+VERSION = "det-v5"
 
 TYPES = ("module", "class", "function", "method", "constant", "package", "repository", "skill", "instructions", "readme",
          "config_file", "document")
@@ -302,10 +302,12 @@ class DeterministicExtractor:
                 if not local:
                     local = module.split(".")[0]
             target_rel = self._resolve_module(rel, module, level)
-            if name and target_rel is None and not level:
-                # from a.b import c: c may also be a submodule
-                sub = self._resolve_module(rel, f"{module}.{name}" if module else name, 0)
-                if sub:
+            if name and (target_rel is None or name not in self._analysis(target_rel)["symbols"]):
+                # from a.b import c: when c is not a symbol defined in module a.b, try the submodule a/b/c.py first,
+                # for relative imports too (`from .. import db`, `from .graph import build` are the usual in-package
+                # forms; both used to lose their calls / imports edges).
+                sub = self._resolve_module(rel, f"{module}.{name}" if module else name, level)
+                if sub and sub != target_rel:
                     out[local] = (sub, None, None)
                     continue
             if target_rel is not None:
@@ -492,12 +494,20 @@ class DeterministicExtractor:
             return
         if "." in callee:
             head, tail = callee.split(".", 1)
-            if head in imports and imports[head][0] and "." not in tail:
-                target_rel = imports[head][0]
+            if "." in tail:
+                return                                            # multi-level paths (a.b.c()) cannot be resolved statically
+            if head in imports and imports[head][0]:
+                target_rel, sym_name, _pkg = imports[head]
                 tsyms = self._analysis(target_rel)["symbols"]
-                if tail in tsyms:
-                    ents.append(self._sym(tsyms[tail], tail, scope_doc=self.doc_of.get(target_rel)))
-                    rels.append(_relation(source, tail, "calls", f"{source} calls {tail} ({target_rel})"))
+                # module alias.function (db.claim) -> that module's symbol; imported class.method (Store.open) -> that method
+                target = f"{sym_name}.{tail}" if sym_name else tail
+                if target in tsyms:
+                    ents.append(self._sym(tsyms[target], target, scope_doc=self.doc_of.get(target_rel)))
+                    rels.append(_relation(source, target, "calls", f"{source} calls {target} ({target_rel})"))
+            elif f"{head}.{tail}" in symbols:
+                target = f"{head}.{tail}"                          # class.method defined in this file
+                ents.append(self._sym(symbols[target], target))
+                rels.append(_relation(source, target, "calls", f"{source} calls {target}"))
             return
         self._target_edge(rel, source, callee, "calls", symbols, imports, ents, rels)
 
