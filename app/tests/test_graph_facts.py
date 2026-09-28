@@ -1483,3 +1483,22 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         rows = [{"concept": "功率", "value": "2", "unit": "mW", "valid_from": "2024"},
                 {"concept": "功率", "value": "1", "unit": "MW", "valid_from": "2025"}]
         self.assertEqual(_trend(rows, L), L["trend_mixed"])                         # numbers in different units are not compared
+
+
+class WideTableFactsPromptTests(unittest.TestCase):
+    def test_facts_prompt_uses_expanded_rows_when_enabled(self) -> None:
+        from unittest.mock import patch
+
+        from kb_pipeline.graph import tabletext
+        from kb_pipeline.graph.facts import render_facts_prompt
+        from kb_pipeline.graph.units import Unit
+
+        text = ("SHEET: 表\nROWS: 1-2\nHEADER: 功能 | 描述 | 钉钉 | 飞书 | 热聊 | 云之家\n"
+                "标签 |  | 1 | 1 | 0 | 1")
+        unit = Unit(unit_id="u", doc_id="d", rel_path="a.xlsx", section_path=[], block_ids=[], chunk_uids=[], point_ids=[], n_tokens=10, text=text)
+        with patch.object(tabletext, "FACTS_EXPAND_WIDE_TABLES", True), patch("kb_pipeline.graph.facts.FACTS_EXPAND_WIDE_TABLES", True):
+            self.assertIn("功能: 标签 | 钉钉: 1 | 飞书: 1 | 热聊: 0 | 云之家: 1", render_facts_prompt(unit, document="a", subjects=["热聊"]))
+        with patch("kb_pipeline.graph.facts.FACTS_EXPAND_WIDE_TABLES", False):
+            prompt = render_facts_prompt(unit, document="a", subjects=["热聊"])
+            self.assertIn("标签 |  | 1 | 1 | 0 | 1", prompt)
+            self.assertNotIn("钉钉: 1", prompt)

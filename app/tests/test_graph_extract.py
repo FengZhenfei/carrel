@@ -1723,3 +1723,42 @@ class ExtractionFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalT
                 self.assertEqual(db.graph_extraction_unit_ids(con, "kb", "fp"), {"u-bad", "u-empty", "u-ok"})
                 self.assertEqual(db.graph_extraction_unit_ids(con, "kb", "fp", skip_empty_malformed=True), {"u-empty", "u-ok"})
         self.assertIn("skip_empty_malformed=True", _repo_file("app/kb_pipeline/graph/build.py"))
+
+
+class WideTableRenderingTests(unittest.TestCase):
+    """Wide tables reach the model as "column: value" pairs (spot check: entity descriptions read the wrong column of a
+    15-column comparison sheet); chunk text is untouched and only expanded units get a render-versioned unit_id."""
+
+    NATIVE = ("SHEET: 竞品对比表\nROWS: 126-129\nHEADER: 一级模块 | 二级模块 | 功能 | 描述 | 钉钉 | 飞书 | 热聊v4.8.61 | 备注\n"
+              "聊天能力 | 会话列表 | 移除会话 |  | 1 | 0 | 1 | \n聊天能力 | 会话列表 | 标签 |  | 1 | 1 | 0 | 计划支持")
+    NARROW = "SHEET: s\nROWS: 1-2\nHEADER: 功能 | 钉钉 | 飞书\n标签 | 1 | 0"
+    MARKDOWN = "| 功能 | a | b | c | d | e |\n|---|---|---|---|---|---|\n| 标签 | 1 | 0 | 1 |  | 0 |\n\n后面的正文 | 不是表"
+
+    def test_native_and_markdown_wide_rows_become_name_value_pairs(self) -> None:
+        from kb_pipeline.graph.tabletext import expand_wide_tables, table_render_tag
+
+        out = expand_wide_tables(self.NATIVE)
+        self.assertIn("HEADER: 一级模块 | 二级模块", out)                                          # prefix lines stay as they are
+        self.assertIn("一级模块: 聊天能力 | 二级模块: 会话列表 | 功能: 移除会话 | 钉钉: 1 | 飞书: 0 | 热聊v4.8.61: 1", out)
+        self.assertIn("功能: 标签 | 钉钉: 1 | 飞书: 1 | 热聊v4.8.61: 0 | 备注: 计划支持", out)
+        self.assertNotIn("聊天能力 | 会话列表 | 标签", out)                                          # empty cells skipped, column names keep positions clear
+        self.assertIsNone(expand_wide_tables(self.NARROW))                                       # tables with few columns are left alone
+        md = expand_wide_tables(self.MARKDOWN)
+        self.assertIn("功能: 标签 | a: 1 | b: 0 | c: 1 | e: 0", md)
+        self.assertIn("后面的正文 | 不是表", md)                                                    # after a blank line it is no longer a table
+        self.assertEqual(table_render_tag(self.NATIVE), table_render_tag(self.MARKDOWN))
+        self.assertTrue(table_render_tag(self.NATIVE).startswith("wide-table-v1"))
+        self.assertEqual(table_render_tag(self.NARROW), "")
+
+    def test_only_expanded_units_get_a_new_unit_id(self) -> None:
+        from kb_pipeline.graph.tabletext import table_render_tag
+        from kb_pipeline.graph.units import unit_id_for
+
+        plain = unit_id_for("kb", "d", self.NARROW, positions=[0])
+        self.assertEqual(unit_id_for("kb", "d", self.NARROW, positions=[0], render_tag=table_render_tag(self.NARROW)), plain)
+        wide = unit_id_for("kb", "d", self.NATIVE, positions=[0])
+        self.assertNotEqual(unit_id_for("kb", "d", self.NATIVE, positions=[0], render_tag=table_render_tag(self.NATIVE)), wide)
+        src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "extract.py").read_text(encoding="utf-8")
+        self.assertIn("render_extract_prompt(expand_wide_tables(unit.text) or unit.text", src)   # the extraction prompt uses the expanded text
+        src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "units.py").read_text(encoding="utf-8")
+        self.assertIn("render_tag=table_render_tag(text)", src)

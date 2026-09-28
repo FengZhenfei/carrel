@@ -29,6 +29,7 @@ from typing import Any, Iterable
 
 from ..parsers.table_check import unrepaired_glued_values
 from ..utils import count_tokens
+from .tabletext import table_render_tag
 
 DEFAULT_UNIT_CHUNKS = 3
 MIN_OVERLAP_CHARS = 12
@@ -253,7 +254,7 @@ class Unit:
 
 
 def unit_id_for(kb_id: str, doc_id: str, text: str, chunk_uids: Iterable[str] = (), *,
-                positions: Iterable[int] | None = None) -> str:
+                positions: Iterable[int] | None = None, render_tag: str = "") -> str:
     """Content-addressed unit id. Besides the text it also takes the unit's position in the document (chunk
     indexes): one document may contain two identical passages (a repeated table in a datasheet, the same note at
     the end of every chapter), and addressing by text alone would collapse the two units into one -- Neo4j would
@@ -263,7 +264,9 @@ def unit_id_for(kb_id: str, doc_id: str, text: str, chunk_uids: Iterable[str] = 
     R10). With position-based addressing, units whose text and chunking are unchanged stay stable across parse
     versions; when positions is not given the uids are still used (legacy callers)."""
     key = ",".join(str(int(p)) for p in positions) if positions is not None else ",".join(chunk_uids)
-    raw = f"unit|{kb_id}|{doc_id}|{key}|{text}".encode("utf-8")
+    # render_tag: when the text shown to the model differs from the stored text (wide-table expansion, tabletext)
+    # the render version is recorded so that only those units lose their cache
+    raw = (f"unit|{kb_id}|{doc_id}|{key}|{text}" + (f"|{render_tag}" if render_tag else "")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
@@ -341,7 +344,7 @@ def _flush(unit_chunks: list[ChunkRef], texts: list[str], *, kb_id: str, order: 
         kind="body" if any(str(c.block_type) == "code" for c in unit_chunks)
         else classify_unit_text(text, sections, conclusion_headings=conclusion_headings,
                                 boilerplate_headings=boilerplate_headings, listing_headings=listing_headings),
-        unit_id=unit_id_for(kb_id, first.doc_id, text, positions=[c.chunk_index for c in unit_chunks]),
+        unit_id=unit_id_for(kb_id, first.doc_id, text, positions=[c.chunk_index for c in unit_chunks], render_tag=table_render_tag(text)),
         doc_id=first.doc_id,
         rel_path=first.rel_path,
         section_path=list(first.section_path),

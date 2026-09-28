@@ -20,6 +20,7 @@ from typing import Any, Iterable
 from . import prompts
 from .extract import normalize_name
 from .llm import ChatClient, LLMSpec
+from .tabletext import FACTS_EXPAND_WIDE_TABLES, expand_wide_tables
 from .units import Unit, unit_signals
 
 FACTS_MAX_PER_UNIT = 120
@@ -542,7 +543,8 @@ def render_facts_prompt(unit: Unit, *, document: str, subjects: Iterable[str], m
     return prompts.FACTS_PROMPT.format(
         document=document or unit.rel_path or "(unknown)", section=unit.section_label,
         axis=axis or getattr(unit, "axis", "") or "(unknown)",
-        subjects=subject_text, input_text=unit.text, max_facts=int(max_facts),
+        subjects=subject_text, input_text=((expand_wide_tables(unit.text) if FACTS_EXPAND_WIDE_TABLES else None) or unit.text),
+        max_facts=int(max_facts),
     )
 
 

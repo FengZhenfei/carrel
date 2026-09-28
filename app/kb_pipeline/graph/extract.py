@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import prompts
+from .tabletext import expand_wide_tables
 from .llm import ChatClient, LLMSpec
 from .units import UNIT_KINDS, Unit
 
@@ -486,7 +487,8 @@ class GraphExtractor:
 
     def extract(self, unit: Unit) -> ExtractionResult:
         has_table = any(str(b).lower() == "table" for b in (unit.block_types or []))
-        prompt = render_extract_prompt(unit.text, section=unit.section_label, schema=self.schema,
+        # wide tables are shown to the model as "column: value" pairs (tabletext): the model miscounts columns in rows of a dozen cells
+        prompt = render_extract_prompt(expand_wide_tables(unit.text) or unit.text, section=unit.section_label, schema=self.schema,
                                        document=unit.document_label, unit_kind=unit.kind, has_table=has_table)
         messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
         entities: list[dict[str, Any]] = []
