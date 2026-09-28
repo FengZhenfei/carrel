@@ -49,7 +49,8 @@ class GraphEntityTypesTests(unittest.TestCase):
             src = path.read_text(encoding="utf-8")
             top = symtable.symtable(src, str(path), "exec")
             defined = {s.get_name() for s in top.get_symbols() if s.is_assigned() or s.is_imported() or s.is_parameter()}
-            defined |= set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__builtins__", "__package__", "__loader__"}
+            defined |= set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__builtins__", "__package__", "__loader__",
+                                             "__conditional_annotations__"}   # implicit module name on Python 3.14+ (PEP 649 deferred annotations)
             stack = [top]
             while stack:
                 table = stack.pop()
