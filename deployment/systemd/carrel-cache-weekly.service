@@ -1,0 +1,13 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: weekly cache rotation
+After=network-online.target
+
+[Service]
+TimeoutStartSec=7200
+Environment=PYTHONUNBUFFERED=1
+Type=oneshot
+WorkingDirectory=__CARREL_HOME__
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+ExecStart=/bin/bash __CARREL_HOME__/scripts/kb-cleanup.sh weekly

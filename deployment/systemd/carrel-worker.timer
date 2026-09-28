@@ -1,0 +1,19 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel timer: consume parse queue
+
+[Timer]
+# All timers use relative times (2026-09-09, at the user's request): OnActiveSec is the first trigger after the
+# timer is activated (boot / reinstall / timer restart), OnUnitActiveSec is the interval after the previous
+# trigger. No wall clock, no time zone: a new machine, a reset or enabling at any moment all follow the same
+# rhythm; the price is that triggers are no longer pinned to a clock time (the graph check used to run at :07
+# past even hours, cleanup at 04:02 at night).
+# Not OnBootSec: when the timer is (re)enabled long after boot that moment has already passed and systemd
+# will never fire it; nor OnUnitActiveSec alone: the service last ran in a previous boot cycle, this cycle has
+# no reference point, and the timer would stay silent forever.
+OnActiveSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

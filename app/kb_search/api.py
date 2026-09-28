@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import base64
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel, Field
+
+from . import service
+
+router = APIRouter()
+
+
+def require_token(request: Request) -> None:
+    """Static Bearer (Q01): when a token is configured it must be sent; without one only loopback
+    requests are accepted."""
+    _, ss, _ = service.runtime()
+    if ss.token:
+        header = request.headers.get("authorization") or ""
+        if header.strip() != f"Bearer {ss.token}":
+            raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+        return
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=401, detail="KB_SEARCH_TOKEN is not configured; only loopback requests are accepted")
+
+
+class SearchRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    kbs: list[str] | None = None
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    hints: dict[str, Any] | None = None
+    context: bool = True
+    explain: bool = False
+    image_b64: str | None = Field(default=None, max_length=12_000_000)   # image-to-image (Q17): the caller supplies an image, base64 or data URL
+
+
+class ContextRequest(BaseModel):
+    kb_id: str
+    doc_id: str
+    content_version: str | None = None
+    chunk_from: int = Field(ge=0)
+    chunk_to: int = Field(ge=0)
+
+
+class NeighborsRequest(BaseModel):
+    kb_id: str
+    entity: str | None = Field(default=None, max_length=200)      # entity title or alias (case-insensitive)
+    entity_id: str | None = Field(default=None, max_length=200)   # or the entity id directly (the id from a previous response)
+    limit: int = Field(default=20, ge=1, le=100)
+    types: list[str] | None = None                                 # only these predicates
+    direction: str = Field(default="both", pattern="^(both|out|in)$")
+
+
+class CropRequest(BaseModel):
+    kb_id: str
+    point_id: str
+    bbox: list[float] = Field(min_length=4, max_length=4)   # 0-1 fractions, 0-1000 per-mille or pixels
+    pad: int = Field(default=16, ge=0, le=200)
+
+
+def _wrap(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"not found: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+def _decode_image(b64: str | None) -> bytes | None:
+    if not b64:
+        return None
+    raw = b64.strip()
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[1] if "," in raw else ""
+    try:
+        return base64.b64decode(raw, validate=False)
+    except Exception:
+        raise HTTPException(status_code=422, detail="image_b64 is not valid base64")
+
+
+def _image_response(img: dict[str, Any]) -> Response:
+    headers = {"X-Image-Source": str(img.get("source") or ""), "X-Image-Width": str(img.get("width") or 0), "X-Image-Height": str(img.get("height") or 0)}
+    if img.get("box"):
+        headers["X-Crop-Box"] = ",".join(str(v) for v in img["box"])
+    return Response(content=img["bytes"], media_type=img["mime"], headers=headers)
+
+
+@router.get("/health")
+def health() -> dict[str, Any]:
+    return service.health()
+
+
+@router.get("/catalog", dependencies=[Depends(require_token)])
+def catalog(refresh: bool = False) -> dict[str, Any]:
+    return service.catalog(force=refresh)
+
+
+@router.post("/search", dependencies=[Depends(require_token)])
+def search(req: SearchRequest) -> dict[str, Any]:
+    return _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context,
+                 explain=req.explain, image_bytes=_decode_image(req.image_b64))
+
+
+@router.post("/context", dependencies=[Depends(require_token)])
+def context(req: ContextRequest) -> dict[str, Any]:
+    return _wrap(service.context, req.kb_id, req.doc_id, req.chunk_from, req.chunk_to, content_version=req.content_version)
+
+
+@router.get("/image/{kb_id}/{point_id}", dependencies=[Depends(require_token)])
+def image(kb_id: str, point_id: str) -> Response:
+    return _image_response(_wrap(service.image, kb_id, point_id))
+
+
+@router.post("/crop", dependencies=[Depends(require_token)])
+def crop(req: CropRequest) -> Response:
+    return _image_response(_wrap(service.crop, req.kb_id, req.point_id, req.bbox, pad=req.pad))
+
+
+@router.post("/graph/neighbors", dependencies=[Depends(require_token)])
+def graph_neighbors(req: NeighborsRequest) -> dict[str, Any]:
+    return _wrap(service.graph_neighbors, req.kb_id, entity=req.entity, entity_id=req.entity_id, limit=req.limit, types=req.types,
+                 direction=req.direction)
+

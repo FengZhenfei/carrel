@@ -1,0 +1,22 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: web console (enrollment, progress, LLM registry)
+After=network-online.target
+# When a broken config makes the service crash on start, do not restart every 3 seconds forever and flood the
+# log: stop after 5 times / 60 seconds and leave the unit in failed so it gets noticed. (These two belong to
+# the [Unit] section.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=__CARREL_HOME__/app
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+ExecStart=__CARREL_HOME__/app/.venv/bin/python -m kb_server
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

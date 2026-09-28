@@ -1,0 +1,13 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: scan mirror for changes
+After=network-online.target
+
+[Service]
+TimeoutStartSec=1800
+Environment=PYTHONUNBUFFERED=1
+Type=oneshot
+WorkingDirectory=__CARREL_HOME__
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+ExecStart=/bin/bash __CARREL_HOME__/scripts/kb-pipeline-scan.sh

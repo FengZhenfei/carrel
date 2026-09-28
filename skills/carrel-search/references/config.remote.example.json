@@ -1,0 +1,5 @@
+{
+  "base_url": "http://carrel-host.example:9810",
+  "token_env": "KB_SEARCH_TOKEN",
+  "timeout_seconds": 60
+}

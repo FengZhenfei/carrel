@@ -1,0 +1,27 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: consume parse queue
+After=network-online.target
+
+[Service]
+# A hung oneshot stays activating forever and every later timer trigger is swallowed. Measured: in a round
+# where the worker ran the full two hours, the 5-minute timer fired 24 times, only 3 of which actually started
+# the service; the rest were silently swallowed. A real hang would freeze the parse queue with no error at
+# all. This timeout is the only escape hatch.
+#
+# But it **only catches real hangs** and must not be the regular control: it is a hard kill from outside, and
+# where it lands is pure luck. It used to be 2 hours, commented as "the order of the longest single-file
+# parse", which did not match the implementation: a worker round claims up to 200 jobs, and 2 hours is the
+# budget for the whole round. On 2026-08-25 it landed in the middle of one file's MinerU parse; the parse
+# cache is only written once the whole document is done, so those 12 minutes of compute were wasted.
+#
+# Regular control is now KB_WORKER_MAX_SECONDS in the script (default 90 minutes, stopping **between** two
+# files). This one is relaxed to 4 hours, which only has to be "larger than any normal case, smaller than
+# forever", leaving enough room for the file in progress to finish after the soft limit fires.
+TimeoutStartSec=14400
+Environment=PYTHONUNBUFFERED=1
+Type=oneshot
+WorkingDirectory=__CARREL_HOME__
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+ExecStart=/bin/bash __CARREL_HOME__/scripts/kb-pipeline-worker-once.sh

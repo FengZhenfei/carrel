@@ -1,0 +1,18 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: inactive point GC
+After=network-online.target
+
+[Service]
+TimeoutStartSec=7200
+Environment=PYTHONUNBUFFERED=1
+Type=oneshot
+WorkingDirectory=__CARREL_HOME__
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+# retention comes from QDRANT_INACTIVE_RETENTION_DAYS in the env file (default 7);
+# hardcoding it here silently overrode the operator's setting
+# Waiting for Qdrant (on a catch-up run after boot the container may not be up yet) happens in the script:
+# if it never comes up, the deferral is counted and the script exits quietly, instead of the old ExecStartPre
+# exiting 75 outright and painting the unit failed (see scripts/lib/kb-maint-defer.sh)
+ExecStart=/bin/bash __CARREL_HOME__/scripts/kb-cleanup.sh parse-assets-gc

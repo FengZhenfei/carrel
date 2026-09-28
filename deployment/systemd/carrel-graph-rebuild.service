@@ -1,0 +1,24 @@
+# Installed from __CARREL_HOME__/deployment/systemd by scripts/install-systemd.sh; the path marks which checkout owns this unit.
+[Unit]
+Description=Carrel: graph maintenance check (append new documents, rebuild policy)
+After=network-online.target
+
+[Service]
+# A graph build can take tens of hours. This used to be 43200 (12 hours), shorter than one normal build:
+# kb_004 measured about 23 hours, so via the timer path it would be SIGTERMed halfway. Aligned with the
+# console path's KB_GRAPH_BUILD_MAX_HOURS at 48 hours. A yield (this KB is parsing) no longer sleeps and
+# retries inside the script; the next round (2 hours later) comes by itself.
+TimeoutStartSec=172800
+Environment=PYTHONUNBUFFERED=1
+Type=oneshot
+WorkingDirectory=__CARREL_HOME__
+Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
+Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
+# The wait for Qdrant at the start of the script probes ${QDRANT_URL}; that value used to be undefined in the
+# unit's environment (only the KB_ENV_FILE path was), so it always probed 127.0.0.1:6333. Loading the env file
+# itself into the environment makes the probe follow a changed URL (2026-09-06 health check B11). When Qdrant
+# cannot be reached, ExecStartPre no longer exits 75 directly (which painted the unit failed every round while
+# the services were deliberately stopped); the script counts the deferral and exits quietly instead, see
+# scripts/lib/kb-maint-defer.sh for the policy.
+EnvironmentFile=-__CARREL_HOME__/config/knowledge-base.env
+ExecStart=/bin/bash __CARREL_HOME__/scripts/kb-graph-rebuild-check.sh

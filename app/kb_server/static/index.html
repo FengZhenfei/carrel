@@ -1,0 +1,783 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f9f9fb">
+<title>Carrel 控制台</title>
+<link rel="icon" href="data:,">
+<style>
+/* Design direction: the Linear / Vercel Geist / shadcn lineage -- neutral light grey background, white
+   cards, 1px hairline borders, minimal shadows, a single indigo accent, restrained 150ms motion.
+   Layout: top bar + knowledge base navigation on the left + workspace on the right (three tabs:
+   Configuration / Files / Graph); the model registry and service status are global and live in a
+   right-hand drawer; chunk preview and the job timeline use a drawer too. */
+:root{
+  --bg:#f9f9fb;--card:#ffffff;--well:#f6f6f8;
+  --line:#e8e8ee;--line-2:#f1f1f5;--line-strong:#dcdce4;
+  --text:#1c1c22;--text-2:#4c4c56;--muted:#73737e;--faint:#a3a3ae;
+  --green:#10b981;--yellow:#f59e0b;--red:#ef4444;--gray:#c8c8d2;
+  --btn:#e3e3ea;--btn-hover:#d6d6df;--btn-active:#c8c8d2;
+  --chip-blue:#d9e8fa;--chip-blue-line:#bcd6f1;
+  --amber-text:#b45309;--amber-bg:#fdf7e8;--amber-line:#f2e3bb;
+  --green-text:#047857;--green-bg:#ecfdf5;--green-line:#a7f3d0;
+  --red-text:#dc2626;--red-bg:#fef2f2;--red-line:#fecaca;
+  --accent:#4f46e5;--accent-deep:#4338ca;--accent-soft:#eef0ff;--accent-line:#dfe3ff;
+  --ring:0 0 0 3px rgba(79,70,229,.14);
+  --shadow-card:0 1px 2px rgba(20,20,30,.04);
+  --shadow-pop:0 0 0 1px rgba(20,20,30,.03),0 8px 24px rgba(20,20,30,.10),0 24px 56px rgba(20,20,30,.08);
+  --r:12px;--top:52px;--side:252px;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-size:13.5px;line-height:1.55;min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","HarmonyOS Sans SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:rgba(79,70,229,.16)}
+
+/* ── top bar ── */
+header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;height:var(--top);
+  padding:0 20px;background:rgba(255,255,255,.82);backdrop-filter:blur(16px) saturate(1.6);-webkit-backdrop-filter:blur(16px) saturate(1.6);
+  border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.brand h1{font-size:14px;font-weight:600;margin:0;letter-spacing:.01em;display:grid;min-width:0;white-space:nowrap}
+.brand h1>span{grid-area:1/1;overflow:hidden;text-overflow:ellipsis}
+.brand h1 .ghost{visibility:hidden}   /* the invisible English title reserves the wider of the two languages' widths: the switch does not move with the language */
+/* language switch: a two-cell pill, the selected cell white. Switching reloads the page (i18n.js) */
+.lang-switch{display:inline-flex;align-items:center;flex:none;padding:2px;border:1px solid var(--line-strong);border-radius:999px;background:var(--well)}
+.lang-switch button{border:0;background:transparent;padding:1px 9px;font-size:11.5px;font-weight:500;line-height:1.6;border-radius:999px;color:var(--muted)}
+.lang-switch button:hover{background:transparent;color:var(--text)}
+.lang-switch button.on{background:var(--card);color:var(--text);box-shadow:var(--shadow-card)}
+.tabs{margin-left:auto;display:flex;gap:8px;flex:none}
+.tabs button{background:var(--card);border-color:var(--line-strong);color:var(--text-2);display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
+#btn-llms{min-width:80px}#btn-health{min-width:96px}   /* text widths differ between the two languages; a minimum keeps the two top-right buttons in place across languages */
+.tabs button:hover{background:var(--well);border-color:#c9c9d4}
+.tabs button.active{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+
+/* ── common controls ── */
+button{border:1px solid transparent;background:var(--btn);border-radius:8px;padding:6px 13px;
+  font-size:13px;font-weight:500;cursor:pointer;color:var(--text);font-family:inherit;line-height:1.5;
+  transition:background .15s,border-color .15s,color .15s,box-shadow .15s}
+button:hover{background:var(--btn-hover);border-color:transparent;color:var(--text)}
+button:active{background:var(--btn-active)}
+button:focus-visible{outline:none;box-shadow:var(--ring)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:var(--accent-deep);border-color:var(--accent-deep);color:#fff}
+button.danger{color:var(--red-text);border-color:transparent;background:#fae6e6}
+button.danger:hover{background:#f5d6d6;border-color:transparent;color:var(--red-text)}
+button.sm{padding:3px 10px;font-size:12px;border-radius:7px}
+/* secondary buttons: light fill + thin border, recognizable as buttons at a glance (they used to be plain
+   text, and "Chunk preview / Re-parse" in the file table and "whole graph" in the graph preview looked
+   like ordinary text) */
+button.ghost{border-color:var(--line);background:var(--well);color:var(--text-2)}
+button.ghost:hover{background:var(--line-2);border-color:var(--line);color:var(--text)}
+button:disabled{opacity:.45;cursor:default;pointer-events:none}
+input:not([type=checkbox]):not([type=radio]),select,textarea{width:100%;padding:7px 11px;
+  border:1px solid var(--line-strong);border-radius:8px;font-size:13px;font-family:inherit;
+  background:var(--card);color:var(--text);transition:border-color .15s,box-shadow .15s}
+input:hover,select:hover,textarea:hover{border-color:#c9c9d4}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:var(--ring)}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+input.mono,textarea.mono{font-family:var(--mono);font-size:12.5px}
+select{appearance:none;-webkit-appearance:none;padding-right:30px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2373737e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center}
+textarea{min-height:118px;resize:vertical;line-height:1.65}
+label.f{display:block;font-size:12.5px;font-weight:500;color:var(--text-2);margin-bottom:6px}label.f:has(.f-note){white-space:nowrap;overflow:hidden;text-overflow:ellipsis}label.f .f-note{margin-left:10px;font-weight:400;color:var(--text-3,#8a8f98)}
+.hint{font-size:12px;color:var(--faint);margin-top:6px}
+.ro{padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--well);
+  color:var(--text-2);font-size:13px;line-height:1.5;min-height:34px;box-sizing:border-box}
+.ro.empty{color:var(--faint)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:7px 8px;min-height:34px;
+  border:1px solid var(--line);border-radius:8px;background:var(--well);box-sizing:border-box}
+.chips .empty{color:var(--faint);font-size:13px;line-height:1.5;padding:0 3px}
+/* The entity label row is not split evenly: the two inputs must hold a model name and a number while the
+   button has only a few characters; equal columns would leave the button a wide gap and squeeze the
+   inputs. Limited to above the 720px breakpoint -- on mobile the single-column .form-grid rule still
+   takes over. */
+@media (min-width:721px){
+  #cfg-tune .form-grid{grid-template-columns:1.4fr 1.4fr .75fr 1fr}
+  #cfg-ver-row > :last-child{grid-column:2 / -1}
+}
+.chip-t{background:var(--chip-blue);color:var(--text);border:1px solid var(--chip-blue-line);
+  border-radius:6px;padding:2px 9px;font-size:12.5px;line-height:1.6;white-space:nowrap}
+/* schema layer (parent types / predicates / competency questions) each take a full row: they are tables
+   or multi-line text and do not fit the four-column grid above */
+#cfg-tune .form-grid.one{grid-template-columns:1fr}
+.chip-p{display:inline-flex;align-items:baseline;gap:6px;background:var(--well);border:1px solid var(--line);
+  border-radius:6px;padding:2px 9px;font-size:12.5px;line-height:1.6}
+.chip-p b{font-weight:600;color:var(--text-2)}
+.chip-p span{color:var(--muted)}
+.pred-table{font-size:12.5px}
+.pred-table td,.pred-table th{padding:4px 8px}
+.pred-table td.mono{white-space:nowrap}
+/* graph preview tool row (search box / count / cluster) */
+.tool-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.tool-row input,.tool-row select{width:auto;flex:1;min-width:160px}
+.tool-row select.narrow{flex:none;width:110px}
+.tool-row button{flex:none}
+.muted{color:var(--muted)}
+.faint{color:var(--faint)}
+.small{font-size:12px}
+.mono{font-family:var(--mono)}
+.num{font-variant-numeric:tabular-nums}
+h2{font-size:13px;font-weight:600;margin:0 0 10px;color:var(--text)}
+.badge{display:inline-block;font-size:11.5px;line-height:1.5;padding:1px 7px;border-radius:6px;border:1px solid var(--line);
+  background:var(--well);color:var(--text-2);white-space:nowrap}
+.badge.ok{background:var(--green-bg);border-color:var(--green-line);color:var(--green-text)}
+.badge.warn{background:var(--amber-bg);border-color:var(--amber-line);color:var(--amber-text)}
+.badge.bad{background:var(--red-bg);border-color:var(--red-line);color:var(--red-text)}
+.badge.info{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+
+/* ── status dots ── */
+.dot{width:8px;height:8px;border-radius:50%;flex:none;display:inline-block;position:relative;transition:background .25s}
+.dot.green{background:var(--green)}
+.dot.yellow{background:var(--yellow)}
+.dot.red{background:var(--red)}
+.dot.gray{background:var(--gray)}
+.dot.half{background:linear-gradient(135deg,var(--green) 0 50%,var(--yellow) 50% 100%)}
+.dot.pulse::after{content:"";position:absolute;inset:-2px;border-radius:50%;
+  border:1.5px solid var(--yellow);opacity:0;animation:ping 1.8s cubic-bezier(0,0,.2,1) infinite}
+@keyframes ping{0%{transform:scale(.6);opacity:.55}80%,100%{transform:scale(1.8);opacity:0}}
+/* Pulsing dot: shared by parsing and building. The two rules stack, they are not duplicates --
+   .dot.pulse::after above draws the expanding halo, this one makes the dot itself breathe.
+   Removing either changes the effect; look closely before changing. */
+.dot.pulse{animation:ping 1.6s ease-in-out infinite}
+
+/* ── skeleton: left navigation + workspace ── */
+.shell{display:grid;grid-template-columns:var(--side) minmax(0,1fr);min-height:calc(100vh - var(--top))}
+.sidebar{border-right:1px solid var(--line);background:var(--card);position:sticky;top:var(--top);
+  height:calc(100vh - var(--top));overflow-y:auto;padding:10px 8px calc(16px + env(safe-area-inset-bottom))}
+.side-head{display:flex;align-items:center;gap:8px;padding:8px 10px 6px;font-size:12px;color:var(--faint);font-weight:500}
+.side-head .n{margin-left:auto;font-variant-numeric:tabular-nums}
+.kb-row{display:block;padding:9px 10px;border-radius:9px;cursor:pointer;transition:background .12s}
+.kb-row:hover{background:var(--well)}
+.kb-row.sel{background:var(--accent-soft)}
+.kb-row.sel .kb-row-name{color:var(--accent)}
+.kb-row-top{display:flex;align-items:center;gap:8px}
+.kb-row .dots{display:inline-flex;gap:5px;align-items:center;flex:none}
+.kb-row-name{font-weight:500;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-row-n{font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums;flex:none}
+.kb-row-sub{display:flex;align-items:center;gap:8px;margin-top:3px;padding-left:29px;font-size:11.5px;color:var(--faint)}
+.kb-row-sub .mini{flex:1 1 56px;min-width:56px;height:3px;background:var(--line-2);border-radius:99px;overflow:hidden}
+.kb-row-sub .mini i{display:block;height:100%;background:var(--yellow);border-radius:99px;transition:width .5s}
+.kb-row-sub .mini i.done{background:var(--green)}
+.kb-row-sub .mini.graph i{background:var(--accent)}
+.kb-row-sub .lbl{flex:0 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.side-empty{padding:14px 10px;font-size:12.5px;color:var(--muted);line-height:1.6}
+.sidebar input.side-search{display:block;width:calc(100% - 20px);margin:0 10px 8px;padding:6px 9px;font-size:12.5px;min-width:0}   /* the selector must outweigh the width:100% of the input:not(...) rule above */
+.workspace{padding:18px 24px calc(28px + env(safe-area-inset-bottom));min-width:0}
+.ws-empty{margin:80px auto 0;max-width:420px;text-align:center;color:var(--muted);font-size:13.5px;line-height:1.8}
+.ws-empty b{display:block;color:var(--text);font-size:16px;margin-bottom:6px}
+
+/* workspace head: name, stats, switch */
+.ws-head{display:flex;align-items:center;gap:11px;flex-wrap:wrap;padding:2px 2px 12px}
+.kb-name{font-weight:600;font-size:17px}
+.kb-id{font-size:12px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-left:2px}
+.kb-stats{display:flex;gap:14px;font-size:12.5px;color:var(--muted);align-items:center;flex-wrap:wrap}
+.kb-stats b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+.toggle-wrap{margin-left:auto;display:flex;align-items:center;gap:8px}
+.cfg-hint{margin:0 0 12px;font-size:12.5px;color:var(--muted);background:var(--well);
+  border:1px solid var(--line-2);border-radius:8px;padding:8px 12px}
+/* tab bar: underline style */
+.ws-tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:16px;overflow-x:auto;scrollbar-width:none}
+.ws-tabs::-webkit-scrollbar{display:none}
+.ws-tabs button{background:transparent;border:none;border-radius:0;padding:8px 12px 9px;color:var(--muted);font-weight:500;
+  border-bottom:2px solid transparent;margin-bottom:-1px;flex:none}
+.ws-tabs button:hover{background:transparent;color:var(--text)}
+.ws-tabs button.active{color:var(--accent);border-bottom-color:var(--accent)}
+.ws-tabs button:disabled{opacity:.4}
+.ws-tabs button .n{display:inline-block;min-width:16px;margin-left:5px;padding:0 5px;border-radius:99px;background:var(--line-2);
+  font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;line-height:1.5}
+.ws-tabs button .n.bad{background:var(--red-bg);color:var(--red-text)}
+.ws-tabs button .n:empty{display:none}
+.ws-tab{display:none}
+.ws-tab.show{display:block;animation:fadeIn .16s ease-out}
+@keyframes fadeIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  margin-bottom:14px;box-shadow:var(--shadow-card)}
+.card.pad{padding:16px 20px}
+.sec-head{display:flex;align-items:center;gap:11px;padding:14px 20px 10px;margin-top:6px;
+  border-top:1px solid var(--line-2);font-weight:600;font-size:13.5px}
+.sec-head.first{border-top:none;margin-top:0}
+#cfg-fields,#graph-fields{border:none;margin:0;padding:2px 20px 4px;transition:opacity .2s}
+#cfg-fields:disabled,#graph-fields:disabled{opacity:.45}
+.cfg-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 20px 18px}
+.cfg-actions .danger{margin-left:auto}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+/* Grid items default to min-width:auto: the .tbl-wrap holding the predicate table would stretch its
+   column to the table's minimum width, the whole page grew to 586px on phones and the browser had to
+   shrink the page (2026-09-11 user screenshot). Allow shrinking; the table scrolls horizontally inside
+   .tbl-wrap */
+.form-grid>*{min-width:0}
+.card{min-width:0}
+.row-actions{display:flex;gap:8px;margin-top:16px;align-items:center;flex-wrap:wrap}
+.note{font-size:12.5px;color:var(--amber-text);background:var(--amber-bg);border:1px solid var(--amber-line);border-radius:8px;
+  padding:5px 10px;display:none}
+.switch-line{display:flex;align-items:center;gap:10px;min-height:34px}
+.switch-line .lbl{font-size:13px;color:var(--text-2)}
+
+/* ── switch ── */
+.switch{position:relative;width:38px;height:22px;flex:none;cursor:pointer}
+.switch i{position:absolute;inset:0;background:var(--line-strong);border-radius:999px;transition:background .18s}
+.switch i::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;
+  background:#fff;border-radius:50%;transition:left .18s cubic-bezier(.4,0,.2,1);
+  box-shadow:0 1px 2px rgba(0,0,0,.2),0 0 0 .5px rgba(0,0,0,.04)}
+.switch input:checked + i{background:var(--green)}
+.switch input:checked + i::after{left:18px}
+.switch input:disabled + i{opacity:.5;cursor:default}
+.switch input{position:absolute;opacity:0;width:1px;height:1px;clip:rect(0 0 0 0);clip-path:inset(50%)}
+.switch input:focus-visible + i{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ── toolbar + table ── */
+.tb{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.tb input,.tb select{width:auto}
+.tb input[type=search]{min-width:220px}
+.tb .sp{flex:1}
+.tb .cnt{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+.tbl-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+/* merges drawer: one table holds the merged / blocked sections with aligned columns; cells do not wrap,
+   overflow scrolls horizontally in the wrapper */
+.merge-wrap{margin-top:10px}
+.merge-tbl{width:100%;table-layout:fixed}   /* fixed column widths: route / grounds fixed, the two entity columns share the rest */
+.merge-tbl th,.merge-tbl td{white-space:nowrap}
+.merge-tbl td .cell{overflow:hidden;white-space:nowrap}   /* overflowing cell content scrolls in a loop inside its cell (app.js marqueeMergeCells, like the long names in the model panel): no wrapping, no stretching, no dragging */
+.merge-tbl td .cell .cell-in{display:inline-flex;gap:36px;will-change:transform}
+.merge-tbl td .cell .seg{flex:0 0 auto;white-space:nowrap}
+.merge-tbl td .cell.scroll{-webkit-mask-image:linear-gradient(to right,transparent 0,#000 8px,#000 calc(100% - 12px),transparent 100%);
+          mask-image:linear-gradient(to right,transparent 0,#000 8px,#000 calc(100% - 12px),transparent 100%)}
+.merge-tbl td .cell.scroll .cell-in{animation:llm-marquee var(--dur,9s) linear infinite}
+@media (prefers-reduced-motion: reduce){.merge-tbl td .cell.scroll .cell-in{animation:none}}
+.merge-tbl tr.merge-sec td{background:var(--line-2);color:var(--text);font-weight:600;font-size:13px}
+.merge-tbl tr.merge-sec td .n{color:var(--muted);font-weight:500;margin-left:4px}
+.merge-tbl td.merge-none{color:var(--faint)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line-2);vertical-align:top}
+th{color:var(--faint);font-weight:500;font-size:12px;white-space:nowrap;position:sticky;top:0;background:var(--card);z-index:1;user-select:none}
+th.sortable{cursor:pointer}
+th.sortable:hover{color:var(--text)}
+th .arrow{font-size:10px;margin-left:3px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:#fafafc}
+tbody tr.sel{background:var(--accent-soft)}
+td .err{color:var(--red-text);font-size:12px;white-space:pre-wrap;word-break:break-all}
+.stage{color:var(--accent);font-size:12px}
+.fn-link{cursor:pointer;color:var(--text);text-decoration:underline dotted var(--line-strong);text-underline-offset:3px}
+.fn-link:hover{color:var(--accent)}
+td.path{word-break:break-all;min-width:220px}
+.pager{display:flex;gap:6px;align-items:center;justify-content:flex-end;margin-top:10px;font-size:12px;color:var(--faint)}
+.empty-state{padding:26px 16px;text-align:center;color:var(--muted);font-size:13px}
+.act{display:inline-flex;gap:6px;white-space:nowrap}
+
+/* ── chunks tab ── */
+.pv-verdict{border-radius:8px;padding:9px 13px;font-size:12.5px;margin-bottom:12px;line-height:1.6}
+.pv-verdict.ok{background:var(--green-bg);border:1px solid var(--green-line);color:var(--green-text)}
+.pv-verdict.warn{background:var(--amber-bg);border:1px solid var(--amber-line);color:var(--amber-text)}
+.pv-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.pv-stats > div{background:var(--well);border:1px solid var(--line-2);border-radius:9px;padding:8px 12px;min-width:0}
+.pv-stats b{display:block;font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.3}
+.pv-stats span{font-size:11.5px;color:var(--faint)}
+.pv-filters{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;font-size:12px}
+.pv-filters .chip{padding:2px 10px;border:1px solid var(--line);border-radius:99px;background:var(--card);cursor:pointer;color:var(--text-2);font-size:12px}
+.pv-filters .chip.on{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+.pv-chunk{border:1px solid var(--line-2);border-radius:9px;margin-bottom:6px;background:var(--card)}
+.pv-chunk.tiny{border-left:3px solid var(--yellow)}
+.pv-chunk.over{border-left:3px solid var(--red)}
+.pv-chunk summary{cursor:pointer;padding:7px 12px;font-size:12px;display:flex;gap:10px;align-items:center;list-style:none}
+.pv-chunk summary::-webkit-details-marker{display:none}
+.pv-chunk summary .t{font-weight:600;min-width:38px;font-variant-numeric:tabular-nums}
+.pv-badge{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--line-strong);white-space:nowrap;margin-left:2px}
+.pv-badge.warn{color:var(--amber-text);background:var(--amber-bg);border-color:var(--amber-line)}
+.pv-badge.ok{color:var(--green-text);background:var(--green-bg);border-color:var(--green-line)}
+.pv-chunk summary .tok{color:var(--accent);min-width:58px;font-variant-numeric:tabular-nums}
+.pv-chunk summary .bt{color:var(--faint);min-width:76px}
+.pv-chunk summary .sp{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.pv-chunk summary .pv-peek{color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1.4;min-width:0}
+.pv-chunk[open] summary .pv-peek{display:none}
+.pv-chunk pre{margin:0;padding:10px 14px 12px;border-top:1px solid var(--line-2);font-size:12.5px;line-height:1.6;
+  white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;font-family:inherit}
+
+/* ── jobs tab ── */
+.split{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1.45fr);gap:16px;align-items:start}
+.jl-row{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;padding:8px 10px;border-bottom:1px solid var(--line-2);cursor:pointer;font-size:12.5px}
+.jl-row:last-child{border-bottom:none}
+.jl-row:hover{background:#fafafc}
+.jl-row.sel{background:var(--accent-soft)}
+.jl-row .fn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.jl-row .st{color:var(--faint);white-space:nowrap;font-size:12px}
+.jl-row .sub{grid-column:2 / -1;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jl-row .sub.err{color:var(--red-text)}
+.job-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 14px;font-size:12px;margin:12px 0}
+.job-meta span{color:var(--faint)}
+.job-meta b{display:block;font-weight:500;word-break:break-all}
+.timeline{border:1px solid var(--line-2);border-radius:9px;padding:8px 12px;font-size:12.5px;line-height:1.75;max-height:60vh;overflow:auto}
+.timeline > div{display:flex;gap:12px;align-items:baseline}
+.timeline .ts{color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+.timeline .dur{color:var(--accent);min-width:56px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.timeline .tx{flex:1;min-width:0;word-break:break-word;white-space:pre-wrap}
+.timeline .stage .tx{font-weight:600}
+.timeline .error .tx,.timeline .retry .tx{color:var(--red-text)}
+.timeline .done .tx{color:var(--green-text)}
+.timeline .cancelled .tx{color:var(--amber-text)}
+.timeline .synth .tx{color:var(--muted)}
+
+/* ── graph tab ── */
+.gstat{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.gstats{grid-template-columns:repeat(3,minmax(0,1fr));margin:2px 0 0}
+.gstats-at{font-size:11.5px;color:var(--faint);margin-top:8px}
+.gstat .big{font-size:15px;font-weight:600}
+.pbar{height:6px;background:var(--line-2);border-radius:99px;overflow:hidden;margin:10px 0 6px}
+.pbar i{display:block;height:100%;border-radius:99px;transition:width .5s cubic-bezier(.4,0,.2,1);background:var(--green)}
+.pbar i.busy{background:repeating-linear-gradient(-55deg,var(--yellow) 0 8px,#fbbf24 8px 16px);
+  background-size:23px 100%;animation:slide 1.1s linear infinite}
+.pbar i.fail{background:var(--red)}
+@keyframes slide{to{background-position:23px 0}}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:12px}
+.kpis > div{background:var(--well);border:1px solid var(--line-2);border-radius:9px;padding:8px 12px}
+.kpis b{display:block;font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.3}
+.kpis span{font-size:11.5px;color:var(--faint)}
+.phases{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.phase{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--muted)}
+.phase.done{background:var(--green-bg);border-color:var(--green-line);color:var(--green-text)}
+.phase.cur{background:var(--amber-bg);border-color:var(--amber-line);color:var(--amber-text)}
+.phase .d{font-variant-numeric:tabular-nums;color:inherit;opacity:.8}
+
+/* service rows */
+.svc-row{display:flex;align-items:center;gap:10px;padding:9px 6px;border-bottom:1px solid var(--line-2)}
+.svc-row:last-child{border-bottom:none}
+.svc-name{font-weight:500}
+.svc-restart{margin-left:auto;padding:3px 10px;font-size:12px;border-radius:7px;color:var(--muted)}
+.svc-head{margin:16px 6px 4px;font-size:12px;color:var(--muted)}
+.svc-head-row{display:flex;align-items:center;justify-content:space-between;margin-top:4px}
+.svc-bulk{display:flex;gap:6px}
+.svc-meta{margin-left:auto;font-size:12px;color:var(--muted);text-align:right;line-height:1.5}
+
+/* ── right-hand drawers (models / services) ── */
+.scrim{position:fixed;inset:0;background:rgba(15,15,22,.18);z-index:55;display:none}
+.scrim.show{display:block}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:440px;max-width:100vw;background:var(--card);border-left:1px solid var(--line);
+  box-shadow:var(--shadow-pop);z-index:60;display:flex;flex-direction:column;transform:translateX(102%);transition:transform .2s cubic-bezier(.16,1,.3,1)}
+.drawer.show{transform:none}
+.drawer.wide{width:760px}
+#side-body .pv-stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+.pv-file{display:flex;flex-direction:column;gap:2px;margin-bottom:10px;font-size:13px;word-break:break-all}
+.gp-wrap{position:relative}
+#gp-cluster.on{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+#gp-canvas{display:block;width:100%;height:calc(100vh - 330px);min-height:640px;border:1px solid var(--line-2);border-radius:10px;background:var(--well);cursor:grab;
+  touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}   /* touch: pinch / drag go to app.js, the browser must not zoom the whole page */
+.gp-nav{position:absolute;top:10px;left:10px;display:flex;gap:6px;z-index:2}
+.gp-nav button{width:34px;height:30px;padding:0;font-size:16px;line-height:28px}
+.gp-tip{position:absolute;display:none;pointer-events:none;max-width:340px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font-size:12px;line-height:1.55;box-shadow:0 6px 24px rgba(0,0,0,.12);z-index:3}
+.gp-tip b{display:block;font-size:13px;margin-bottom:2px}
+.gp-tip .muted{display:block}
+#gp-legend .chip i{display:inline-block;width:9px;height:9px;border-radius:99px;margin-right:5px;vertical-align:-1px}
+#gp-legend .chip .en{color:var(--muted);font-size:11px;margin-left:2px}
+.drawer .pw-head{display:flex;align-items:center;gap:8px;padding:14px 12px 12px 18px;border-bottom:1px solid var(--line-2);font-weight:600;font-size:14px}
+.drawer .pw-body{overflow-y:auto;padding:12px 16px calc(16px + env(safe-area-inset-bottom));overscroll-behavior:contain;flex:1}
+.pw-body::-webkit-scrollbar{width:8px}
+.pw-body::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:99px;border:2px solid var(--card)}
+.pw-head .panel-close{margin-left:auto;width:26px;height:26px;padding:0;display:grid;place-items:center;
+  border:none;background:transparent;color:var(--faint);font-size:12px;border-radius:7px;font-weight:400}
+.pw-head .panel-close:hover{background:var(--line-2);color:var(--text)}
+.ri-row{display:flex;gap:8px}
+/* Version dropdown + delete button on one line. .ri-row is not reused: that rule pins the select to 88px,
+   while a version label is a long "date · model · sample · label count" string. */
+.ver-row{display:flex;gap:8px}
+.ver-row select{flex:1;min-width:0}
+.ver-row button{flex:none}
+.ri-row input{flex:1}
+.ri-row select{width:88px;flex:none}
+.ri-row.nc select{width:158px}
+
+/* model registry */
+.llm-card{border:1px solid var(--line);border-radius:10px;padding:13px 14px;margin-bottom:10px;background:var(--card)}
+.llm-top{display:flex;align-items:center;gap:8px}
+.llm-actions{margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0}
+.llm-actions .llm-chip{margin-right:6px}
+.llm-actions .llm-chip,.llm-actions button{white-space:nowrap}
+.llm-title{font-weight:600;font-size:13.5px;flex:0 0 var(--llm-name-w,150px);
+  width:var(--llm-name-w,150px);overflow:hidden;white-space:nowrap}
+.llm-title.marquee{
+  -webkit-mask-image:linear-gradient(to right,transparent 0,#000 10px,#000 calc(100% - 14px),transparent 100%);
+          mask-image:linear-gradient(to right,transparent 0,#000 10px,#000 calc(100% - 14px),transparent 100%)}
+.llm-title-inner{display:inline-flex;gap:var(--gap,36px);will-change:transform}
+.llm-seg{flex:0 0 auto;white-space:nowrap}
+.llm-title.marquee .llm-title-inner{animation:llm-marquee var(--dur,9s) linear infinite}
+@keyframes llm-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--shift,0px)))}}
+@media (prefers-reduced-motion: reduce){
+  .llm-title.marquee .llm-title-inner{animation:none}
+  .llm-title.marquee{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 14px),transparent 100%);
+                              mask-image:linear-gradient(to right,#000 calc(100% - 14px),transparent 100%)}
+}
+.llm-meta{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:7px;word-break:break-all;line-height:1.5}
+.llm-chip{font-family:var(--mono);font-size:11.5px;color:var(--text-2);background:var(--well);
+  border:1px solid var(--line);border-radius:6px;padding:2px 8px}
+.llm-chip.key{font-family:inherit;color:var(--green);background:#effaf5;border-color:#d3f0e2}
+.llm-card .fld{margin-bottom:12px}
+.llm-card .fld:first-child{margin-top:2px}
+.llm-card .c-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:2px}
+.llm-empty{font-size:12.5px;color:var(--muted);padding:6px 4px 12px;line-height:1.6}
+#llm-add{width:100%;padding:9px;border:1px dashed var(--line-strong);font-size:13px;color:var(--muted);
+  border-radius:10px;background:transparent}
+#llm-add:hover{color:var(--accent);border-color:var(--accent-line);background:#fbfbff}
+
+/* toast / dialog */
+.toast{position:fixed;left:50%;transform:translateX(-50%) translateY(10px);bottom:calc(24px + env(safe-area-inset-bottom));
+  background:#1c1c22;color:#f4f4f6;padding:9px 16px;border-radius:9px;font-size:13px;z-index:99;
+  opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;
+  box-shadow:0 4px 16px rgba(0,0,0,.2);max-width:86vw}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+dialog{border:1px solid var(--line);border-radius:14px;padding:20px 22px;max-width:420px;width:calc(100vw - 48px);
+  font-size:13.5px;box-shadow:var(--shadow-pop);color:var(--text)}
+dialog[open]{animation:dlgIn .16s cubic-bezier(.16,1,.3,1)}
+@keyframes dlgIn{from{opacity:0;transform:scale(.98) translateY(6px)}to{opacity:1;transform:none}}
+dialog::backdrop{background:rgba(15,15,22,.4);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)}
+dialog button.danger{background:var(--red-text);border-color:var(--red-text);color:#fff}
+dialog button.danger:hover{background:#b91c1c;border-color:#b91c1c;color:#fff}
+
+/* global banner when the backend is unreachable / parsing is turned off (lit only after two failed polls,
+   to avoid flicker) */
+body.backend-offline header::after{content:"后端不可达,显示的是最后一次成功获取的数据";
+  position:absolute;left:0;right:0;top:100%;display:block;background:var(--red);color:#fff;font-size:12.5px;padding:4px 20px;letter-spacing:.02em}
+body.parse-disabled header::before{content:"解析已在配置中关闭(KB_PARSE_ENABLED=0),队列不会被消费";
+  position:absolute;left:0;right:0;top:100%;display:block;background:var(--amber-text);color:#fff;font-size:12.5px;padding:4px 20px}
+html[lang=en] body.backend-offline header::after{content:"Backend unreachable, showing the last data fetched successfully"}
+html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in the config (KB_PARSE_ENABLED=0); the queue is not consumed"}
+
+/* ── narrow screens ── */
+@media (max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line);
+    overflow-x:auto;padding:8px 10px}
+  .side-head{display:none}
+  #kb-nav{display:flex;gap:6px;min-width:max-content}   /* one horizontal row of cards, swipe sideways */
+  .kb-row{flex:none;min-width:150px;max-width:220px;border:1px solid var(--line);padding:7px 10px}
+  .kb-row-sub{padding-left:0}
+  header{padding:0 12px;gap:10px}
+  .brand{gap:8px}
+  .tabs{gap:6px}
+  .tabs button{padding:5px 10px;min-width:0}
+  .workspace{padding:14px 12px calc(24px + env(safe-area-inset-bottom))}
+  .split{grid-template-columns:1fr}
+  .pv-stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .drawer,.drawer.wide{width:100vw}
+  .form-grid{grid-template-columns:1fr}
+  #cfg-fields,#graph-fields{padding:2px 14px 4px}
+  .sec-head{padding:12px 14px 8px}
+  button{padding:7px 13px}
+  button.sm{padding:4px 10px}
+  input,select,textarea{font-size:16px}   /* iOS Safari zooms the whole page on focus when a control's font size is <16px */
+  .tb input[type=search]{min-width:0;flex:1 1 100%}   /* a full row of its own: sharing the remaining width with .sp squeezes it into a tiny square */
+  #pv-file{min-width:0 !important}
+  .card.pad{padding:14px 14px}
+  .cfg-actions{padding:12px 14px 16px}
+  .ws-empty{margin-top:40px}
+  .gp-tip{max-width:calc(100vw - 48px)}
+  #gp-canvas{height:calc(100vh - 300px);min-height:520px}   /* leave screen height for the tool row and legend on phones */
+}
+/* ── phones (2026-09-11 user screenshot: after the buttons wrapped, "Delete" was flung to the right of the
+   second row by margin-left:auto, with "Pause build" alone on the left) ──
+   The action row becomes a two-column grid: Save (primary) and Delete (danger) each take a full row, the
+   rest go two per row; with an odd number of ordinary buttons the last one takes a full row too.
+   Predicate table: the description column is hidden, and "source→target" in the data column may break
+   after the arrow, so the table fits the screen. */
+@media (max-width:600px){
+  .cfg-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:12px 14px 16px}
+  .cfg-actions button{width:100%;margin:0}
+  .cfg-actions .primary,.cfg-actions .danger,.cfg-actions .note{grid-column:1 / -1}
+  .cfg-actions .danger{margin-top:4px}
+  .cfg-actions > button:not(.primary):not(.danger):nth-of-type(even):nth-last-of-type(2){grid-column:1 / -1}
+  .pred-table{font-size:12px}
+  .pred-table td,.pred-table th{padding:4px 6px}
+  .pred-table td:nth-child(5),.pred-table th:nth-child(5){display:none}
+  .pred-table td.mono{white-space:normal;overflow-wrap:break-word}   /* predicate names wrap as whole words, never mid-word; only when they really do not fit does the wrapper scroll horizontally */
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><h1><span>Carrel 控制台</span><span class="ghost" aria-hidden="true">Carrel Console</span></h1>
+    <div class="lang-switch" id="lang-switch" title="界面语言 / Language"><button type="button" data-lang="zh">中</button><button type="button" data-lang="en">EN</button></div></div>
+  <nav class="tabs">
+    <button id="btn-llms">模型列表</button>
+    <button id="btn-health"><span class="dot gray" id="health-dot"></span>服务状态</button>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="side-head"><span data-en="Knowledge bases">知识库</span><span class="n" id="side-count"></span></div>
+    <input type="search" id="kb-q" class="side-search" placeholder="筛选知识库" autocomplete="off">
+    <div id="kb-nav"><div class="side-empty">载入中…</div></div>
+  </aside>
+
+  <main class="workspace">
+    <div class="ws-empty" id="ws-empty">
+      <b>选择一个知识库</b>
+    </div>
+
+    <div id="ws" hidden>
+      <div class="ws-head">
+        <span class="dot gray" id="sel-dot"></span>
+        <span class="kb-name" id="sel-name">未选择知识库</span>
+        <span class="kb-id" id="sel-id" title="库的编号:Qdrant 集合、日志、缓存目录都用它"></span>
+        <span class="kb-stats" id="sel-stats"></span>
+      </div>
+      <div class="cfg-hint" id="sel-hint" style="display:none"></div>
+      <!-- Directory rename: an unenrolled directory can be adopted as the renamed directory of a knowledge
+           base whose directory vanished, keeping its id and data without re-parsing -->
+      <div class="cfg-hint" id="sel-adopt" style="display:none">这个目录是已登记的库改了名?
+        <select id="adopt-from" class="narrow" style="margin:0 6px"></select>
+        <button class="sm ghost" id="adopt-go">沿用原库,不重新解析</button></div>
+      <nav class="ws-tabs">
+        <button data-tab="config">配置管理</button>
+        <button data-tab="files">文件管理<span class="n" id="tabn-files"></span></button>
+        <button data-tab="graph">图谱预览</button>
+      </nav>
+
+      <!-- ── files ── -->
+      <section class="ws-tab" id="tab-files">
+        <div class="tb">
+          <input type="search" id="fl-q" placeholder="按文件名 / 路径筛选">
+          <select id="fl-status">
+            <option value="all">全部状态</option>
+            <option value="indexed">已入库</option>
+            <option value="pending">待解析 / 排队</option>
+            <option value="running">解析中</option>
+            <option value="failed">失败</option>
+            <option value="diag">有切块提示</option>
+          </select>
+          <span class="sp"></span>
+          <span class="cnt" id="fl-count"></span>
+        </div>
+        <div class="tbl-wrap" id="fl-wrap"><div class="empty-state">载入中…</div></div>
+        <div class="pager" id="fl-pager"></div>
+      </section>
+
+      <!-- ── graph ── -->
+      <section class="ws-tab" id="tab-graph">
+        <div class="card pad" id="graph-status"></div>
+        <!-- Graph preview: entities and relations of the current version's graph.json drawn as a force-directed
+             graph; the top N by degree (100 ~ 3000; no "whole graph" since 2026-09-12).
+             Click an entity to center on it and see its neighbours (next level), the search box jumps straight
+             to one, and the top-left ← → on the canvas move between levels; wheel to zoom, drag to pan.
+             Neo4j is not touched; the build artifact is the data source. -->
+        <h2>图谱预览</h2>
+        <div class="card pad" id="gp-card">
+          <div class="tool-row">
+            <input type="text" id="gp-q" placeholder="输入实体名定位,回车;留空看连接最多的实体">
+            <select id="gp-limit" class="narrow" title="画多少个实体">
+              <option value="100">100 个</option>
+              <option value="200" selected>200 个</option>
+              <option value="300">300 个</option>
+              <option value="400">400 个</option>
+              <option value="500">500 个</option>
+              <option value="1000">1000 个</option>
+              <option value="1500">1500 个</option>
+              <option value="2000">2000 个</option>
+              <option value="3000">3000 个</option></select>
+            <button id="gp-cluster" class="ghost on" title="按上层本体分区排布:同类聚成一团、类与类分开;再点一次回到纯力导向">分区</button>
+            <button id="gp-merges" class="ghost" title="这一版实体归并的账:每一对并掉的实体并进了谁、走的哪一路、依据是什么;以及被规则或第二道判定挡下的对">实体归并审计</button>
+          </div>
+          <div class="pv-filters" id="gp-legend"></div>
+          <div class="gp-wrap">
+            <div class="gp-nav">
+              <button id="gp-back" class="ghost" title="上一层" disabled>&larr;</button>
+              <button id="gp-fwd" class="ghost" title="下一层" disabled>&rarr;</button>
+            </div>
+            <canvas id="gp-canvas"></canvas><div class="gp-tip" id="gp-tip"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── config ── -->
+      <section class="ws-tab" id="tab-config">
+        <div class="card" id="config-card">
+          <div class="sec-head first">
+            <span>知识库</span>
+            <span class="toggle-wrap">
+              <span class="small muted">开启知识库</span>
+              <label class="switch"><input type="checkbox" id="sel-toggle" disabled><i></i></label>
+            </span>
+          </div>
+          <fieldset id="cfg-fields" disabled>
+            <div class="form-grid">
+              <div><label class="f">chunk max_tokens</label>
+                <input type="number" id="cfg-max" value="400">
+                <div class="hint" id="cfg-max-hint"></div></div>
+              <div><label class="f">chunk overlap_tokens</label>
+                <input type="number" id="cfg-ov" value="80">
+                <div class="hint" id="cfg-ov-hint"></div></div>
+            </div>
+            <div style="margin-top:14px"><label class="f">多模态结构化描述提示词(留空 = 内置默认)</label>
+              <textarea id="cfg-prompt" placeholder="内置默认(自定义后替换此段):
+This is an image from a knowledge-base document; examine it carefully and output a structured result.
+Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, formulas, whole slides; decide the kind first, then extract the information item by item.
+Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, watermarks and purely decorative elements, and extract only content that carries information.
+(独立图片文件会额外附上文件名作为主题参考)"></textarea>
+              <div class="hint">保存只更新策略,解析由自动扫描或「立即解析」触发;要应用到已入库内容用「整库重新解析」。</div></div>
+          </fieldset>
+          <div class="cfg-actions">
+            <button class="primary" id="cfg-save" disabled>保存配置</button>
+            <button id="cfg-parse-now" disabled>立即解析</button>
+            <button id="cfg-reparse" disabled>整库重新解析</button>
+            <span class="note" id="cfg-note"></span>
+            <button class="danger" id="cfg-delete" disabled>删除知识库</button>
+          </div>
+          <div class="sec-head">
+            <span>知识图谱</span>
+            <span class="toggle-wrap">
+              <span class="small muted">开启知识图谱</span>
+              <label class="switch"><input type="checkbox" id="cfg-graph" disabled><i></i></label>
+            </span>
+          </div>
+          <fieldset id="graph-fields" disabled>
+            <div class="form-grid" style="margin-bottom:14px">
+              <div><label class="f">每单元合并切片数</label>
+                <select id="cfg-guc">
+                  <option value="1">1(不合并,一片一单元)</option>
+                  <option value="2">2 片合一</option>
+                  <option value="3" selected>3 片合一(默认)</option>
+                  <option value="4">4 片合一</option>
+                  <option value="5">5 片合一</option>
+                  <option value="6">6 片合一</option>
+                  <option value="7">7 片合一</option>
+                  <option value="8">8 片合一</option>
+                </select>
+                </div>
+              <div><label class="f">补漏轮数</label>
+                <select id="cfg-ggl">
+                  <option value="0">0(只抽一遍)</option>
+                  <option value="1" selected>1 轮(默认)</option>
+                  <option value="2">2 轮</option>
+                </select>
+                </div>
+            </div>
+            <!-- Schema layer: model, action, sample size, and the extracted language / labels / parent types /
+                 predicates / competency questions. Placed first: the type table and predicate table it
+                 produces feed the graph extraction step below, so the order follows the data flow. -->
+            <div id="cfg-tune">
+              <div class="form-grid">
+                <div><label class="f">实体标签模型</label><select id="cfg-gt"></select></div>
+                <div><label class="f">采样数量</label>
+                  <input type="number" id="cfg-gss" min="1" max="32" step="1" value="8">
+                  <div class="hint" id="cfg-gss-hint"></div></div>
+                <div><label class="f">&nbsp;</label>
+                  <button id="cfg-gtune" style="width:100%">立即/重新抽取标签</button></div>
+                <!-- Output language, entity labels, parent types and predicates are extracted, derived results,
+                     shown read-only; to change them, extract again. Competency questions are maintained by
+                     hand and editable. -->
+                <div><label class="f">输出语言</label>
+                  <div class="ro empty" id="cfg-glang">尚未抽取</div></div>
+              </div>
+              <!-- Same grid as the row above: the dropdown takes column 1 (aligned with "Label extraction
+                   model"), the label box spans columns 2-4 (left edge aligned with "Sample size", right edge
+                   with "Output language"). -->
+              <div class="form-grid" id="cfg-ver-row" style="margin-top:12px">
+                <div><label class="f">标签版本</label>
+                  <div class="ver-row">
+                    <select id="cfg-gver"></select>
+                    <button class="danger" id="cfg-gvdel" title="删除选中的这一版标签" disabled>删除</button>
+                  </div></div>
+                <div><label class="f">实体标签</label>
+                  <div class="chips" id="cfg-get"></div>
+                  <div class="hint" id="cfg-get-hint"></div></div>
+              </div>
+              <div class="form-grid one" style="margin-top:12px">
+                <div><label class="f">类型父类(端点约束用)</label>
+                  <div class="chips" id="cfg-gparents"></div></div>
+              </div>
+              <div class="form-grid one" style="margin-top:12px">
+                <div><label class="f">关系谓词</label>
+                  <div class="tbl-wrap" id="cfg-gpreds"></div></div>
+              </div>
+            </div>
+            <div class="form-grid" id="cfg-gllm" style="margin-top:14px">
+              <div><label class="f">实体抽取模型</label><select id="cfg-ge"></select></div>
+              <div><label class="f">描述摘要模型</label><select id="cfg-gs"></select></div>
+            </div>
+            <div style="margin-top:14px" id="cfg-policy">
+              <div class="form-grid" style="margin-bottom:12px">
+                <div><label class="f">新增内容自动并入</label>
+                  <div style="display:flex;align-items:center;gap:10px;min-height:32px">
+                    <label class="switch"><input type="checkbox" id="cfg-gaa" checked><i></i></label>
+                    <span class="hint" style="margin:0">解析完的新增 / 变更文档每 2 小时自动增量并入现行图:只抽新单元,沿用上一版的归并结论与向量,不等整库重建</span>
+                  </div></div>
+              </div>
+              <div class="form-grid">
+                <div><label class="f">自动重建·时间条件<span class="f-note" id="cfg-ri-progress" hidden></span></label>
+                  <div class="ri-row">
+                    <input type="number" id="cfg-ri-n" min="1" max="30" step="1" placeholder="留空 = 不按时间">
+                    <select id="cfg-ri-u">
+                      <option value="d">天</option>
+                      <option value="w">周</option>
+                      <option value="m">月</option></select>
+                  </div></div>
+                <div><label class="f">自动重建·新增内容条件<span class="f-note" id="cfg-rp-progress" hidden></span></label>
+                  <div class="ri-row nc">
+                    <input type="number" id="cfg-rp-n" min="1" step="1" placeholder="留空 = 不按增量">
+                    <select id="cfg-rp-u">
+                      <option value="c">个,新增 Chunk 数</option>
+                      <option value="p">%,新增百分比</option></select>
+                  </div></div>
+                <div><label class="f">自动重建·条件组合</label>
+                  <select id="cfg-ro">
+                    <option value="or">满足其一即重建</option>
+                    <option value="and">须同时满足</option></select></div>
+              </div>
+            </div>
+          </fieldset>
+          <div class="cfg-actions">
+            <button class="primary" id="cfg-gsave" disabled>保存配置</button>
+            <button id="cfg-gbuild" disabled>立即/重新建图</button>
+            <button id="cfg-gappend" disabled title="只抽新增 / 变更文档的单元,回放上一版的归并结论、沿用没变的向量,作为新版本切换">并入新增内容</button>
+            <button id="cfg-gpause" disabled>暂停建图</button>
+            <span class="note" id="cfg-gnote"></span>
+            <button class="danger" id="cfg-gdelete" disabled>删除知识图谱</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div id="llm-win" class="drawer">
+  <div class="pw-head"><span>模型列表</span>
+    <button class="panel-close" aria-label="收起" title="收起">✕</button></div>
+  <div class="pw-body">
+    <div id="llm-cards"></div>
+    <button id="llm-add" title="添加模型">＋ 添加模型</button>
+  </div>
+</div>
+<div id="health-win" class="drawer">
+  <div class="pw-head"><span>服务状态</span>
+    <button class="panel-close" aria-label="收起" title="收起">✕</button></div>
+  <div class="pw-body" id="health-body"></div>
+</div>
+<!-- Drawer for the file table: "Chunk preview" shows the chunks currently stored; clicking a file name
+     shows this parse's job timeline -->
+<div id="side-win" class="drawer wide">
+  <div class="pw-head"><span id="side-title">切块预览</span>
+    <button class="panel-close" aria-label="收起" title="收起">✕</button></div>
+  <div class="pw-body" id="side-body"></div>
+</div>
+<div class="toast" id="toast"></div>
+<dialog id="confirm-dlg">
+  <div id="confirm-text" style="white-space:pre-wrap;line-height:1.7"></div>
+  <div class="row-actions" style="justify-content:flex-end;margin-top:18px">
+    <button id="confirm-no">取消</button>
+    <button class="danger" id="confirm-yes">确认</button>
+  </div>
+</dialog>
+<script src="i18n.js?v=20260923-4"></script>
+<script src="app.js?v=20260923-4"></script>
+</body>
+</html>

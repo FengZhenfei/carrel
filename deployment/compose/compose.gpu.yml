@@ -1,0 +1,7 @@
+# GPU overlay: reserves the NVIDIA GPU for the parser. `deploy.sh` includes
+# this file through COMPOSE_FILE in `.env` when the host has the NVIDIA
+# container toolkit; without it `docker compose up` would fail on hosts that
+# have no GPU driver at all.
+services:
+  mineru:
+    gpus: all
