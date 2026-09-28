@@ -53,6 +53,7 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "visual": visual_block(payload),
         "boilerplate": bool(cand.get("boilerplate")) or is_boilerplate(payload),
         "bucket": cand.get("bucket"),
+        "degraded": payload.get("degraded"),      # parse-time degradation reason (e.g. text_layer_cjk_lost), distinct from the channel-level degraded list
         "accepted": cand.get("accepted"),
     }
     for key in ("score_rerank", "score_final"):

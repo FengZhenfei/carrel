@@ -9,6 +9,7 @@ from ..headings import infer_heading_level, is_note_label, is_page_footer, is_sh
 from ..models import ParsedBlock
 from ..utils import count_tokens
 from .mineru_pdf import MinerUServiceError, mineru_pdf_blocks
+from .pdf_textlayer import mark_degraded_pages, repair_lost_text_layer
 from ..vision.vlm import compose_prompt
 from .table_check import high_confidence
 from .table_repair import repair_ambiguous_tables
@@ -54,8 +55,22 @@ def parse_pdf_enhanced(
         print(f"[parser] pdf mineru failed file={path.name} error={exc!r}", flush=True)
         raise
 
+    # Text-layer cross-check: when MinerU cannot render non-embedded Chinese fonts whole pages lose their CJK text;
+    # render those pages with PyMuPDF and send them through MinerU once more (pdf_textlayer)
+    blocks, layer_info = repair_lost_text_layer(
+        blocks, path=path, rendered_path=cache_dir / "rendered" / f"{path.stem}.lost-pages.pdf",
+        parse_rendered=lambda rendered: mineru_pdf_blocks(mineru_url=mineru_url, path=rendered, cache_dir=cache_dir / "rendered",
+                                                          timeout=timeout))
+    if layer_info.get("lost_before"):
+        print(f"[parser] pdf text-layer cjk lost pages={layer_info['lost_before']} rendered={layer_info['rendered']} "
+              f"recovered={layer_info['recovered']} still_lost={layer_info['lost']}"
+              + (f" error={layer_info['error']}" if layer_info.get("error") else "") + f" file={path.name}", flush=True)
+
     blocks = merge_mineru_text_blocks(blocks, target_tokens=merge_target_tokens)
     blocks = merge_split_tables(blocks)
+    if layer_info.get("lost"):
+        marked = mark_degraded_pages(blocks, layer_info["lost"])
+        print(f"[parser] pdf degraded blocks={marked} pages={layer_info['lost']} file={path.name}", flush=True)
 
     image_blocks = [block for block in blocks if block.block_type in {"image", "chart"} and block.visual_ref]
     print(f"[parser] pdf vlm candidates={len(image_blocks)} file={path.name}", flush=True)

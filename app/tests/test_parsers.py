@@ -2368,3 +2368,92 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
             with mock.patch.object(code_symbols, "parse_code", return_value=None):
                 blocks = router.parse_native(p)
             self.assertTrue(blocks)
+
+
+class PdfTextLayerTests(unittest.TestCase):
+    """Whole pages lose their CJK text when MinerU cannot render non-embedded Chinese fonts (spot check: an ECG report
+    kept only digits on 6 pages): compare against the text layer page by page, confirm through the fonts, render and
+    resend only the lost pages, splice them back, mark pages still lost as degraded."""
+
+    @staticmethod
+    def _block(page, text, block_type="text", bbox=None, **meta):
+        from kb_pipeline.models import ParsedBlock
+        return ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type=block_type, text=text,
+                           block_id=f"b-{page}-{abs(hash(text)) % 1000}", page_idx=page, bbox=bbox, metadata=dict(meta))
+
+    def test_candidate_pages_compare_layer_with_blocks_and_skip_figures(self) -> None:
+        from kb_pipeline.parsers.pdf_textlayer import blocks_cjk_by_page, candidate_pages, figure_boxes_by_page
+
+        blocks = [self._block(0, "心电图报告 结论正常"), self._block(1, "12 34 56"), self._block(2, "图里的汉字不算", "chart", bbox=[100, 100, 900, 600]),
+                  self._block(3, "英文页 abc")]
+        got = blocks_cjk_by_page(blocks)
+        self.assertEqual(got, {0: 9, 1: 0, 3: 3})                                  # figure blocks do not count
+        self.assertEqual(candidate_pages({0: 9, 1: 40, 2: 30, 3: 3, 4: 0}, got), [1, 2])   # page 3 has too little Chinese to count
+        self.assertEqual(figure_boxes_by_page(blocks), {2: [[100.0, 100.0, 900.0, 600.0]]})
+
+    def test_repair_renders_only_confirmed_pages_and_splices_them_back(self) -> None:
+        from kb_pipeline.parsers import pdf_textlayer as tl
+
+        original = [self._block(0, "第一章 总则", section_path=["第一章"]), self._block(1, "1 2 3", section_path=["第一章"]),
+                    self._block(2, "4 5 6"), self._block(3, "第二章 正文照旧", section_path=["第二章"])]
+        layer = {0: 5, 1: 40, 2: 40, 3: 8}
+        rendered_pages = []
+        rendered_blocks = [self._block(1, "第一页救回来了 窦性心律 未见明显异常 建议定期复查"), self._block(2, "7 8 9")]   # small-PDF pages are 1-based
+        with patch.object(tl, "render_pages", side_effect=lambda src, pages, out, **kw: rendered_pages.append(list(pages)) or out):
+            merged, info = tl.repair_lost_text_layer(
+                original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none/x.pdf"), layer=layer,
+                detail=lambda pages, boxes: {1: (40, 40), 2: (40, 40)},     # both pages: CJK drawn with non-embedded fonts
+                parse_rendered=lambda p: rendered_blocks)
+        self.assertEqual(rendered_pages, [[1, 2]])                               # only the two confirmed pages are rendered
+        self.assertEqual((info["candidates"], info["lost_before"], info["recovered"], info["lost"]), ([1, 2], [1, 2], [1], [2]))
+        self.assertEqual([b.page_idx for b in merged], [0, 1, 2, 3])
+        page1 = merged[1]
+        self.assertTrue(page1.block_id.startswith("rendered-") and page1.metadata["rendered_page"])
+        self.assertEqual(page1.metadata["section_path"], ["第一章"])              # inherits the preceding block's section
+        self.assertIs(merged[2], original[2])                                    # a page that did not recover keeps its original blocks
+        self.assertIs(merged[3], original[3])
+
+    def test_repair_skips_pages_whose_chinese_is_embedded_or_inside_figures(self) -> None:
+        from kb_pipeline.parsers import pdf_textlayer as tl
+
+        original = [self._block(0, "封面"), self._block(1, "1 2 3")]
+        with patch.object(tl, "render_pages") as render:
+            blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"),
+                                                     layer={0: 2, 1: 40}, detail=lambda pages, boxes: {1: (40, 0)},   # all embedded fonts
+                                                     parse_rendered=lambda p: [])
+            self.assertIs(blocks, original)
+            self.assertEqual((info["candidates"], info["lost"]), ([1], []))
+            render.assert_not_called()
+            # the second parse blows up: the main flow is unaffected, the original result is used, the page stays lost
+            def boom(p):
+                raise RuntimeError("mineru down")
+            blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"),
+                                                     layer={0: 2, 1: 40}, detail=lambda pages, boxes: {1: (40, 40)}, parse_rendered=boom)
+            self.assertIs(blocks, original)
+            self.assertEqual(info["lost"], [1])
+            self.assertIn("mineru down", info["error"])
+        # no text-layer information (PyMuPDF missing / unreadable): the whole check is skipped
+        blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"), layer={},
+                                                 parse_rendered=lambda p: [])
+        self.assertIs(blocks, original)
+        self.assertFalse(info["checked"])
+
+    def test_degraded_mark_reaches_the_chunk_payload_and_search_row(self) -> None:
+        from kb_pipeline.models import UnifiedChunk
+        from kb_pipeline.parsers.pdf_textlayer import mark_degraded_pages
+        from kb_pipeline.pipeline.parse_job import _payload_for_chunk
+        from kb_search.evidence import source_row
+
+        merged = self._block(2, "跨页正文", page_start=2, page_end=3)
+        single = self._block(5, "别页")
+        table = self._block(3, "1 | 2", "table")
+        self.assertEqual(mark_degraded_pages([merged, single, table], [3]), 2)      # merged blocks match by page range; page 5 untouched
+        self.assertEqual(merged.metadata["degraded"], "text_layer_cjk_lost")
+        self.assertNotIn("degraded", single.metadata)
+        settings = SimpleNamespace(cache_dir=Path("/cache"), embedding_model_id="m")
+        row = {"kb_id": "k", "file_key": 1, "source_path": "r/a.pdf", "rel_path": "a.pdf", "filename": "a.pdf",
+               "dir": "", "content_version": "v", "size": 1, "mtime": 1, "mime_type": "application/pdf"}
+        payload = _payload_for_chunk(settings, row, UnifiedChunk("u", 0, "t", table, 1), 1)
+        self.assertEqual(payload["degraded"], "text_layer_cjk_lost")
+        self.assertIsNone(_payload_for_chunk(settings, row, UnifiedChunk("u2", 1, "t", single, 1), 2).get("degraded"))
+        self.assertEqual(source_row(1, {"point_id": "p"}, {"text": "t", **payload})["degraded"], "text_layer_cjk_lost")

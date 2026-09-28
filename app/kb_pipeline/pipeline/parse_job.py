@@ -704,6 +704,7 @@ def _payload_for_chunk(
         # Table merged-cell flags and screenshot verification result (F02): fact extraction marks facts that took
         # an unverified merged value as untrusted, and the console shows a badge
         "table_flags": block.metadata.get("table_flags") or None,
+        "degraded": block.metadata.get("degraded") or None,          # parse-time degradation reason, e.g. lost text layer (pdf_textlayer)
         "table_repair": block.metadata.get("table_repair") or None,
         # content
         "text": chunk.text,
