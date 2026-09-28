@@ -632,11 +632,11 @@ def split_long_row(row: list[str], budget: int, header: list[str] | None = None)
     split by sentence."""
     cells = []
     for idx, cell in enumerate(row):
-        text = (cell or "").strip()
+        text = flat_cell(cell)
         if not text:
             continue
         name = (header[idx] if header and idx < len(header) and str(header[idx] or "").strip() else col_name(idx))
-        cells.append((str(name).strip(), text))
+        cells.append((flat_cell(str(name)), text))
     if not cells:
         return [row_to_text(row)]
     ident = f"{cells[0][0]}: {cells[0][1]}" if len(cells[0][1]) <= ROW_IDENT_MAX_CHARS else ""
@@ -685,12 +685,23 @@ def first_nonempty_row(rows: list[tuple[int, list[str]]]) -> tuple[int, list[str
     return None
 
 
+_CELL_WS_RE = re.compile(r"\s+")
+
+
+def flat_cell(value: str | None) -> str:
+    """Flatten a cell to one line: newlines inside the cell become spaces and runs of
+    whitespace collapse. A spot check found in-cell newlines ("Session list<LF>@owner",
+    header "WPS Collab<LF>public") splitting one record over two or three lines, so neither
+    readers nor the model could line values up with columns."""
+    return _CELL_WS_RE.sub(" ", value or "").strip()
+
+
 def _joined_cells(values: list[str]) -> str:
     """Join cells positionally, trimming only trailing empties. Dropping
     interior holes shifted every later cell left, so a sparse row no longer
     lined up with the HEADER prefix and values got attributed to the wrong
     column."""
-    cells = [(value or "").strip() for value in values]
+    cells = [flat_cell(value) for value in values]
     while cells and not cells[-1]:
         cells.pop()
     if not any(cells):

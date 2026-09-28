@@ -599,7 +599,7 @@ def parser_profile_for_path(path: Path) -> str:
     if suffix in LANGUAGE_BY_SUFFIX:
         return "code-symbols-v1"      # 2026-09-05: tree-sitter chunking by symbol (JS/TS/Go/Java/Rust/C/C++/C#/PHP/Ruby/Swift/Kotlin/Scala/Shell/Lua/PowerShell)
     if suffix in {".xlsx", ".xls", ".csv"}:
-        return "table-native-v2"
+        return "table-native-v3"      # v3: newlines inside cells are flattened, one record per line
     if suffix in IMAGE_SUFFIXES:
         return "image-vlm-v1"
     return f"{infer_doc_type(path.name)}-native-v1"

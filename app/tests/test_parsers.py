@@ -1935,6 +1935,18 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
 
         self.assertEqual(row_to_text(["服务器A", "", "已下线"]), "服务器A |  | 已下线")
         self.assertEqual(row_to_text(["a", "b", "", ""]), "a | b")
+
+    def test_cell_newlines_are_flattened_so_one_record_stays_one_line(self) -> None:
+        """In-cell newlines ("Session list<LF>@owner", header "WPS Collab<LF>public") used to split one record
+        over two or three lines; rows, headers and the column names / values of an over-budget split all
+        collapse to one line."""
+        from kb_pipeline.parsers.native_table import flat_cell, header_text, row_to_text, split_long_row
+
+        self.assertEqual(flat_cell("会话列表\n@某某"), "会话列表 @某某")
+        self.assertEqual(flat_cell("  a \r\n\n b\tc  "), "a b c")
+        self.assertEqual(row_to_text(["聊天能力", "会话列表\n@某某", "移除会话", "", "1"]), "聊天能力 | 会话列表 @某某 | 移除会话 |  | 1")
+        self.assertEqual(header_text(["支持情况/WPS协作\n公网", "WPS协作\n私网"]), "支持情况/WPS协作 公网 | WPS协作 私网")
+        self.assertEqual(split_long_row(["a\nb", "c"], 100, ["x\ny", "z"]), ["x y: a b | z: c"])
         self.assertEqual(row_to_text(["", "", ""]), "")
 
     def test_gbk_files_keep_their_chinese(self) -> None:  # issue 3
