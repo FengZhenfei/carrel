@@ -1,7 +1,7 @@
 """Graph vectors: the entity collection (title: description) and the relation collection (A -[predicate]-> B:
 description) are written into Qdrant.
 
-Replaces the old scripts/graphrag_qdrant_enrich.py (which only back-filled payloads; the vectors were written
+Replaces the old enrichment script (which only back-filled payloads; the vectors were written
 upstream). Now vectors and payloads are written together and the point id is determined by (graph_version,
 entity/relation id) -- re-running the same version is an idempotent upsert. The payload fields stay compatible
 with the old collections (gr_id / title / search_text / type / degree / frequency ...), minus the community

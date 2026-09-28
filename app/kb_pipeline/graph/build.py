@@ -1,7 +1,7 @@
 """Entity graph build orchestration: prepare corpus → extract → merge → write vectors → graph database
 import → switch aliases → GC.
 
-Everything runs inside this process; no GraphRAG subprocess is spawned any more. Phase markers
+Everything runs inside this process; no external indexing subprocess is spawned. Phase markers
 (graph_build_phases), same-version resume, the build lock, signal handling, alias switching with rollback,
 GC, the rebuild policy and adopt-current all keep their original mechanisms.
 
@@ -289,14 +289,11 @@ def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
 
     specs = resolve_llm_specs(settings, source, GRAPH_LLM_STEPS)
     return stable_json_hash({
-        # Bumped to local-graph-2 on the evening of 2026-09-06: the fingerprint now covers full predicate
-        # definitions, the facts cap and the embedding model (Codex review F05); old fingerprints are all treated
-        # as "configuration changed" (the existing KBs are test data, no compatibility shim).
-        "v": "local-graph-2",
-        # The value keeps the old name graphrag: it is just a constant inside the fingerprint, and changing it would
-        # invalidate every KB's recorded fingerprint (resume judged impossible, append judged "config changed").
-        # Renaming it to entity_graph when the summary tree was removed on 2026-09-05 hit exactly that.
-        "mode": "graphrag",
+        # Version tag of the fingerprint layout. Any change to the constants below invalidates every recorded
+        # fingerprint: resume is judged impossible and append is judged "configuration changed", so every
+        # graph-enabled knowledge base has to be rebuilt in full. Bump it only together with such a change.
+        "v": "local-graph-3",
+        "mode": "entity_graph",
         "models": {step: spec.model_id for step, spec in sorted(specs.items())},
         "entity_types": list(source.graph_entity_types) or list(GRAPH_ENTITY_TYPES_DEFAULT),
         "predicates": [str(p.get("name") or "") for p in (source.graph_predicates or ())],

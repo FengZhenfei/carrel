@@ -1304,7 +1304,7 @@ def delete_graph_schema_version(kb_id: str, version_id: str) -> dict[str, Any]:
     return {"deleted": wanted, "schema": schema_versions_view(merged)}
 
 
-# Config keys of the old pipeline (vendored GraphRAG). Forms from before the console redesign still send
+# Config keys of the old pipeline. Forms from before the console redesign still send
 # them; the server drops them silently instead of raising, and old values already in config_json are
 # ignored by build_source.
 RETIRED_CONFIG_KEYS = {

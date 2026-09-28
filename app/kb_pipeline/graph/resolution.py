@@ -1,7 +1,7 @@
 """Entity resolution: coarse candidate screening → one LLM same-entity call per batch of 100 pairs → pairs
 judged yes are merged as whole connected components.
 
-Moved in from kb_graphrag/resolution_core.py (that one was a workflow hooked into the GraphRAG pipeline); the
+Moved in from the old pipeline's resolution workflow; the
 rules come from an actual reading of RAGFlow's entity_resolution.py: differing digit-bearing 2-grams → no
 outright (ZK7C4021KV13 and ZK7C4041KV13 are two devices); English by edit distance ≤ min(len)//2; Chinese
 changed to the Dice coefficient of **ordered** character bigrams ≥ 0.7 (the original bag of characters judged

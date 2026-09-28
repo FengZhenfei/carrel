@@ -1192,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset.add_argument("--keep-graph", action="store_true",
 
-                        help="Leave graph collections / Neo4j / GraphRAG workspace in place")
+                        help="Leave graph collections / Neo4j / graph workspace in place")
     reset.add_argument(
         "--keep-collection",
         action="store_true",
@@ -1216,7 +1216,7 @@ def build_parser() -> argparse.ArgumentParser:
     qdrant_gc.set_defaults(func=cmd_cleanup)
     qdrant_graph_gc = cleanup_sub.add_parser(
         "qdrant-graph-gc",
-        help="Delete unaliased versioned GraphRAG Qdrant collections older than retention",
+        help="Delete unaliased versioned graph Qdrant collections older than retention",
     )
     qdrant_graph_gc.add_argument("--retention-days", type=int, default=None)
     qdrant_graph_gc.add_argument(
@@ -1228,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
     qdrant_graph_gc.set_defaults(func=cmd_cleanup)
     neo4j_graph_gc_parser = cleanup_sub.add_parser(
         "neo4j-graph-gc",
-        help="Delete inactive Neo4j GraphRAG projection versions older than retention",
+        help="Delete inactive Neo4j graph projection versions older than retention",
     )
     neo4j_graph_gc_parser.add_argument("--retention-days", type=int, default=None)
     neo4j_graph_gc_parser.add_argument(

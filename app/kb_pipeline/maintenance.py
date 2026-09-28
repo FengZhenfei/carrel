@@ -698,7 +698,7 @@ def delete_kb_now(settings: Settings, *, kb_id: str) -> dict[str, Any]:
 def kb_sources_gc(settings: Settings, *, retention_days: int, dry_run: bool = False) -> dict[str, object]:
     """Drop knowledge bases whose top-level directory has been gone longer
     than the retention window: Qdrant collection, graph artefacts, OpenSearch
-    index, GraphRAG workspace, SQLite state, parse cache, and the kb_sources
+    index, graph workspace, SQLite state, parse cache, and the kb_sources
     row (all via _hard_delete_kb). Mirrors per-point inactive GC one level
     up. Never touches a KB whose directory is present again."""
     from . import discovery

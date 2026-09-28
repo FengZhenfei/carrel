@@ -1179,8 +1179,8 @@ _JOBS_MIGRATIONS = (
     # running row belongs to the worker -- changing status from outside would race with the worker's
     # terminal-state write, and the job would look cancelled while still writing to the vector store.
     "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER",
-    # The block-span table was a product of the old pipeline (GraphRAG sliding-window text_unit
-    # provenance); once extraction units come straight from chunks it has no consumer, so the table goes.
+    # The block-span table was a product of the old pipeline (sliding-window text-unit provenance);
+    # once extraction units come straight from chunks it has no consumer, so the table goes.
     "DROP TABLE IF EXISTS block_spans",
     "ALTER TABLE graph_builds ADD COLUMN stage TEXT",
     # API protocol: openai = /chat/completions compatible; anthropic = /v1/messages

@@ -65,7 +65,7 @@ GRAPH_PAYLOAD_INDEX_FIELDS = {
     "property": models.PayloadSchemaType.KEYWORD,
 }
 
-# The entity graph's collections (entities, relations, facts). community (old GraphRAG community reports)
+# The entity graph's collections (entities, relations, facts). community (the old pipeline's community reports)
 # and raptor (the removed summary-tree mode) are historical types: no longer produced, but GC and alias
 # cleanup must still recognize them to reclaim the old collections.
 GRAPH_VECTOR_TYPES = ("entity", "relation", "spec", "page")
