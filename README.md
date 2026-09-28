@@ -11,15 +11,11 @@ the resulting *evidence* to whichever agent asks. Carrel never writes the
 answer itself; the agent does. Everything runs on scheduled tasks behind a
 small web console.
 
-A carrel is the private desk in a library where a reader works through the
-stacks. This is that desk for your agent.
-
 One command deploys it: `./deploy.sh` detects the machine, starts MinerU,
 Qdrant, OpenSearch and Neo4j, installs the app and the console. Embeddings,
 figure descriptions and the extraction LLM are plain OpenAI-compatible
 endpoints, hosted or local.
 
-- [Design principles](#design-principles)
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
@@ -36,17 +32,6 @@ endpoints, hosted or local.
 - [Troubleshooting](#troubleshooting)
 - [Security boundary](#security-boundary)
 - [License](#license)
-
-## Design principles
-
-1. **Fully automatic, no curation.** There is no manual tagging, no hand-linked
-   entities, no graph editing. Anything that needs a person in the loop was
-   left out so that the system converges unattended.
-2. **General over tuned.** Rules are written for any corpus, not for the
-   corpora it was developed on, and a little noise is accepted in exchange.
-3. **Evidence, not answers.** The search service returns sources, facts and
-   graph neighbourhoods with provenance; generation stays with the calling
-   agent, so the server needs no generative model at all.
 
 ## What it does
 

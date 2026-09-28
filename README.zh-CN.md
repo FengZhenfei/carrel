@@ -5,15 +5,13 @@
 **Ontology-Augmented Generation for AI agents.** Carrel 是一个本地知识库:把目录里的文档解析、切块、
 向量化后写进 Qdrant 和 OpenSearch,可选地为每个知识库建一张按本体分层的实体图(LLM 抽取 → 归并 →
 Qdrant 实体 / 关系 / 事实集合 + Neo4j 投影),再通过一个只出证据、不做生成的检索服务把这些资产交给
-调用它的 agent。全部由定时任务驱动,配一个局域网内的 Web 控制台。名字取自图书馆里的单人书桌:
-一张你的 agent 在你私人藏书里工作的书桌。
+调用它的 agent。全部由定时任务驱动,配一个局域网内的 Web 控制台。
 
 一条命令部署:`./deploy.sh` 会探测机器、拉起 MinerU / Qdrant / OpenSearch / Neo4j 四个容器、装好应用。
 文本向量、图片描述和建图用的 LLM 只认 OpenAI 兼容地址,本地或公网服务都行。
 
 ## 目录
 
-- [设计原则](#设计原则)
 - [功能](#功能)
 - [架构](#架构)
 - [运行环境](#运行环境)
@@ -28,16 +26,6 @@ Qdrant 实体 / 关系 / 事实集合 + Neo4j 投影),再通过一个只出证�
 - [排障](#排障)
 - [安全边界](#安全边界)
 - [许可](#许可)
-
-## 设计原则
-
-1. **流程全自动化,尽量不要人为干预。** 为此放弃了手工改标签、手工关联实体、手工管理图谱这类功能:
-   标签由样本自动抽取,图谱由定时任务增量并入或整库重建,坏了就重建而不是修补。
-2. **所有功能高度通用。** 提示词、切块、抽取、归并都不针对某一个知识库的资料特性做倾向性处理,
-   代价是产出物会带一些噪声;系统只保证不把噪声当成事实(证据冲突会被标记而不是被抹平)。
-
-审查修复时也按这两条取舍:优先修「代码在改错 / 在丢状态」的问题,不为模型噪声堆逻辑;
-无人值守下能自己收敛的现象不额外处理。
 
 ## 功能
 
@@ -87,12 +75,12 @@ MinerU、Qdrant、OpenSearch、Neo4j 四个容器默认启动,五个 vLLM 模型
 
 ## 运行环境
 
-| 平台 | 能到什么程度 |
-|---|---|
-| Linux + NVIDIA GPU | 全部功能本地跑;MinerU 走 vlm-engine,模型服务可以本地起 |
-| Linux 无 GPU | MinerU 走 CPU 的 pipeline 后端,向量 / 多模态 / LLM 走公网接口 |
-| macOS(Docker Desktop) | 容器只能用 CPU,应用原生跑;视觉两路关掉,定时任务用二期的进程内调度或自行安排 |
-| Windows | 通过 WSL2 等于 Linux 路径;原生 Windows 不支持 |
+| 平台                    | 能到什么程度                                          |
+| --------------------- | ----------------------------------------------- |
+| Linux + NVIDIA GPU    | 全部功能本地跑;MinerU 走 vlm-engine,模型服务可以本地起           |
+| Linux 无 GPU           | MinerU 走 CPU 的 pipeline 后端,向量 / 多模态 / LLM 走公网接口 |
+| macOS(Docker Desktop) | 容器只能用 CPU,应用原生跑;视觉两路关掉,定时任务用二期的进程内调度或自行安排       |
+| Windows               | 通过 WSL2 等于 Linux 路径;原生 Windows 不支持              |
 
 - Docker 25+ 与 Compose v2;有 GPU 的 Linux 主机还要 NVIDIA 容器工具包(CDI 或 nvidia runtime 均可)。
 - Python 3.12+(管线、控制台与检索服务装在 `app/.venv`)。`deploy.sh --with-pdf-images` 会多装可选的
@@ -142,19 +130,19 @@ Carrel 只管 `runtime/mirror/` 之后的事,文件怎么到那里不限:
 
 模板是 [`config/knowledge-base.env.example`](config/knowledge-base.env.example),按组说明:
 
-| 组 | 主要键 | 说明 |
-|---|---|---|
-| 根目录 | `KB_LOCAL_BASE_DIR` `KB_MIRROR_ROOT` `KB_STATE_DB` `KB_RUNTIME_DIR` `KB_CACHE_DIR` `KB_LOG_DIR` `KB_GRAPH_WORK_DIR` | 仓库、镜像目录、状态库(SQLite,WAL)、运行态、解析缓存、日志、建图工作区 |
-| 存储 | `QDRANT_URL` `OPENSEARCH_URL` `NEO4J_URI` `NEO4J_USER` `NEO4J_PASSWORD` | 全部 loopback;Neo4j 密码只在这个 600 权限的文件里 |
-| 解析 | `MINERU_SERVICE_URL` `MINERU_BACKEND=auto` `MINERU_LANG` `KB_PARSE_ENABLED` `KB_MIN_FILE_AGE_SECONDS` `KB_JOB_MAX_RETRIES` `KB_JOB_RETRY_*` `KB_*_JOB_LEASE_SECONDS` | `MINERU_BACKEND=auto` 用解析容器自己按硬件选的后端;`KB_PARSE_ENABLED=0` 是总闸,worker 会把解析任务挂起;文件写入后要静置 `KB_MIN_FILE_AGE_SECONDS` 才入队 |
-| 保留期 | `QDRANT_INACTIVE_RETENTION_DAYS` `KB_CACHE_ROTATION_KEEP` `KB_LOG_ROTATION_KEEP_MONTHS` `KB_VLM_CACHE_MAX_AGE_DAYS` | 软删点的撤销窗口(默认 7 天)、缓存 / 日志轮换份数、图片描述缓存寿命 |
-| 文本向量 | `EMBEDDING_*` | 任意 OpenAI 兼容 `/v1/embeddings`;默认 qwen3-embedding-0.6b @ 1024 维,维度建库后不能改 |
-| 图片描述 | `VLM_*` `KB_IMAGE_MAX_PIXELS` | 任意 OpenAI 兼容多模态 chat 接口;像素预算要与模型允许的 `max_pixels` 一致 |
-| 视觉向量 | `VISUAL_EMBEDDING_*` | 可选,只有本地 vLLM 提供(`messages` 形态请求);默认关,开了是 qwen3-vl-embedding-2b @ 2048 维 |
-| 重排序 | `RERANKER_BASE_URL` `VISUAL_RERANKER_BASE_URL` | 检索侧可选;入库不调用 |
-| 控制台纳管 | `KB_CONSOLE_SERVICES` | 服务状态里探活与重启的行,默认 `database,mineru`;本机跑模型服务时再加上模型行 |
-| 控制台 | `KB_WEB_HOST` `KB_WEB_PORT` | 默认 `0.0.0.0:9800` |
-| 图谱 | `QDRANT_GRAPH_COLLECTION_RETENTION_DAYS` `NEO4J_GRAPH_RETENTION_DAYS` `GRAPH_GC_KEEP_VERSIONS` `GRAPH_NEO4J_IMPORT_*` `KB_GRAPH_LLM_CONCURRENCY` `KB_GRAPH_LLM_TIMEOUT` `KB_GRAPH_CIRCUIT_FAILS` | 旧版本保留 14 天、每库保留 2 个版本;公网 LLM 并发、单次超时、连续失败熔断 |
+| 组     | 主要键                                                                                                                                                                                              | 说明                                                                                                                   |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| 根目录   | `KB_LOCAL_BASE_DIR` `KB_MIRROR_ROOT` `KB_STATE_DB` `KB_RUNTIME_DIR` `KB_CACHE_DIR` `KB_LOG_DIR` `KB_GRAPH_WORK_DIR`                                                                              | 仓库、镜像目录、状态库(SQLite,WAL)、运行态、解析缓存、日志、建图工作区                                                                            |
+| 存储    | `QDRANT_URL` `OPENSEARCH_URL` `NEO4J_URI` `NEO4J_USER` `NEO4J_PASSWORD`                                                                                                                          | 全部 loopback;Neo4j 密码只在这个 600 权限的文件里                                                                                  |
+| 解析    | `MINERU_SERVICE_URL` `MINERU_BACKEND=auto` `MINERU_LANG` `KB_PARSE_ENABLED` `KB_MIN_FILE_AGE_SECONDS` `KB_JOB_MAX_RETRIES` `KB_JOB_RETRY_*` `KB_*_JOB_LEASE_SECONDS`                             | `MINERU_BACKEND=auto` 用解析容器自己按硬件选的后端;`KB_PARSE_ENABLED=0` 是总闸,worker 会把解析任务挂起;文件写入后要静置 `KB_MIN_FILE_AGE_SECONDS` 才入队 |
+| 保留期   | `QDRANT_INACTIVE_RETENTION_DAYS` `KB_CACHE_ROTATION_KEEP` `KB_LOG_ROTATION_KEEP_MONTHS` `KB_VLM_CACHE_MAX_AGE_DAYS`                                                                              | 软删点的撤销窗口(默认 7 天)、缓存 / 日志轮换份数、图片描述缓存寿命                                                                                |
+| 文本向量  | `EMBEDDING_*`                                                                                                                                                                                    | 任意 OpenAI 兼容 `/v1/embeddings`;默认 qwen3-embedding-0.6b @ 1024 维,维度建库后不能改                                              |
+| 图片描述  | `VLM_*` `KB_IMAGE_MAX_PIXELS`                                                                                                                                                                    | 任意 OpenAI 兼容多模态 chat 接口;像素预算要与模型允许的 `max_pixels` 一致                                                                  |
+| 视觉向量  | `VISUAL_EMBEDDING_*`                                                                                                                                                                             | 可选,只有本地 vLLM 提供(`messages` 形态请求);默认关,开了是 qwen3-vl-embedding-2b @ 2048 维                                              |
+| 重排序   | `RERANKER_BASE_URL` `VISUAL_RERANKER_BASE_URL`                                                                                                                                                   | 检索侧可选;入库不调用                                                                                                          |
+| 控制台纳管 | `KB_CONSOLE_SERVICES`                                                                                                                                                                            | 服务状态里探活与重启的行,默认 `database,mineru`;本机跑模型服务时再加上模型行                                                                     |
+| 控制台   | `KB_WEB_HOST` `KB_WEB_PORT`                                                                                                                                                                      | 默认 `0.0.0.0:9800`                                                                                                    |
+| 图谱    | `QDRANT_GRAPH_COLLECTION_RETENTION_DAYS` `NEO4J_GRAPH_RETENTION_DAYS` `GRAPH_GC_KEEP_VERSIONS` `GRAPH_NEO4J_IMPORT_*` `KB_GRAPH_LLM_CONCURRENCY` `KB_GRAPH_LLM_TIMEOUT` `KB_GRAPH_CIRCUIT_FAILS` | 旧版本保留 14 天、每库保留 2 个版本;公网 LLM 并发、单次超时、连续失败熔断                                                                          |
 
 向量维度在建 collection 时写死,改 `EMBEDDING_DIM` / `VISUAL_EMBEDDING_DIM` 意味着重建全部 collection。
 
@@ -162,14 +150,14 @@ Carrel 只管 `runtime/mirror/` 之后的事,文件怎么到那里不限:
 
 每个知识库一行 `kb_sources` 记录,策略存在 `config_json` 里,只在控制台改:
 
-| 组 | 键 | 说明 |
-|---|---|---|
-| 切块 | `max_tokens` `overlap_tokens` | 上限由文本向量服务的上下文决定,控制台会给提示 |
-| 图谱开关 | `graph_enabled` `graph_auto_append` `graph_profile` | 开关、是否允许定时增量并入、场景画像 |
-| 标签 | `graph_entity_types` `graph_parent_types` `graph_type_definitions` `graph_predicates` `graph_examples` `graph_language` | 由「抽标签」按 `graph_tune_sample_size` 个样本自动生成,可选一个历史版本生效;不建议手改 |
-| 抽取 | `graph_unit_chunks` `graph_max_gleanings` | 每几个连续切片合成一个抽取单元(默认 3,1 = 不合并);每单元最多补抽几轮 |
-| 模型 | `graph_llm.extract` `graph_llm.summarize` `graph_llm.tune` | 每一步各选注册表里的一个模型 |
-| 重建策略 | `graph_rebuild_interval` `graph_rebuild_new_chunk_pct` `graph_rebuild_new_chunk_count` `graph_rebuild_operator` | 距上次整库重建满 N 天,或新切片占比 / 条数超阈值(`or` / `and`)则整库重建,否则增量并入 |
+| 组    | 键                                                                                                                       | 说明                                                        |
+| ---- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 切块   | `max_tokens` `overlap_tokens`                                                                                           | 上限由文本向量服务的上下文决定,控制台会给提示                                   |
+| 图谱开关 | `graph_enabled` `graph_auto_append` `graph_profile`                                                                     | 开关、是否允许定时增量并入、场景画像                                        |
+| 标签   | `graph_entity_types` `graph_parent_types` `graph_type_definitions` `graph_predicates` `graph_examples` `graph_language` | 由「抽标签」按 `graph_tune_sample_size` 个样本自动生成,可选一个历史版本生效;不建议手改 |
+| 抽取   | `graph_unit_chunks` `graph_max_gleanings`                                                                               | 每几个连续切片合成一个抽取单元(默认 3,1 = 不合并);每单元最多补抽几轮                   |
+| 模型   | `graph_llm.extract` `graph_llm.summarize` `graph_llm.tune`                                                              | 每一步各选注册表里的一个模型                                            |
+| 重建策略 | `graph_rebuild_interval` `graph_rebuild_new_chunk_pct` `graph_rebuild_new_chunk_count` `graph_rebuild_operator`         | 距上次整库重建满 N 天,或新切片占比 / 条数超阈值(`or` / `and`)则整库重建,否则增量并入     |
 
 `graph_chunk_size`、`graph_mode` 等旧键服务端静默丢弃(摘要树模式已于 2026-09-05 删除,建图只有实体图一种)。
 
@@ -196,19 +184,19 @@ Carrel 只管 `runtime/mirror/` 之后的事,文件怎么到那里不限:
 
 `app/.venv/bin/kb`(下文简写 `kb`),配置从 `config/knowledge-base.env` 读:
 
-| 命令 | 用途 |
-|---|---|
-| `kb config` / `kb status` / `kb health` | 打印生效配置、队列与知识库状态、各服务健康 |
-| `kb init-db` | 建 SQLite 状态库 |
-| `kb scan [--source kb_NNN] [--requeue-failed] [--rehash]` | 扫描镜像目录并排队(定时器每分钟自动跑) |
-| `kb worker --once --max-jobs N --max-seconds S` | 消费队列(定时器自动跑;**不要**与 systemd worker 并行手动起第二个) |
-| `kb qdrant ensure-collections` / `ensure-graph-collections` | 补建集合 |
-| `kb fts init` / `status` / `rebuild` / `sync-doc` / `search` | OpenSearch 索引维护与试搜 |
-| `kb graph build` / `append` / `check-rebuild [--execute] [--force-full]` | 整库建图、增量并入、按策略检查(定时器用的就是 check-rebuild) |
-| `kb graph adopt-current` / `neo4j-import` / `neo4j-status` / `neo4j-delete` | 版本基线、Neo4j 投影 |
-| `kb graph query` / `factcheck` / `status` | 图召回原型、事实级对照评测、建图状态 |
-| `kb cleanup status` / `weekly` / `monthly` / `qdrant-gc` / `qdrant-graph-gc` / `neo4j-graph-gc` / `parse-assets-gc` | 各种 GC(定时器自动跑) |
-| `kb reset --source kb_NNN --yes` | 清空某库的状态 / 缓存 / 索引并重建 collection(不带 `--yes` 只打印计划) |
+| 命令                                                                                                                  | 用途                                                |
+| ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `kb config` / `kb status` / `kb health`                                                                             | 打印生效配置、队列与知识库状态、各服务健康                             |
+| `kb init-db`                                                                                                        | 建 SQLite 状态库                                      |
+| `kb scan [--source kb_NNN] [--requeue-failed] [--rehash]`                                                           | 扫描镜像目录并排队(定时器每分钟自动跑)                              |
+| `kb worker --once --max-jobs N --max-seconds S`                                                                     | 消费队列(定时器自动跑;**不要**与 systemd worker 并行手动起第二个)      |
+| `kb qdrant ensure-collections` / `ensure-graph-collections`                                                         | 补建集合                                              |
+| `kb fts init` / `status` / `rebuild` / `sync-doc` / `search`                                                        | OpenSearch 索引维护与试搜                                |
+| `kb graph build` / `append` / `check-rebuild [--execute] [--force-full]`                                            | 整库建图、增量并入、按策略检查(定时器用的就是 check-rebuild)            |
+| `kb graph adopt-current` / `neo4j-import` / `neo4j-status` / `neo4j-delete`                                         | 版本基线、Neo4j 投影                                     |
+| `kb graph query` / `factcheck` / `status`                                                                           | 图召回原型、事实级对照评测、建图状态                                |
+| `kb cleanup status` / `weekly` / `monthly` / `qdrant-gc` / `qdrant-graph-gc` / `neo4j-graph-gc` / `parse-assets-gc` | 各种 GC(定时器自动跑)                                     |
+| `kb reset --source kb_NNN --yes`                                                                                    | 清空某库的状态 / 缓存 / 索引并重建 collection(不带 `--yes` 只打印计划) |
 
 整库推倒重来(三条命令即可;第一条不带 `--yes` 只打印计划):
 
@@ -273,15 +261,15 @@ kb scan --source kb_001 && systemctl --user start --no-block carrel-worker.servi
 
 ## 定时任务与维护
 
-| 单元 | 节奏 | 做什么 |
-|---|---|---|
-| `carrel-scan.timer` | 启用后 30 秒,之后每分钟 | 扫描目录,发现新增 / 修改 / 删除并排队 |
-| `carrel-worker.timer` | 启用后 1 分钟,之后每 5 分钟 | 消费队列:解析 → 切块 → 向量化 → 写入 |
-| `carrel-graph-rebuild.timer` | 启用后 10 分钟,之后每 2 小时 | 增量并入;达到策略条件整库重建 |
-| `carrel-qdrant-gc.timer` | 启用后 30 分钟,之后每 24 小时 | 点级 GC、失活知识库到期硬删、旧图版本清理、任务历史清理 |
-| `carrel-cache-weekly.timer` | 启用后 1 小时,之后每 7 天 | 缓存轮换(整机的 uv / pip / Docker 清理只在 `KB_HOST_HOUSEKEEPING=1` 时做) |
-| `carrel-logs-monthly.timer` | 启用后 2 小时,之后每 30 天 | 日志轮换 |
-| `carrel-web.service` | 常驻 | 控制台 |
+| 单元                           | 节奏                  | 做什么                                                          |
+| ---------------------------- | ------------------- | ------------------------------------------------------------ |
+| `carrel-scan.timer`          | 启用后 30 秒,之后每分钟      | 扫描目录,发现新增 / 修改 / 删除并排队                                       |
+| `carrel-worker.timer`        | 启用后 1 分钟,之后每 5 分钟   | 消费队列:解析 → 切块 → 向量化 → 写入                                      |
+| `carrel-graph-rebuild.timer` | 启用后 10 分钟,之后每 2 小时  | 增量并入;达到策略条件整库重建                                              |
+| `carrel-qdrant-gc.timer`     | 启用后 30 分钟,之后每 24 小时 | 点级 GC、失活知识库到期硬删、旧图版本清理、任务历史清理                                |
+| `carrel-cache-weekly.timer`  | 启用后 1 小时,之后每 7 天    | 缓存轮换(整机的 uv / pip / Docker 清理只在 `KB_HOST_HOUSEKEEPING=1` 时做) |
+| `carrel-logs-monthly.timer`  | 启用后 2 小时,之后每 30 天   | 日志轮换                                                         |
+| `carrel-web.service`         | 常驻                  | 控制台                                                          |
 
 定时器全部是相对时间(`OnActiveSec` / `OnUnitActiveSec`),不读墙钟、不看时区:换机器、重置、随时启用
 都是同一套节奏。维护类任务撞上系统繁忙时让路(退出码 75),连续让路超过上限才把单元标成失败,
@@ -326,15 +314,15 @@ LICENSE、NOTICE.md    MIT 与第三方声明
 
 给 agent 用的客户端在 [`skills/carrel-search/`](skills/carrel-search/SKILL.md):一个只依赖标准库的 Python 脚本加一份 SKILL.md,装进 Claude Code / Codex 这类 agent 后,agent 自己理解问题、按需补查并组织回答;默认地址 `http://127.0.0.1:9810`,地址与 token 用 `CARREL_SEARCH_BASE_URL` / `CARREL_SEARCH_TOKEN` 或 `~/.config/carrel-search/config.json` 指定。
 
-| 接口 | 作用 |
-|---|---|
-| `GET /health` | 免鉴权;库列表、鉴权方式、Qdrant 连通性 |
-| `GET /catalog` | 知识库目录:名字、领域、主体类型、类型表、规模、文件名样本、有没有图(没开图谱的库照样有目录项);`?refresh=1` 重建 |
-| `POST /search` | `{question, kbs?, top_k?, hints?, context?, explain?, image_b64?}` → 编号的 Sources / Entities / Relationships / Specs / Pages、doc_aggs、retrieval_summary |
-| `POST /context` | `{kb_id, doc_id, content_version?, chunk_from, chunk_to}` → 某文档序号区间的切片(追问用) |
-| `GET /image/{kb_id}/{point_id}` | 图片切片的原图:镜像 PDF 的 sha256 与切片的 content_version 对得上才用它(嵌图按摆放位置匹配优先,其次按 bbox 高清渲染),否则解析缓存;失活的点不给;响应头 `X-Image-Source` 说明来源 |
-| `POST /crop` | `{kb_id, point_id, bbox, pad?}` → 按调用方给的框(0–1 比例或 0–1000 千分比)从原图裁出局部,服务端 只做确定性裁剪 |
-| `POST /graph/neighbors` | `{kb_id, entity 或 entity_id, limit?, types?, direction?}` → 一个实体在现行图谱里的一跳关系:谓语、方向、权重、对端实体、证据切片(可直接喂 /context);同名多个走关系最多的、其余在 matches,找不到给向量候选。多跳由 agent 逐步走 |
+| 接口                              | 作用                                                                                                                                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /health`                   | 免鉴权;库列表、鉴权方式、Qdrant 连通性                                                                                                                                     |
+| `GET /catalog`                  | 知识库目录:名字、领域、主体类型、类型表、规模、文件名样本、有没有图(没开图谱的库照样有目录项);`?refresh=1` 重建                                                                                            |
+| `POST /search`                  | `{question, kbs?, top_k?, hints?, context?, explain?, image_b64?}` → 编号的 Sources / Entities / Relationships / Specs / Pages、doc_aggs、retrieval_summary      |
+| `POST /context`                 | `{kb_id, doc_id, content_version?, chunk_from, chunk_to}` → 某文档序号区间的切片(追问用)                                                                                 |
+| `GET /image/{kb_id}/{point_id}` | 图片切片的原图:镜像 PDF 的 sha256 与切片的 content_version 对得上才用它(嵌图按摆放位置匹配优先,其次按 bbox 高清渲染),否则解析缓存;失活的点不给;响应头 `X-Image-Source` 说明来源                                      |
+| `POST /crop`                    | `{kb_id, point_id, bbox, pad?}` → 按调用方给的框(0–1 比例或 0–1000 千分比)从原图裁出局部,服务端 只做确定性裁剪                                                                            |
+| `POST /graph/neighbors`         | `{kb_id, entity 或 entity_id, limit?, types?, direction?}` → 一个实体在现行图谱里的一跳关系:谓语、方向、权重、对端实体、证据切片(可直接喂 /context);同名多个走关系最多的、其余在 matches,找不到给向量候选。多跳由 agent 逐步走 |
 
 一次查询:向量路 + BM25 路在所有库上并行探测(五库几十毫秒)→ 按证据选库(调用方指定了 `kbs` 就不路由)→
 图路(一跳扩展;0 / 1 / 2 / 3 / 5 跳实测候选集与指标相同、只差延迟,多跳关联交给 agent 用 `/graph/neighbors` 逐步走)、视觉路只在选中的库上跑(没开图谱的库自然没有图路)→ 每库 RRF 融合、多主体 / 多文档分桶交错 → 8102 交叉编码器重排
