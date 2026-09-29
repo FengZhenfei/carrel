@@ -174,6 +174,31 @@ class ExtractionOutputParserTests(unittest.TestCase):
         result = GraphExtractor(client, self.SCHEMA, max_gleanings=2).extract(tiny)
         self.assertEqual((result.calls, result.stats["gleanings"]), (1, 0))
 
+    def test_second_gleaning_round_sees_the_yes_no_answer_in_history(self) -> None:
+        """With two or more gleaning rounds the answer to the yes/no question has to stay in the conversation history.
+        It used to be dropped, and the next round appended the previous gleaning output once more: the same output
+        appeared twice in the history, as if the model had answered the yes/no question with it."""
+        first = '("entity"<|>A<|>ORGANIZATION<|>first)'
+        gleaned = '("entity"<|>B<|>ORGANIZATION<|>second)<|COMPLETE|>'
+        replies = [first, gleaned, "Y", '("entity"<|>C<|>PERSON<|>third)<|COMPLETE|>']
+        seen: list[list[dict]] = []
+
+        def chat(messages):
+            seen.append([dict(m) for m in messages])
+            return replies[len(seen) - 1]
+
+        unit = Unit(unit_id="u", doc_id="d", rel_path="a.pdf", section_path=["S"], block_ids=[], chunk_uids=[],
+                    point_ids=[], n_tokens=500, text="A and B and C")
+        result = GraphExtractor(_client(chat), self.SCHEMA, max_gleanings=2).extract(unit)
+        self.assertEqual(sorted(e["name"] for e in result.entities), ["A", "B", "C"])
+        last = seen[-1]
+        self.assertEqual([m["role"] for m in last], ["user", "assistant", "user", "assistant", "user", "assistant", "user"])
+        self.assertEqual([m["content"] for m in last[1:]],
+                         [first, prompts.CONTINUE_PROMPT, gleaned, prompts.LOOP_PROMPT, "Y", prompts.CONTINUE_PROMPT])
+        # with a single gleaning round (the usual setting) the conversation is unchanged: the first output is followed
+        # directly by the gleaning prompt
+        self.assertEqual([m["content"] for m in seen[1][1:]], [first, prompts.CONTINUE_PROMPT])
+
     def test_truncated_output_is_asked_again_with_a_bigger_budget(self) -> None:
         """2026-09-12: extraction budget 4096 → 8192; when the output is truncated (finish_reason=length) ask again
         with double the budget; if still truncated keep the longer one and record truncated. Previously this step
@@ -370,6 +395,55 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(edges[0]["unit_ids"], ["t1", "t2"])
         self.assertEqual(stats["self_loops_dropped"], 1)
 
+    def test_merged_rows_keep_every_description_with_its_source(self) -> None:
+        """A merged entity used to keep only its first 8 descriptions, with source labels only for the
+        representative's own, and merged relations did not carry sources either: the statements merged in reached
+        the summary without source or date. Now nothing is cut, and descriptions and sources are aligned by index."""
+        from kb_pipeline.graph.summarize import description_rows
+
+        def src(doc: str, when: str) -> dict:
+            return {"source": f"{doc}.pdf", "when": when}
+
+        ents = [
+            {"key": "bmi", "title": "BMI", "type": "indicator", "frequency": 9, "unit_ids": ["u1"], "aliases": [],
+             "descriptions": [f"报告 {i} 的说法" for i in range(10)], "description_sources": [src(f"d{i}", f"20{10 + i}") for i in range(10)]},
+            {"key": "体重指数", "title": "体重指数", "type": "indicator", "frequency": 2, "unit_ids": ["u2"], "aliases": [],
+             "attributes": ["measured_as = 22.6"],
+             # the last one is an attribute row synthesised at admission and never had a source; the second repeats
+             # a description of the representative
+             "descriptions": ["另一份报告的说法", "报告 3 的说法", "体重指数: measured_as = 22.6"],
+             "description_sources": [src("other", "2026"), src("other", "2026")]},
+            {"key": "体重指数(bmi)", "title": "体重指数(BMI)", "type": "indicator", "frequency": 1, "unit_ids": ["u3"], "aliases": [],
+             "descriptions": ["第三份报告的说法"], "description_sources": [src("third", "2027")]},
+            {"key": "zhang", "title": "张三", "type": "person", "frequency": 5, "unit_ids": ["u1"], "aliases": [], "descriptions": ["受检者"]},
+        ]
+        rels = [
+            {"source_key": "zhang", "target_key": "体重指数", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 0,
+             "unit_ids": ["u2"], "descriptions": ["推出来的边,没有来源"]},
+            {"source_key": "zhang", "target_key": "bmi", "predicate": "variant_of", "directed": True, "strength_sum": 2.0, "evidence": 1,
+             "unit_ids": ["u1"], "descriptions": ["2024 年的说法"], "description_sources": [src("d1", "2024")]},
+            {"source_key": "zhang", "target_key": "体重指数(bmi)", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 1,
+             "unit_ids": ["u3"], "descriptions": ["2027 年的说法", "2024 年的说法"], "description_sources": [src("third", "2027"), src("third", "2027")]},
+        ]
+        original = json.dumps([ents, rels], ensure_ascii=False, sort_keys=True)
+        merged, edges, _ = resolution.merge_entities(ents, rels, [(0, 1), (1, 2)])
+        head = next(e for e in merged if e["key"] == "bmi")
+        self.assertEqual(head["descriptions"], [f"报告 {i} 的说法" for i in range(10)]
+                         + ["另一份报告的说法", "体重指数: measured_as = 22.6", "第三份报告的说法"])
+        self.assertEqual(len(head["description_sources"]), len(head["descriptions"]))
+        rows = description_rows(head)
+        self.assertEqual(rows[9], {"text": "报告 9 的说法", "source": "d9.pdf", "when": "2019"})
+        self.assertEqual(rows[10], {"text": "另一份报告的说法", "source": "other.pdf", "when": "2026"})
+        self.assertEqual(rows[11], {"text": "体重指数: measured_as = 22.6"})                     # a description without a source takes an empty slot, so the ones after it do not shift
+        self.assertEqual(rows[12], {"text": "第三份报告的说法", "source": "third.pdf", "when": "2027"})
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(description_rows(edges[0]), [{"text": "推出来的边,没有来源"},
+                                                      {"text": "2024 年的说法", "source": "d1.pdf", "when": "2024"},
+                                                      {"text": "2027 年的说法", "source": "third.pdf", "when": "2027"}])
+        self.assertEqual(json.dumps([ents, rels], ensure_ascii=False, sort_keys=True), original)      # the input rows are not modified
+        # entities that were not merged stay as they are
+        self.assertEqual(next(e for e in merged if e["key"] == "zhang")["descriptions"], ["受检者"])
+
     def test_resolve_runs_batches_and_tolerates_a_failed_batch(self) -> None:
         # Northwind / NORTHWIND and Northwind / Northwind Technologies are now merged directly without asking the
         # model (identifier equality, organisation suffix); here we use a pair that does need the model (spelling variant)
@@ -447,6 +521,11 @@ class NoiseReductionTests(unittest.TestCase):
         self.assertEqual(strip_latex("A $_{0-A19}$"), "A0-A19")
         self.assertEqual(strip_latex("芯片使能($\\overline{\\mathrm{CE}}$)"), "芯片使能(CE#)")
         self.assertEqual(strip_latex("ZK7C4021KV13"), "ZK7C4021KV13")
+        # a $, backslash or underscore that is not LaTeX stays untouched: variable names, currencies, paths
+        for name in ("$SKILL_DIR", "${HOME}_dir", "Revenue A$", "$schema", "C:\\data\\my_file", "$100 to $200",
+                     "$PATH and $HOME_DIR", "部门\\成员_列表"):
+            self.assertEqual(strip_latex(name), name)
+            self.assertEqual(normalize_name(name), name)
         self.assertEqual(normalize_name("  $t_{\\text{TF}}$ "), "tTF")
         self.assertEqual(entity_key("$t_{\\text{AS}}$"), entity_key("tAS"))
         # Merging recomputes the key from the name: a stored extraction whose name is LaTeX and whose key came from
@@ -459,6 +538,26 @@ class NoiseReductionTests(unittest.TestCase):
         out = merge_extractions(units, ext)
         self.assertEqual([e["title"] for e in out["entities"]], ["tAS"])
         self.assertEqual(out["entities"][0]["frequency"], 2)
+
+    def test_digit_superscripts_keep_the_caret_and_values_only_restore_math(self) -> None:
+        from kb_pipeline.graph.extract import strip_latex, strip_math
+
+        # a numeric superscript after a digit would merge with its base into another number once the marker is gone,
+        # so the ^ stays; a superscript after a letter still joins the name
+        self.assertEqual(strip_latex("$10^{9}$/L"), "10^9/L")
+        self.assertEqual(strip_latex("$10^{-6}$"), "10^-6")
+        self.assertEqual(strip_latex("$10^9$"), "10^9")
+        self.assertEqual(strip_latex("$I^{2}C$"), "I2C")
+        self.assertEqual(strip_latex("$x^{2}$"), "x2")
+        self.assertEqual(strip_latex("$t_{1}$"), "t1")
+        # strip_math: only recognisable fragments inside a paired $...$ are touched
+        self.assertEqual(strip_math("$V_{CC}$ + 0.5"), "VCC + 0.5")
+        self.assertEqual(strip_math("$t_{\\text{AS}}$ 与 $\\overline{\\mathrm{CE}}$"), "tAS 与 CE#")
+        self.assertEqual(strip_math("$10^{9}$/L"), "10^9/L")
+        self.assertEqual(strip_math("$5\\%$"), "5%")
+        for raw in ("$85K", "$85K – $120K", "${HOME}_dir", "${A_B}:${C_D}", "a\\b", "$\\pm 5$", "$\\frac{1}{2}$", "$a\\_b$", "$x$",
+                    "V_{CC}", ""):
+            self.assertEqual(strip_math(raw), raw, raw)
 
     def test_combine_unit_kind_prefers_boilerplate_then_listing(self) -> None:
         from kb_pipeline.graph.merge import combine_unit_kind
@@ -543,6 +642,53 @@ class NoiseReductionTests(unittest.TestCase):
         # reference and TAP Registers is boilerplate-only, but the other entities of that type must not lose seed status
         self.assertEqual(st["demoted_types"], 0)
         self.assertEqual(st["demoted_type_names"], [])
+
+    def test_combined_name_split_does_not_depend_on_relation_order(self) -> None:
+        """Two problems when splitting combined names: an original relation that came after a split-off relation with
+        the same key was skipped entirely and its evidence lost; and swapping the ends of an undirected edge changed
+        the loop variables, so when the target was split into several parts the later parts attached to the wrong
+        start."""
+        from kb_pipeline.graph.merge import dissolve_combined_names
+
+        def ent(key: str, title: str) -> dict:
+            return {"key": key, "title": title, "descriptions": [], "description_sources": [], "unit_ids": [], "doc_ids": [],
+                    "frequency": 1, "aliases": [], "scope": ""}
+
+        def rel(source: str, target: str, *, predicate: str = "supports", strength: float, units: list, text: str, doc: str) -> dict:
+            return {"source_key": source, "target_key": target, "predicate": predicate, "directed": predicate != "related_to",
+                    "descriptions": [text], "description_sources": [{"source": doc}], "unit_ids": list(units),
+                    "strength_sum": strength, "evidence": len(units), "evidence_kind": "body", "boilerplate": False}
+
+        ents = [ent("abc", "ABC"), ent("def", "DEF"), ent("xyz", "XYZ"), ent("abc/def", "ABC/DEF")]
+        combined = rel("abc/def", "xyz", strength=1.0, units=["u1"], text="合写的说法", doc="a.pdf")
+        own = rel("abc", "xyz", strength=2.0, units=["u2", "u3"], text="原有的说法", doc="b.pdf")
+        results = []
+        for order in ([combined, own], [own, combined]):
+            _, rows, split = dissolve_combined_names([dict(e) for e in ents], [dict(r) for r in order])
+            self.assertEqual(split, 1)
+            by = {(r["source_key"], r["target_key"]): r for r in rows}
+            self.assertEqual(set(by), {("abc", "xyz"), ("def", "xyz")})
+            edge = by[("abc", "xyz")]
+            self.assertEqual((edge["strength_sum"], edge["evidence"], sorted(edge["unit_ids"])), (3.0, 3, ["u1", "u2", "u3"]))
+            self.assertEqual(sorted(zip(edge["descriptions"], (s["source"] for s in edge["description_sources"]))),
+                             [("原有的说法", "b.pdf"), ("合写的说法", "a.pdf")])
+            self.assertEqual((by[("def", "xyz")]["strength_sum"], by[("def", "xyz")]["unit_ids"]), (1.0, ["u1"]))
+            results.append(edge["strength_sum"])
+        self.assertEqual(results[0], results[1])
+        # undirected edge: the start key sorts between the parts of the combined name (abc < mmm < zzz), and every part
+        # has to link back to mmm
+        ents2 = [ent("abc", "abc"), ent("zzz", "zzz"), ent("mmm", "mmm"), ent("abc/zzz", "abc/zzz")]
+        loose = rel("abc/zzz", "mmm", predicate="related_to", strength=1.0, units=["u1"], text="x", doc="a.pdf")
+        _, rows, _ = dissolve_combined_names(ents2, [loose])
+        self.assertEqual([(r["source_key"], r["target_key"]) for r in rows], [("abc", "mmm"), ("mmm", "zzz")])
+        flipped = rel("mmm", "abc/zzz", predicate="related_to", strength=1.0, units=["u1"], text="x", doc="a.pdf")
+        _, rows, _ = dissolve_combined_names([dict(e) for e in ents2], [flipped])
+        self.assertEqual([(r["source_key"], r["target_key"]) for r in rows], [("abc", "mmm"), ("mmm", "zzz")])
+        # both ends are combined names and the two split pairs land on the same key: the relation counts once
+        ents3 = [ent("abc", "abc"), ent("zzz", "zzz"), ent("abc/zzz", "abc/zzz"), ent("zzz/abc", "zzz/abc")]
+        twice = rel("abc/zzz", "zzz/abc", predicate="related_to", strength=4.0, units=["u1"], text="x", doc="a.pdf")
+        _, rows, _ = dissolve_combined_names(ents3, [twice])
+        self.assertEqual([(r["source_key"], r["target_key"], r["strength_sum"]) for r in rows], [("abc", "zzz", 4.0)])
 
     def test_type_health_demotes_types_made_of_references_and_boilerplate(self) -> None:
         from kb_pipeline.graph.merge import type_health
@@ -634,8 +780,9 @@ class NoiseReductionTests(unittest.TestCase):
              "reference": True, "evidence_kind": "listing"}
         pr = relation_payload(r, kb_id="kb", source_collection="kb", graph_version="v1", point_ids=[])
         self.assertEqual((pr["boilerplate"], pr["reference"], pr["evidence_kind"]), (False, True, "listing"))
-        for field in ("boilerplate", "reference", "evidence_kind"):
+        for field in ("boilerplate", "reference"):
             self.assertIn(field, GRAPH_PAYLOAD_INDEX_FIELDS)
+        self.assertNotIn("evidence_kind", GRAPH_PAYLOAD_INDEX_FIELDS)       # carried in the payload, but no filter uses it: no index
         flt = seed_filter()
         self.assertEqual(sorted(c.key for c in flt.must_not), ["boilerplate", "reference"])
         recall_src = Path(__file__).resolve().parents[1].joinpath("kb_pipeline/graph/recall.py").read_text(encoding="utf-8")
@@ -1042,7 +1189,7 @@ class DeterministicBuilderTests(unittest.TestCase):
                 path.write_text(text, encoding="utf-8")
                 doc_ids[rel] = f"kb_007:{i}"
                 blocks = parse_native(path, "")
-                self.assertEqual(blocks[0].parser_profile, "code-symbols-v1")
+                self.assertEqual(blocks[0].parser_profile, "code-symbols-v2")
                 refs += [ChunkRef(point_id=f"p{i}-{k}", chunk_uid=f"c{i}-{k}", doc_id=doc_ids[rel], content_version="v", chunk_index=k,
                                   block_id=b.block_id, block_type=b.block_type, section_path=list(b.metadata.get("section_path") or []),
                                   text=b.text, n_tokens=max(1, len(b.text) // 4), rel_path=rel, filename=rel.rsplit("/", 1)[-1])
@@ -1156,6 +1303,65 @@ class DeterministicBuilderTests(unittest.TestCase):
             self.assertIn(("app/pkg/vector/store.py", "imports", "qdrant_client"), triples)
             self.assertIn(("app/pkg/vector/store.py", "imports", "app/pkg/models.py"), triples)   # from `from pkg import models`
 
+    def _config_extractor(self, root: Path, files: dict[str, str]):
+        from kb_pipeline.graph.deterministic import DeterministicExtractor
+
+        units = []
+        for i, (rel, text) in enumerate(files.items()):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            unit = _unit(f"u{i}", doc=f"kb_x:{i}", order=i)
+            unit.rel_path, unit.text = rel, text
+            units.append(unit)
+        return DeterministicExtractor(units, file_for=lambda rel: root / rel, kb_id="kb_x"), {u.rel_path: u for u in units}
+
+    def test_config_files_that_cannot_be_parsed_go_to_the_model(self) -> None:
+        """Without PyYAML, YAML cannot be parsed, and .ini / .conf have no parser at all: such files used to stay on
+        the config route and yield only an empty shell entity, and the model did not pick them up either. Config
+        files that cannot be parsed now go to llm as plain text, and the route counts record them."""
+        import sys
+        from unittest import mock
+
+        from kb_pipeline.graph.deterministic import route_for
+
+        files = {"app/compose.yml": "services:\n  web:\n    image: example/web\n", "app/setup.ini": "[core]\nname = demo\n",
+                 "app/server.conf": "server { listen 80; }\n", "app/broken.json": "{\"name\": ", "app/ok.json": "{\"name\": \"demo\"}",
+                 "app/pyproject.toml": "[project]\nname = \"demo\"\n", "app/requirements.txt": "requests>=2.28\n"}
+        self.assertEqual({route_for(rel) for rel in files}, {"config"})           # the routing by suffix is unchanged
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"yaml": None}):      # import yaml raises ImportError
+            det, by_rel = self._config_extractor(Path(tmp), files)
+            routes = {rel: det.route(u) for rel, u in by_rel.items()}
+            self.assertEqual(routes, {"app/compose.yml": "llm", "app/setup.ini": "llm", "app/server.conf": "llm", "app/broken.json": "llm",
+                                      "app/ok.json": "config", "app/pyproject.toml": "config", "app/requirements.txt": "config"})
+            self.assertFalse(det.wants(by_rel["app/compose.yml"]))                 # every build phase treats it as an llm unit
+            self.assertEqual(det.facts(by_rel["app/compose.yml"]), [])
+            self.assertEqual(det.route_counts["config_unparsed"], 4)
+            self.assertEqual({(f["property"], f["value"]) for f in det.facts(by_rel["app/ok.json"])}, {("name", "demo")})
+            self.assertEqual({(f["property"], f["value"]) for f in det.facts(by_rel["app/pyproject.toml"])}, {("project.name", "demo")})
+
+    def test_yaml_config_facts(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        files = {"app/compose.yml": ("services:\n  web:\n    image: example/web:1.27\n    environment:\n      DB_URL: \"${DB_HOST}:${DB_PORT}\"\n"
+                                     "    ports: [\"80:80\", \"443:443\"]\n"),
+                 "deploy/all.yaml": "kind: Service\nmetadata:\n  name: web\n---\nkind: Deployment\nmetadata:\n  name: web\n",
+                 "deploy/empty.yaml": "# 只有注释\n", "deploy/broken.yaml": "a: [1, 2\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            det, by_rel = self._config_extractor(Path(tmp), files)
+            self.assertEqual({rel: det.route(u) for rel, u in by_rel.items()},
+                             {"app/compose.yml": "config", "deploy/all.yaml": "config", "deploy/empty.yaml": "llm", "deploy/broken.yaml": "llm"})
+            facts = {(f["property"], f["value"]) for f in det.facts(by_rel["app/compose.yml"])}
+            self.assertEqual(facts, {("services.web.image", "example/web:1.27"), ("services.web.environment.DB_URL", "${DB_HOST}:${DB_PORT}"),
+                                     ("services.web.ports", "80:80, 443:443")})
+            # several documents separated by --- in one file: key paths per document
+            multi = {(f["property"], f["value"]) for f in det.facts(by_rel["deploy/all.yaml"])}
+            self.assertEqual(multi, {("[0].kind", "Service"), ("[0].metadata.name", "web"), ("[1].kind", "Deployment"), ("[1].metadata.name", "web")})
+            res = det.extract(by_rel["app/compose.yml"])
+            self.assertEqual([(e["name"], e["type"]) for e in res.entities], [("app/compose.yml", "config_file")])
+
     def test_extraction_fingerprint_only_changes_with_deterministic_units(self) -> None:
         from kb_pipeline.graph.build import extraction_fingerprint
 
@@ -1245,6 +1451,30 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertFalse(in_window("2021-03-14", win))
         self.assertTrue(in_window("rev *L", win))      # non-date axis values are not filtered
         self.assertTrue(in_window("", None))
+
+    def test_document_axis_ignores_bare_years_in_the_body(self) -> None:
+        """A lone 19xx / 20xx number in the first-page text used to be taken as the document's year and so became the
+        validity of every fact in the document. The text now only counts dates given to the month or day; a bare
+        year only counts in the file name."""
+        from kb_pipeline.graph.temporal import document_axis, find_dates
+
+        for head in ("MAX_TOKENS = 2048\nWIDTH = 1920", "公司现有 2023 个员工", "从1988年到2023年,公司经历了三个阶段",
+                     "方案编号 YY-2026-018", "Copyright 2019 Example Press"):
+            axis = document_axis("docs/overview.md", head)
+            self.assertEqual((axis["kind"], axis["value"], axis["date"]), ("none", "", ""), head)
+            self.assertEqual(document_axis("docs/overview.md", head, kind="version")["kind"], "none", head)
+        self.assertEqual(find_dates("公司现有 2023 个员工"), ["2023"])                # the time window of a question still needs bare years: find_dates is unchanged
+        # a bare year earlier on does not hide a full date after it
+        self.assertEqual(document_axis("方案.md", "方案编号 YY-2026-018\n日期:2026 年 3 月 9 日")["value"], "2026-03-09")
+        self.assertEqual(document_axis("notes.md", "2024 年度总结,发布于 2025-01-15")["value"], "2025-01-15")
+        self.assertEqual(document_axis("notes.md", "Revised August 2020")["value"], "2020-08")
+        # the year in the file name works as before; a full date of the same year on the first page completes it, one
+        # of another year does not
+        self.assertEqual(document_axis("2021体检报告.pdf", "本中心成立于 1995 年")["value"], "2021")
+        self.assertEqual(document_axis("2021体检报告.pdf", "2021 年度体检报告\n检查日期 2021-03-14")["value"], "2021-03-14")
+        self.assertEqual(document_axis("2021体检报告.pdf", "出生日期 1980-01-01")["value"], "2021")
+        # a version axis without a version number falls back to the date, again only a full one
+        self.assertEqual(document_axis("a.py", "# 2026-09-12 改过一次\nLIMIT = 2048", kind="version")["value"], "2026-09-12")
 
     def test_unit_classifier_recognises_report_boilerplate_and_conclusions(self) -> None:
         from kb_pipeline.graph.units import classify_unit_text, unit_signals
@@ -1497,6 +1727,34 @@ class ResolutionEvidenceTests(unittest.TestCase):
         from kb_pipeline.graph.resolution import auto_merge_pairs
         self.assertEqual(auto_merge_pairs(ents), [(1, 2)])     # t_DOE / tDOE: merged only on canonical identifier equality
 
+    def test_identifier_keys_keep_the_grouping_of_digits(self) -> None:
+        """A separator between digits decides how the digits are grouped: identifiers, part numbers or versions
+        grouped differently are not the same, and the rules must not merge them outright; those that differ only in
+        spelling (the kind of separator, a separator or none between letters and digits) still merge."""
+        from kb_pipeline.graph.resolution import auto_merge_pairs, canonical_identifier
+
+        def pairs(a: str, b: str) -> list:
+            return auto_merge_pairs([{"title": a, "type": "t"}, {"title": b, "type": "t"}])
+
+        for a, b in (("Nova3-2B", "Nova-32B"), ("表 3-12", "表31-2"), ("式(1-11)", "式(11-1)"), ("v1.10", "v11.0"),
+                     ("1.1.0", "11.0"), ("v1.10", "v110")):
+            self.assertNotEqual(canonical_identifier(a), canonical_identifier(b), (a, b))
+            self.assertEqual(pairs(a, b), [], (a, b))
+        for a, b in (("t_AS", "t AS"), ("ZK7C 1049 GN", "ZK7C1049GN"), ("ZM32 F103", "ZM32F103"), ("表 3-12", "表3.12"),
+                     ("2024-01-05", "2024/01/05"), ("ISO 9001:2015", "ISO9001-2015"), ("W.B.", "WB")):
+            self.assertEqual(pairs(a, b), [(0, 1)], (a, b))
+        # keys obtained by stripping type words or bracketed aliases go through the same function: a different grouping
+        # of digits still does not merge
+        rows = [{"title": "Rev 1.10 package", "type": "package"}, {"title": "Rev 11.0", "type": "package"},
+                {"title": "协议(v1.10)", "type": "standard"}, {"title": "V11.0", "type": "standard"}]
+        self.assertEqual(auto_merge_pairs(rows), [])
+        # a pair the rules do not merge does not come back through the model either: the digit pairs of the two sides
+        # differ, so they never become candidates
+        ents = [{"key": "a", "title": "Nova3-2B", "type": "model", "descriptions": ["x"], "unit_ids": ["u1"], "frequency": 1, "aliases": []},
+                {"key": "b", "title": "Nova-32B", "type": "model", "descriptions": ["y"], "unit_ids": ["u2"], "frequency": 1, "aliases": []}]
+        merged, _, stats = resolution.resolve(_client([]), ents, [])
+        self.assertEqual((stats["auto_pairs"], stats["candidates"], len(merged)), (0, 0, 2))
+
     def test_polarity_and_qualifiers_block_merges(self) -> None:
         from kb_pipeline.graph.resolution import is_containment, is_similar, polarity_conflict
 
@@ -1603,6 +1861,31 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertEqual({e["key"] for e in merged}, {"a", "c", "d"})
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
         self.assertIn('"resolution_log": resolution_log', src)
+
+    def test_merge_log_has_one_row_per_merged_entity(self) -> None:
+        """When neither end of a matched pair is the representative (the "body mass index (BMI)" entity links "body
+        mass index" and "BMI", and "body mass index" is the representative), the log used to record the
+        representative's key with another entity's title, and the merged-away entity could not be found in it. Now
+        there is one row per merged-away entity, kept is always the representative, and the entity it was linked
+        through is recorded in via_title."""
+        def ent(key: str, title: str, freq: int) -> dict:
+            return {"key": key, "title": title, "type": "health indicator", "descriptions": [], "unit_ids": [f"u-{key}"],
+                    "frequency": freq, "aliases": []}
+
+        ents = [ent("bmi", "BMI", 2), ent("体重指数(bmi)", "体重指数(BMI)", 1), ent("体重指数", "体重指数", 9),
+                ent("身高", "身高", 3)]
+        merged, _, stats = resolution.resolve(_client([]), ents, [])
+        self.assertEqual({e["key"] for e in merged}, {"体重指数", "身高"})
+        self.assertEqual(stats["_map"], {"bmi": "体重指数", "体重指数(bmi)": "体重指数"})
+        log = stats["_log"]
+        self.assertEqual(sorted(r["merged"] for r in log), sorted(stats["_map"]))                # every merged-away key exactly once
+        self.assertEqual({(r["kept"], r["kept_title"]) for r in log}, {("体重指数", "体重指数")})
+        direct = next(r for r in log if r["merged"] == "体重指数(bmi)")
+        self.assertEqual((direct["merged_title"], direct["source"], direct["category"], direct.get("via_title")),
+                         ("体重指数(BMI)", "auto", "paren", None))
+        chained = next(r for r in log if r["merged"] == "bmi")
+        self.assertEqual((chained["merged_title"], chained["source"], chained["category"], chained["via_title"]),
+                         ("BMI", "auto", "paren", "体重指数(BMI)"))
 
     def test_embedding_alias_merges_get_a_second_stricter_check(self) -> None:
         from kb_pipeline.graph import resolution

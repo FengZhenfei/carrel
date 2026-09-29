@@ -283,12 +283,13 @@ def sample_docs(settings: Any, source: KBSource, *, q: Any = None) -> dict[str, 
 
 def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adopt: bool, use_prior: bool = True,
                            client: Any = None, docs: list[str] | None = None, sample: dict[str, Any] | None = None,
-                           spec: Any = None) -> dict[str, Any]:
+                           spec: Any = None, stop: threading.Event | None = None) -> dict[str, Any]:
     """Extract one label version into the ring; with adopt=True it takes effect immediately (labels / language /
     predicates / parents / definitions / examples / profile are expanded into the active values together).
     With use_prior=True and an active version, the model revises on the basis of that version + its endpoint
     ledger. client / docs are injection points for tests and callers; when absent, the tune model and the sample
-    are taken from this KB's configuration."""
+    are taken from this KB's configuration.
+    stop: the graph build's stop event; once it is set, model calls are neither retried nor started."""
     from . import schema as graph_schema
 
     config = load_config(settings, source.kb_id)
@@ -313,7 +314,7 @@ def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adop
             cache = LLMCache(graph_paths(settings, source).cache_file)
             close = cache.close
             client = ChatClient(spec, cache=cache, timeout=min(SUGGEST_TIMEOUT_SECONDS, int(settings.graph_llm_timeout_seconds)),
-                                workers=1, circuit_fails=0)
+                                workers=1, circuit_fails=0, stop=stop)
         started = time.time()
         stop_renewing = threading.Event()
 
@@ -400,7 +401,8 @@ def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adop
     finally:
         release_suggest(settings, source.kb_id, token)      # released only after the version is saved (or failed): no idle-looking window while still unpublished
 
-def ensure_schema_before_build(settings: Any, source: KBSource) -> tuple[KBSource, dict[str, Any] | None]:
+def ensure_schema_before_build(settings: Any, source: KBSource, *,
+                               stop: threading.Event | None = None) -> tuple[KBSource, dict[str, Any] | None]:
     """Before a full graph build: with no schema version at all, extract one with the default parameters, adopt it
     and return the source reassembled from the new configuration. With a version, return it unchanged."""
     try:
@@ -424,7 +426,7 @@ def ensure_schema_before_build(settings: Any, source: KBSource) -> tuple[KBSourc
     print(f"[graph] {source.kb_id}({source.source_root}): no schema version yet; extracting labels with default settings first"
           f" (sample size {source.graph_tune_sample_size})", flush=True)
     try:
-        info = suggest_schema_version(settings, source, origin=ORIGIN_BLANK, adopt=True, use_prior=False)
+        info = suggest_schema_version(settings, source, origin=ORIGIN_BLANK, adopt=True, use_prior=False, stop=stop)
     except SuggestBusy:
         # someone (the console) started extracting between the wait and the claim: wait again and adopt their version
         waited = wait_for_suggest(settings, source.kb_id)

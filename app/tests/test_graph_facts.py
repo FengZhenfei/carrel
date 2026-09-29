@@ -370,6 +370,45 @@ class FactsSpineTests(unittest.TestCase):
                       "doc_id": "d1", "unit_id": "u-n2", "valid_from": "2025-01-01", "conditions": {}, "flag": "↑"}]
         self.assertEqual(reconcile_facts(same_axis)["stats"]["conflicts"], 0)     # on the same axis "5.4 mmol/L" and "elevated" are two spellings of one measurement
 
+    def test_date_and_version_axes_never_share_a_series(self) -> None:
+        """In a KB whose profile is version both kinds of axis value coexist: documents without a version number get
+        a date axis value, and validity periods the model copies from the text are dates too. Dates used to sort
+        before versions, so "2023-10-31 -> v6.0" became the start and end of one series. Now dates and versions are
+        sorted separately."""
+        from kb_pipeline.graph.reconcile import reconcile_facts, series_of
+        from kb_pipeline.graph.temporal import axis_value_kind
+
+        self.assertEqual([axis_value_kind(v) for v in ("2024", "2024-07", "2024-07-26", "v6.0", "rev *J", "v2024.1", "")],
+                         ["date", "date", "date", "version", "version", "version", ""])
+
+        def fact(fid, doc, value, *, valid_from="", axis=""):
+            row = {"id": fid, "subject": "某平台", "subject_key": "platform", "property": "支撑用户量", "symbol": "", "value": value,
+                   "value_num": float(value), "unit": "万", "doc_id": doc, "unit_id": f"u-{fid}", "conditions": {}}
+            if valid_from:
+                row["valid_from"] = valid_from
+            if axis:
+                row["axis"] = axis
+            return row
+
+        # one date and one version: the two points have no order between them, so they form no series
+        pair = [fact("a", "d1", "50", valid_from="2023-10-31", axis="v6.0"), fact("b", "d1", "80", valid_from="v6.0", axis="v6.0")]
+        out = reconcile_facts(pair)
+        self.assertEqual(out["stats"]["series"], 0)
+        self.assertEqual([("series_key" in f) for f in pair], [False, False])
+        self.assertEqual(series_of(pair), {})
+        # two dates, two versions and one without an axis: one series per kind, each indexed from 0
+        rows = [fact("d1", "d1", "50", valid_from="2023-10-31"), fact("v2", "d2", "90", axis="v6.10"), fact("d2", "d3", "60", valid_from="2024-05"),
+                fact("v1", "d4", "80", axis="v6.2"), fact("n", "d5", "70")]
+        out = reconcile_facts(rows)
+        by = {f["id"]: f for f in rows}
+        self.assertEqual(out["stats"]["series"], 2)
+        self.assertEqual(by["d1"]["series_key"], by["d2"]["series_key"])
+        self.assertEqual(by["v1"]["series_key"], by["v2"]["series_key"])
+        self.assertNotEqual(by["d1"]["series_key"], by["v1"]["series_key"])
+        self.assertEqual([(by[k]["series_index"], by[k]["series_len"]) for k in ("d1", "d2", "v1", "v2")], [(0, 2), (1, 2), (0, 2), (1, 2)])
+        self.assertNotIn("series_key", by["n"])
+        self.assertEqual(sorted([f["id"] for f in part] for part in series_of(rows).values()), [["d1", "d2"], ["v1", "v2"]])
+
     def test_spec_vectors_are_three_named_vectors_and_pages_are_optional(self) -> None:
         from kb_pipeline.graph.vectors import page_payload, spec_embed_texts, write_graph_vectors
         from kb_pipeline.vector.qdrant import GRAPH_OPTIONAL_TYPES, GRAPH_VECTOR_TYPES, graph_vector_layout
@@ -721,6 +760,52 @@ class ViewLayerTests(unittest.TestCase):
         only_flags = [rows[0], rows[3]]
         self.assertEqual(_series_line(only_flags, L), "总胆固醇:2022-06-05 增高 → 2023-09-12 增高(持平,2 个点)")
 
+    def test_trend_counts_each_axis_once(self) -> None:
+        """The same value stated repeatedly on one axis used to count as one point per row: the difference between the
+        repeated rows is 0, so a monotonic series was called "changing" and one with numbers on a single axis "flat".
+        The trend now compares axes; different values on the same axis leave no single trend."""
+        from kb_pipeline.graph.compile import _series_line, _trend, labels_for
+
+        L = labels_for("Chinese")
+
+        def row(when, value, unit="mmol/L"):
+            return {"concept": "总胆固醇", "value": value, "unit": unit, "valid_from": when}
+
+        self.assertEqual(_trend([row("2023", "5.0"), row("2023", "5.00"), row("2024", "6.0")], L), L["trend_up"])
+        self.assertEqual(_trend([row("2023", "6.0"), row("2024", "5.5"), row("2024", "5.5"), row("2025", "5.0")], L), L["trend_down"])
+        self.assertEqual(_trend([row("2023", "5.0"), row("2023", "5.0"), row("2024", "5.0")], L), L["trend_flat"])
+        self.assertEqual(_trend([row("2024", "6.0"), row("2023", "5.0"), row("2023", "5.0")], L), L["trend_up"])          # ordered by axis, not by row order
+        self.assertEqual(_trend([row("2023", "5.0"), row("2023", "5.4"), row("2024", "6.0")], L), L["trend_mixed"])       # two values on one axis
+        # the rows with numbers all sit on one axis: nothing was compared across axes, so a zero difference between
+        # repeated rows does not make it flat
+        self.assertEqual(_trend([row("2023", "5.0"), row("2023", "5.0"), row("2024", "增高", unit="")], L), L["trend_mixed"])
+        self.assertEqual(_trend([row("2023", "5.0"), row("2023", "5.0")], L), L["trend_flat"])
+        # the point count still follows the evidence rows, matching the rows of the page's table
+        self.assertEqual(_series_line([row("2023", "5.0"), row("2023", "5.0"), row("2024", "6.0")], L),
+                         "总胆固醇:2023 5.0 mmol/L → 2024 6.0 mmol/L(上升,3 个点)")
+
+    def test_subject_page_series_stay_within_one_kind_of_axis(self) -> None:
+        from kb_pipeline.graph.compile import compile_pages
+
+        graph, units = self._graph()
+        base = graph["specs"][0]
+
+        def fact(fid, prop, value, when, *, ckey):
+            return {**base, "id": fid, "property": prop, "concept": prop, "concept_key": ckey, "value": value, "value_num": float(value),
+                    "unit": "万", "valid_from": when, "axis": when, "flag": "", "ref_min": "", "ref_max": "", "series_key": None}
+
+        graph["specs"] = [
+            fact("m1", "支撑用户量", "50", "2023-10-31", ckey="c5"), fact("m2", "支撑用户量", "80", "v6.0", ckey="c5"),       # one date, one version
+            fact("k1", "并发数", "10", "2023-01", ckey="c6"), fact("k2", "并发数", "20", "2024-01", ckey="c6"),
+            fact("k3", "并发数", "90", "v6.10", ckey="c6"), fact("k4", "并发数", "70", "v6.2", ckey="c6"), fact("k5", "并发数", "5", "", ckey="c6"),
+        ]
+        pages, _ = compile_pages(graph, units, out_dir=None, language="Chinese")
+        subject = next(p for p in pages if p["kind"] == "subject")
+        self.assertEqual(subject["series"], ["并发数:2023-01 10 万 → 2024-01 20 万(上升,2 个点)",
+                                             "并发数:v6.2 70 万 → v6.10 90 万(上升,2 个点)"])
+        self.assertNotIn("支撑用户量:", subject["summary"])                          # one date point and one version point: no series
+        self.assertIn("| v6.0 | 80 万 |", subject["text"])                          # still listed in the fact table
+
     def test_subject_selection_degrades_without_profile_or_facts(self) -> None:
         from kb_pipeline.graph.compile import SUBJECT_FALLBACK, select_subjects
 
@@ -893,6 +978,38 @@ class MeasurementNormalizationTests(unittest.TestCase):
         build_concepts(series)
         self.assertEqual(series[0]["concept_key"], series[1]["concept_key"])
 
+    def test_flag_words_are_only_stripped_from_text_valued_facts(self) -> None:
+        """High / Low, "decrease" or "abnormal" at the end of a property name used to be split off as a flag every
+        time: Price High and Price Low merged into one property, both carrying an out-of-range arrow, and the decrease
+        in "consumption down 30%" was read as the consumption itself. When the value is a quantity the tail word is
+        part of the property name and stays; when the value is text it is still split off, and the original name is
+        recorded."""
+        from kb_pipeline.graph.concepts import build_concepts
+        from kb_pipeline.graph.facts import normalize_fact, normalize_measurements
+
+        def fact(fid, prop, **fields):
+            row = normalize_fact({"subject": "某基金", "property": prop, **fields})
+            row.update(id=fid, unit_id="u1", doc_id="d1")
+            return row
+
+        facts = [fact("hi", "Price High", value="105.2"), fact("lo", "Price Low", value="98.7"),
+                 fact("cut", "消耗下降", value="30%"), fact("p50", "首 token 延迟 p50 降低", min="20", max="35", unit="%"),
+                 fact("rng", "Score-Q High", value="1.2 to 1.8"), fact("expr", "Input voltage high", max="V_CC + 0.5"),
+                 fact("tc", "总胆固醇增高", value="增高"), fact("mk", "Marker-X positive", value="阳性", flag="+"),
+                 fact("note", "检查结果异常", value="详见附页"), fact("bare", "异常", value="有")]
+        stats = normalize_measurements(facts, [], units_by_id={"u1": _unit("u1", doc="d1")}, profile={"subject_types": ["fund"], "axis": "date"})
+        by = {f["id"]: f for f in facts}
+        for fid, prop in (("hi", "Price High"), ("lo", "Price Low"), ("cut", "消耗下降"), ("p50", "首 token 延迟 p50 降低"),
+                          ("rng", "Score-Q High"), ("expr", "Input voltage high")):
+            self.assertEqual((by[fid]["property"], by[fid].get("flag"), by[fid].get("property_raw")), (prop, None, None), fid)
+        self.assertEqual((by["tc"]["property"], by["tc"]["flag"], by["tc"]["property_raw"]), ("总胆固醇", "↑", "总胆固醇增高"))
+        self.assertEqual((by["mk"]["property"], by["mk"]["flag"], by["mk"]["property_raw"]), ("Marker-X", "+", "Marker-X positive"))   # the flag given by the model wins
+        self.assertEqual((by["note"]["property"], by["note"]["flag"], by["note"]["property_raw"]), ("检查结果", "异常", "检查结果异常"))
+        self.assertEqual((by["bare"]["property"], by["bare"].get("property_raw")), ("异常", None))          # the whole property name is a flag word: left alone
+        self.assertEqual(stats["flag_words"], 3)
+        build_concepts(facts)
+        self.assertNotEqual(by["hi"]["concept_key"], by["lo"]["concept_key"])
+
     def test_bad_endpoint_constraints_are_relaxed(self) -> None:
         from kb_pipeline.graph.merge import predicate_health, relax_bad_endpoints
 
@@ -982,6 +1099,34 @@ class MeasurementNormalizationTests(unittest.TestCase):
         normalize_measurements(facts2, ents, units_by_id=units, profile={"subject_types": ["patient"], "axis": "date"})
         self.assertEqual(facts2[0]["subject"], "李先生_2000000000002_1")
 
+
+
+    def test_period_in_a_condition_wins_over_the_date_inherited_from_the_document(self) -> None:
+        """link_facts fills the document's axis value into facts without a validity; in a multi-year comparison table
+        each row's year sits in the conditions and has to move to valid_from, otherwise the whole table lands on the
+        single point of the report date. Facts that state their own validity are left alone."""
+        from kb_pipeline.graph.facts import normalize_measurements
+
+        facts = [
+            {"id": "a", "subject": "李华", "property": "体重指数", "value": "21.9", "value_num": 21.9, "axis": "2023-09-12",
+             "valid_from": "2023-09-12", "conditions": {"年份": "2021/05"}},
+            {"id": "b", "subject": "李华", "property": "体重指数", "value": "22.6", "value_num": 22.6, "axis": "2023-09-12",
+             "valid_from": "2023-09-12", "conditions": {"年份": "2022/06"}},
+            {"id": "c", "subject": "李华", "property": "体重指数", "value": "23.0", "value_num": 23.0, "axis": "2023-09-12",
+             "valid_from": "2023-09-12", "conditions": {"体位": "立位"}},
+            {"id": "d", "subject": "李华", "property": "体重指数", "value": "21.4", "value_num": 21.4, "axis": "2023-09-12",
+             "valid_from": "2020-04", "conditions": {"年份": "2019"}},
+        ]
+        stats = normalize_measurements(facts, [], units_by_id={})
+        by = {f["id"]: f for f in facts}
+        self.assertEqual([(by[k]["valid_from"], by[k].get("period_text"), by[k]["conditions"]) for k in "abcd"], [
+            ("2021-05", "年份: 2021/05", {}),
+            ("2022-06", "年份: 2022/06", {}),
+            ("2023-09-12", None, {"体位": "立位"}),
+            ("2020-04", None, {"年份": "2019"}),
+        ])
+        self.assertEqual({f["axis"] for f in facts}, {"2023-09-12"})
+        self.assertEqual(stats["period_conditions"], 2)
 
 class FinerEvalTests(unittest.TestCase):
     """Finer evaluation (2026-09-08): cross-document questions check how many documents the evidence comes from and
@@ -1332,6 +1477,64 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         self.assertEqual(payload["kinds"], {"min": "scalar", "max": "expression"})
         self.assertNotIn("max_num", payload)          # None fields stay out of the payload: filters will not treat the expression as 0.5
 
+    def test_only_grouped_commas_are_thousands_separators(self) -> None:
+        """Commas not followed by groups of three digits (a decimal comma, two comma-separated values) used to be
+        dropped to read one large number: 12,50 -> 1250. Now only thousands-separator notation counts as one number;
+        anything else is text, has no numeric value and takes no part in trends or reconciliation."""
+        from kb_pipeline.graph.facts import classify_value, comparable_number, normalize_fact, parse_number
+        from kb_pipeline.graph.reconcile import _values_equal
+
+        for t, want in {"1,024": 1024.0, "12,345.6": 12345.6, "1,234,567": 1234567.0, "-1,500 mA": -1500.0, "≤ 1,024": 1024.0,
+                        "１，０２４": 1024.0}.items():
+            self.assertEqual(classify_value(t)["kind"], "scalar", t)
+            self.assertEqual(parse_number(t), want, t)
+        for t in ("12,50", "2,86", "34,57", "172,2576", "12,26,9", "0,5", "1,0245", "1234,567", "1.024,5", "12,50 mm"):
+            self.assertEqual(classify_value(t), {"kind": "text", "num": None}, t)
+        self.assertEqual(classify_value("1,024 to 2,048"), {"kind": "range", "num": None, "lo": 1024.0, "hi": 2048.0})
+        self.assertEqual(classify_value("2,5 - 3,5")["kind"], "text")
+        fact = normalize_fact({"subject": "X", "property": "参数", "value": "12,50", "min": "2,86", "ref_min": "1,5", "ref_max": "1,500"})
+        self.assertEqual((fact["value"], fact["value_num"], fact["min_num"], fact["kinds"]), ("12,50", None, None, {"value": "text", "min": "text"}))
+        self.assertEqual((fact["ref_min_num"], fact["ref_max_num"]), (None, 1500.0))
+        self.assertIsNone(comparable_number(fact))
+        self.assertFalse(_values_equal({"value": "12,50"}, {"value": "1250"}))
+
+    def test_value_fields_are_not_rewritten_as_entity_names(self) -> None:
+        """Values, units, conditions and notes used to go through the LaTeX restoration of entity names: every $ or
+        backslash was deleted, rewriting currencies, variable names and paths. Now these fields stay as in the source
+        and only recognisable $...$ fragments are restored; subject, property and symbol are still normalised like
+        entity names."""
+        from kb_pipeline.graph.facts import classify_value, normalize_fact
+
+        def value_of(raw: str) -> str:
+            return normalize_fact({"subject": "S", "property": "p", "value": raw})["value"]
+
+        for raw in ("$85K", "$10亿", "A$21,050", "$85K – $120K", "${HOME}_dir", "${DB_HOST}:${DB_PORT}", "{name}_{id}.log",
+                    "C:\\Users\\foo_bar", "CRM系统\\ERP", "$defs.item.$ref"):
+            self.assertEqual(value_of(raw), raw, raw)
+        money = normalize_fact({"subject": "某公司", "property": "薪资范围", "min": "$85K", "max": "$120K", "unit": "$",
+                                "conditions": {"币种": "US$"}, "note": "含 $5K 签约奖金"})
+        self.assertEqual((money["min"], money["max"], money["unit"], money["unit_canonical"]), ("$85K", "$120K", "$", "USD"))
+        self.assertEqual((money["conditions"], money["note"]), ({"币种": "US$"}, "含 $5K 签约奖金"))
+        self.assertEqual((money["min_num"], money["kinds"]), (None, {"min": "text", "max": "text"}))      # a number with a currency sign is not a bare number
+        # a paired $...$ fragment that really holds LaTeX notation is still restored; one with commands that are not
+        # all recognised stays as it is, rather than losing its backslashes into a run of letters and digits
+        self.assertEqual(value_of("$V_{CC}$ + 0.5"), "VCC + 0.5")
+        self.assertEqual(value_of("$\\overline{\\mathrm{CE}}$ low"), "CE# low")
+        self.assertEqual(value_of("$5\\%$"), "5%")
+        self.assertEqual(value_of("$\\frac{1}{2} V_{CC}$"), "$\\frac{1}{2} V_{CC}$")
+        self.assertEqual(value_of("V_{CC} + 0.3"), "V_{CC} + 0.3")
+        self.assertEqual(classify_value(value_of("V_{CC} + 0.3"))["kind"], "expression")
+        # full-width characters, surrounding quotes and whitespace are normalised as before
+        self.assertEqual((value_of("  “１２．５　ｍＡ”  "), value_of('"a   b"')), ("12.5 mA", "a b"))
+        # an exponent is not merged into its base: a superscript 9 after 10 and $10^{9}$ are both written 10^9, not 109
+        blood = normalize_fact({"subject": "S", "property": "白细胞计数", "value": "5.2", "unit": "10⁹/L", "ref_max": "$10^{9}$"})
+        self.assertEqual((blood["unit"], blood["unit_canonical"], blood["ref_max"], blood["ref_max_num"]), ("10^9/L", "10^9/L", "10^9", None))
+        self.assertEqual(classify_value("10⁹"), {"kind": "text", "num": None})
+        self.assertEqual(value_of("5 m²"), "5 m2")
+        # name fields: LaTeX notation is restored so that they match entity names
+        named = normalize_fact({"subject": "$t_{\\text{AS}}$", "property": "Setup time", "symbol": "$V_{CC}$", "value": "1"})
+        self.assertEqual((named["subject"], named["symbol"]), ("tAS", "VCC"))
+
     def test_f03_malformed_llm_output_is_retried_uncached_and_fails_the_unit(self) -> None:
         """F03: an HTTP success whose content was not the requested JSON used to be cached anyway and counted as a
         "successful empty result". Now: ask again with a correction prompt; if still malformed raise
@@ -1399,7 +1602,7 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         self.assertIn('"rejected_units": len(rejected_units)', build_src)
         # units handled by the rule extractor (code, config, structured markdown) never go to the model for facts
         self.assertIn("todo_units = [u for u in units if not det.wants(u) and wants_facts(u, kinds.get(u.unit_id))]", build_src)
-        self.assertIn("facts-v3", _repo_file("app/kb_pipeline/graph/facts.py"))     # bumped to v3 on 09-07 when facts gained axis / bound fields
+        self.assertIn("facts-v4", _repo_file("app/kb_pipeline/graph/facts.py"))     # v3 on 09-07 for the axis / bound fields; v4 when number parsing and value cleaning changed
         self.assertNotEqual(facts_fingerprint(spec), "")
         src = _repo_file("app/kb_pipeline/graph/build.py")
         self.assertIn('facts_phase_gate(failed, partial_ok=_env_flag("KB_GRAPH_FACTS_PARTIAL_OK"))', src)
@@ -1447,8 +1650,8 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         html = _repo_file("app/kb_server/static/index.html")
         self.assertIn(".pv-badge.warn", html)
         self.assertRegex(html, r"app\.js\?v=\d{8}-\d+")
-        self.assertEqual(parser_profile_for_path(Path("x.pdf")), "pdf-mineru-table-vlm-v14")
-        self.assertEqual(parser_profile_for_path(Path("x.docx")), "docx-mineru-ooxml-vlm-v9")
+        self.assertEqual(parser_profile_for_path(Path("x.pdf")), "pdf-mineru-table-vlm-v15")
+        self.assertEqual(parser_profile_for_path(Path("x.docx")), "docx-mineru-ooxml-vlm-v10")
         for name in ("mineru_pdf.py", "mineru_docx.py"):
             self.assertIn("table_ambiguity_flags(", _repo_file(f"app/kb_pipeline/parsers/{name}"), name)
         for name in ("pdf_enhanced.py", "docx_enhanced.py"):

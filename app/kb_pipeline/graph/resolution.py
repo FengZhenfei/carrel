@@ -237,10 +237,18 @@ def is_similar(a: str, b: str) -> bool:
     return levenshtein(a, b) <= min(len(a), len(b)) // 2
 
 
+def _identifier_separator(m: re.Match) -> str:
+    text = m.string
+    between_digits = 0 < m.start() and m.end() < len(text) and text[m.start() - 1].isdigit() and text[m.end()].isdigit()
+    return "-" if between_digits else ""
+
+
 def canonical_identifier(title: str) -> str:
-    """Drop spaces, underscores, hyphens, dots, slashes and case: t_AS / tAS / t AS are one symbol."""
+    """Drop spaces, underscores, hyphens, dots, slashes and case: t_AS / tAS / t AS are one symbol.
+    A separator between two digits leaves one marker: it decides how the digits are grouped, so 3-12 and 31-2, or
+    v1.10 and v11.0, are two different identifiers, and dropping it altogether would give them the same key."""
     text = unicodedata.normalize("NFKC", str(title or "")).casefold()
-    return _IDENT_STRIP_RE.sub("", text)
+    return _IDENT_STRIP_RE.sub(_identifier_separator, text)
 
 
 def strip_type_words(title: str, extra: Iterable[str] = ()) -> str:
@@ -667,21 +675,37 @@ def _ordered_union(groups: list[list[Any]]) -> list[Any]:
     return out
 
 
+def _absorb_descriptions(slot: dict[str, Any], row: dict[str, Any]) -> None:
+    """Merge row's descriptions, each with its source label, into slot (deduplicated, order kept). The two lists
+    are aligned by index and the summary takes the source by index: a description without a label (attribute
+    rows, inferred edges) gets an empty dict as a placeholder so the labels after it do not shift."""
+    descriptions, sources = slot["descriptions"], slot["description_sources"]
+    sources.extend({} for _ in range(len(descriptions) - len(sources)))
+    seen = set(descriptions)
+    own = list(row.get("description_sources") or [])
+    for i, d in enumerate(row.get("descriptions") or ([row["description"]] if row.get("description") else [])):
+        d = str(d).strip()
+        if d and d not in seen:
+            seen.add(d)
+            descriptions.append(d)
+            sources.append(dict(own[i]) if i < len(own) and isinstance(own[i], dict) else {})
+
+
 def merge_entities(
     entities: list[dict[str, Any]],
     relations: list[dict[str, Any]],
     yes_pairs: list[tuple[int, int]],
     *,
-    max_descriptions: int = 8,
     canonical_out: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
     """Pairs judged yes form a graph and are merged per connected component (not pairwise). When canonical_out is
     given it is filled with {merged key: representative key} (for incremental append replay).
 
-    Representative = the highest frequency (ties go to the shortest title); descriptions deduplicated in order (at
-    most max_descriptions), unit_ids / doc_ids / aliases unioned, frequency summed. Relation endpoints are
-    rewritten to the representative; self-loops are dropped; edges that coincide after rewriting are merged
-    (strength_sum and evidence added, descriptions and unit_ids unioned).
+    Representative = the highest frequency (ties go to the shortest title); descriptions deduplicated in order,
+    each with its source label, and none cut off (unmerged entities are not cut either: the summary batches them
+    by token budget); unit_ids / doc_ids / aliases unioned, frequency summed. Relation endpoints are rewritten to
+    the representative; self-loops are dropped; edges that coincide after rewriting are merged (strength_sum and
+    evidence added, descriptions and unit_ids unioned).
     """
     uf = _UnionFind(len(entities))
     for i, j in yes_pairs:
@@ -699,13 +723,9 @@ def merge_entities(
             continue
         members.sort(key=lambda i: (-int(entities[i].get("frequency") or 0), len(str(entities[i].get("title") or ""))))
         head = dict(entities[members[0]])
-        descriptions: list[str] = []
+        head["descriptions"], head["description_sources"] = [], []
         for i in members:
-            for d in entities[i].get("descriptions") or ([entities[i]["description"]] if entities[i].get("description") else []):
-                d = str(d).strip()
-                if d and d not in descriptions:
-                    descriptions.append(d)
-        head["descriptions"] = descriptions[:max_descriptions]
+            _absorb_descriptions(head, entities[i])
         head["description"] = ""
         head["unit_ids"] = _ordered_union([list(entities[i].get("unit_ids") or []) for i in members])
         head["doc_ids"] = _ordered_union([list(entities[i].get("doc_ids") or []) for i in members])
@@ -740,9 +760,7 @@ def merge_entities(
             slot = edges[key]
             slot["strength_sum"] = round(float(slot.get("strength_sum") or 0) + float(rel.get("strength_sum") or 0), 3)
             slot["evidence"] = int(slot.get("evidence") or 0) + int(rel.get("evidence") or 0)
-            for d in rel.get("descriptions") or []:
-                if d and d not in slot["descriptions"]:
-                    slot["descriptions"].append(d)
+            _absorb_descriptions(slot, rel)
             slot["unit_ids"] = _ordered_union([list(slot.get("unit_ids") or []), list(rel.get("unit_ids") or [])])
             slot["type_violation"] = bool(slot.get("type_violation")) and bool(rel.get("type_violation"))
             slot["boilerplate"] = bool(slot.get("boilerplate")) and bool(rel.get("boilerplate"))
@@ -754,6 +772,7 @@ def merge_entities(
             row["source_key"], row["target_key"] = src, dst
             row["source"], row["target"] = title_of.get(src, row.get("source")), title_of.get(dst, row.get("target"))
             row["descriptions"] = list(rel.get("descriptions") or [])
+            row["description_sources"] = [dict(s) if isinstance(s, dict) else {} for s in (rel.get("description_sources") or [])]
             edges[key] = row
     if canonical_out is not None:
         canonical_out.update(canonical_of)
@@ -763,6 +782,45 @@ def merge_entities(
         "self_loops_dropped": self_loops, "groups": sum(1 for m in groups.values() if len(m) > 1),
     }
     return merged, list(edges.values()), stats
+
+
+def _merge_log(entities: list[dict[str, Any]], key_of: list[str], canonical_of: dict[str, str],
+               evidence: dict[tuple[int, int], tuple[str, str]]) -> list[dict[str, Any]]:
+    """Resolution log: one row per merged-away entity, recording the representative it went into and the pair
+    whose judgement merged it (source auto / lexical / embedding / replay, and the basis category).
+    Merging works on whole connected components, so neither end of a matched pair need be the representative
+    (A-B and B-C linked, representative A): walk out from the representative along the matched pairs, record every
+    entity reached, and when the entity it was reached from is not the representative, note that one in
+    via_title. Recorded per pair, such a pair's kept key and kept_title would name two different entities and the
+    merged-away one could not be found in the log."""
+    index = {k: i for i, k in enumerate(key_of) if k}
+    links: dict[int, list[tuple[int, str, str]]] = {}
+    for (i, j), (source, cat) in evidence.items():
+        links.setdefault(i, []).append((j, source, cat))
+        links.setdefault(j, []).append((i, source, cat))
+
+    def title(i: int) -> str:
+        return str(entities[i].get("title") or "")
+
+    log: list[dict[str, Any]] = []
+    for head_key in dict.fromkeys(canonical_of.values()):
+        head = index.get(head_key)
+        if head is None:
+            continue
+        reached, queue = {head}, [head]
+        while queue:
+            cur = queue.pop(0)
+            for other, source, cat in links.get(cur, []):
+                if other in reached or canonical_of.get(key_of[other]) != head_key:
+                    continue
+                reached.add(other)
+                queue.append(other)
+                row = {"kept": head_key, "merged": key_of[other], "kept_title": title(head), "merged_title": title(other),
+                       "source": source, "category": cat}
+                if cur != head:
+                    row["via_title"] = title(cur)
+                log.append(row)
+    return log
 
 
 def resolve(client: ChatClient, entities: list[dict[str, Any]], relations: list[dict[str, Any]], *,
@@ -938,17 +996,6 @@ def resolve(client: ChatClient, entities: list[dict[str, Any]], relations: list[
     stats.update(merge_stats)
     stats["_map"] = canonical_of
     stats["_judged"] = sorted(sorted(p) for p in judged_keys if len(p) == 2)
-    # Resolution log: each merged pair records source and basis category (auto: equal symbol; lexical: literal
-    # similarity; embedding: vector neighbour; replay: previous version)
-    log: list[dict[str, Any]] = []
-    for (i, j), (source, cat) in evidence.items():
-        ki, kj = key_of[i], key_of[j]
-        if canonical_of.get(ki, ki) != canonical_of.get(kj, kj):
-            continue
-        kept = canonical_of.get(ki, ki)
-        merged_key = kj if kept == ki else ki
-        log.append({"kept": kept, "merged": merged_key, "kept_title": str(entities[i if kept == ki else j].get("title") or ""),
-                    "merged_title": str(entities[j if kept == ki else i].get("title") or ""), "source": source, "category": cat})
-    stats["_log"] = log
+    stats["_log"] = _merge_log(entities, key_of, canonical_of, evidence)
     stats["_rejected"] = rejected
     return merged_entities, merged_relations, stats

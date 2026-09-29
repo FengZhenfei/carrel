@@ -783,28 +783,34 @@ def dissolve_combined_names(entities: list[dict[str, Any]], relations: list[dict
     for r in relations:
         sources = split.get(r["source_key"], [r["source_key"]])
         targets = split.get(r["target_key"], [r["target_key"]])
-        for sk in sources:
-            for tk in targets:
+        placed: set[tuple[str, str, str]] = set()
+        for source in sources:
+            for target in targets:
+                # the ends of an undirected edge are ordered by key: the swap holds for this pair of ends only and
+                # must not change the loop variables carried into the next pass
+                sk, tk = (target, source) if not r.get("directed") and target < source else (source, target)
                 if sk == tk:
                     continue
-                if not r.get("directed") and tk < sk:
-                    sk, tk = tk, sk
                 key = (sk, tk, str(r.get("predicate")))
+                if key in placed:
+                    continue             # two end pairs split from one relation land on the same key: counted once
+                placed.add(key)
                 if key in merged:
+                    # an existing key absorbs the relation whichever arrived first: when the original relation comes
+                    # after a split-off relation with the same key, its evidence counts all the same
                     slot = merged[key]
-                    if sk != r["source_key"] or tk != r["target_key"]:
-                        slot["strength_sum"] = round(float(slot.get("strength_sum") or 0) + float(r.get("strength_sum") or 0), 3)
-                        r_sources = list(r.get("description_sources") or [])
-                        for i, d in enumerate(r.get("descriptions") or []):
-                            if d not in slot["descriptions"]:
-                                slot["descriptions"].append(d)
-                                slot.setdefault("description_sources", []).append(dict(r_sources[i]) if i < len(r_sources) else {})
-                        for u in r.get("unit_ids") or []:
-                            if u not in slot["unit_ids"]:
-                                slot["unit_ids"].append(u)
-                        slot["evidence"] = len(slot["unit_ids"])      # evidence = distinct units, the same unit is not counted twice
-                        slot["boilerplate"] = bool(slot.get("boilerplate")) and bool(r.get("boilerplate"))
-                        slot["evidence_kind"] = best_kind([slot.get("evidence_kind") or "body", r.get("evidence_kind") or "body"])
+                    slot["strength_sum"] = round(float(slot.get("strength_sum") or 0) + float(r.get("strength_sum") or 0), 3)
+                    r_sources = list(r.get("description_sources") or [])
+                    for i, d in enumerate(r.get("descriptions") or []):
+                        if d not in slot["descriptions"]:
+                            slot["descriptions"].append(d)
+                            slot.setdefault("description_sources", []).append(dict(r_sources[i]) if i < len(r_sources) else {})
+                    for u in r.get("unit_ids") or []:
+                        if u not in slot["unit_ids"]:
+                            slot["unit_ids"].append(u)
+                    slot["evidence"] = len(slot["unit_ids"])      # evidence = distinct units, the same unit is not counted twice
+                    slot["boilerplate"] = bool(slot.get("boilerplate")) and bool(r.get("boilerplate"))
+                    slot["evidence_kind"] = best_kind([slot.get("evidence_kind") or "body", r.get("evidence_kind") or "body"])
                     continue
                 row = dict(r)
                 row["source_key"], row["target_key"] = sk, tk

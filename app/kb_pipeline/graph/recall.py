@@ -1,8 +1,8 @@
-"""Graph recall prototype: question → entity / relation vector seeds → Neo4j expansion along RELATED_TO →
+"""Graph recall: question → entity / relation vector seeds → Neo4j expansion along RELATED_TO →
 aggregation into chunks.
 
-Used in two places: `kb graph query` for manual checks and `kb graph eval` for this KB's capability questions
-(4.10). Scoring follows plan 4.7: entity = sim × pagerank_norm; relation = sim × weight_norm; the score at hop
+Used in two places: the graph route of the search service (kb_search/channels.graph_channel) and `kb graph query`
+for manual checks. Scoring follows plan 4.7: entity = sim × pagerank_norm; relation = sim × weight_norm; the score at hop
 i = seed score / (2 + i); chunk score = the scores of the entities hitting it (via MENTIONED_IN, weighted by hit
 count and idf) + relation scores (via EVIDENCES → CONTRIBUTES_TO, likewise by idf). It returns chunk ids with
 scores so the layer above can treat it as one recall route and fuse it with vectors and BM25 by RRF.
@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from typing import Any
+
+from neo4j import Query
 
 from ..config import Settings
 from ..embedding.client import EmbeddingClient
@@ -356,11 +359,10 @@ PAGE_TEXT_LIMIT = 6000
 PAGE_EVIDENCE_MIN_SCORE = 0.6
 
 
-def page_seeds(q: Any, page_collection: str, vector: list[float], question: str, *, limit: int = PAGE_SEED_LIMIT,
-               window: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def page_seeds(q: Any, page_collection: str, vector: list[float], question: str, *,
+               limit: int = PAGE_SEED_LIMIT) -> list[dict[str, Any]]:
     """Dense hits among view pages (subject / timeline / source / index pages); returns empty when the collection
-    does not exist. With a time window in the question, timeline and subject pages are not filtered (they span
-    time by nature)."""
+    does not exist. Not filtered by the question's time window: timeline and subject pages span time by nature."""
     try:
         rows = _query_points(q, page_collection, vector, limit)
     except Exception:
@@ -405,6 +407,70 @@ def _query_points(q: Any, collection: str, vector: list[float], limit: int, quer
     return out
 
 
+SOURCE_SAMPLE = 16
+
+
+def spread(items: list[Any], limit: int) -> list[Any]:
+    """With more than limit items, take limit of them at even spacing: taking the first limit would put the whole
+    sample on the first few documents."""
+    return items if len(items) <= limit else [items[i * len(items) // limit] for i in range(limit)]
+
+
+def source_points(rows: list[dict[str, Any]], owner_key: str, *, limit: int = SOURCE_SAMPLE) -> dict[str, list[str]]:
+    """Each entity / relation carries a few representative source points, so the search service can check that
+    its sources are still active (when a document is deleted or re-parsed, the graph only catches up with the next
+    version). One point per document: a deleted document, changed content or an upgraded parse profile all replace
+    the chunks of a whole document at once. With many documents they are sorted by path and taken at even spacing."""
+    by_owner: dict[str, dict[str, str]] = {}
+    for row in rows:
+        pid = str(row.get("point_id") or "")
+        if pid:
+            by_owner.setdefault(str(row[owner_key]), {}).setdefault(str(row.get("rel_path") or pid), pid)
+    return {owner: [by_doc[d] for d in spread(sorted(by_doc), limit)] for owner, by_doc in by_owner.items()}
+
+
+class TimedSession:
+    """Adds a transaction timeout to every query of the session: Neo4j sets no limit by default, and a query
+    keeps running after the caller has given up at its deadline, holding a connection and a thread."""
+
+    def __init__(self, session: Any, timeout: float) -> None:
+        self._session, self._timeout = session, float(timeout)
+
+    def run(self, text: str, **params: Any) -> Any:
+        return self._session.run(Query(text, timeout=self._timeout), **params)
+
+
+STATS_TTL = 600.0
+_version_stats: dict[str, tuple[str, float, dict[str, float]]] = {}      # kb_id -> (graph version, computed at, statistics)
+
+
+def version_stats(session: Any, kb_id: str, gv: str) -> dict[str, float]:
+    """Three whole-graph statistics of a graph version: the maximum pagerank, the number of chunks and the total
+    number of mentions. A version's content no longer changes once it is active, so they need not be recomputed
+    for every query (the mention total expands every MENTIONED_IN, about half a second on a large KB); each KB
+    keeps one copy, for its active version, recomputed after a while so that a version re-imported by hand is
+    picked up too. The mention total carries e.id IS NOT NULL so that the (kb_id, graph_version, id) composite
+    index is used: with only the first two equality conditions the plan falls back to a label scan across all KBs."""
+    cached = _version_stats.get(kb_id)
+    if cached and cached[0] == gv and time.time() - cached[1] < STATS_TTL:
+        return cached[2]
+    max_rank = session.run(
+        "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) RETURN max(e.pagerank) AS m", kb=kb_id, gv=gv,
+    ).single()
+    n_chunks = session.run(
+        "MATCH (c:QdrantChunkSnapshot {kb_id: $kb, graph_version: $gv}) RETURN count(c) AS n", kb=kb_id, gv=gv,
+    ).single()
+    total_mentions = session.run(
+        "MATCH (e:Entity {kb_id: $kb, graph_version: $gv})-[m:MENTIONED_IN]->() WHERE e.id IS NOT NULL RETURN count(m) AS n",
+        kb=kb_id, gv=gv,
+    ).single()
+    stats = {"max_rank": float((max_rank or {}).get("m") or 0.0) or 1.0,
+             "n_chunks": int((n_chunks or {}).get("n") or 0),
+             "total_mentions": int((total_mentions or {}).get("n") or 0)}
+    _version_stats[kb_id] = (gv, time.time(), stats)
+    return stats
+
+
 def graph_query(
     settings: Settings,
     source: KBSource,
@@ -421,11 +487,18 @@ def graph_query(
     candidate_limit: int = CANDIDATE_LIMIT,
     vector: list[float] | None = None,
     lexical_only: bool = False,
+    q: Any = None,
+    driver: Any = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """vector: the question vector the caller already computed (the search service embeds once and shares it across
     three routes); lexical_only: when the embedding service is unavailable, use lexical seeds only (exact symbol
     matches on entities / relations / facts' symbols and properties), with dense seeds, pages and the cosine term
-    all empty (Q19)."""
+    all empty (Q19).
+    q / driver: the resident search service passes in its shared Qdrant client and Neo4j driver; when absent
+    (command line) they are created here and closed afterwards.
+    timeout: the transaction timeout (seconds) of each Neo4j query of the graph route, except the point lookup of
+    the active version number; no limit when absent. On the Qdrant side the timeout is that of the client passed in."""
     from .temporal import question_time_window
 
     if vector is None and not lexical_only:
@@ -434,7 +507,8 @@ def graph_query(
             model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=1,
         )
         vector = embedder.embed([question])[0]
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    if q is None:
+        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     seeds_only = seed_filter()
     collections = graph_collections_for(source.collection, graph_version)
     entity_alias, relation_alias = collections["entity"], collections["relation"]
@@ -462,12 +536,14 @@ def graph_query(
             dense_r[str(s.get("gr_id"))] = s
     relation_seeds = list(dense_r.values())
     specs = spec_seeds(q, collections["spec"], vector, question, limit=top_relations, window=window)
-    pages = page_seeds(q, collections["page"], vector, question, window=window) if vector is not None else []
+    pages = page_seeds(q, collections["page"], vector, question) if vector is not None else []
     doc_paths: dict[str, str] = {}          # page doc_ids -> file paths; evaluation uses it to tell which document a subject page is from
     seed_summary = {"entities": len(entity_seeds), "relations": len(relation_seeds), "specs": len(specs), "pages": len(pages),
                     "lexical_entities": sum(1 for s in entity_seeds if s.get("_via") == "lexical"), "lexical_only": vector is None}
 
-    driver = neo4j_driver(settings)
+    own_driver = driver is None
+    if own_driver:
+        driver = neo4j_driver(settings)
     try:
         gv = graph_version or active_neo4j_graph_version(driver, source.kb_id)
         if not gv:
@@ -497,11 +573,10 @@ def graph_query(
                                               "hop": 0, "via": "relation"}
 
         with driver.session() as session:
-            # pagerank normalization factor and back-filling of seed titles
-            max_rank = session.run(
-                "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) RETURN max(e.pagerank) AS m", kb=source.kb_id, gv=gv,
-            ).single()
-            max_rank = float((max_rank or {}).get("m") or 0.0) or 1.0
+            if timeout:
+                session = TimedSession(session, timeout)
+            stats = version_stats(session, source.kb_id, gv)
+            max_rank = stats["max_rank"]          # pagerank normalization factor
             frontier = list(entity_scores)
             seed_ids = set(entity_scores)          # relations with both ends seeded (in-network) do not decay by hop (GraphRAG local)
             for hop in range(1, max(0, int(hops)) + 1):
@@ -514,7 +589,7 @@ def graph_query(
                     WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
                     WITH eid, r, n ORDER BY r.weight DESC
                     WITH eid, collect({rid: r.id, type: r.type, weight: r.weight, description: r.description,
-                                       nid: n.id, title: n.title, ntype: n.type, pagerank: n.pagerank,
+                                       nid: n.id, title: n.title, ntype: n.type, scope: n.scope, pagerank: n.pagerank,
                                        degree: n.degree})[0..$k] AS neighbours
                     RETURN eid, neighbours
                     """,
@@ -534,7 +609,7 @@ def graph_query(
                             if slot is None:
                                 next_frontier.append(nid)
                             entity_scores[nid] = {"id": nid, "title": nb.get("title"), "type": nb.get("ntype"),
-                                                  "score": score, "hop": hop, "via": "expand"}
+                                                  "scope": nb.get("scope"), "score": score, "hop": hop, "via": "expand"}
                         rid = str(nb.get("rid") or "")
                         if rid:
                             in_network = nid in seed_ids and hop == 1
@@ -550,9 +625,9 @@ def graph_query(
             if missing:
                 for row in session.run(
                     "UNWIND $ids AS eid MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid}) "
-                    "RETURN eid, e.title AS title, e.type AS type", ids=missing, kb=source.kb_id, gv=gv,
+                    "RETURN eid, e.title AS title, e.type AS type, e.scope AS scope", ids=missing, kb=source.kb_id, gv=gv,
                 ).data():
-                    entity_scores[str(row["eid"])].update({"title": row["title"], "type": row["type"]})
+                    entity_scores[str(row["eid"])].update({"title": row["title"], "type": row["type"], "scope": row.get("scope")})
             rel_missing = [rid for rid, s in relation_scores.items() if not s.get("source")]
             if rel_missing:
                 for row in session.run(
@@ -571,15 +646,8 @@ def graph_query(
 
             # Chunk aggregation: entity attribution and relation evidence each weighted by idf (see mention_weight /
             # evidence_weight)
-            n_chunks = int((session.run(
-                "MATCH (c:QdrantChunkSnapshot {kb_id: $kb, graph_version: $gv}) RETURN count(c) AS n",
-                kb=source.kb_id, gv=gv,
-            ).single() or {}).get("n") or 0)
-            total_mentions = int((session.run(
-                "MATCH (:Entity {kb_id: $kb, graph_version: $gv})-[m:MENTIONED_IN]->() RETURN count(m) AS n",
-                kb=source.kb_id, gv=gv,
-            ).single() or {}).get("n") or 0)
-            mean_hub = total_mentions / n_chunks if n_chunks else 0.0
+            n_chunks = stats["n_chunks"]
+            mean_hub = stats["total_mentions"] / n_chunks if n_chunks else 0.0
             mention_rows = session.run(
                 """
                 UNWIND $ids AS eid
@@ -596,8 +664,10 @@ def graph_query(
                 entity_df[str(row["eid"])] = entity_df.get(str(row["eid"]), 0) + 1
                 if row.get("rel_path"):
                     entity_docs.setdefault(str(row["eid"]), set()).add(str(row["rel_path"]))
+            entity_points = source_points(mention_rows, "eid")
             for eid, slot in entity_scores.items():
                 slot["docs"] = sorted(entity_docs.get(eid, ()))      # docs of the chunks mentioning it; evaluation locates a cited entity's document by it
+                slot["point_ids"] = entity_points.get(eid, [])
             chunk_scores: dict[str, dict[str, Any]] = {}
             parts: dict[str, dict[str, Any]] = {}
             for row in mention_rows:
@@ -630,6 +700,8 @@ def graph_query(
                 relation_df: dict[str, int] = {}
                 for row in evidence_rows:
                     relation_df[str(row["rid"])] = relation_df.get(str(row["rid"]), 0) + 1
+                for rid, pids in source_points(evidence_rows, "rid").items():
+                    relation_scores[rid]["point_ids"] = pids
                 for row in evidence_rows:
                     rid = str(row["rid"])
                     rscore = relation_scores[rid]["score"]
@@ -681,7 +753,8 @@ def graph_query(
                     chunk_scores[pid]["explain"] = {"hub": part["hub"], "mean_hub": mean_hub, "n_chunks": n_chunks,
                                                     "entities": part["entity_detail"], "relations": part["evidence_detail"]}
     finally:
-        driver.close()
+        if own_driver:
+            driver.close()
 
     candidates = sorted(chunk_scores.values(), key=lambda c: -c["score"])[:max(int(candidate_limit), int(chunk_limit))]
     for rank, c in enumerate(candidates, 1):
@@ -729,7 +802,8 @@ def graph_query(
         "series": list(pg.get("series") or [])[:80],
         "doc_ids": list(pg.get("doc_ids") or []), "spec_ids": list(pg.get("spec_ids") or [])[:32],
         "docs": sorted({doc_paths[str(d)] for d in (pg.get("doc_ids") or []) if doc_paths.get(str(d))}),
-        "entity_keys": list(pg.get("entity_keys") or [])[:16], "point_ids": list(pg.get("point_ids") or [])[:16], "path": pg.get("path"),
+        "entity_keys": list(pg.get("entity_keys") or [])[:16], "point_ids": spread(list(pg.get("point_ids") or []), SOURCE_SAMPLE),
+        "path": pg.get("path"),
     } for pg in pages]
     return {
         "question": question, "kb_id": source.kb_id, "graph_version": gv,

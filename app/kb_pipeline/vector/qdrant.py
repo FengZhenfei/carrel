@@ -17,52 +17,31 @@ from .layout import TEXT_VECTOR, VectorLayout
 
 PAYLOAD_INDEX_FIELDS = {
     # every entry here must back an actual filter; unused indexes cost RAM
-    "kb_id": models.PayloadSchemaType.KEYWORD,
     "doc_id": models.PayloadSchemaType.KEYWORD,
-    "source_path": models.PayloadSchemaType.KEYWORD,
-    "dir_ancestors": models.PayloadSchemaType.KEYWORD,
     "content_version": models.PayloadSchemaType.KEYWORD,
     "chunk_index": models.PayloadSchemaType.INTEGER,
     "is_active": models.PayloadSchemaType.BOOL,
     "inactive_at": models.PayloadSchemaType.INTEGER,
+    # search service: scoping by file path (the rel_paths of hints), fetching a block's table header (table_head)
+    "rel_path": models.PayloadSchemaType.KEYWORD,
+    "block_id": models.PayloadSchemaType.KEYWORD,
 }
 
+# The same rule for graph collections: only fields that a filter actually uses get an index. A graph collection
+# is created anew for every version, and each of its points has to maintain every index listed here
 GRAPH_PAYLOAD_INDEX_FIELDS = {
-    "kb_id": models.PayloadSchemaType.KEYWORD,
-    "graph_version": models.PayloadSchemaType.KEYWORD,
-    "graph_type": models.PayloadSchemaType.KEYWORD,
-    "source_collection": models.PayloadSchemaType.KEYWORD,
-    "gr_id": models.PayloadSchemaType.KEYWORD,
-    "title": models.PayloadSchemaType.KEYWORD,
-    "search_text": models.TextIndexParams(
-        type=models.TextIndexType.TEXT,
-        tokenizer=models.TokenizerType.MULTILINGUAL,
-        lowercase=True,
-        phrase_matching=True,
-    ),
-    "type": models.PayloadSchemaType.KEYWORD,
-    "parent_type": models.PayloadSchemaType.KEYWORD,
-    "degree": models.PayloadSchemaType.INTEGER,
-    "frequency": models.PayloadSchemaType.INTEGER,
-    "pagerank": models.PayloadSchemaType.FLOAT,
-    "weight": models.PayloadSchemaType.FLOAT,
-    "source_id": models.PayloadSchemaType.KEYWORD,
-    "target_id": models.PayloadSchemaType.KEYWORD,
-    "level": models.PayloadSchemaType.INTEGER,
-    "doc_id": models.PayloadSchemaType.KEYWORD,
-    "content_version": models.PayloadSchemaType.KEYWORD,
-    # Noise-reduction flags (2026-09-04): recall seeds are filtered by them
-    "boilerplate": models.PayloadSchemaType.BOOL,
-    "reference": models.PayloadSchemaType.BOOL,
-    "evidence_kind": models.PayloadSchemaType.KEYWORD,
     # Lexical seeds (recall.lexical_seeds): exact lookup by title / alias / relation endpoint
+    "title": models.PayloadSchemaType.KEYWORD,
     "aliases": models.PayloadSchemaType.KEYWORD,
     "source": models.PayloadSchemaType.KEYWORD,
     "target": models.PayloadSchemaType.KEYWORD,
-    # Structured-fact collection (spec): exact lookup by subject / symbol / property
-    "subject": models.PayloadSchemaType.KEYWORD,
+    # Structured-fact collection (recall.spec_seeds): exact lookup by symbol / property
     "symbol": models.PayloadSchemaType.KEYWORD,
     "property": models.PayloadSchemaType.KEYWORD,
+    # Noise-reduction flags (recall.seed_filter): entities found only on boilerplate pages and reference numbers
+    # are not used as seeds
+    "boilerplate": models.PayloadSchemaType.BOOL,
+    "reference": models.PayloadSchemaType.BOOL,
 }
 
 # The entity graph's collections (entities, relations, facts). community (the old pipeline's community reports)
@@ -791,6 +770,10 @@ def inactive_doc_versions_older_than(
     *,
     batch_size: int = 512,
 ) -> list[dict[str, Any]]:
+    """Inactive points past the retention period, grouped by (document, content version). Only these two values,
+    as written on the points, are reported: whether the version is still in use is decided by the caller from the
+    files rows, not guessed from the point payload (the visual_sha256 of an image point is the hash of that one
+    image, not of the file)."""
     if not collection_exists(q, collection):
         return []
 
@@ -819,9 +802,6 @@ def inactive_doc_versions_older_than(
                     "doc_id": doc_id,
                     "kb_id": str(payload.get("kb_id") or doc_id.rsplit(":", 1)[0]),
                     "content_version": content_version,
-                    # The payload has no sha256 key (the parse side writes visual_sha256 and
-                    # content_version); keeping one would only make maintainers think it has a value.
-                    "sha256": str(payload.get("visual_sha256") or ""),
                     "inactive_at": None,
                     "points": 0,
                 },
@@ -841,34 +821,75 @@ def inactive_doc_versions_older_than(
     return sorted(groups.values(), key=lambda item: (str(item["collection"]), str(item["doc_id"]), str(item["content_version"])))
 
 
-def delete_inactive_doc_version_older_than(
+def expired_inactive_point_ids(
     q: QdrantClient,
     collection: str,
     *,
     doc_id: str,
     content_version: str,
     cutoff_ts: int,
-    dry_run: bool = False,
-) -> int:
+    batch_size: int = 512,
+) -> list[str]:
+    """Ids of the inactive points of one document version that are past the retention period. Reclaiming goes by
+    id: the caller clears the SQLite chunk ledger with the same ids, so both sides delete the same set."""
     if not collection_exists(q, collection):
-        return 0
+        return []
     query_filter = models.Filter(
         must=[
             models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id)),
             models.FieldCondition(key="content_version", match=models.MatchValue(value=content_version)),
-            models.FieldCondition(key="is_active", match=models.MatchValue(value=False)),
-            models.FieldCondition(key="inactive_at", range=models.Range(lt=float(cutoff_ts))),
+            *inactive_older_than_filter(cutoff_ts).must,
         ]
     )
-    count = int(q.count(collection_name=collection, count_filter=query_filter, exact=True).count)
-    if dry_run or count == 0:
-        return count
-    q.delete(
-        collection_name=collection,
-        points_selector=models.FilterSelector(filter=query_filter),
-        wait=True,
-    )
-    return count
+    point_ids: list[str] = []
+    offset = None
+    while True:
+        records, offset = q.scroll(
+            collection_name=collection,
+            scroll_filter=query_filter,
+            limit=batch_size,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        point_ids.extend(str(record.id) for record in records)
+        if offset is None:
+            break
+    return point_ids
+
+
+def delete_expired_inactive_points(
+    q: QdrantClient,
+    collection: str,
+    point_ids: Iterable[str],
+    cutoff_ts: int,
+    *,
+    batch_size: int = 512,
+) -> int:
+    """Delete points by id, still requiring "inactive and past the retention period" at the moment of deletion:
+    points that a re-parse wrote back or a restore turned active again between listing the ids and deleting them
+    are kept. Returns the number of deleted points."""
+    ids = [str(p) for p in point_ids]
+    if not ids or not collection_exists(q, collection):
+        return 0
+    deleted = 0
+    for start in range(0, len(ids), batch_size):
+        query_filter = models.Filter(
+            must=[
+                models.HasIdCondition(has_id=ids[start : start + batch_size]),
+                *inactive_older_than_filter(cutoff_ts).must,
+            ]
+        )
+        count = int(q.count(collection_name=collection, count_filter=query_filter, exact=True).count)
+        if count == 0:
+            continue
+        q.delete(
+            collection_name=collection,
+            points_selector=models.FilterSelector(filter=query_filter),
+            wait=True,
+        )
+        deleted += count
+    return deleted
 
 
 def delete_malformed_inactive_points(

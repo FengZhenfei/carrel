@@ -28,7 +28,7 @@ from . import prompts
 from .facts import comparable_number, conditions_text, symbol_only_value, values_text, when_text
 from .llm import ChatClient, LLMCallError
 from .reconcile import fact_axis, series_of, unit_of
-from .temporal import axis_sort_key
+from .temporal import axis_sort_key, axis_value_kind
 
 SUBJECT_MAX_PAGES = 80
 SUBJECT_MIN_FACTS = 3           # an entity not listed as a subject type by the profile still gets a page with this many facts
@@ -154,11 +154,22 @@ def select_subjects(entities: list[dict[str, Any]], facts_by_subject: dict[str, 
 
 def _trend(rows: list[dict[str, Any]], L: dict[str, str]) -> str:
     numeric_rows = [r for r in rows if _numeric(r) is not None]
-    nums = [_numeric(r) for r in numeric_rows]
-    if len(nums) < 2:
+    # the trend compares axis values: one value stated repeatedly on the same axis (once by each of two adjacent
+    # units, copied by several documents) is a single point; otherwise the difference between the repeated rows
+    # is 0, a monotonic series reads as "changing" and one with numbers on a single axis reads as "flat"
+    by_axis: dict[str, list[float]] = {}
+    for r in numeric_rows:
+        seen = by_axis.setdefault(fact_axis(r), [])
+        num = _numeric(r)
+        if not any(abs(num - v) < 1e-9 for v in seen):
+            seen.append(num)
+    if len(by_axis) < 2:
         return L["trend_mixed"] if len({values_text(r) for r in rows}) > 1 else L["trend_flat"]
     if len({unit_of(r) for r in numeric_rows if unit_of(r)}) > 1:
         return L["trend_mixed"]            # numbers in two different real units cannot be compared directly
+    if any(len(values) > 1 for values in by_axis.values()):
+        return L["trend_mixed"]            # several different values on one axis: there is no single trend
+    nums = [by_axis[axis][0] for axis in sorted(by_axis, key=axis_sort_key)]
     diffs = [b - a for a, b in zip(nums, nums[1:])]
     if all(d > 0 for d in diffs):
         return L["trend_up"]
@@ -215,9 +226,16 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
             head = [f"### {label}" + (f" ({unit})" if unit else ""), "",
                     f"| {L['when']} | {L['value']} | {L['flag']} | {L['ref']} | {L['conditions']} | {L['source']} |",
                     "|---|---|---|---|---|---|"]
-            if len({fact_axis(r) for r in rows if fact_axis(r)}) >= 2:
-                line = _series_line(rows, L)
-                flagged = sum(1 for r in rows if str(r.get("flag") or "").strip())
+            # a series line only covers axis values of one kind: dates and versions have no order between them,
+            # so one cannot be the start and the other the end
+            by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for r in rows:
+                by_kind[axis_value_kind(fact_axis(r))].append(r)
+            for kind, part in by_kind.items():
+                if not kind or len({fact_axis(r) for r in part}) < 2:
+                    continue
+                line = _series_line(part, L)
+                flagged = sum(1 for r in part if str(r.get("flag") or "").strip())
                 series_lines.append(line + ("," + L["out_of_range"].format(n=flagged) if flagged else ""))
             shown = rows[:ROWS_PER_CONCEPT]
             more = [L["more"].format(n=len(rows) - ROWS_PER_CONCEPT)] if len(rows) > ROWS_PER_CONCEPT else []

@@ -41,6 +41,7 @@ from ..limits import GRAPH_ENTITY_TYPES_DEFAULT
 from ..models import KBSource
 from ..utils import stable_json_hash
 from ..vector.qdrant import (
+    ALL_GRAPH_VECTOR_TYPES,
     GRAPH_OPTIONAL_TYPES,
     GRAPH_VECTOR_TYPES,
     LEGACY_GRAPH_VECTOR_TYPES,
@@ -100,10 +101,29 @@ def default_graph_version(source: KBSource) -> str:
     return f"{graph_collection_short_name(source.collection)}-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
 
 
+def write_graph_file(path: Path, graph: dict[str, Any]) -> None:
+    """graph.json is first written to a temporary file in the same directory and renamed once it is on disk. The
+    facts and view-page phases keep writing on top of the merge phase's output; overwritten in place, a process
+    killed or a power loss halfway would leave a truncated file while the earlier phases' completion marks
+    remain, and every resume would fail to read it."""
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(graph, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 class GraphBuildInterrupted(RuntimeError):
     """The graph build was interrupted by a signal (e.g. systemctl stop / pause). Inherits RuntimeError so that
     the except Exception in build_graph writes the record as cancelled instead of leaving an orphan row that
     stays running forever."""
+
+
+class GraphBuildCalledOff(GraphBuildInterrupted):
+    """This KB's own switches called the build off (KB turned off, graph turned off, paused); the process did not
+    receive a stop signal. The record is written as cancelled all the same; the timer check only skips this KB
+    and goes on with the ones after it."""
 
 
 class GraphInputIncomplete(RuntimeError):
@@ -121,6 +141,27 @@ def kb_still_active(settings: Settings, kb_id: str) -> bool:
     except Exception:
         return True
     return row is None or str(row["status"]) == "active"
+
+
+def graph_switched_off(settings: Settings, source: KBSource, *, paused_at_start: bool = False) -> str | None:
+    """The current values of this KB's graph switch and pause mark (read fresh from the registry): when the graph
+    is turned off or paused, returns the reason, and the build then neither starts nor publishes.
+    The source held by the build process was assembled before the run: the run record is only written once the
+    lock is taken, so a "Turn off knowledge graph" clicked before that finds no process and only saves the
+    configuration; for KBs late in a timer check round, the configuration may have been read hours ago.
+    A pause already set when the run started does not count (a manual build from the command line); a KB missing
+    from the registry (test stubs, extra sources) is not blocked."""
+    from .schema_flow import reload_source
+
+    try:
+        now = reload_source(settings, source)
+    except Exception:
+        return None
+    if not now.graph_enabled:
+        return "The knowledge graph has been turned off"
+    if now.graph_paused and not paused_at_start:
+        return "The graph build has been paused"
+    return None
 
 
 def input_drift(ledger: Iterable[dict[str, Any]], payloads: Iterable[Any]) -> dict[str, int]:
@@ -144,6 +185,28 @@ def input_drift(ledger: Iterable[dict[str, Any]], payloads: Iterable[Any]) -> di
         if sha and db.chunk_text_sha(str(getattr(p, "text", "") or "")) != sha:
             out["text_mismatch"] += 1
     return out
+
+
+def attribution_texts(ledger: Iterable[dict[str, Any]], payloads: Iterable[Any]) -> tuple[dict[str, str], dict[str, str], int]:
+    """Texts and section paths for chunk attribution in the merge phase, keeping only chunks whose text matches
+    the frozen chunk ledger; returns (texts, sections, number of mismatched chunks).
+    Extraction used the text frozen when the corpus was prepared, but attribution fetches it again from the main
+    store in the merge phase: when a file of the same version was re-parsed in between and its text replaced in
+    place, matching the new text against the old extraction results would hang entities on unrelated chunks.
+    Mismatched chunks take no part in exact attribution -- an entity that matches no chunk of its unit is still
+    attributed to the whole unit. Ledger rows without a fingerprint (old ledgers) are not compared."""
+    frozen = {str(c.get("point_id") or ""): str(c.get("text_sha") or "") for c in ledger}
+    texts: dict[str, str] = {}
+    sections: dict[str, str] = {}
+    stale = 0
+    for c in payloads:
+        sha = frozen.get(str(c.point_id), "")
+        if sha and db.chunk_text_sha(str(c.text or "")) != sha:
+            stale += 1
+            continue
+        texts[c.point_id] = c.text
+        sections[c.point_id] = " > ".join(x for x in c.section_path if x)
+    return texts, sections, stale
 
 
 class NoGraphCorpus(RuntimeError):
@@ -243,6 +306,19 @@ def extraction_fingerprint(base_fingerprint: str, *, deterministic_units: int) -
     if not deterministic_units:
         return base_fingerprint
     return hashlib.sha256(f"{base_fingerprint}|{VERSION}".encode("utf-8")).hexdigest()[:24]
+
+
+def prune_unit_caches(settings: Settings, source: KBSource, units_file: Path) -> dict[str, int]:
+    """Prune the two per-unit caches (extraction results, structured facts) against this version's unit table:
+    rows of units missing from the table are deleted, rows of units in it are kept whatever their fingerprint."""
+    from .units import read_units
+
+    keep_ids = {u.unit_id for u in read_units(units_file)}
+    with db.connect(settings.state_db) as con:
+        return {
+            "extraction_cache_pruned": db.prune_graph_extractions(con, source.kb_id, keep_ids),
+            "facts_cache_pruned": db.prune_graph_extractions(con, source.kb_id, keep_ids, table="graph_facts"),
+        }
 
 
 def extraction_schema_for(source: KBSource) -> ExtractionSchema:
@@ -353,6 +429,41 @@ def facts_phase_gate(failed: list[tuple[Any, BaseException]], *, partial_ok: boo
         f"Structured facts failed for {len(failed)} units ({kinds}): {ids}{' …' if len(failed) > 8 else ''}; "
         "if retries keep failing, set KB_GRAPH_FACTS_PARTIAL_OK=1 to accept a partial release explicitly"
     )
+
+
+class _StoppableEmbedder:
+    """A wrapper around the embedding client: one batch per call, with a stop-signal check after every batch. The
+    client's retries swallow an interruption that lands inside an HTTP call as an ordinary error, and the
+    resolution phase embeds tens of thousands of titles at once; without the checks the process would be killed
+    before the embedding finished."""
+
+    def __init__(self, client: Any, check_stop: Callable[[], None]) -> None:
+        self.client = client
+        self.check_stop = check_stop
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        step = max(1, int(self.client.batch_size))
+        for start in range(0, len(texts), step):
+            vectors.extend(self.client.embed(texts[start:start + step]))
+            self.check_stop()
+        return vectors
+
+
+def graph_embedder(settings: Settings, check_stop: Callable[[], None] | None = None):
+    """The embedding client for graph builds; the pause between calls and the retry count follow the configuration
+    (EMBEDDING_SLEEP_SECONDS / EMBEDDING_RETRY). Not passing them left a configured pause without effect on graph
+    builds: a fixed 0.1 s after every call, and with the tens of thousands of calls needed to write graph vectors
+    the pauses alone took up most of that phase. With check_stop the stop signal is checked batch by batch (see
+    _StoppableEmbedder)."""
+    from ..embedding.client import EmbeddingClient
+
+    client = EmbeddingClient(
+        base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
+        model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=settings.embedding_batch,
+        retry=settings.embedding_retry, sleep_seconds=settings.embedding_sleep_seconds,
+    )
+    return client if check_stop is None else _StoppableEmbedder(client, check_stop)
 
 
 def graph_cache_entries(settings: Settings, source_collection: str) -> int:
@@ -502,10 +613,13 @@ def _phase_retry_config() -> dict[str, float]:
 
 
 def _run_phase(settings: Settings, *, build_id: str, phase: str, label: str, fn, done: set[str], stage,
-               retries: int = 1, backoff: float = 5.0):
+               retries: int = 1, backoff: float = 5.0, interrupted: threading.Event | None = None):
     """Run one build phase: skip it if already marked done, otherwise run with backoff retries and write a phase
     marker on completion. Returns fn's return value; None when skipped, in which case the caller rebuilds what it
-    needs from the previous artifacts."""
+    needs from the previous artifacts.
+    interrupted: the mark set when a stop signal arrives. A signal that lands inside an HTTP call raises an
+    interruption that the client's retries swallow or wrap in their own exception type; the mark is not lost, and
+    once it is set the phase does not start, is not retried and is not marked done, but ends as interrupted."""
     if phase in done:
         stage(f"{label} (done, skipped)")
         print(f"[graph] phase={phase} skipped: done in a previous run", flush=True)
@@ -515,11 +629,21 @@ def _run_phase(settings: Settings, *, build_id: str, phase: str, label: str, fn,
     while True:
         attempt += 1
         try:
+            if interrupted is not None and interrupted.is_set():
+                raise GraphBuildInterrupted("Graph build interrupted by a stop signal")
             out = fn()
+            if interrupted is not None and interrupted.is_set():
+                # the phase returned normally, so the interruption was swallowed inside: either by a retry (the
+                # output is complete) or by a "degrade on error" branch (one route of resolution candidates missing
+                # when the vector service is down). There is no telling which, so the phase is not marked done and
+                # a resume runs it again
+                raise GraphBuildInterrupted("Graph build interrupted by a stop signal")
             break
         except (GraphBuildInterrupted, LLMInterrupted, LLMCircuitOpen):
             raise
         except Exception as exc:
+            if interrupted is not None and interrupted.is_set():
+                raise GraphBuildInterrupted(f"Graph build interrupted by a stop signal ({exc!r})") from exc
             if attempt >= max(1, int(retries)):
                 raise
             delay = float(backoff) * (2 ** (attempt - 1))
@@ -594,18 +718,8 @@ def build_graph(
     lock = GraphBuildLock(settings) if not dry_run else None
     if lock is not None:
         lock.acquire()
-    # Blank graph: with no schema version at all, first extract and activate one label version with default
-    # parameters, then build (2026-09-08, the user asked for full automation)
     schema_auto: dict[str, Any] | None = None
-    try:
-        if not incremental and not dry_run and doc_ids is None:
-            from .schema_flow import ensure_schema_before_build
-
-            source, schema_auto = ensure_schema_before_build(settings, source)
-    except BaseException:
-        if lock is not None:
-            lock.release()
-        raise
+    paused_at_start = bool(source.graph_paused)
 
     graph_version = graph_version or default_graph_version(source)
     print(f"[graph] build start kb={source.kb_id}({source.source_root}) version={graph_version} "
@@ -616,7 +730,15 @@ def build_graph(
     input_manifest: dict[str, Any] | None = None
     build_chunks: list[dict[str, str]] = []
     stop_event = threading.Event()
-    restore_signals = _install_build_signal_handlers(stop_event)
+    interrupted = threading.Event()
+    restore_signals = _install_build_signal_handlers(stop_event, interrupted)
+
+    def check_stop() -> None:
+        # the main thread is mostly blocked in HTTP calls (embedding, writing vectors), where the retries of that
+        # layer swallow the interruption the signal raises: check again at each checkpoint
+        if interrupted.is_set():
+            raise GraphBuildInterrupted("Graph build interrupted by a stop signal")
+
     try:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
         graph_types = list(GRAPH_VECTOR_TYPES)
@@ -658,16 +780,12 @@ def build_graph(
                 if str(base_row["cache_fingerprint"] or "") != graph_cache_fingerprint(settings, source):
                     raise ValueError("Model / labels / predicates / unit settings changed; the previous extraction and merge cannot be reused, run a full rebuild")
                 base_docs = db.graph_build_doc_chunks(con, str(base_row["graph_build_id"]))
-            base_paths = graph_paths(settings, source, str(base_row["graph_version"]))
-            if base_paths.graph_file.exists():
-                try:
-                    base_graph = json.loads(base_paths.graph_file.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    base_graph = None
-            if base_graph is None:
-                print(f"[graph] base workspace {base_paths.graph_file} missing: resolution decisions will be judged afresh", flush=True)
         phases_done: set[str] = set()
         if not dry_run:
+            # the run record is written before the slow preparations (automatic label extraction, reading the
+            # previous version's graph): "Turn off knowledge graph", "Pause build" and KB deletion all find the
+            # process by its running record, and during the minutes of label extraction the lock used to be held
+            # without a record, so a build whose graph had been turned off still ran to the end and published
             with db.connect(settings.state_db) as con:
                 previous = (db.graph_build_by_version(con, source.collection, graph_version)
                             if allow_existing_graph_version else None)
@@ -677,8 +795,41 @@ def build_graph(
                     cache_fingerprint=graph_cache_fingerprint(settings, source),
                     build_kind="append" if incremental else "full",
                 )
+                # in the same transaction as the fingerprint rewrite: once the record carries this run's fingerprint,
+                # the phase marks left on it must be the ones checked against it
                 if previous is not None:
                     phases_done = _resumable_phases(con, previous, settings=settings, source=source)
+            switched_off = graph_switched_off(settings, source, paused_at_start=paused_at_start)
+            if switched_off:
+                raise GraphBuildCalledOff(f"{switched_off}; this build does not start")
+        if base_row is not None:
+            base_paths = graph_paths(settings, source, str(base_row["graph_version"]))
+            if base_paths.graph_file.exists():
+                try:
+                    base_graph = json.loads(base_paths.graph_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    base_graph = None
+            if base_graph is None:
+                print(f"[graph] base workspace {base_paths.graph_file} missing: resolution decisions will be judged afresh", flush=True)
+        # Blank graph: with no schema version at all, first extract and activate one label version with default
+        # parameters, then build (2026-09-08, the user asked for full automation)
+        if not incremental and not dry_run and doc_ids is None:
+            from .schema_flow import ensure_schema_before_build
+
+            source, schema_auto = ensure_schema_before_build(settings, source, stop=stop_event)
+            check_stop()
+            if schema_auto is not None:
+                switched_off = graph_switched_off(settings, source, paused_at_start=paused_at_start)
+                if switched_off:
+                    raise GraphBuildCalledOff(f"{switched_off}; this build does not start")
+                # the record and the phase marks were written under the configuration from before the label
+                # extraction: the fingerprint becomes the one with the new labels in effect, and phases finished
+                # earlier are not reused
+                with db.connect(settings.state_db) as con:
+                    con.execute("UPDATE graph_builds SET cache_fingerprint = ? WHERE graph_build_id = ?",
+                                (graph_cache_fingerprint(settings, source), build_id))
+                    db.clear_graph_phases(con, build_id)
+                phases_done = set()
         # The response cache is managed per version: entries hit / written by this build are tagged with the build
         # id, and after a full build the unused ones are deleted (see LLMCache)
         LLMCache.build_tag = build_id if not dry_run else None
@@ -724,19 +875,19 @@ def build_graph(
             if dry_run or build_id == "dry-run":
                 return fn()
             return _run_phase(settings, build_id=build_id, phase=phase, label=label, fn=fn,
-                              done=phases_done, stage=stage, retries=retries, backoff=retry_cfg["backoff"])
+                              done=phases_done, stage=stage, retries=retries, backoff=retry_cfg["backoff"],
+                              interrupted=interrupted)
 
         # ── 1. Prepare corpus ──
         def prepare():
             paths.work_dir.mkdir(parents=True, exist_ok=True)
-            manifest, chunks, units = prepare_graph_input(settings, source, paths=paths, q=q, write_units_file=not dry_run,
+            manifest, chunks, _units = prepare_graph_input(settings, source, paths=paths, q=q, write_units_file=not dry_run,
                                                           doc_ids=doc_ids)
             if not dry_run:
                 with db.connect(settings.state_db) as con:
                     db.replace_graph_build_chunks(con, build_id, chunks)
                     db.record_graph_build_input(con, build_id, input_rows=int(manifest.get("documents") or 0),
                                                 chunks=chunks, source_content_hash=source_snapshot_hash(chunks))
-                    db.replace_graph_units(con, build_id, units)
             return manifest, chunks
 
         prepared = run_phase("prepare_input", prepare)
@@ -877,7 +1028,6 @@ def build_graph(
 
         # ── 3. Merge / resolution / summaries / weights / attribution ──
         def merge() -> dict[str, Any]:
-            from ..embedding.client import EmbeddingClient
             from .merge import attribute_mentions, combine_unit_kind, compute_weights, merge_extractions
             from .resolution import resolve as resolve_entities
             from .summarize import summarize_rows
@@ -961,10 +1111,7 @@ def build_graph(
             client = ChatClient(specs["summarize"], cache=cache, stop=stop_event,
                                 timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
                                 circuit_fails=settings.graph_circuit_fails)
-            embedder = EmbeddingClient(
-                base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
-                model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=settings.embedding_batch,
-            )
+            embedder = graph_embedder(settings, check_stop)
             try:
                 stage("Entity resolution")
                 # Incremental append: replay the last version's decisions, judge only pairs involving new entities
@@ -998,8 +1145,11 @@ def build_graph(
             stage("Computing weights and chunk attribution")
             stats["weights"] = compute_weights(entities, relations, n_units=len(units))
             payloads = fetch_chunk_payloads(q, source.collection, build_chunks)
-            chunk_texts = {c.point_id: c.text for c in payloads}
-            chunk_sections = {c.point_id: " > ".join(x for x in c.section_path if x) for c in payloads}
+            chunk_texts, chunk_sections, stale_chunks = attribution_texts(build_chunks, payloads)
+            if stale_chunks:
+                print(f"[graph] {stale_chunks} chunks changed text since the corpus was frozen; "
+                      "their entities are attributed at unit level", flush=True)
+            stats["attribution_stale_chunks"] = stale_chunks
             mentions = attribute_mentions(entities, units_by_id, chunk_texts, chunk_sections=chunk_sections)
             documents_axis = dict((input_manifest or {}).get("documents_axis") or {})
             graph = {
@@ -1017,7 +1167,7 @@ def build_graph(
                 "stats": {**stats, "units": len(units), "entities": len(entities), "relations": len(relations),
                           "mentions": len(mentions)},
             }
-            paths.graph_file.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
+            write_graph_file(paths.graph_file, graph)
             return dict(graph["stats"])
 
         merge_stats = run_phase("merge", merge)
@@ -1110,14 +1260,10 @@ def build_graph(
                                                        profile=graph.get("profile") or {}, documents=doc_paths)
                 # Fact skeleton (plan 5.A): property concept keys (normalization + vector neighbours + same-concept
                 # judgement) and cross-document reconciliation (sequences / conflicts, annotation only)
-                from ..embedding.client import EmbeddingClient
                 from .concepts import build_concepts
                 from .reconcile import reconcile_facts
 
-                embedder = EmbeddingClient(
-                    base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
-                    model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=settings.embedding_batch,
-                )
+                embedder = graph_embedder(settings, check_stop)
                 judge = ChatClient(specs["summarize"], cache=cache, stop=stop_event,
                                    timeout=settings.graph_llm_timeout_seconds, workers=1, circuit_fails=settings.graph_circuit_fails)
                 stage("Normalizing property concepts")
@@ -1151,7 +1297,7 @@ def build_graph(
                     "requalified": requalified,
                 }
                 graph.setdefault("stats", {})["facts"] = stats
-                paths.graph_file.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
+                write_graph_file(paths.graph_file, graph)
                 facts_phase_gate(failed, partial_ok=_env_flag("KB_GRAPH_FACTS_PARTIAL_OK"))
                 return stats
             finally:
@@ -1183,7 +1329,7 @@ def build_graph(
                 cache.close()
             graph["pages"] = [{k: v for k, v in p.items() if k != "narrate_text"} for p in pages]     # the narration input is not persisted
             graph.setdefault("stats", {})["compile"] = stats
-            paths.graph_file.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
+            write_graph_file(paths.graph_file, graph)
             return stats
 
         compile_stats = run_phase("compile", compile_views, retries=int(retry_cfg["retries"]))
@@ -1194,15 +1340,11 @@ def build_graph(
 
         # ── 4. Write vectors ──
         def enrich() -> dict[str, Any]:
-            from ..embedding.client import EmbeddingClient
             from .vectors import write_graph_vectors
 
             graph = json.loads(paths.graph_file.read_text(encoding="utf-8"))
             units_by_id = {u.unit_id: u for u in read_units(paths.units_file)}
-            embedder = EmbeddingClient(
-                base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
-                model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=settings.embedding_batch,
-            )
+            embedder = graph_embedder(settings, check_stop)
             # Incremental append: rows whose title/description is unchanged keep the previous vectors, no re-embedding
             reuse_from = None
             base_version = str(base_row["graph_version"]) if (incremental and base_row is not None) else None
@@ -1213,6 +1355,7 @@ def build_graph(
                 graph_version=graph_version, bundle=graph, units_by_id=units_by_id,
                 vector_size=settings.embedding_dim, stage=lambda label: progress(label),
                 reuse_from=reuse_from, base_version=base_version, embed_model=settings.embedding_model_id,
+                check_stop=check_stop,
             )
 
         enrich_result = run_phase("enrich", enrich, retries=int(retry_cfg["retries"]))
@@ -1253,11 +1396,17 @@ def build_graph(
             result["neo4j_import"] = {"skipped": True, "reason": "GRAPH_NEO4J_IMPORT_AFTER_BUILD=false"}
 
         # ── 6. Switch version ──
+        check_stop()                 # a stop signal swallowed in the last phase: stop before publishing
         if should_activate:
             if not dry_run and not kb_still_active(settings, source.kb_id):
                 # The KB was turned off during the build (final review F02): this version is not published, the
                 # record says cancelled; cache and artifacts stay so a resume can follow once it is re-enabled
-                raise GraphBuildInterrupted("The knowledge base was turned off during the build; this version is not published")
+                raise GraphBuildCalledOff("The knowledge base was turned off during the build; this version is not published")
+            switched_off = graph_switched_off(settings, source, paused_at_start=paused_at_start)
+            if switched_off:
+                # the same for a graph turned off or paused: normally the process has already been stopped, and
+                # getting here means it was not found at the time
+                raise GraphBuildCalledOff(f"{switched_off}; this version is not published")
             stage("Switching version aliases")
             alias_result = activate_graph_aliases(q, source_collection=source.collection, graph_version=graph_version)
             result["qdrant_alias_activation"] = alias_result
@@ -1331,15 +1480,14 @@ def build_graph(
                 if gc["errors"]:
                     result["graph_gc_errors"] = gc["errors"]
                     result["graph_gc_error"] = "; ".join(f"{k}: {v}" for k, v in gc["errors"].items())
-            # The extraction cache is content-addressed, so rows left by deleted documents or changed text will
-            # never hit again; clean them up after a full-corpus build
+            # The extraction and facts caches are content-addressed, so rows left by deleted documents or changed
+            # text will never hit again; clean them up after a full-corpus build
             if not dry_run and doc_ids is None and paths.units_file.exists():
-                keep_ids = {u.unit_id for u in read_units(paths.units_file)}
-                with db.connect(settings.state_db) as con:
-                    pruned = db.prune_graph_extractions(con, source.kb_id, keep_ids)
-                result["extraction_cache_pruned"] = pruned
-                if pruned:
-                    print(f"[graph] extraction cache pruned rows={pruned} kb={source.kb_id}", flush=True)
+                pruned = prune_unit_caches(settings, source, paths.units_file)
+                result.update(pruned)
+                if any(pruned.values()):
+                    print(f"[graph] unit caches pruned extraction_rows={pruned['extraction_cache_pruned']} "
+                          f"fact_rows={pruned['facts_cache_pruned']} kb={source.kb_id}", flush=True)
             # The response cache is managed per version: after a full build that skipped no phase (a phase skipped
             # by a resume never tags entries; phases_done holds every phase once the run ends, so use resumed_phases
             # as recorded at the start), delete the responses this version did not use; incremental appends never prune
@@ -1402,10 +1550,20 @@ def record_build_outcome(con, build_id: str, *, status: str, manifest: dict[str,
     is already live and recorded as done -- it was the clean-up afterwards that went wrong -- only the manifest
     is updated and the terminal state stays: the aliases and Neo4j point at it, and recording it as cancelled
     would make the next round redo the work from the old baseline. Returns the resulting status."""
-    row = con.execute("SELECT status FROM graph_builds WHERE graph_build_id = ?", (build_id,)).fetchone()
+    row = con.execute("SELECT status, input_rows, active_chunk_count, active_doc_count, source_content_hash "
+                      "FROM graph_builds WHERE graph_build_id = ?", (build_id,)).fetchone()
     if row is not None and str(row["status"]) == "done":
         db.update_graph_build_manifest(con, build_id, manifest)
         return "done"
+    if row is not None and not counts.get("source_content_hash"):
+        # stopped before the corpus was prepared (blocked by the graph switch at the start, stopped during label
+        # extraction): the record keeps the corpus figures it already had. Whether a resume of the same version can
+        # reuse the phases the previous run finished is checked against the corpus fingerprint; wiped, every
+        # finished phase would run again next time
+        counts = {**counts, "input_rows": int(row["input_rows"] or 0),
+                  "active_chunk_count": int(row["active_chunk_count"] or 0),
+                  "active_doc_count": int(row["active_doc_count"] or 0),
+                  "source_content_hash": row["source_content_hash"]}
     db.finish_graph_build(con, build_id, status=status, manifest=manifest, error=error, **counts)
     return status
 
@@ -1570,11 +1728,16 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     return {"result": result, "steps": steps, "errors": errors}
 
 
-def _install_build_signal_handlers(stop_event: threading.Event | None = None):
+def _install_build_signal_handlers(stop_event: threading.Event | None = None,
+                                   interrupted: threading.Event | None = None):
     """Turn SIGTERM/SIGINT into an exception handled by build_graph's failure path; also set the stop event so
     worker threads waiting on the LLM exit as soon as possible. Returns a function that restores the original
-    handlers."""
+    handlers.
+    interrupted is set only here (stop is also set by a circuit break or a thread-pool error): when the raised
+    exception is swallowed on its way, the checkpoints recognise the stop signal by it."""
     def handler(signum, _frame):
+        if interrupted is not None:
+            interrupted.set()
         if stop_event is not None:
             stop_event.set()
         raise GraphBuildInterrupted(f"Graph build interrupted by signal {signum}")
@@ -1754,7 +1917,6 @@ def evaluate_rebuild(settings: Settings, *, source_key: str, source: KBSource) -
     now = int(time.time())
 
     with db.connect(settings.state_db) as con:
-        db.init_db(settings.state_db)
         latest = db.latest_successful_graph_build(con, source_key)
         if latest is None:
             return {"source": source_key, "graph_enabled": True, "due": True, "reason": "no_successful_build",
@@ -2066,3 +2228,67 @@ def _record_rollback(con, settings: Settings, source: KBSource, *, source_key: s
                           source_content_hash=source_snapshot_hash(chunks), output_dir=output_dir,
                           manifest={"adopted": True, "rollback": note})
     return {"graph_build_id": build_id, "record": "created", "rejected": rejected}
+
+
+def graph_retirable(settings: Settings, source: KBSource) -> list[str]:
+    """The versions to retire (the version numbers that were completed) when a KB has been emptied while its graph
+    remains; empty when nothing should be retired.
+    "Emptied" = no active chunks, and the directory still exists but holds no file that can be ingested. Chunks
+    alone are not enough: after a KB is turned off and on again, or deleted files are put back, the chunk count is
+    also 0 until the restore jobs finish, but then the directory has files and the graph is usable again once they
+    are restored. A directory that no longer exists is left to the KB's deactivation and garbage collection."""
+    from ..localfs.scanner import list_source_files
+
+    if source.physical_base is None or not Path(source.physical_base).is_dir():
+        return []
+    if active_source_chunks(settings, source):
+        return []
+    with db.connect(settings.state_db) as con:
+        rows = con.execute("SELECT graph_version FROM graph_builds WHERE kb_id = ? AND status = 'done'",
+                           (source.kb_id,)).fetchall()
+    versions = sorted({str(r["graph_version"]) for r in rows if r["graph_version"]})
+    if not versions or list_source_files(source, limit=1, hash_content=False):
+        return []
+    return versions
+
+
+def retire_graph(settings: Settings, *, source_key: str, source: KBSource, q: Any = None,
+                 grace_seconds: int | None = None) -> dict[str, Any] | None:
+    """Retire the graph of a KB that has been emptied. Without a corpus no append or rebuild ever happens, so the
+    current version would keep its aliases and search would go on returning entities, facts and pages of deleted
+    documents. The Qdrant aliases are dropped, the active Neo4j version is deactivated, the completed records are
+    marked rolled_back (no longer the current version, and no longer a baseline for appends / rebuilds), and the
+    artifacts are deleted by the same rule as the old-version cleanup. The graph switch, labels, extraction and
+    response caches are left alone: when files come in again it is handled as a first build, and units extracted
+    before hit the cache directly.
+    Returns None when there is nothing to retire (see graph_retirable). Shares the build lock with builds: refused
+    while a build is running."""
+    guard = GraphBuildLock(settings)
+    guard.acquire()
+    try:
+        versions = graph_retirable(settings, source)
+        if not versions:
+            return None
+        q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        result: dict[str, Any] = {"source": source_key, "kb_id": source.kb_id, "retired_versions": versions, "steps": []}
+        result["aliases_dropped"] = drop_graph_aliases(q, source.collection, ALL_GRAPH_VECTOR_TYPES)
+        result["steps"].append("drop_qdrant_aliases")
+        if getattr(settings, "graph_neo4j_import_after_build", False):
+            from .neo4j_import import deactivate_neo4j_graph_version
+
+            result["neo4j_deactivation"] = deactivate_neo4j_graph_version(settings, source=source)
+            result["steps"].append("deactivate_neo4j")
+        with db.connect(settings.state_db) as con:
+            con.execute("UPDATE graph_builds SET status = 'rolled_back', error = ? WHERE kb_id = ? AND status = 'done'",
+                        ("retired: the knowledge base has no active content", source.kb_id))
+        result["steps"].append("record")
+        grace = int(grace_seconds if grace_seconds is not None else getattr(settings, "graph_gc_grace_seconds", 0) or 0)
+        gc = gc_graph_versions(settings, source, q=q, graph_version="", grace_seconds=grace)
+        result.update(gc["result"])
+        result["steps"].extend(gc["steps"])
+        if gc["errors"]:
+            result["graph_gc_errors"] = gc["errors"]
+        print(f"[graph] retired kb={source.kb_id}({source.source_root}): no active content; versions={versions}", flush=True)
+        return result
+    finally:
+        guard.release()

@@ -119,13 +119,16 @@ def find_versions(text: Any) -> list[str]:
 def document_axis(rel_path: str, head_text: str = "", *, kind: str = "auto") -> dict[str, str]:
     """The document's axis value. Returns {"kind": date|version|none, "value": ..., "date": ..., "version": ...}.
     Date: the one in the file name ("2024 checkup report" -> 2024) takes precedence over the first page (when
-    the first page gives a more precise date, it completes the file-name date); version: the Rev / Version at
-    the start of the first page; with kind=auto a date wins when present, a version is used when only it exists,
-    and none is recorded when neither is found."""
+    the first page gives a more precise date, it completes the file-name date); the first-page text only counts
+    dates written to the month or day: a lone four-digit number there (1920 pixels, 2048 tokens, 2023 employees,
+    "from 1988 to 2023") is mostly not the document's date, and taking it would make it the validity of every
+    fact in the document, so an empty value is better; version: the Rev / Version at the start of the first
+    page; with kind=auto a date wins when present, a version is used when only it exists, and none is recorded
+    when neither is found."""
     name = str(rel_path or "").rsplit("/", 1)[-1]
     head = str(head_text or "")[:1500]
     name_date = parse_date(name)
-    head_dates = find_dates(head)
+    head_dates = [d for d in find_dates(head) if len(d) > 4]
     head_date = head_dates[0] if head_dates else None
     date_value = name_date or ""
     if name_date and head_date and head_date.startswith(name_date) and len(head_date) > len(name_date):
@@ -144,13 +147,27 @@ def document_axis(rel_path: str, head_text: str = "", *, kind: str = "auto") -> 
     return {"kind": chosen[0], "value": chosen[1], "date": date_value, "version": version_value}
 
 
-def axis_sort_key(value: Any) -> tuple:
-    """Sort key by axis value: dates lexicographically (ISO prefixes are ordered); versions by natural numeric
-    segments; empty values last."""
+def axis_value_kind(value: Any) -> str:
+    """Whether an axis value is a date or a version (an empty string for an empty value). In a KB whose profile
+    is version, documents without a version number get a date axis value, and validity periods the model copies
+    from the text are dates as well: both kinds coexist in one KB. Dates and versions have no order between
+    them, so each kind can only be sorted on its own."""
     s = str(value or "")
     if not s:
+        return ""
+    return "date" if _ISO_RE.match(s) or _YEAR_RE.fullmatch(s) else "version"
+
+
+def axis_sort_key(value: Any) -> tuple:
+    """Sort key by axis value: dates lexicographically (ISO prefixes are ordered); versions by natural numeric
+    segments; empty values last.
+    Dates sort before versions only to keep the sort stable, not to mean earlier; code that compares order
+    separates the two by axis_value_kind first."""
+    s = str(value or "")
+    kind = axis_value_kind(s)
+    if not kind:
         return (2, ())
-    if _ISO_RE.match(s) or _YEAR_RE.fullmatch(s):
+    if kind == "date":
         return (0, (s,))
     parts = tuple(int(p) if p.isdigit() else p.lower() for p in re.findall(r"\d+|[A-Za-z*]+", s))
     return (1, parts)

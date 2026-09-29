@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from . import prompts
-from .extract import normalize_name
+from .extract import normalize_name, strip_math
 from .llm import ChatClient, LLMSpec
 from .tabletext import FACTS_EXPAND_WIDE_TABLES, expand_wide_tables
 from .units import Unit, unit_signals
@@ -34,13 +34,17 @@ _NUMBER_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?(?:\s*[eE][-+]?\d+)?")
 # record it as 0.5, and V_SS - 0.5 even as a positive 0.5.
 _UNIT_CLASS = r"%°℃℉µμΩ℧A-Za-z/·"
 _FOOTNOTE_RE = re.compile(r"\s*(?:\[\s*\d{1,3}\s*\]|\(\s*\d{1,2}\s*\)|（\s*\d{1,2}\s*）)+\s*$")   # trailing footnote markers [6], (4)
+# a comma is a thousands separator only in groups of three (1,024, 12,345.6); "12,50" and "2,86" are a decimal
+# comma or two comma-separated values, and dropping the comma to read 1250 or 286 would change the number, so
+# such a string does not count as one number
+_PLAIN_NUMBER = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 _SCALAR_RE = re.compile(
-    r"^(?P<cmp><=|>=|[<>≤≥~≈±])?\s*(?P<num>[-+]?\d+(?:[.,]\d+)*(?:\s*[eE][-+]?\d+)?)"
+    rf"^(?P<cmp><=|>=|[<>≤≥~≈±])?\s*(?P<num>{_PLAIN_NUMBER}(?:\s*[eE][-+]?\d+)?)"
     rf"\s*(?P<unit>[{_UNIT_CLASS}]*)(?:\s*[\(（][^\)）]{{0,40}}[\)）])?$"
 )
 _RANGE_RE = re.compile(
-    rf"^(?P<lo>[-+]?\d+(?:[.,]\d+)*)\s*[{_UNIT_CLASS}]*\s*(?:to|~|–|—|-|至|到|\.\.\.?)\s*"
-    rf"(?P<hi>[-+]?\d+(?:[.,]\d+)*)\s*[{_UNIT_CLASS}]*$"
+    rf"^(?P<lo>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*\s*(?:to|~|–|—|-|至|到|\.\.\.?)\s*"
+    rf"(?P<hi>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*$"
 )
 _EXPR_RE = re.compile(r"[A-Za-z_}\)]\s*[+\-×x\*/]\s*[\d(]|[\d\)]\s*[+\-×x\*/]\s*[A-Za-z_({\\]")
 _IDENT_RE = re.compile(r"[A-Za-z]+_[A-Za-z0-9{}]+|\\[A-Za-z]+|[A-Za-z]+\{")
@@ -80,6 +84,16 @@ def _to_float(raw: str) -> float | None:
         return None
 
 
+_SUPERSCRIPT_RE = re.compile(r"(?<=\d)[⁰¹²³⁴-⁹⁺⁻]+")
+
+
+def _nfkc(text: str) -> str:
+    """Full-width / half-width normalisation. A superscript after a digit is first written as ^n: NFKC would
+    flatten 10 with a superscript 9 into 109, which is another number."""
+    text = _SUPERSCRIPT_RE.sub(lambda m: "^" + unicodedata.normalize("NFKC", m.group(0)).replace("−", "-"), text)
+    return unicodedata.normalize("NFKC", text)
+
+
 def classify_value(value: Any) -> dict[str, Any]:
     """What kind of thing a value field is:
       scalar     the whole string is one number (comparator, unit, footnote, bracketed remark allowed): '0.160',
@@ -87,10 +101,10 @@ def classify_value(value: Any) -> dict[str, Any]:
       range      two numbers around a range marker: '2.7 to 3.6', '-40 ~ +85'
       expression a relative value with variables / arithmetic: 'V_CC + 0.5', '0.8 × V_DD', 'VCC/2'; cannot be
                  evaluated without variable bindings
-      text       anything else ('n/a', 'Max', '20/25/45')
+      text       anything else ('n/a', 'Max', '20/25/45', '12,50')
       empty
     Only scalar yields num; range yields lo / hi."""
-    text = unicodedata.normalize("NFKC", str(value or "")).replace("−", "-").strip()
+    text = _nfkc(str(value or "")).replace("−", "-").strip()
     text = _FOOTNOTE_RE.sub("", text).strip()
     if not text:
         return {"kind": "empty", "num": None}
@@ -259,7 +273,19 @@ def parse_facts_json(text: str) -> tuple[list[dict[str, Any]], int]:
 
 
 def _clean(value: Any, limit: int = 200) -> str:
+    """Subject, property, symbol: normalised the same way as entity names, so facts can be matched to entities
+    by name."""
     return normalize_name(str(value if value is not None else ""))[:limit]
+
+
+def _clean_value(value: Any, limit: int = 200) -> str:
+    """Value, unit, conditions, note: full-width / half-width normalisation, surrounding quotes and whitespace
+    stripped, whitespace collapsed, everything else as in the source.
+    These fields are not names and skip the LaTeX restoration of entity names ("$85K" would lose its currency,
+    "${HOME}_dir" would become HOMEdir); only recognisable $...$ fragments are restored (see strip_math)."""
+    text = _nfkc(strip_math(str(value if value is not None else "")))
+    text = text.strip().strip("\"'`“”‘’").strip()
+    return re.sub(r"\s+", " ", text)[:limit]
 
 
 def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -268,13 +294,13 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
     subject = _clean(raw.get("subject"), 160)
     prop = _clean(raw.get("property"), 160)
     symbol = _clean(raw.get("symbol"), 60)
-    value = _clean(raw.get("value"), 120)
-    lo, typ, hi = _clean(raw.get("min"), 60), _clean(raw.get("typ"), 60), _clean(raw.get("max"), 60)
-    unit = _clean(raw.get("unit"), 40)
-    note = _clean(raw.get("note"), 300)
-    flag = _clean(raw.get("flag"), 40)
-    ref_min, ref_max = _clean(raw.get("ref_min"), 60), _clean(raw.get("ref_max"), 60)
-    period_text = _clean(raw.get("period_text"), 120)
+    value = _clean_value(raw.get("value"), 120)
+    lo, typ, hi = _clean_value(raw.get("min"), 60), _clean_value(raw.get("typ"), 60), _clean_value(raw.get("max"), 60)
+    unit = _clean_value(raw.get("unit"), 40)
+    note = _clean_value(raw.get("note"), 300)
+    flag = _clean_value(raw.get("flag"), 40)
+    ref_min, ref_max = _clean_value(raw.get("ref_min"), 60), _clean_value(raw.get("ref_max"), 60)
+    period_text = _clean_value(raw.get("period_text"), 120)
     if not subject or not prop:
         return None
     if not any((value, lo, typ, hi)):
@@ -283,11 +309,11 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
     raw_conditions = raw.get("conditions")
     if isinstance(raw_conditions, dict):
         for k, v in list(raw_conditions.items())[:8]:
-            ck, cv = _clean(k, 60), _clean(v, 80)
+            ck, cv = _clean_value(k, 60), _clean_value(v, 80)
             if ck and cv:
                 conditions[ck] = cv
     elif isinstance(raw_conditions, str) and raw_conditions.strip():
-        conditions["condition"] = _clean(raw_conditions, 120)
+        conditions["condition"] = _clean_value(raw_conditions, 120)
     kinds: dict[str, str] = {}
     nums: dict[str, float | None] = {}
     ranges: dict[str, list[float]] = {}
@@ -322,7 +348,7 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
         out["ref_min_num"], out["ref_max_num"] = parse_number(ref_min), parse_number(ref_max)
     from .temporal import parse_date
     for field in ("valid_from", "valid_until"):
-        text = _clean(raw.get(field), 40)
+        text = _clean_value(raw.get(field), 40)
         parsed = parse_date(text) if text else None
         if parsed:
             out[field] = parsed
@@ -567,9 +593,11 @@ def facts_prompt_hash() -> str:
 
 
 def facts_fingerprint(spec: LLMSpec) -> str:
-    # facts-v3 (2026-09-07): facts gained flag / reference range / validity fields, and both the prompt and the
-    # normalization changed; old rows are never reused
-    raw = "|".join(["facts-v3", spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
+    # the version label follows the output of normalize_fact: what is stored is the normalised fact, so old rows
+    # cannot be reused once normalisation changes.
+    # facts-v4: a comma only counts as a thousands separator, value fields no longer get the LaTeX restoration
+    # of entity names
+    raw = "|".join(["facts-v4", spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -892,11 +920,20 @@ def is_measurement(fact: dict[str, Any]) -> bool:
             or bool(str(fact.get("flag") or "").strip()) or bool(fact.get("ref_min") or fact.get("ref_max")) or bool(fact.get("unit")))
 
 
+def _is_quantity(fact: dict[str, Any]) -> bool:
+    """The value is a quantity: a number was parsed, or a value field is a range, an expression or an unverified
+    glued number."""
+    if any(fact.get(f"{field}_num") is not None for field in ("value", "min", "typ", "max")):
+        return True
+    return any(kind != "text" for kind in (fact.get("kinds") or {}).values())
+
+
 def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, units_by_id: dict[str, Unit],
                            profile: dict[str, Any] | None = None, documents: dict[str, str] | None = None) -> dict[str, int]:
     """Deterministic re-homing, run after link_facts (so old facts from the cache get fixed too):
     · marker words at the tail of a property name (total cholesterol elevated) are split off into flag, so the
-      concept can merge into "total cholesterol";
+      concept can merge into "total cholesterol"; only when the value is text, and the original property name is
+      kept in property_raw;
     · a period in the conditions (year: 2024/07) moves to valid_from / period_text, so each row of a multi-year
       comparison table becomes its own time point;
     · in documents with a profile subject (examinee, part number), measurement facts get the profile subject as
@@ -936,15 +973,24 @@ def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str,
     for f in facts:
         prop = str(f.get("property") or "")
         m = _FLAG_SUFFIX_RE.search(prop)
-        if m and len(prop) > len(m.group(0)):
+        # not split off when the value is a quantity: in "Price High 105.2" or "consumption down 30%" the tail word
+        # is part of the property name, the very thing the number measures; splitting it off would merge Price High
+        # and Price Low into one property and read the decrease as the indicator itself. Only a text value
+        # (elevated, positive, a passage of findings) makes it a flag
+        if m and len(prop) > len(m.group(0)) and not _is_quantity(f):
             word = m.group(0).strip().casefold()
+            f["property_raw"] = prop
             f["property"] = prop[: m.start()].strip(" :：-")
             if not str(f.get("flag") or "").strip():
                 f["flag"] = _FLAG_SYMBOL.get(word, m.group(0).strip())
             stats["flag_words"] += 1
         conds = dict(f.get("conditions") or {})
+        # a validity inherited from the document axis (filled in by link_facts) is not one the fact states itself:
+        # a multi-year comparison table has each row's year in the conditions, and unless it is moved the whole
+        # table lands on the single point of the report date
+        inherited = not f.get("valid_until") and str(f.get("valid_from") or "") == str(f.get("axis") or "")
         for k in list(conds):
-            if _PERIOD_KEY_RE.search(str(k)) and not f.get("valid_from"):
+            if _PERIOD_KEY_RE.search(str(k)) and (inherited or not f.get("valid_from")):
                 parsed = parse_date(str(conds[k]))
                 if parsed:
                     f["valid_from"] = parsed

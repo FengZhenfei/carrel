@@ -10,7 +10,8 @@ scoping, vectors, Neo4j and recall downstream are all shared.
   (skill / instructions / readme), frontmatter fields go into the fact layer, files referenced in the body get
   references edges.
 - config (json / yaml / toml / requirements.txt): key paths go into the fact layer; requirements packages become
-  package entities with depends_on edges.
+  package entities with depends_on edges. A config file that cannot be parsed (a format without a parser,
+  PyYAML not installed, invalid syntax) goes to llm as plain text rather than leaving an empty shell without facts.
 Everything else is llm (the existing model extraction).
 """
 from __future__ import annotations
@@ -26,7 +27,7 @@ from .extract import ExtractionResult
 from .facts import fact_id, normalize_fact
 from .units import Unit
 
-VERSION = "det-v6"
+VERSION = "det-v7"
 
 TYPES = ("module", "class", "function", "method", "constant", "package", "repository", "skill", "instructions", "readme",
          "config_file", "document")
@@ -147,6 +148,7 @@ class DeterministicExtractor:
                 self.first_order[u.doc_id] = u.order
         self._routes: dict[str, str] = {}
         self._code: dict[str, dict[str, Any]] = {}       # rel_path -> analysis result
+        self._configs: dict[str, Any] = {}               # rel_path -> parsed configuration (None when it cannot be parsed)
         self._text_cache: dict[str, str] = {}
         self.route_counts: Counter = Counter()
 
@@ -158,7 +160,14 @@ class DeterministicExtractor:
             if rel.lower().endswith((".md", ".markdown")):
                 text = self._text(rel)
                 first = text.splitlines()[0] if text else ""
-            self._routes[rel] = route_for(rel, first_line=first)
+            route = route_for(rel, first_line=first)
+            if route == "config" and not rel.lower().endswith("requirements.txt") and self._config(rel) is None:
+                # cannot be parsed (a format without a parser such as .ini / .conf, PyYAML not installed, invalid
+                # syntax): hand it to the model as plain text. Left on the config route it would only yield an empty
+                # shell entity, and the model would not pick it up either
+                route = "llm"
+                self.route_counts["config_unparsed"] += 1
+            self._routes[rel] = route
         return self._routes[rel]
 
     def wants(self, unit: Unit) -> bool:
@@ -631,7 +640,7 @@ class DeterministicExtractor:
                     fact["id"] = fact_id(unit.unit_id, fact); fact["unit_id"] = unit.unit_id
                     facts.append(fact)
             return ents, rels, facts
-        data = self._load_config(rel, text)
+        data = self._config(rel)
         ents.append(_entity(rel, "config_file", f"configuration file {rel}"))
         if data is None:
             return ents, rels, facts
@@ -641,6 +650,11 @@ class DeterministicExtractor:
                 fact["id"] = fact_id(unit.unit_id, fact); fact["unit_id"] = unit.unit_id
                 facts.append(fact)
         return ents, rels, facts
+
+    def _config(self, rel: str) -> Any:
+        if rel not in self._configs:
+            self._configs[rel] = self._load_config(rel, self._text(rel))
+        return self._configs[rel]
 
     @staticmethod
     def _load_config(rel: str, text: str) -> Any:
@@ -657,7 +671,10 @@ class DeterministicExtractor:
                     import yaml  # type: ignore
                 except ImportError:
                     return None
-                return yaml.safe_load(text)
+                # several documents separated by --- in one file: safe_load raises on them, so read them one by one,
+                # and a single document is not wrapped in a list
+                docs = [d for d in yaml.safe_load_all(text) if d is not None]
+                return docs[0] if len(docs) == 1 else (docs or None)
         except Exception:
             return None
         return None

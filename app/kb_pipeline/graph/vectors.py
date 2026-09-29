@@ -11,6 +11,10 @@ Incremental append (reuse_from): rows whose gr_id exists in the previous version
 embedding text (same embed_sha in the payload) take over the previous version's vector; only new rows and rows
 whose description changed are embedded. Retrieval is batched, so the previous collection is never read into
 memory as a whole.
+
+Reading the previous version and writing the new one go in batches of UPSERT_BATCH, independent of the embedding
+batch size (the embedding client splits its own batches); writes are not awaited batch by batch, and the point
+count is checked once a collection has been written.
 """
 from __future__ import annotations
 
@@ -29,7 +33,12 @@ from ..vector.qdrant import (
 
 EMBED_TEXT_MAX_CHARS = 2000
 POINT_IDS_LIMIT = 32
-UPSERT_BATCH = 128
+# 256 points per batch: a fact point carries three vectors, so the request body is about 10 MB, well within
+# Qdrant's per-request limit (32 MB)
+UPSERT_BATCH = 256
+# payload fields needed to reuse a vector: the embedding fingerprint and the embedding model; old versions
+# without a fingerprint recompute it from the remaining fields (see _base_embed_sha)
+BASE_PAYLOAD_FIELDS = ["embed_sha", "embed_model", "graph_type", "title", "description", "source", "type", "target"]
 
 
 def entity_id(key: str) -> str:
@@ -72,7 +81,7 @@ def _retrieve_base(q: Any, collection: str, ids: list[str]) -> dict[str, tuple[s
     full. Collections with named vectors (facts) return a {name: vector} dict, reused only if it matches the new
     layout."""
     try:
-        points = q.retrieve(collection_name=collection, ids=ids, with_payload=True, with_vectors=True)
+        points = q.retrieve(collection_name=collection, ids=ids, with_payload=BASE_PAYLOAD_FIELDS, with_vectors=True)
     except Exception as exc:
         print(f"[graph] vector reuse from {collection} skipped: {exc!r}", flush=True)
         return None
@@ -192,6 +201,9 @@ def entity_payload(e: dict[str, Any], *, kb_id: str, source_collection: str, gra
         "kb_id": kb_id, "graph_version": graph_version, "graph_type": "entity",
         "source_collection": source_collection,
         "title": e.get("title"), "type": e.get("type"), "parent_type": e.get("parent_type") or None,
+        # scope of a document-scoped entity (doc_id): same-named entities exist once per document, and search
+        # results tell them apart by it
+        "scope": e.get("scope") or None,
         "description": e.get("description"),
         "search_text": _search_text(e.get("title"), e.get("aliases"), e.get("type"), e.get("description")),
         "degree": int(e.get("degree") or 0), "frequency": int(e.get("frequency") or 0),
@@ -263,16 +275,21 @@ def write_graph_vectors(
     units_by_id: dict[str, Any],
     vector_size: int,
     stage: Callable[[str], None] | None = None,
-    embed_batch: int = 32,
+    batch: int = UPSERT_BATCH,
     reuse_from: dict[str, str] | None = None,
     base_version: str | None = None,
     embed_model: str = "",
+    check_stop: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """reuse_from: {graph_type: previous version's collection name}, together with base_version; rows whose
     embedding text is unchanged in the previous version and were computed by the same embedding model reuse the
     vector. embed_model is written into every point's payload: when the model changes at the same dimension the
     database would not object, and comparing text fingerprints alone would mix the old and new models' vectors in
-    one collection (Codex review F05)."""
+    one collection (Codex review F05).
+    check_stop: called at the start of every batch and after each named vector of the facts is embedded; it
+    raises the interruption when the build has been asked to stop -- this function waits on the embedding and
+    database HTTP calls in the main thread throughout, and a stop signal landing inside such a call would be
+    swallowed by the embedding client's retries."""
     from qdrant_client.http import models as qm
 
     entities = list(bundle.get("entities") or [])
@@ -318,16 +335,21 @@ def write_graph_vectors(
         base_collection = (reuse_from or {}).get(graph_type) if base_version else None
         written = reused = embedded_rows = 0
         label = labels[graph_type]
-        for start in range(0, len(rows), embed_batch):
-            batch = rows[start:start + embed_batch]
-            texts = [to_text(r) for r in batch]          # named vectors: {name: text}; otherwise a single text
+        expected_ids: set[str] = set()
+        for start in range(0, len(rows), batch):
+            if check_stop is not None:
+                check_stop()
+            chunk = rows[start:start + batch]
+            texts = [to_text(r) for r in chunk]          # named vectors: {name: text}; otherwise a single text
             shas = [embed_sha(json.dumps(t, ensure_ascii=False, sort_keys=True) if isinstance(t, dict) else t) for t in texts]
-            payloads = [to_payload(r) for r in batch]
-            vectors: list[Any] = [None] * len(batch)
+            payloads = [to_payload(r) for r in chunk]
+            vectors: list[Any] = [None] * len(chunk)
             if base_collection:
                 base_ids = [point_id_for(base_version, p["gr_id"]) for p in payloads]
                 base_points = _retrieve_base(q, base_collection, base_ids)
                 if base_points is None:
+                    if check_stop is not None:
+                        check_stop()            # the read may also fail because a stop landed in this call: do not re-embed everything then
                     base_collection = None      # the previous version's collection is gone: re-embed this collection in full
                 else:
                     for k, base_id in enumerate(base_ids):
@@ -345,13 +367,15 @@ def write_graph_vectors(
                     per_name: dict[str, list[list[float]]] = {}
                     for name in layout:
                         per_name[name] = embed([str(texts[k][name]) for k in todo])
+                        if check_stop is not None:
+                            check_stop()        # a batch is embedded three times: honour a stop before the whole batch is done
                     for pos, k in enumerate(todo):
                         vectors[k] = {name: per_name[name][pos] for name in layout}
                 else:
                     fresh = embed([texts[k] for k in todo])
                     for k, vector in zip(todo, fresh, strict=True):
                         vectors[k] = vector
-            reused += len(batch) - len(todo)
+            reused += len(chunk) - len(todo)
             embedded_rows += len(todo)
             points = []
             for payload, vector, sha in zip(payloads, vectors, shas, strict=True):
@@ -359,11 +383,13 @@ def write_graph_vectors(
                 if embed_model:
                     payload["embed_model"] = embed_model
                 points.append(qm.PointStruct(id=point_id_for(graph_version, payload["gr_id"]), vector=vector, payload=payload))
-            q.upsert(collection_name=collection, points=points, wait=True)
+            expected_ids.update(str(p.id) for p in points)
+            # writes to one collection are applied in submission order: waiting for the last batch is enough, once it
+            # has landed so have the earlier ones; the point count is checked below
+            q.upsert(collection_name=collection, points=points, wait=start + batch >= len(rows))
             written += len(points)
             if stage is not None:
                 stage(f"Writing vectors · {label} {written}/{len(rows)}" + (f" (reused {reused})" if reused else ""))
-        expected_ids = {point_id_for(graph_version, to_payload(r)["gr_id"]) for r in rows}
         removed = _delete_points_not_in(q, collection, expected_ids)
         actual = int(q.count(collection_name=collection, exact=True).count)
         if actual != len(rows):

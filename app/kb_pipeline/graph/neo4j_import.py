@@ -183,6 +183,23 @@ def activate_neo4j_graph_version(settings: Settings, *, source: KBSource, graph_
         driver.close()
 
 
+def deactivate_neo4j_graph_version(settings: Settings, *, source: KBSource) -> dict[str, Any]:
+    """The KB no longer has an active version (graph retired): only the active marker on the KB anchor is
+    removed; the nodes of each version are left for the old-version cleanup to delete."""
+    driver = neo4j_driver(settings)
+    try:
+        previous = active_neo4j_graph_version(driver, source.kb_id)
+        with driver.session() as session:
+            session.run(
+                "MATCH (kb:KB {kb_id: $kb_id}) REMOVE kb.active_graph_version, kb.active_graph_version_uid "
+                "SET kb.updated_at = timestamp()",
+                kb_id=source.kb_id,
+            ).consume()
+        return {"kb_id": source.kb_id, "previous_graph_version": previous}
+    finally:
+        driver.close()
+
+
 def delete_neo4j_graph_version(settings: Settings, *, source: KBSource, graph_version: str, dry_run: bool = False) -> dict[str, Any]:
     driver = neo4j_driver(settings)
     try:
@@ -620,18 +637,14 @@ def ensure_constraints(driver) -> None:
             f"CREATE CONSTRAINT ak_{label.lower()}_uid IF NOT EXISTS FOR (n:{label}) REQUIRE n.uid IS UNIQUE"
             for label in NODE_LABELS
         ],
-        "CREATE INDEX ak_entity_title IF NOT EXISTS FOR (n:Entity) ON (n.kb_id, n.graph_version, n.title)",
-        "CREATE INDEX ak_entity_type IF NOT EXISTS FOR (n:Entity) ON (n.kb_id, n.graph_version, n.type)",
-        "CREATE INDEX ak_chunk_lookup IF NOT EXISTS FOR (n:QdrantChunkSnapshot) ON (n.kb_id, n.graph_version, n.chunk_uid)",
-        "CREATE INDEX ak_chunk_point_id IF NOT EXISTS FOR (n:QdrantChunkSnapshot) ON (n.kb_id, n.graph_version, n.point_id)",
+        # every index is written along with each import and deletion of a version: only properties that a query
+        # uses get one (the maximum pagerank, entities / relations by id)
         "CREATE INDEX ak_entity_pagerank IF NOT EXISTS FOR (n:Entity) ON (n.kb_id, n.graph_version, n.pagerank)",
         # Graph recall fetches entities / relations by id in batches (UNWIND $ids ... {kb_id, graph_version, id}):
         # without these two indexes every id is filtered over the whole graph version; on kb_003 one hop took 2
         # seconds and two hops 5-10 seconds.
         "CREATE INDEX ak_entity_id IF NOT EXISTS FOR (n:Entity) ON (n.kb_id, n.graph_version, n.id)",
         "CREATE INDEX ak_relation_id IF NOT EXISTS FOR (n:Relation) ON (n.kb_id, n.graph_version, n.id)",
-        "CREATE INDEX ak_spec_id IF NOT EXISTS FOR (n:Spec) ON (n.kb_id, n.graph_version, n.id)",
-        "CREATE INDEX ak_spec_subject IF NOT EXISTS FOR (n:Spec) ON (n.kb_id, n.graph_version, n.subject)",
     ]
     with driver.session() as session:
         for statement in statements:
@@ -646,7 +659,6 @@ def upsert_kb_and_graph_version(
         "uid": graph_version_uid, "kb_id": source.kb_id, "source_key": source_key,
         "source_collection": source.collection, "source_root": source.source_root,
         "graph_version": graph_version, "graph_build_id": build.get("graph_build_id"),
-        "started_at": build.get("started_at"), "finished_at": build.get("finished_at"),
         "input_rows": build.get("input_rows"), "active_chunk_count": build.get("active_chunk_count"),
         "active_doc_count": build.get("active_doc_count"), "source_content_hash": build.get("source_content_hash"),
         "output_dir": str(output_dir), "imported_at": int(time.time()), "mode": "entity_graph",
@@ -778,71 +790,103 @@ def active_neo4j_graph_version(driver, kb_id: str) -> str | None:
 
 
 def neo4j_graph_versions(driver, kb_id: str) -> list[dict[str, Any]]:
+    # only the two properties the ranking needs: a query naming a property that no node has makes Neo4j return an
+    # UnknownPropertyKeyWarning every time
     with driver.session() as session:
         return session.run(
             """
             MATCH (gv:GraphVersion {kb_id: $kb_id})
-            RETURN gv.graph_version AS graph_version, gv.imported_at AS imported_at,
-                   gv.started_at AS started_at, gv.finished_at AS finished_at
+            RETURN gv.graph_version AS graph_version, gv.imported_at AS imported_at
             ORDER BY gv.graph_version
             """,
             kb_id=kb_id,
         ).data()
 
 
+def _scoped_matches(kb_id: str, graph_version: str | None, *, sweep: bool = True) -> list[tuple[str, dict[str, Any]]]:
+    """The nodes of one version (of the whole KB when graph_version is None) are matched in several segments;
+    deletion and counting both go in this order, each segment being (MATCH ... WHERE ..., parameters).
+    Each kind of node is found by label + uid prefix (the uid is what graph_uid assembles: kb:version:label:id),
+    which uses the unique-constraint index; matching by properties without a label would scan every node of the
+    database for every batch. The sweep segment has no label and catches nodes outside the label table, one scan
+    per version.
+    The GraphVersion marker comes last: when a cleanup is interrupted halfway the marker is still there and the
+    next round lists the version again and carries on deleting -- were the marker gone first, nothing would
+    recognise the remaining nodes any more. For a whole-KB deletion the KB anchor comes after the markers."""
+    params: dict[str, Any] = {"kb_id": kb_id}
+    scope = "n.kb_id = $kb_id"
+    version_part = ""
+    if graph_version is not None:
+        params["graph_version"] = graph_version
+        scope += " AND n.graph_version = $graph_version"
+        version_part = f"{graph_version}:"
+    matches: list[tuple[str, dict[str, Any]]] = [
+        (f"MATCH (n:{label}) WHERE n.uid STARTS WITH $prefix AND {scope}",
+         {**params, "prefix": f"{kb_id}:{version_part}{label}:" if version_part else f"{kb_id}:"})
+        for label in NODE_LABELS if label != "GraphVersion"
+    ]
+    if sweep:
+        matches.append((f"MATCH (n) WHERE {scope} AND NOT n:GraphVersion AND NOT n:KB", params))
+    matches.append((f"MATCH (n:GraphVersion) WHERE {scope}", params))
+    if graph_version is None:
+        matches.append(("MATCH (n:KB) WHERE n.kb_id = $kb_id", params))
+    return matches
+
+
 def count_version_nodes(driver, kb_id: str, graph_version: str) -> int:
+    total = 0
     with driver.session() as session:
-        row = session.run(
-            "MATCH (n {kb_id: $kb_id, graph_version: $graph_version}) RETURN count(n) AS count",
-            kb_id=kb_id, graph_version=graph_version,
-        ).single()
-    return int(row["count"] if row else 0)
+        for match, params in _scoped_matches(kb_id, graph_version, sweep=False):
+            row = session.run(f"{match} RETURN count(n) AS count", **params).single()
+            total += int(row["count"] if row else 0)
+    return total
 
 
 DELETE_BATCH_MIN = 100
 
 
-def _delete_matching(driver, node_pattern: str, params: dict[str, Any], batch_size: int) -> int:
-    """Delete the nodes matching node_pattern in batches: first their relationships batch by batch, then the nodes
-    batch by batch, one auto-commit transaction per batch. When a batch hits the transaction memory limit
-    (dbms.memory.transaction.total.max, 70% of the heap by default) the batch size is halved and retried, and the
-    error is only raised once the size is down to DELETE_BATCH_MIN and it still fails -- on 2026-09-13 an old
-    library-KB version with 470k nodes hit the 1.4 GiB limit when one DETACH DELETE removed 5000 nodes (with their
-    hundreds of thousands of relationships) and the whole cleanup aborted. Returns the number of deleted nodes."""
+def _delete_matching(driver, matches: list[tuple[str, dict[str, Any]]], batch_size: int) -> int:
+    """Delete segment by segment in the order of matches: for each segment first the nodes' relationships batch
+    by batch, then the nodes batch by batch, one auto-commit transaction per batch. When a batch hits the
+    transaction memory limit (dbms.memory.transaction.total.max, 70% of the heap by default) the batch size is
+    halved and retried, and the error is only raised once the size is down to DELETE_BATCH_MIN and it still fails
+    -- on 2026-09-13 an old library-KB version with 470k nodes hit the 1.4 GiB limit when one DETACH DELETE removed
+    5000 nodes (with their hundreds of thousands of relationships) and the whole cleanup aborted. Returns the
+    number of deleted nodes."""
     from neo4j.exceptions import TransientError
 
     total = 0
-    queries = (
-        (f"MATCH (n {node_pattern})-[r]-() WITH DISTINCT r LIMIT $batch_size DELETE r RETURN count(r) AS n", False),
-        (f"MATCH (n {node_pattern}) WITH n LIMIT $batch_size DETACH DELETE n RETURN count(n) AS n", True),
-    )
     with driver.session() as session:
-        for query, counts in queries:
-            size = max(DELETE_BATCH_MIN, int(batch_size))
-            while True:
-                try:
-                    row = session.run(query, **params, batch_size=size).single()
-                except TransientError:
-                    if size <= DELETE_BATCH_MIN:
-                        raise
-                    size = max(DELETE_BATCH_MIN, size // 2)
-                    continue
-                n = int(row["n"] if row else 0)
-                if counts:
-                    total += n
-                if n == 0:
-                    break
+        for match, params in matches:
+            queries = (
+                (f"{match} MATCH (n)-[r]-() WITH DISTINCT r LIMIT $batch_size DELETE r RETURN count(r) AS n", False),
+                (f"{match} WITH n LIMIT $batch_size DETACH DELETE n RETURN count(n) AS n", True),
+            )
+            for query, counts in queries:
+                size = max(DELETE_BATCH_MIN, int(batch_size))
+                while True:
+                    try:
+                        row = session.run(query, **params, batch_size=size).single()
+                    except TransientError:
+                        if size <= DELETE_BATCH_MIN:
+                            raise
+                        size = max(DELETE_BATCH_MIN, size // 2)
+                        continue
+                    n = int(row["n"] if row else 0)
+                    if counts:
+                        total += n
+                    if n == 0:
+                        break
     return total
 
 
 def delete_kb_projection(driver, kb_id: str, batch_size: int = 5000) -> int:
     """Delete a KB's entire projection: all versions, the GraphVersion markers and the KB anchor (all carry kb_id)."""
-    return _delete_matching(driver, "{kb_id: $kb_id}", {"kb_id": kb_id}, batch_size)
+    return _delete_matching(driver, _scoped_matches(kb_id, None), batch_size)
 
 
 def delete_version(driver, kb_id: str, graph_version: str, batch_size: int = 5000) -> int:
-    return _delete_matching(driver, "{kb_id: $kb_id, graph_version: $graph_version}",
-                            {"kb_id": kb_id, "graph_version": graph_version}, batch_size)
+    return _delete_matching(driver, _scoped_matches(kb_id, graph_version), batch_size)
 
 
 _COUNT_QUERIES = {

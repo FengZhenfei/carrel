@@ -45,7 +45,7 @@ class GraphEntityTypesTests(unittest.TestCase):
 
         root = Path(__file__).resolve().parents[1]
         problems: list[str] = []
-        for path in sorted(list((root / "kb_pipeline").rglob("*.py")) + list((root / "kb_server").rglob("*.py"))):
+        for path in sorted(p for pkg in ("kb_pipeline", "kb_server", "kb_search") for p in (root / pkg).rglob("*.py")):
             src = path.read_text(encoding="utf-8")
             top = symtable.symtable(src, str(path), "exec")
             defined = {s.get_name() for s in top.get_symbols() if s.is_assigned() or s.is_imported() or s.is_parameter()}
@@ -101,11 +101,12 @@ class GraphEntityTypesTests(unittest.TestCase):
 
                 class S:
                     graph_work_dir = Path(tmp) / "work"
-                    qdrant_url = "http://127.0.0.1:6333"
+                    qdrant_url = "http://127.0.0.1:1"      # unreachable: 6333 on a deployment host's loopback is a live store
                     qdrant_api_key = ""
 
                 errors: list[str] = []
-                with mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}), \
+                with mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()), \
+                     mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}), \
                      mock.patch.object(maintenance, "_drop_neo4j_projection", return_value={}):
                     maintenance._drop_graph_data(S, con, kb_id="kb_003",
                                                  collection="kb_003", errors=errors)
@@ -127,7 +128,7 @@ class GraphEntityTypesTests(unittest.TestCase):
         from kb_server import service
 
         self.assertNotIn(GRAPH_TUNE_STEP, GRAPH_LLM_STEPS)
-        self.assertNotIn(GRAPH_TUNE_STEP, service.GRAPH_LLM_STEPS)
+        self.assertFalse(hasattr(service, "GRAPH_LLM_STEPS"))      # the console keeps no copy of its own; validation takes it from graph.build
 
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "s.db"

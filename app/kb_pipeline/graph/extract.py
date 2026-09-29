@@ -85,15 +85,32 @@ _LATEX_WRAP_RE = re.compile(r"\\(?:text|mathrm|mathit|mathbf|textrm|operatorname
 _LATEX_OVERLINE_RE = re.compile(r"\\overline\s*\{([^{}]*)\}")
 _LATEX_SUBSUP_RE = re.compile(r"[_^]\s*\{([^{}]*)\}")
 _LATEX_SUBSUP_BARE_RE = re.compile(r"[_^]([A-Za-z0-9])")
+# recognisably LaTeX: a braced subscript / superscript, a known wrapper command, or a paired $...$ holding a
+# subscript, superscript, command or brace
+_LATEX_EVIDENCE_RE = re.compile(
+    r"[_^]\s*\{|\\(?:text|mathrm|mathit|mathbf|textrm|operatorname|overline)\s*\{|\$[^$]*[_^\\{}][^$]*\$")
+
+
+def _subsup(m: re.Match) -> str:
+    """A subscript / superscript drops its marker and joins the preceding name (t_{AS} -> tAS); a numeric
+    superscript after a digit keeps its ^ -- 10^{9} joined into 109 would be another number."""
+    body = m.group(1)
+    after_digit = m.start() > 0 and m.string[m.start() - 1].isdigit()
+    if m.group(0)[0] == "^" and after_digit and re.match(r"[-+−]?\d", body):
+        return "^" + body
+    return body
 
 
 def strip_latex(name: str) -> str:
     """Names parsed out of datasheets often carry LaTeX: $t_{\\text{AS}}$ -> tAS, $V_{CC}$ -> VCC,
     $\\overline{\\mathrm{CE}}$ -> CE# (overline = active low, written CE# in the body text). The same symbol is
     LaTeX in tables and plain text in the body; without normalisation they become two entities, and the LaTeX
-    form has a very low vector similarity to questions."""
+    form has a very low vector similarity to questions.
+    Only restored when the name is recognisably LaTeX: a lone $, backslash or underscore belongs to variable
+    names, currencies and paths ($SKILL_DIR, A$, C:\\data\\my_file), and treating such names as LaTeX would turn
+    them into different names."""
     text = str(name or "")
-    if "$" not in text and "\\" not in text and "_{" not in text and "^{" not in text:
+    if not _LATEX_EVIDENCE_RE.search(text):
         return text
     text = re.sub(r"\s+(?=\$?[_^]\{)", "", text)      # "t $_{AA}$": the space before a subscript
     text = text.replace("$", "")
@@ -101,12 +118,39 @@ def strip_latex(name: str) -> str:
         before = text
         text = _LATEX_WRAP_RE.sub(r"\1", text)
         text = _LATEX_OVERLINE_RE.sub(r"\1#", text)
-        text = _LATEX_SUBSUP_RE.sub(r"\1", text)
+        text = _LATEX_SUBSUP_RE.sub(_subsup, text)
         if text == before:
             break
-    text = _LATEX_SUBSUP_BARE_RE.sub(r"\1", text)
+    text = _LATEX_SUBSUP_BARE_RE.sub(_subsup, text)
     text = text.replace("\\", "").replace("{", "").replace("}", "")
     return text
+
+
+_MATH_RE = re.compile(r"\$([^$]+)\$")
+_LATEX_ESCAPED_RE = re.compile(r"\\([%#&])")
+
+
+def _restore_math(m: re.Match) -> str:
+    inner = m.group(1)
+    plain = _LATEX_ESCAPED_RE.sub(r"\1", inner)
+    for _ in range(4):
+        before = plain
+        plain = _LATEX_OVERLINE_RE.sub(r"\1", _LATEX_WRAP_RE.sub(r"\1", plain))
+        if plain == before:
+            break
+    if "\\" in plain or (plain == inner and not _LATEX_SUBSUP_RE.search(inner)):
+        return m.group(0)
+    return strip_latex(m.group(0))
+
+
+def strip_math(text: str) -> str:
+    """LaTeX in value text (a fact's value, unit and conditions): only paired $...$ fragments are restored, and
+    only when the fragment holds a braced subscript / superscript, a known wrapper command or an escaped symbol
+    and no other command ($V_{CC}$ + 0.5 -> VCC + 0.5, $5\\%$ -> 5%). Everything else is left exactly as it is:
+    a lone $, backslash or brace belongs to currencies, paths and variable names ($85K, ${HOME}_dir,
+    team\\members), all of which strip_latex would delete; commands such as \\frac{1}{2} or \\pm leave only a run
+    of letters and digits once the backslash is gone, so they are better kept verbatim."""
+    return _MATH_RE.sub(_restore_math, str(text or ""))
 
 
 def normalize_name(name: str) -> str:
@@ -442,12 +486,14 @@ def prompt_hash() -> str:
 
 
 def extraction_fingerprint(spec: LLMSpec, schema: ExtractionSchema, *, max_gleanings: int) -> str:
-    # extract-v5: the type menu (with definitions and parents), the KB's few-shot examples and the per-kind caps
-    # all go into the fingerprint -- they are all in the prompt, so changing them invalidates the cache; the
-    # predicate menu is still hashed in its full prompt form (name + description + endpoints)
+    # the type menu (with definitions and parents), the KB's few-shot examples and the per-kind caps all go into
+    # the fingerprint -- they are all in the prompt, so changing them invalidates the cache; the predicate menu is
+    # still hashed in its full prompt form (name + description + endpoints).
+    # The version label follows the stored output: from extract-v6 on, names are only restored when they are
+    # recognisably LaTeX
     caps = ",".join(f"{k}={v[0]}/{v[1]}" for k, v in sorted(RECORD_CAPS.items())) + f",table={RECORD_CAPS_TABLE_BODY[0]}/{RECORD_CAPS_TABLE_BODY[1]}"
     raw = "|".join([
-        "extract-v5", spec.model_id, spec.protocol,
+        "extract-v6", spec.model_id, spec.protocol,
         type_menu(schema), predicate_menu(schema), schema.language or "",
         hashlib.sha256((schema.examples or "").encode("utf-8")).hexdigest()[:16], caps,
         str(int(max_gleanings)), str(GLEANING_MIN_TOKENS), prompt_hash(),
@@ -511,9 +557,12 @@ class GraphExtractor:
                 break
             messages = messages + [{"role": "assistant", "content": response},
                                    {"role": "user", "content": prompts.LOOP_PROMPT}]
-            answer = self.client.chat(messages, max_tokens=8)
+            # the answer to the yes/no question becomes response: it is what the next round appends to the history.
+            # Appending the previous gleaning output instead would put that output into the history twice, as if
+            # the model had answered the yes/no question with it
+            response = self.client.chat(messages, max_tokens=8)
             calls += 1
-            if not answer.strip().upper().startswith("Y"):
+            if not response.strip().upper().startswith("Y"):
                 break
         context = "\n".join([unit.text or "", unit.document_label or "", unit.section_label or "", unit.rel_path or ""])
         entities, relations, ungrounded = ground_records(entities, relations, context=context, example_names=self.example_names)

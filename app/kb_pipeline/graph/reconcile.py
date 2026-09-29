@@ -18,7 +18,7 @@ from typing import Any
 from .concepts import concept_norm
 from .facts import classify_value
 from ..measure_units import unit_key
-from .temporal import axis_sort_key
+from .temporal import axis_sort_key, axis_value_kind
 
 VALUE_TOLERANCE = 1e-6
 
@@ -127,10 +127,17 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
         by_axis: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             by_axis.setdefault(fact_axis(r), []).append(r)
-        skey = "s" + hashlib.sha256("|".join(key).encode("utf-8")).hexdigest()[:16]
-        axes = [a for a in by_axis if a]
-        if len(axes) >= 2:
+        # date axes and version axes form separate series: "2023-10-31" and "v6.0" have no order between them, so
+        # in one series the start, the end and the trend would all be arbitrary
+        axes_by_kind: dict[str, list[str]] = {}
+        for a in by_axis:
+            if a:
+                axes_by_kind.setdefault(axis_value_kind(a), []).append(a)
+        for kind, axes in axes_by_kind.items():
+            if len(axes) < 2:
+                continue
             stats["series"] += 1
+            skey = "s" + hashlib.sha256("|".join((*key, kind)).encode("utf-8")).hexdigest()[:16]
             ordered = sorted(axes, key=axis_sort_key)
             for idx, axis in enumerate(ordered):
                 for r in by_axis[axis]:

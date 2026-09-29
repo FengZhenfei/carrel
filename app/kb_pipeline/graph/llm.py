@@ -653,7 +653,7 @@ class ChatClient:
 
         A single failure (LLMCallError or any other exception) is recorded in error and the run continues; a
         circuit break or an interruption stops the whole pool immediately and re-raises, since carrying on in
-        those two cases only burns money or delays the exit.
+        those two cases only burns money or delays the exit. A circuit break always raises LLMCircuitOpen.
         """
         items = list(items)
         total = len(items)
@@ -680,11 +680,16 @@ class ChatClient:
                         progress(done_count, total)
                 if self.stop.is_set():
                     raise LLMInterrupted("stop requested")
-        except BaseException:
+        except BaseException as exc:
             self.stop.set()
             for future in pending:
                 future.cancel()
             pool.shutdown(wait=False, cancel_futures=True)
+            # A circuit break halts the other threads by setting stop, so they raise LLMInterrupted; whose result
+            # arrives first is not fixed, and reporting an interruption would record the build as stopped and
+            # lose the reason for the break
+            if isinstance(exc, LLMInterrupted) and self.circuit_reason:
+                raise LLMCircuitOpen(self.circuit_reason) from exc
             raise
         pool.shutdown(wait=True)
         return results

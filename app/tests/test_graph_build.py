@@ -150,6 +150,21 @@ class RebuildPolicyTests(unittest.TestCase):
             decision = mod.evaluate_rebuild(settings, source_key=key, source=source)
             self.assertTrue(decision["due"], decision)
 
+    def test_evaluating_the_policy_does_not_touch_the_schema(self) -> None:
+        """The console evaluates the rebuild policy of every KB with a graph once a minute: nothing on that path may
+        create tables or run migrations."""
+        from unittest import mock
+
+        base = [{"point_id": f"p{i}", "chunk_uid": f"u{i}", "doc_id": "d", "content_version": "v"} for i in range(4)]
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, settings, key, source = self._prepare(
+                tmp, policy={"graph_rebuild_interval": "7d"}, chunks=base + [dict(base[0], point_id="new")],
+                baseline=[c["point_id"] for c in base], finished_days_ago=10)
+            with mock.patch.object(db, "init_db", side_effect=AssertionError("evaluating the policy must not initialise the state database")), \
+                    mock.patch.object(db, "migrate_schema", side_effect=AssertionError("evaluating the policy must not run migrations")):
+                decision = mod.evaluate_rebuild(settings, source_key=key, source=source)
+            self.assertTrue(decision["due"], decision)
+
     def test_interval_due_but_corpus_unchanged_is_skipped(self) -> None:
         chunks = [{"point_id": "p1", "chunk_uid": "u1", "doc_id": "d", "content_version": "v"}]
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,8 +402,6 @@ class GraphCacheFingerprintTests(unittest.TestCase):
     So a config fingerprint is recorded when the build starts, and after a pause it is compared with the
     current config."""
 
-    REPO = Path(__file__).resolve().parents[2]
-
     # _resolve_graph_llm reads graph_llm from the **database** (by kb_id), not from the KBSource passed in,
     # so the fixture must create real kb_sources rows + a model registry.
     def _prep(self, tmp: str):
@@ -431,9 +444,9 @@ class GraphCacheFingerprintTests(unittest.TestCase):
         return graph_cache_fingerprint(self._settings(state), source)
 
     def _settings(self, state: Path):
-        """The fingerprint hashes settings.yaml, the three upstream prompt constants and the render script --
-        pointing at the real repository, these tests also guard that those paths still exist."""
-        return SimpleNamespace(state_db=state, runtime_dir=self.REPO / "runtime")
+        """The fingerprint only reads the model registry from the state database, no file; runtime_dir stays inside
+        the temporary directory."""
+        return SimpleNamespace(state_db=state, runtime_dir=state.parent / "runtime")
 
     def test_everything_that_invalidates_the_cache_changes_the_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,9 +506,7 @@ class GraphCacheFingerprintTests(unittest.TestCase):
                                        fingerprint=fingerprint, corpus=corpus)
         try:
             with mock.patch.object(service, "settings", lambda: SimpleNamespace(
-                    state_db=state, mirror_root=root,
-                    graphrag_root=self.REPO / "graphrag",
-                    runtime_dir=self.REPO / "runtime")):
+                    state_db=state, mirror_root=root, runtime_dir=state.parent / "runtime")):
                 return service._paused_cache_reuse(con, kb_id, row)
         finally:
             con.close()
@@ -780,9 +791,9 @@ class RetiredRaptorModeTests(unittest.TestCase):
 
 
 class GraphBuildRecordPruneTests(unittest.TestCase):
-    """Now that artifacts keep only the current version (GRAPH_GC_KEEP_VERSIONS default 1), build records
+    """Now that artifacts keep only the latest few versions (GRAPH_GC_KEEP_VERSIONS, default 2), build records
     also keep only the useful rows: the running one, the latest successful one, and those after the latest
-    full version; older ones are deleted together with their chunk ledger, phase check-ins and unit table."""
+    full version; older ones are deleted together with their chunk ledger and phase check-ins."""
 
     def test_prune_keeps_the_rows_the_policy_needs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -816,7 +827,6 @@ class GraphBuildRecordPruneTests(unittest.TestCase):
         self.assertIn('"truncated_cached": asset_flags.get("truncated", 0)', src)
         self.assertIn('facts_stats.get("partial_units_total")', _repo_file("app/kb_server/service.py"))
         self.assertIn('gc_step("build_records_pruned", prune_records', src)                         # 2026-09-13: its own step, not dragged down by the earlier cleanups
-        self.assertIn('os.getenv("GRAPH_GC_KEEP_VERSIONS", "2")', _repo_file("app/kb_pipeline/config.py"))   # 09-06 evening: keep the previous version too so it can be switched back
 
 
 class ExtractionPersistenceTests(unittest.TestCase):
@@ -837,12 +847,6 @@ class ExtractionPersistenceTests(unittest.TestCase):
                 self.assertEqual(rows["u1"]["entities"], [{"name": "A"}])
                 self.assertEqual(db.graph_extraction_entity_total(con, "kb_003", "fp2", ["u1"]), 2)
                 self.assertEqual(db.graph_extraction_count(con, "kb_003"), 3)
-                units = [Unit(unit_id="u1", doc_id="d", rel_path="a", section_path=["S", "T"], block_ids=["b"],
-                              chunk_uids=["c1", "c2"], point_ids=["p1", "p2"], n_tokens=12, text="t", order=0)]
-                bid = db.begin_graph_build(con, source_key="k", kb_id="kb_003", source_collection="kb_003", graph_version="v1")
-                self.assertEqual(db.replace_graph_units(con, bid, units), 1)
-                row = con.execute("SELECT section, chunk_count, n_tokens FROM graph_units WHERE graph_build_id=?", (bid,)).fetchone()
-                self.assertEqual((row["section"], row["chunk_count"], row["n_tokens"]), ("S > T", 2, 12))
                 self.assertEqual(db.delete_graph_extractions(con, "kb_003"), 3)
 
     def test_prune_keeps_current_units_across_fingerprints(self) -> None:
@@ -861,6 +865,38 @@ class ExtractionPersistenceTests(unittest.TestCase):
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
         self.assertIn("db.prune_graph_extractions(con, source.kb_id, keep_ids)", src)
         self.assertIn("doc_ids is None and paths.units_file.exists()", src)   # a sample build does not clear the cache
+
+    def test_fact_cache_is_pruned_by_the_same_unit_table(self) -> None:
+        """The facts cache is content-addressed by unit just like the extraction cache: when a document is deleted
+        or a re-parse changes the unit ids, the fact rows of the old units have to go as well."""
+        from kb_pipeline.graph.build import prune_unit_caches
+        from kb_pipeline.graph.units import write_units
+
+        from _support import _unit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"
+            db.init_db(state)
+            with db.connect(state) as con:
+                for unit, fp in (("u1", "fp1"), ("u1", "fp2"), ("gone", "fp1"), ("gone2", "fp2")):
+                    db.save_graph_facts(con, kb_id="kb_003", unit_id=unit, fingerprint=fp,
+                                        facts=[{"subject": "A", "value": "1"}], model="m", calls=1)
+                    db.save_graph_extraction(con, kb_id="kb_003", unit_id=unit, fingerprint=fp,
+                                             entities=[], relations=[], model="m", calls=1)
+                db.save_graph_facts(con, kb_id="kb_009", unit_id="gone", fingerprint="fp1", facts=[], model="m", calls=1)
+            units_file = Path(tmp) / "units.jsonl"
+            write_units(units_file, [_unit("u1"), _unit("u-new", order=1)])          # u-new has no cache yet
+            settings = SimpleNamespace(state_db=state)
+            source = SimpleNamespace(kb_id="kb_003")
+            self.assertEqual(prune_unit_caches(settings, source, units_file),
+                             {"extraction_cache_pruned": 2, "facts_cache_pruned": 2})
+            with db.connect(state) as con:
+                self.assertEqual(db.graph_fact_unit_ids(con, "kb_003", "fp1"), {"u1"})      # both fingerprints of a current unit are kept
+                self.assertEqual(db.graph_fact_unit_ids(con, "kb_003", "fp2"), {"u1"})
+                self.assertEqual(db.graph_fact_unit_ids(con, "kb_009", "fp1"), {"gone"})    # other KBs untouched
+                self.assertEqual(db.graph_extraction_count(con, "kb_003"), 2)
+            self.assertEqual(prune_unit_caches(settings, source, units_file),
+                             {"extraction_cache_pruned": 0, "facts_cache_pruned": 0})
 
 
 class BundleTests(unittest.TestCase):
@@ -1035,6 +1071,10 @@ class BuildWiringTests(unittest.TestCase):
         self.assertTrue(validate_graph_unit_config(3, 5))
         self.assertTrue(validate_graph_unit_config("x", 1))
         self.assertEqual(validate_graph_schema_config([{"name": "a"}], {"t": "p"}), [])
+        # the limit is counted before truncating: the list used to be cut to 24 first and compared afterwards, so it
+        # never exceeded the limit and the extra predicates were dropped silently on saving
+        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(24)] + ["p0", "related_to"], {}), [])
+        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(25)], {}), ["At most 24 predicates"])
         self.assertTrue(validate_graph_schema_config("", {"t": "p", "u": "q", "v": "r", "w": "s", "x": "t", "y": "u", "z": "v", "aa": "w", "bb": "x"}))
         with tempfile.TemporaryDirectory() as tmp:
             src = discovery.build_source(Path(tmp), "库", {
@@ -1440,34 +1480,102 @@ class IncrementalAppendTests(unittest.TestCase):
         self.assertEqual(sorted(deleted), sorted([versions[1], versions[3]]))
         self.assertEqual(out["total_deleted_nodes"], 20)
 
-    def test_neo4j_version_delete_removes_rels_first_and_halves_the_batch_under_memory_pressure(self) -> None:
-        from neo4j.exceptions import TransientError
+    class _FakeNeo4j:
+        """Records every Cypher statement and simulates "how many relationships / nodes are left" per label. segment:
+        the label name for a labelled match, * for the unlabelled sweep."""
 
+        def __init__(self, remaining: dict[str, dict[str, int]], *, rel_limit: int | None = None, fail_at: tuple[str, str] | None = None):
+            self.remaining = remaining
+            self.rel_limit = rel_limit
+            self.fail_at = fail_at
+            self.calls: list[tuple[str, str, int]] = []
+            self.queries: list[tuple[str, dict]] = []
+
+        def session(self):
+            return self
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def run(self, query, **params):
+            from neo4j.exceptions import TransientError
+
+            self.queries.append((query, params))
+            m = re.match(r"MATCH \(n(?::(\w+))?\)", query)
+            segment = m.group(1) or "*"
+            if "RETURN count(n) AS count" in query:
+                return SimpleNamespace(single=lambda: {"count": self.remaining.get(segment, {}).get("nodes", 0)})
+            kind = "rels" if "DELETE r" in query else "nodes"
+            size = int(params["batch_size"])
+            self.calls.append((segment, kind, size))
+            if self.fail_at == (segment, kind):
+                self.fail_at = None
+                raise ConnectionError("neo4j went away")
+            if kind == "rels" and self.rel_limit is not None and size > self.rel_limit:
+                raise TransientError("The allocation of an extra 2.0 MiB would use more than the limit 1.4 GiB")
+            left = self.remaining.setdefault(segment, {})
+            n = min(size, left.get(kind, 0))
+            left[kind] = left.get(kind, 0) - n
+            return SimpleNamespace(single=lambda: {"n": n})
+
+    def test_neo4j_version_delete_removes_rels_first_and_halves_the_batch_under_memory_pressure(self) -> None:
         from kb_pipeline.graph.neo4j_import import delete_version
 
-        calls: list[tuple[str, int]] = []
-        remaining = {"rels": 12000, "nodes": 7000}
-
-        class FakeSession:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def run(self, query, **params):
-                kind = "rels" if "DELETE r" in query else "nodes"
-                size = int(params["batch_size"])
-                calls.append((kind, size))
-                if kind == "rels" and size > 2500:
-                    raise TransientError("The allocation of an extra 2.0 MiB would use more than the limit 1.4 GiB")
-                n = min(size, remaining[kind]); remaining[kind] -= n
-                return SimpleNamespace(single=lambda: {"n": n})
-
-        driver = SimpleNamespace(session=lambda: FakeSession())
+        driver = self._FakeNeo4j({"Entity": {"rels": 12000, "nodes": 7000}, "GraphVersion": {"rels": 1, "nodes": 1}}, rel_limit=2500)
         total = delete_version(driver, "kb_003", "003-v", batch_size=5000)
-        self.assertEqual(total, 7000)                                                   # the return value is the node count
-        self.assertEqual([c for c in calls if c[0] == "rels"][:3], [("rels", 5000), ("rels", 2500), ("rels", 2500)])   # halved on hitting the limit
-        first_node = next(i for i, c in enumerate(calls) if c[0] == "nodes")
-        self.assertTrue(all(c[0] == "rels" for c in calls[:first_node]))                # nodes are deleted only after all relationships
-        self.assertEqual(calls[first_node], ("nodes", 5000))                              # the node round starts from the original batch size
-        self.assertEqual(remaining, {"rels": 0, "nodes": 0})
+        self.assertEqual(total, 7001)                                                   # the return value is the node count
+        entity = [(k, s) for seg, k, s in driver.calls if seg == "Entity"]
+        self.assertEqual([c for c in entity if c[0] == "rels"][:3], [("rels", 5000), ("rels", 2500), ("rels", 2500)])   # halved on hitting the limit
+        first_node = next(i for i, c in enumerate(entity) if c[0] == "nodes")
+        self.assertTrue(all(c[0] == "rels" for c in entity[:first_node]))               # nodes are deleted only after all relationships
+        self.assertEqual(entity[first_node], ("nodes", 5000))                             # the node round starts from the original batch size
+        self.assertEqual(driver.remaining["Entity"], {"rels": 0, "nodes": 0})
+
+    def test_neo4j_delete_seeks_by_label_and_keeps_the_version_marker_until_last(self) -> None:
+        """Matching by properties without a label scans every node of the database for every batch; and with the
+        GraphVersion marker deleted among the other nodes, a cleanup interrupted halfway could lose the marker, after
+        which the remaining nodes could never be listed again."""
+        from kb_pipeline.graph.neo4j_import import NODE_LABELS, delete_kb_projection, delete_version
+
+        def world():
+            return {label: {"rels": 3, "nodes": 2} for label in NODE_LABELS}
+
+        driver = self._FakeNeo4j(world(), fail_at=("Entity", "nodes"))
+        with self.assertRaises(ConnectionError):
+            delete_version(driver, "kb_003", "003-v", batch_size=5000)
+        self.assertEqual(driver.remaining["GraphVersion"], {"rels": 3, "nodes": 2})        # interrupted halfway: the marker is still there
+        self.assertEqual(driver.remaining["Entity"]["nodes"], 2)
+        self.assertGreater(delete_version(driver, "kb_003", "003-v", batch_size=5000), 0)  # the next round finishes the deletion
+        self.assertTrue(all(v == {"rels": 0, "nodes": 0} for v in driver.remaining.values()), driver.remaining)
+
+        driver = self._FakeNeo4j(world())
+        delete_version(driver, "kb_003", "003-v", batch_size=5000)
+        segments = list(dict.fromkeys(seg for seg, _, _ in driver.calls))
+        self.assertEqual(segments[-2:], ["*", "GraphVersion"])                              # the sweep segment, only then the marker
+        self.assertEqual(set(segments[:-2]), set(NODE_LABELS) - {"GraphVersion"})
+        unlabeled = [q for q, _ in driver.queries if q.startswith("MATCH (n) ")]
+        self.assertEqual(len(unlabeled), 2)                                                 # only the sweep scans the whole database: once for relationships, once for nodes
+        self.assertTrue(all("NOT n:GraphVersion" in q for q in unlabeled))
+        for query, params in driver.queries:
+            if query.startswith("MATCH (n:Entity)"):
+                self.assertIn("n.uid STARTS WITH $prefix", query)                           # uses the unique index on uid
+                self.assertEqual(params["prefix"], "kb_003:003-v:Entity:")
+                self.assertEqual((params["kb_id"], params["graph_version"]), ("kb_003", "003-v"))
+
+        driver = self._FakeNeo4j({**world(), "KB": {"rels": 0, "nodes": 1}})
+        self.assertEqual(delete_kb_projection(driver, "kb_003"), 2 * len(NODE_LABELS) + 1)
+        segments = list(dict.fromkeys(seg for seg, _, _ in driver.calls))
+        self.assertEqual(segments[-3:], ["*", "GraphVersion", "KB"])                        # whole-KB deletion: the anchor after the markers
+        self.assertEqual({p.get("prefix") for _, p in driver.queries if "prefix" in p}, {"kb_003:"})
+        self.assertTrue(all("graph_version" not in p for _, p in driver.queries))
+
+    def test_neo4j_version_count_adds_up_label_seeks(self) -> None:
+        from kb_pipeline.graph.neo4j_import import NODE_LABELS, count_version_nodes
+
+        driver = self._FakeNeo4j({label: {"nodes": 10} for label in NODE_LABELS} | {"*": {"nodes": 999}})
+        self.assertEqual(count_version_nodes(driver, "kb_003", "003-v"), 10 * len(NODE_LABELS))
+        self.assertFalse([q for q, _ in driver.queries if q.startswith("MATCH (n) ")])      # counting does not scan the whole database
+        self.assertEqual(count_version_nodes(self._FakeNeo4j({}), "kb_003", "no-such-version"), 0)
 
     def test_resumed_build_recomputes_the_same_corpus_fingerprint(self) -> None:
         """2026-09-29 audit: a resumed build reads the chunk ledger back from graph_build_chunks; without text_sha the
@@ -1979,6 +2087,62 @@ class GraphVersionRetentionTests(unittest.TestCase):
             self.assertEqual([Path(d).name for d in dry["removed_dirs"]], [versions[1]])
             self.assertTrue((parent / versions[1]).exists())                                  # dry_run deletes nothing
 
+    def test_ledgers_stay_only_where_something_reads_them(self) -> None:
+        """Append and failed records since the last full build are kept for counting, but nobody reads their chunk
+        ledgers, each one the size of the whole KB: ledgers stay only for the current version, the latest full
+        version, versions whose artifacts remain (rollback / resume) and the running build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                def row(bid, kind, status, started, finished):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                        "status, started_at, finished_at, build_kind) VALUES(?, 'k', 'kb_1', 'kb_1', ?, ?, ?, ?, ?)",
+                        (bid, "v-" + bid, status, started, finished, kind))
+                    db.replace_graph_build_chunks(con, bid, [{"point_id": f"p-{bid}-{i}", "chunk_uid": f"u{i}", "doc_id": "d",
+                                                              "content_version": "v"} for i in range(3)])
+                    db.mark_graph_phase_done(con, bid, "prepare_input")
+                row("full", "full", "done", 100, 110)             # the baseline of the rebuild policy
+                row("a1", "append", "done", 200, 210)
+                row("failed", "append", "failed", 250, 260)
+                row("a2", "append", "done", 300, 310)             # the previous version within the keep slots (rollback target)
+                row("a3", "append", "done", 400, 410)             # the current version: baseline of the next append
+                row("paused", "append", "cancelled", 500, 510)    # kept for a resume
+                row("run", "append", "running", 600, None)
+                self.assertEqual(db.prune_graph_builds(con, "kb_1", keep_versions={"v-a3", "v-a2", "v-paused"}), 0)
+                ledgers = {r[0]: r[1] for r in con.execute(
+                    "SELECT graph_build_id, COUNT(*) FROM graph_build_chunks GROUP BY graph_build_id")}
+                self.assertEqual(ledgers, {"full": 3, "a2": 3, "a3": 3, "paused": 3, "run": 3})
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM graph_builds").fetchone()[0], 7)           # no record lost
+                self.assertEqual(db.count_graph_builds_since(con, "kb_1", kind="append", since_ts=110), 3)   # counting unchanged
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM graph_build_phases").fetchone()[0], 7)    # phase check-ins stay to weight the progress bar
+                self.assertEqual(len(db.graph_build_doc_chunks(con, "a3")["d"]), 3)                          # the append baseline is readable
+                self.assertEqual(len(db.graph_build_point_ids(con, "full")), 3)                              # the rebuild baseline is readable
+                self.assertEqual(len(db.graph_build_chunk_refs(con, "paused")), 3)                           # a resume can read it
+
+    def test_trial_builds_do_not_move_the_baselines(self) -> None:
+        """A trial build (a few documents only) is also recorded as done and of the full kind, but it is not the
+        current graph: pruning must not take it as a baseline and delete the records and chunk ledgers of the real
+        full version and of the current version."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                def row(bid, kind, started, finished, manifest="{}"):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                        "status, started_at, finished_at, build_kind, manifest_json) VALUES(?, 'k', 'kb_1', 'kb_1', ?, 'done', ?, ?, ?, ?)",
+                        (bid, "v-" + bid, started, finished, kind, manifest))
+                    db.replace_graph_build_chunks(con, bid, [{"point_id": f"p-{bid}", "chunk_uid": "u", "doc_id": "d", "content_version": "v"}])
+                row("full", "full", 100, 110)
+                row("a1", "append", 200, 210)
+                row("trial", "full", 300, 310, json.dumps({"input": {"doc_filter": ["kb_1:7"]}}))
+                self.assertEqual(db.prune_graph_builds(con, "kb_1"), 0)
+                self.assertEqual(str(db.latest_successful_graph_build(con, "k")["graph_build_id"]), "a1")
+                self.assertEqual(str(db.latest_successful_graph_build(con, "k", kind="full")["graph_build_id"]), "full")
+                self.assertEqual(db.graph_build_point_ids(con, "full"), {"p-full"})
+                self.assertEqual(db.graph_build_point_ids(con, "a1"), {"p-a1"})
+                self.assertEqual(db.graph_build_point_ids(con, "trial"), set())        # nobody reads a trial build's ledger
+
     def test_prune_keeps_the_rows_of_kept_versions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "s.db"; db.init_db(state)
@@ -2321,3 +2485,1165 @@ class GraphVersionRetentionTests(unittest.TestCase):
         body = source_text[source_text.index("def build_graph("):source_text.index("def record_build_outcome(")]
         self.assertLess(body.index('status="done"'), body.index('stage("Cleaning up old versions")'))   # done first, clean-up second
         self.assertIn("record_build_outcome(", body)
+
+
+class BuildInterruptTests(unittest.TestCase):
+    """When a stop signal lands inside an HTTP call (embedding, writing vectors), the interruption the handler raises
+    is swallowed by the client's retries or wrapped in the client's own exception type. The build must still wind
+    down: the mark is set as soon as the signal arrives, the phase is neither retried nor marked done, the next batch
+    / phase does not start, and the record is written as cancelled like any interruption."""
+
+    def _phase(self, tmp: str):
+        state = Path(tmp) / "s.db"
+        db.init_db(state)
+        with db.connect(state) as con:
+            bid = db.begin_graph_build(con, source_key="k", kb_id="kb_x", source_collection="kb_x", graph_version="v1")
+        return SimpleNamespace(state_db=state), bid
+
+    def test_a_signal_swallowed_or_wrapped_inside_a_phase_still_ends_the_build(self) -> None:
+        import signal
+        import threading
+
+        from kb_pipeline.graph.build import GraphBuildInterrupted, _install_build_signal_handlers, _run_phase
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, bid = self._phase(tmp)
+            stop, interrupted = threading.Event(), threading.Event()
+            calls = {"wrapped": 0, "swallowed": 0, "next": 0}
+            done: set[str] = set()
+
+            def send_signal() -> None:
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)                          # the handler runs at the main thread's next bytecode
+
+            def wrapped():                                # the vector store client wraps any exception raised while sending in its own type
+                calls["wrapped"] += 1
+                try:
+                    send_signal()
+                except Exception as exc:
+                    raise ConnectionError(exc) from exc
+
+            restore = _install_build_signal_handlers(stop, interrupted)
+            try:
+                with self.assertRaises(GraphBuildInterrupted):
+                    _run_phase(settings, build_id=bid, phase="enrich", label="Writing vectors", fn=wrapped, done=done,
+                               stage=lambda label: None, retries=3, backoff=0, interrupted=interrupted)
+            finally:
+                restore()
+            self.assertEqual(calls["wrapped"], 1)         # not retried
+            self.assertTrue(stop.is_set() and interrupted.is_set())
+            self.assertEqual(done, set())
+
+            def swallowed():                              # the branch that drops one route of resolution candidates when the vector service fails: the interruption passes for an unavailable service
+                calls["swallowed"] += 1
+                try:
+                    send_signal()
+                except Exception:
+                    return "degraded"
+                return "complete"
+
+            def following():
+                calls["next"] += 1
+
+            stop, interrupted = threading.Event(), threading.Event()
+            restore = _install_build_signal_handlers(stop, interrupted)
+            try:
+                for phase, fn in (("merge", swallowed), ("facts", following)):
+                    with self.assertRaises(GraphBuildInterrupted):
+                        _run_phase(settings, build_id=bid, phase=phase, label=phase, fn=fn, done=done,
+                                   stage=lambda label: None, retries=3, backoff=0, interrupted=interrupted)
+            finally:
+                restore()
+            self.assertEqual((calls["swallowed"], calls["next"]), (1, 0))
+            self.assertEqual(done, set())                 # the output may be degraded: the phase is not marked done, a resume runs it again
+            with db.connect(settings.state_db) as con:
+                self.assertEqual(db.graph_phases_done(con, bid), [])
+            # no signal received: other exceptions are retried as before
+            flaky = iter([RuntimeError("hiccup"), "ok"])
+
+            def retried():
+                item = next(flaky)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            self.assertEqual(_run_phase(settings, build_id=bid, phase="compile", label="Compiling view pages", fn=retried, done=done,
+                                        stage=lambda label: None, retries=2, backoff=0, interrupted=threading.Event()), "ok")
+
+    def test_vector_writing_stops_at_the_next_batch(self) -> None:
+        from kb_pipeline.graph.build import GraphBuildInterrupted
+        from kb_pipeline.graph.vectors import write_graph_vectors
+
+        rows = [{"key": f"e{i}", "title": f"E{i}", "type": "t", "description": "d", "unit_ids": []} for i in range(5)]
+        upserts: list[int] = []
+
+        class FakeQ:
+            def get_collections(self): return SimpleNamespace(collections=[])
+            def create_collection(self, collection_name, vectors_config): pass
+            def get_collection(self, collection_name):
+                return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=4))))
+            def create_payload_index(self, **kw): pass
+            def upsert(self, collection_name, points, wait): upserts.append(len(points))
+
+        state = {"stop": False}
+
+        def embed(texts):
+            state["stop"] = True                          # the signal lands in the embedding call and a retry swallows it: the call returns normally
+            return [[0.0] * 4 for _ in texts]
+
+        def check_stop():
+            if state["stop"]:
+                raise GraphBuildInterrupted("stop")
+
+        with self.assertRaises(GraphBuildInterrupted):
+            write_graph_vectors(FakeQ(), embed, kb_id="kb_x", source_collection="kb_x", graph_version="v1",
+                                bundle={"entities": rows}, units_by_id={}, vector_size=4, batch=2, check_stop=check_stop)
+        self.assertEqual(upserts, [2])                    # the first batch is written, the second never starts
+
+
+class BuildGateTests(unittest.TestCase):
+    """Once the build holds the lock it writes the run record first and does the slow preparation afterwards; the
+    graph switch and the pause mark are checked again at the start and before publishing; the timer check rereads
+    each KB's configuration when its turn comes."""
+
+    VERSION = "001-20260930-000000-abcdef"
+
+    def _kb(self, tmp: str, *, config: dict | None = None):
+        from kb_pipeline import discovery
+        from kb_pipeline.graph import build as build_mod
+
+        root = Path(tmp)
+        mirror = root / "mirror"
+        (mirror / "库").mkdir(parents=True)
+        state = root / "state" / "s.db"
+        db.init_db(state)
+        with db.connect(state) as con:
+            db.upsert_llm(con, name="甲", base_url="http://x/v1", api_key="k", model_id="m")
+            src, _ = discovery.enroll(con, mirror, "库")
+            discovery.set_config(con, src.kb_id, {"graph_enabled": True, "graph_llm": {"extract": "甲", "summarize": "甲"},
+                                                  "graph_entity_types": ["role"], **(config or {})})
+        settings = SimpleNamespace(state_db=state, runtime_dir=root, graph_work_dir=root / "graph", mirror_root=mirror,
+                                   qdrant_url="http://q", qdrant_api_key="", graph_neo4j_import_after_build=False,
+                                   graph_llm_timeout_seconds=60, graph_llm_concurrency=1, graph_circuit_fails=0)
+        source = discovery.enrolled_sources(state, mirror)[src.kb_id]
+        return build_mod, settings, source
+
+    @staticmethod
+    def _set(settings, kb_id: str, updates: dict) -> None:
+        from kb_pipeline import discovery
+
+        with db.connect(settings.state_db) as con:
+            discovery.set_config(con, kb_id, updates)
+
+    @staticmethod
+    def _row(settings, kb_id: str):
+        with db.connect(settings.state_db) as con:
+            return con.execute("SELECT * FROM graph_builds WHERE kb_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                               (kb_id,)).fetchone()
+
+    def _finished_phases(self, build_mod, settings, source) -> None:
+        """A version with every phase finished that stopped just before publishing: resuming it goes straight to
+        switching the version."""
+        from kb_pipeline.graph.units import write_units
+
+        paths = build_mod.graph_paths(settings, source, self.VERSION)
+        paths.work_dir.mkdir(parents=True)
+        write_units(paths.units_file, [])
+        paths.manifest_file.write_text(json.dumps({"documents": 0}), encoding="utf-8")
+        paths.graph_file.write_text(json.dumps({"stats": {}}), encoding="utf-8")
+        with db.connect(settings.state_db) as con:
+            bid = db.begin_graph_build(con, source_key=source.kb_id, kb_id=source.kb_id, source_collection=source.collection,
+                                       graph_version=self.VERSION,
+                                       cache_fingerprint=build_mod.graph_cache_fingerprint(settings, source))
+            for phase, _label in build_mod.GRAPH_PHASES:
+                db.mark_graph_phase_done(con, bid, phase)
+            db.finish_graph_build(con, bid, status="cancelled", source_content_hash=build_mod.source_snapshot_hash([]),
+                                  error="stopped")
+
+    def _resume(self, build_mod, settings, source, *, during=None):
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+
+        switched: list[str] = []
+
+        def activate(q, *, source_collection, graph_version, graph_types=None):
+            switched.append(graph_version)
+            return {"previous": {}, "targets": {}, "changed": True, "skipped": []}
+
+        def prepare_labels(settings_, source_, **kw):
+            if during is not None:
+                during()
+            return source_, None
+
+        with mock.patch.object(build_mod, "qdrant_client", return_value=SimpleNamespace()), \
+                mock.patch.object(build_mod, "activate_graph_aliases", activate), \
+                mock.patch.object(build_mod, "drop_graph_aliases", lambda q, collection, types: []), \
+                mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels):
+            try:
+                out = build_mod.build_graph(settings, source_key=source.kb_id, source=source, graph_version=self.VERSION,
+                                            allow_existing_graph_version=True, run_gc=False)
+            except Exception as exc:
+                out = exc
+        return out, switched
+
+    def test_the_running_record_is_written_before_the_slow_preparation(self) -> None:
+        import signal
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+        from kb_pipeline.graph.lock import build_lock_held, build_lock_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            seen: dict = {}
+            outside = signal.getsignal(signal.SIGTERM)
+
+            def prepare_labels(settings_, source_, **kw):
+                row = self._row(settings, source.kb_id)
+                seen.update(status=row["status"], pid=row["worker_pid"], held=build_lock_held(build_lock_path(settings)),
+                            stop=kw.get("stop"), handler=signal.getsignal(signal.SIGTERM))
+                return source_, None
+
+            q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels):
+                with self.assertRaises(build_mod.NoGraphCorpus):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+            # during the minutes of label extraction, "Turn off knowledge graph" and "Pause build" find this process
+            # through the running record and its pid
+            self.assertEqual((seen["status"], seen["pid"], seen["held"]), ("running", os.getpid(), True))
+            self.assertIsNotNone(seen["stop"])                   # the stop event reaches the model calls of the label extraction
+            self.assertTrue(callable(seen["handler"]) and seen["handler"] is not outside)   # the stop signal already has a handler by then
+            self.assertIs(signal.getsignal(signal.SIGTERM), outside)
+            row = self._row(settings, source.kb_id)
+            self.assertEqual(row["status"], "failed")
+            self.assertFalse(build_lock_held(build_lock_path(settings)))
+
+            def stopped(settings_, source_, **kw):               # stopped by "Turn off knowledge graph" during label extraction
+                raise build_mod.GraphBuildInterrupted("Graph build interrupted by signal 15")
+
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build", stopped):
+                with self.assertRaises(build_mod.GraphBuildInterrupted):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+            self.assertEqual(self._row(settings, source.kb_id)["status"], "cancelled")
+            self.assertFalse(build_lock_held(build_lock_path(settings)))
+
+    def test_a_graph_switched_off_meanwhile_is_not_built(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            # the configuration held by the process is stale: in the registry the graph is already off
+            self._set(settings, source.kb_id, {"graph_enabled": False})
+            q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build",
+                                      side_effect=AssertionError("the graph is off, preparation must not start")):
+                with self.assertRaisesRegex(build_mod.GraphBuildInterrupted, "this build does not start"):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+            self.assertEqual(self._row(settings, source.kb_id)["status"], "cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+
+            def prepare_labels(settings_, source_, **kw):          # the graph is turned off during label extraction and the process is not stopped
+                self._set(settings, source.kb_id, {"graph_enabled": False})
+                return schema_flow.reload_source(settings_, source_), {"version_id": "v1", "origin": "auto_blank"}
+
+            q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels), \
+                    mock.patch.object(build_mod, "prepare_graph_input", side_effect=AssertionError("the corpus must not be prepared")):
+                with self.assertRaisesRegex(build_mod.GraphBuildInterrupted, "The knowledge graph has been turned off"):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+            self.assertEqual(self._row(settings, source.kb_id)["status"], "cancelled")
+
+    def test_publishing_rechecks_the_switch_and_the_pause_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            self._finished_phases(build_mod, settings, source)
+            out, switched = self._resume(build_mod, settings, source)
+            self.assertIsInstance(out, dict, out)
+            self.assertEqual(switched, [self.VERSION])                       # nothing changed: published as usual
+            self.assertEqual(self._row(settings, source.kb_id)["status"], "done")
+        for label, updates in (("graph off", {"graph_enabled": False}), ("paused", {"graph_paused": True})):
+            with tempfile.TemporaryDirectory() as tmp:
+                build_mod, settings, source = self._kb(tmp)
+                self._finished_phases(build_mod, settings, source)
+                out, switched = self._resume(build_mod, settings, source,
+                                             during=lambda: self._set(settings, source.kb_id, updates))
+                self.assertIsInstance(out, build_mod.GraphBuildInterrupted, label)
+                self.assertIn("this version is not published", str(out))
+                self.assertEqual(switched, [], label)
+                self.assertEqual(self._row(settings, source.kb_id)["status"], "cancelled", label)
+        # already paused when the run started (a manual build from the command line): built and published as usual
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp, config={"graph_paused": True})
+            self.assertTrue(source.graph_paused)
+            self._finished_phases(build_mod, settings, source)
+            out, switched = self._resume(build_mod, settings, source)
+            self.assertEqual(switched, [self.VERSION])
+
+    def _account(self, settings, kb_id: str):
+        row = self._row(settings, kb_id)
+        with db.connect(settings.state_db) as con:
+            return row, set(db.graph_phases_done(con, str(row["graph_build_id"])))
+
+    def test_a_resumed_build_stopped_before_it_prepared_anything_keeps_what_the_last_run_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            self._finished_phases(build_mod, settings, source)
+            corpus = self._row(settings, source.kb_id)["source_content_hash"]
+            self._set(settings, source.kb_id, {"graph_paused": True})          # "resume" and then "pause" clicked right away: the configuration held by the process is stale
+            out, switched = self._resume(build_mod, settings, source)
+            self.assertIn("this build does not start", str(out))
+            row, phases = self._account(settings, source.kb_id)
+            self.assertEqual((row["status"], row["source_content_hash"]), ("cancelled", corpus))
+            self.assertEqual(phases, {phase for phase, _label in build_mod.GRAPH_PHASES})
+            self._set(settings, source.kb_id, {"graph_paused": False})
+            out, switched = self._resume(build_mod, settings, source)
+            self.assertIsInstance(out, dict, out)                              # the finished phases all still count: published directly
+            self.assertEqual(switched, [self.VERSION])
+
+    def test_phases_finished_under_another_configuration_are_never_picked_up(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+
+        def resume(build_mod, settings, source, prepare_labels, failure):
+            with mock.patch.object(build_mod, "qdrant_client", return_value=SimpleNamespace()), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels), \
+                    mock.patch.object(build_mod, "prepare_graph_input", side_effect=LookupError("start over from corpus preparation")):
+                with self.assertRaises(failure):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source, graph_version=self.VERSION,
+                                          allow_existing_graph_version=True, run_gc=False)
+
+        # labels are only extracted in this round: the record's fingerprint becomes that of the new labels, and phases
+        # finished under the old labels are void
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            self._finished_phases(build_mod, settings, source)
+
+            def prepare_labels(settings_, source_, **kw):
+                self._set(settings, source.kb_id, {"graph_entity_types": ["role", "skill"]})
+                return schema_flow.reload_source(settings_, source_), {"version_id": "v1", "origin": "auto_blank"}
+
+            resume(build_mod, settings, source, prepare_labels, LookupError)
+            row, phases = self._account(settings, source.kb_id)
+            relabelled = schema_flow.reload_source(settings, source)
+            self.assertEqual(row["cache_fingerprint"], build_mod.graph_cache_fingerprint(settings, relabelled))
+            self.assertNotEqual(row["cache_fingerprint"], build_mod.graph_cache_fingerprint(settings, source))
+            self.assertEqual(phases, set())
+        # the configuration changed after the last stop, and this resume is killed during preparation (no time to wind
+        # down): the record already carries the new fingerprint, so phase marks left on it would be taken by the next
+        # resume as finished under the new configuration
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            self._finished_phases(build_mod, settings, source)
+            self._set(settings, source.kb_id, {"graph_entity_types": ["role", "skill"]})
+            changed = schema_flow.reload_source(settings, source)
+
+            def killed(settings_, source_, **kw):
+                raise KeyboardInterrupt
+
+            resume(build_mod, settings, changed, killed, KeyboardInterrupt)
+            row, phases = self._account(settings, source.kb_id)
+            self.assertEqual((row["status"], row["cache_fingerprint"]),
+                             ("running", build_mod.graph_cache_fingerprint(settings, changed)))
+            self.assertEqual(phases, set())
+
+    def test_check_rebuild_does_not_build_a_graph_switched_off_while_the_labels_were_revised(self) -> None:
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli
+        from kb_pipeline.graph import schema_flow
+
+        args = argparse.Namespace(graph_command="check-rebuild", execute=True, dry_run=False, force_full=False,
+                                  env_file=None, source=None, collection=None, all=False)
+        for updates, reason in (({"graph_paused": True}, "paused_by_operator"), ({"graph_enabled": False}, "disabled"),
+                                ({}, None)):
+            with tempfile.TemporaryDirectory() as tmp:
+                _build_mod, settings, source = self._kb(tmp)
+                loaded = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
+                                         runtime_dir=settings.runtime_dir, sources={source.kb_id: source})
+                built: list = []
+
+                def revise(settings_, source_, **kw):          # re-extracting labels takes minutes, with no run record yet
+                    self._set(settings, source.kb_id, updates)
+                    return schema_flow.reload_source(settings_, source_), {"version_id": "v2"}
+
+                due = {"source": source.kb_id, "graph_enabled": True, "due": True, "reason": "interval"}
+                with mock.patch.object(cli, "load_settings", return_value=loaded), \
+                        mock.patch.object(cli, "evaluate_rebuild", return_value=due), \
+                        mock.patch.object(cli, "_rebuild_blocked", return_value=None), \
+                        mock.patch.object(schema_flow, "resuggest_for_rebuild", revise), \
+                        mock.patch.object(cli, "build_graph", side_effect=lambda s, **kw: built.append(kw["source"]) or {"ok": True}):
+                    self.assertEqual(cli.cmd_graph(args), 0)
+                self.assertEqual(len(built), 0 if reason else 1, updates)
+                with db.connect(settings.state_db) as con:
+                    self.assertEqual(db.latest_graph_check(con, source.kb_id)["skipped_reason"], reason, updates)
+
+    def test_check_rebuild_goes_on_to_the_next_kb_when_one_was_called_off_by_its_own_switch(self) -> None:
+        """A build called off by the KB's own switch (graph off, paused, KB off) only skips that KB; only a stop signal
+        received by the process ends the whole round."""
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli
+        from kb_pipeline.graph.build import GraphBuildCalledOff, GraphBuildInterrupted
+
+        args = argparse.Namespace(graph_command="check-rebuild", execute=True, dry_run=False, force_full=False,
+                                  env_file=None, source=None, collection=None, all=False)
+        for error, expected in ((GraphBuildCalledOff("The knowledge graph has been turned off; this build does not start"), ["kb_a", "kb_b"]),
+                                (GraphBuildInterrupted("Graph build interrupted by a stop signal"), ["kb_a"])):
+            with tempfile.TemporaryDirectory() as tmp:
+                _build_mod, settings, source = self._kb(tmp)
+                first = SimpleNamespace(**{**vars(source), "kb_id": "kb_a", "collection": "kb_a"})
+                second = SimpleNamespace(**{**vars(source), "kb_id": "kb_b", "collection": "kb_b"})
+                loaded = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
+                                         runtime_dir=settings.runtime_dir, sources={"kb_a": first, "kb_b": second})
+                tried: list = []
+
+                def build(s, **kw):
+                    tried.append(kw["source"].kb_id)
+                    if kw["source"].kb_id == "kb_a":
+                        raise error
+                    return {"ok": True}
+
+                with mock.patch.object(cli, "load_settings", return_value=loaded), \
+                        mock.patch.object(cli, "_fresh_source", side_effect=lambda settings_, source_: source_), \
+                        mock.patch.object(cli, "evaluate_rebuild", side_effect=lambda s, *, source_key, source: {
+                            "source": source_key, "graph_enabled": True, "due": True, "reason": "interval"}), \
+                        mock.patch.object(cli, "_rebuild_blocked", return_value=None), \
+                        mock.patch("kb_pipeline.graph.schema_flow.resuggest_for_rebuild",
+                                   side_effect=lambda settings_, source_, **kw: (source_, None)), \
+                        mock.patch.object(cli, "build_graph", side_effect=build):
+                    self.assertEqual(cli.cmd_graph(args), 1)
+                self.assertEqual(tried, expected, type(error).__name__)
+
+    def test_check_rebuild_rereads_each_kb_when_its_turn_comes(self) -> None:
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli, discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp, config={"graph_rebuild_interval": "7d"})
+            stale = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
+                                    runtime_dir=settings.runtime_dir, sources={source.kb_id: source})
+            args = argparse.Namespace(graph_command="check-rebuild", execute=True, dry_run=False, force_full=False,
+                                      env_file=None, source=None, collection=None, all=False)
+            chunk = {"point_id": "p1", "chunk_uid": "u1", "doc_id": "d", "content_version": "v"}
+            built: list = []
+            seen: list = []
+            real = cli.evaluate_rebuild
+
+            def evaluate(settings_, *, source_key, source):
+                seen.append((source.graph_enabled, tuple(source.graph_entity_types)))
+                return real(settings_, source_key=source_key, source=source)
+
+            def run():
+                built.clear(); seen.clear()
+                with mock.patch.object(cli, "load_settings", return_value=stale), \
+                        mock.patch.object(cli, "evaluate_rebuild", evaluate), \
+                        mock.patch("kb_pipeline.graph.build.active_source_chunks", return_value=[chunk]), \
+                        mock.patch.object(cli, "_rebuild_blocked", return_value=None), \
+                        mock.patch.object(cli, "build_graph", side_effect=lambda s, **kw: built.append(kw["source"]) or {"ok": True}):
+                    return cli.cmd_graph(args)
+
+            # labels changed: build with the labels now in the registry, not those read when the process started
+            self._set(settings, source.kb_id, {"graph_entity_types": ["role", "skill"]})
+            self.assertEqual(run(), 0)
+            self.assertEqual(seen, [(True, ("role", "skill"))])
+            self.assertEqual([tuple(s.graph_entity_types) for s in built], [("role", "skill")])
+            # graph turned off: not built
+            self._set(settings, source.kb_id, {"graph_enabled": False})
+            self.assertEqual(run(), 0)
+            self.assertEqual((seen, built), ([(False, ("role", "skill"))], []))
+            # KB turned off: neither evaluated nor built
+            self._set(settings, source.kb_id, {"graph_enabled": True})
+            with db.connect(settings.state_db) as con:
+                discovery.mark_inactive(con, source.kb_id, reason="unenrolled")
+            self.assertEqual(run(), 0)
+            self.assertEqual((seen, built), ([], []))
+            with db.connect(settings.state_db) as con:
+                self.assertEqual(db.latest_graph_check(con, source.kb_id)["reason"], "kb_closed")
+
+
+class GraphRetireTests(unittest.TestCase):
+    """Once a KB has been emptied (the directory remains, every file deleted) there is no corpus, so no append or
+    rebuild ever happens, and the current graph would keep its aliases and keep turning up in searches. The graph
+    maintenance check retires the graph of such a KB; even before that, the search catalogue stops treating it as
+    a KB with a graph."""
+
+    VERSION = "001-20260901-000000-abcdef"
+    TYPES = ("entity", "relation", "spec", "page")
+
+    def _kb(self, tmp: str):
+        from kb_pipeline import discovery
+        from kb_pipeline.graph import build as build_mod
+        from kb_pipeline.vector.qdrant import graph_collection_name
+
+        root = Path(tmp)
+        mirror = root / "mirror"
+        (mirror / "库").mkdir(parents=True)
+        state = root / "state" / "s.db"
+        db.init_db(state)
+        with db.connect(state) as con:
+            src, _ = discovery.enroll(con, mirror, "库")
+            discovery.set_config(con, src.kb_id, {"graph_enabled": True})
+            con.execute(
+                "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                "started_at, finished_at, build_kind, cache_fingerprint) VALUES('b1', ?, ?, ?, ?, 'done', 100, 110, 'full', 'fp')",
+                (src.kb_id, src.kb_id, src.collection, self.VERSION))
+        settings = SimpleNamespace(state_db=state, runtime_dir=root, graph_work_dir=root / "graph", mirror_root=mirror,
+                                   qdrant_url="http://q", qdrant_api_key="", graph_neo4j_import_after_build=False,
+                                   graph_gc_keep_versions=2, graph_gc_retention_days=14, neo4j_graph_retention_days=14,
+                                   graph_gc_grace_seconds=0)
+        source = discovery.enrolled_sources(state, mirror)[src.kb_id]
+        work = build_mod.graph_paths(settings, source, self.VERSION).work_dir
+        work.mkdir(parents=True)
+        (work / "units.jsonl").write_text("", encoding="utf-8")
+        names = {t: graph_collection_name(source.collection, t, self.VERSION) for t in self.TYPES}
+        q = self._qdrant(source, names)
+        return build_mod, settings, source, q, work
+
+    @staticmethod
+    def _qdrant(source, names):
+        short = source.collection[3:]
+
+        class FakeQ:
+            aliases = {f"graph_{short}_{t}": name for t, name in names.items()}
+            collections = set(names.values())
+
+            def get_aliases(self):
+                return SimpleNamespace(aliases=[SimpleNamespace(alias_name=a, collection_name=c) for a, c in self.aliases.items()])
+
+            def update_collection_aliases(self, operations):
+                for op in operations:
+                    self.aliases.pop(op.delete_alias.alias_name, None)
+
+            def get_collections(self):
+                return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in sorted(self.collections)])
+
+            def collection_exists(self, name):
+                return name in self.collections
+
+            def delete_collection(self, collection_name):
+                self.collections.discard(collection_name)
+
+        return FakeQ()
+
+    @staticmethod
+    def _active_chunk(settings, source) -> None:
+        with db.connect(settings.state_db) as con:
+            con.execute(
+                "INSERT INTO files(file_id, kb_id, collection, source_root, source_type, file_key, source_path, rel_path, "
+                "filename, dir, physical_path, mime_type, size, mtime, content_version, metadata_fingerprint, first_seen_at, "
+                "last_seen_at, status) VALUES('f1', ?, ?, '库', 'local_mirror', 1, '库/a.md', 'a.md', 'a.md', '', '/x/a.md', "
+                "'text/markdown', 1, 1, 'v1', 'fp', 1, 1, 'indexed')", (source.kb_id, source.collection))
+            con.execute("INSERT INTO chunks(chunk_uid, file_id, content_version, chunk_index, point_id, collection, status, "
+                        "created_at) VALUES('c1', 'f1', 'v1', 0, 'p1', ?, 'active', 1)", (source.collection,))
+
+    def test_an_emptied_kb_retires_its_graph(self) -> None:
+        from kb_pipeline import discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source, q, work = self._kb(tmp)
+            self.assertEqual(build_mod.graph_retirable(settings, source), [self.VERSION])
+            out = build_mod.retire_graph(settings, source_key=source.kb_id, source=source, q=q)
+            self.assertEqual(out["retired_versions"], [self.VERSION])
+            self.assertEqual(len(out["aliases_dropped"]), 4)
+            self.assertEqual((q.aliases, q.collections), ({}, set()))                  # aliases dropped, collections deleted by the cleanup rules
+            self.assertFalse(work.exists())                                            # the workspace holds text of deleted documents
+            with db.connect(settings.state_db) as con:
+                row = con.execute("SELECT status, error FROM graph_builds WHERE graph_build_id = 'b1'").fetchone()
+                self.assertEqual(row["status"], "rolled_back")
+                self.assertIn("retired", row["error"])
+                self.assertIsNone(db.latest_successful_graph_build(con, source.kb_id))   # when files come back it is handled as a first build
+                self.assertTrue(discovery.get_config(con, source.kb_id)["graph_enabled"])   # the switch is left alone
+            self.assertEqual(build_mod.graph_retirable(settings, source), [])
+            self.assertIsNone(build_mod.retire_graph(settings, source_key=source.kb_id, source=source, q=q))
+
+    def test_a_kb_that_is_only_momentarily_without_chunks_keeps_its_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source, q, work = self._kb(tmp)
+            # KB turned off and on again, deleted files put back: the chunk count is 0 until the restore jobs finish,
+            # but the files are in the directory
+            (settings.mirror_root / "库" / "a.md").write_text("# a", encoding="utf-8")
+            self.assertEqual(build_mod.graph_retirable(settings, source), [])
+            self.assertIsNone(build_mod.retire_graph(settings, source_key=source.kb_id, source=source, q=q))
+            self.assertEqual(len(q.aliases), 4)
+            self.assertTrue(work.exists())
+            (settings.mirror_root / "库" / "a.md").unlink()
+            (settings.mirror_root / "库" / ".DS_Store").write_text("x", encoding="utf-8")   # files that are not ingested do not count
+            self.assertEqual(build_mod.graph_retirable(settings, source), [self.VERSION])
+            self._active_chunk(settings, source)
+            self.assertEqual(build_mod.graph_retirable(settings, source), [])              # active chunks exist: appends / rebuilds take care of it
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source, q, _work = self._kb(tmp)
+            (settings.mirror_root / "库").rmdir()                                          # the whole directory is gone (mirror not mounted): the graph is left alone
+            self.assertEqual(build_mod.graph_retirable(settings, source), [])
+
+    def test_neo4j_is_deactivated_before_the_versions_are_collected(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import neo4j_import as n4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source, q, _work = self._kb(tmp)
+            settings.graph_neo4j_import_after_build = True
+            order: list[str] = []
+            state = {"active": self.VERSION}
+
+            class FakeSession:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def run(self, query, **params):
+                    if "REMOVE kb.active_graph_version" in query:
+                        order.append("deactivate")
+                        state["active"] = None
+                    return SimpleNamespace(consume=lambda: None,
+                                           single=lambda: {"version": state["active"]})
+
+            driver = SimpleNamespace(session=lambda: FakeSession(), close=lambda: None)
+
+            def collect(settings_, *, sources, discard_versions, **kw):
+                order.append(f"gc:active={state['active']}")
+                return {"discard_versions": sorted(discard_versions)}
+
+            with mock.patch.object(n4, "neo4j_driver", lambda s: driver), \
+                    mock.patch.object(n4, "delete_old_neo4j_graph_versions", collect):
+                out = build_mod.retire_graph(settings, source_key=source.kb_id, source=source, q=q)
+            self.assertEqual(order, ["deactivate", "gc:active=None"])                    # a version that is still active would be skipped by the cleanup
+            self.assertEqual(out["neo4j_deactivation"]["previous_graph_version"], self.VERSION)
+            self.assertEqual(out["neo4j_graph_gc"]["discard_versions"], [self.VERSION])
+
+    def test_check_rebuild_retires_and_yields_like_any_other_graph_action(self) -> None:
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source, _q, _work = self._kb(tmp)
+            stub = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
+                                   runtime_dir=settings.runtime_dir, sources={source.kb_id: source})
+            args = argparse.Namespace(graph_command="check-rebuild", execute=True, dry_run=False, force_full=False,
+                                      env_file=None, source=None, collection=None, all=False)
+            retired: list[str] = []
+
+            def run(*, blocked=None):
+                with mock.patch.object(cli, "load_settings", return_value=stub), \
+                        mock.patch.object(cli, "_rebuild_blocked", return_value=blocked) as gate, \
+                        mock.patch.object(cli, "build_graph", side_effect=AssertionError("an empty KB is not built")), \
+                        mock.patch.object(cli, "retire_graph",
+                                          side_effect=lambda s, **kw: retired.append(kw["source"].kb_id) or {"steps": []}):
+                    return cli.cmd_graph(args), gate.call_count
+
+            self.assertEqual(run(blocked={"reason": "another graph build is running", "retry": True}), (75, 1))
+            self.assertEqual(retired, [])                                   # a build is running: yield, come back next round
+            self.assertEqual(run(), (0, 1))
+            self.assertEqual(retired, [source.kb_id])
+            with db.connect(settings.state_db) as con:
+                con.execute("DELETE FROM graph_builds")
+            retired.clear()
+            self.assertEqual(run(blocked={"reason": "another graph build is running", "retry": True}), (0, 0))
+            self.assertEqual(retired, [])                                   # an empty KB that never had a graph: no retirement, no yield recorded
+
+    def test_the_search_catalog_stops_offering_the_graph_of_an_empty_kb(self) -> None:
+        from kb_search import catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source, q, _work = self._kb(tmp)
+            q.count = lambda collection_name, count_filter, exact: SimpleNamespace(count=0)
+            stub = SimpleNamespace(state_db=settings.state_db, sources={source.kb_id: source})
+            entry = catalog.build_catalog(stub, q)[0]
+            self.assertEqual((entry["docs"], entry["has_graph"]), (0, False))   # the aliases remain, but the KB has no active document any more
+            self._active_chunk(settings, source)
+            entry = catalog.build_catalog(stub, q)[0]
+            self.assertEqual((entry["docs"], entry["has_graph"], entry["graph_version"]), (1, True, self.VERSION))
+
+
+class BuildArtefactAndRecordTests(unittest.TestCase):
+    """Small defects of build artifacts and records: graph.json overwritten in place, dead records judged alive by
+    pid, queries on GraphVersion properties that are never written, entity vector payloads without their scope."""
+
+    def test_graph_file_is_replaced_whole_or_not_at_all(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import build as build_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "graph.json"
+            build_mod.write_graph_file(path, {"entities": ["合并阶段的产物"], "stats": {}})
+            merged = path.read_text(encoding="utf-8")
+            self.assertEqual(json.loads(merged)["entities"], ["合并阶段的产物"])
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["graph.json"])
+            # the process is killed halfway through the facts phase's rewrite: the merge phase's output stays intact
+            # and a resume can still read it
+            for crash in ("fsync", "replace"):
+                with mock.patch.object(build_mod.os, crash, side_effect=KeyboardInterrupt("killed")):
+                    with self.assertRaises(KeyboardInterrupt):
+                        build_mod.write_graph_file(path, {"entities": ["x"] * 1000, "specs": ["y"] * 1000})
+                self.assertEqual(path.read_text(encoding="utf-8"), merged, crash)
+            build_mod.write_graph_file(path, {"entities": ["x"], "specs": ["y"]})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["specs"], ["y"])
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["graph.json"])      # the temporary file left last time is replaced
+
+    def test_a_dead_record_whose_pid_was_reused_is_still_reconciled(self) -> None:
+        from kb_pipeline.graph.lock import GraphBuildLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state" / "s.db"
+            db.init_db(state)
+            cfg = SimpleNamespace(runtime_dir=root)
+
+            def put(con, build_id: str, pid: int) -> None:
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                    "started_at, worker_host, worker_pid, heartbeat_at) VALUES(?, 'k', 'k', 'kb_k', ?, 'running', ?, ?, ?, ?)",
+                    (build_id, build_id, int(time.time()), socket.gethostname(), pid, int(time.time())))
+
+            def statuses(con) -> dict:
+                return dict(con.execute("SELECT graph_build_id, status FROM graph_builds").fetchall())
+
+            lock = GraphBuildLock(cfg)
+            lock.acquire()
+            lock.release()                                  # a graph was built: the lock file exists, nobody holds it now
+            with db.connect(state) as con:
+                # the record's pid is alive (the test process itself here, as if another process had reused it), but no
+                # process holds the build lock
+                put(con, "reused-pid", os.getpid())
+                self.assertEqual(db.reconcile_stale_graph_builds(con), ["reused-pid"])
+                self.assertEqual(statuses(con)["reused-pid"], "failed")
+                lock.acquire()                              # a build is running and this process holds the lock
+                try:
+                    put(con, "building", os.getpid())
+                    put(con, "other-pid", os.getppid())      # the pid is alive but does not hold the lock
+                    self.assertEqual(db.reconcile_stale_graph_builds(con), ["other-pid"])
+                    self.assertEqual(statuses(con)["building"], "running")
+                    (root / "state" / "graph_build.lock.d" / "pid").unlink()
+                    put(con, "just-started", os.getppid())   # lock just taken, pid not yet written: when in doubt it counts as alive
+                    self.assertEqual(db.reconcile_stale_graph_builds(con), [])
+                finally:
+                    lock.release()
+            # the state database is not in the default place (no lock file next to it): the caller passes the lock directory
+            elsewhere = root / "other" / "s.db"
+            db.init_db(elsewhere)
+            with db.connect(elsewhere) as con:
+                put(con, "alive-pid", os.getpid())
+                self.assertEqual(db.reconcile_stale_graph_builds(con), [])                       # falls back to the pid
+                self.assertEqual(db.reconcile_stale_graph_builds(con, lock_path=lock.path), ["alive-pid"])
+
+    def test_graph_version_queries_only_touch_properties_that_are_written(self) -> None:
+        from kb_pipeline.graph import neo4j_import as n4
+
+        queries: list[tuple[str, dict]] = []
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, query, **params):
+                queries.append((query, params))
+                return SimpleNamespace(consume=lambda: None, data=lambda: [], single=lambda: None)
+
+        driver = SimpleNamespace(session=lambda: FakeSession())
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="r", source_type="local_mirror",
+                          max_tokens=400, overlap_tokens=80)
+        # the record passed in at the end of a build and the full row read back by a manual import write the same set
+        # of properties to the node
+        for build in ({"graph_build_id": "b", "input_rows": 3}, {"graph_build_id": "b", "input_rows": 3, "started_at": 1, "finished_at": 2}):
+            n4.upsert_kb_and_graph_version(driver, source_key="kb_003", source=source, graph_version="v1",
+                                           graph_version_uid="uid", output_dir=Path("/w"), build=build, activate=False)
+        written = [set(params["props"]) for _query, params in queries]
+        self.assertEqual(written[0], written[1])
+        self.assertIn("imported_at", written[0])
+        queries.clear()
+        n4.neo4j_graph_versions(driver, "kb_003")
+        returned = set(re.findall(r"gv\.(\w+)", queries[0][0]))
+        self.assertEqual(returned - {"graph_version"}, {"imported_at"})
+        self.assertLessEqual(returned, written[0])                       # every property queried has been written: no more UnknownPropertyKeyWarning
+
+    def test_entity_scope_reaches_the_vector_payload_and_the_recall_rows(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import recall
+        from kb_pipeline.graph.vectors import embed_sha, entity_embed_text, entity_payload
+
+        scoped = {"key": "kb_1:7::尿常规", "title": "尿常规", "type": "检查", "description": "d", "scope": "kb_1:7"}
+        plain = {"key": "白细胞", "title": "白细胞", "type": "指标", "description": "d", "scope": ""}
+        payload = entity_payload(scoped, kb_id="kb_1", source_collection="kb_1", graph_version="v1", point_ids=[])
+        self.assertEqual(payload["scope"], "kb_1:7")
+        self.assertNotIn("scope", entity_payload(plain, kb_id="kb_1", source_collection="kb_1", graph_version="v1", point_ids=[]))
+        # the scope is not part of the embedding text: with the new field the previous version's vectors are still reused
+        self.assertEqual(embed_sha(entity_embed_text(scoped)), embed_sha(entity_embed_text({**scoped, "scope": ""})))
+
+        seed = SimpleNamespace(id="p-e1", score=0.9, payload={**payload, "gr_id": "e1", "graph_version": "v1"})
+        relation = SimpleNamespace(id="p-r1", score=0.8, payload={"gr_id": "r1", "source": "尿常规", "target": "蛋白", "type": "has",
+                                                                   "source_id": "e1", "target_id": "e3", "graph_version": "v1"})
+
+        class FakeQ:
+            def query_points(self, collection_name, query, limit, with_payload, query_filter=None, **kw):
+                points = {"graph_1_entity": [seed], "graph_1_relation": [relation]}.get(collection_name, [])
+                return SimpleNamespace(points=points)
+
+            def scroll(self, **kw): return [], None
+            def retrieve(self, **kw): return []
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, query, **params):
+                rows: list = []
+                if "[r:RELATED_TO]" in query:
+                    rows = [{"eid": "e1", "neighbours": [{"rid": "r2", "type": "has", "weight": 2.0, "description": "", "nid": "e2",
+                                                         "title": "尿常规", "ntype": "检查", "scope": "kb_1:9", "pagerank": 0.1, "degree": 1}]}]
+                elif "RETURN eid, e.title" in query:
+                    rows = [{"eid": eid, "title": "蛋白", "type": "指标", "scope": "kb_1:7"} for eid in params["ids"]]
+                return SimpleNamespace(data=lambda: rows, single=lambda: {"m": 1.0, "n": 0})
+
+        driver = SimpleNamespace(session=lambda: FakeSession(), close=lambda: None)
+        settings = SimpleNamespace(qdrant_url="http://q", qdrant_api_key="")
+        source = SimpleNamespace(kb_id="kb_1", collection="kb_1")
+        with mock.patch.object(recall, "qdrant_client", return_value=FakeQ()), \
+                mock.patch.object(recall, "neo4j_driver", return_value=driver), \
+                mock.patch.object(recall, "active_neo4j_graph_version", return_value="v1"):
+            out = recall.graph_query(settings, source, "尿常规", vector=[0.1] * 4, hops=1)
+        scopes = {e["id"]: e.get("scope") for e in out["entities"]}
+        # seeds, expanded neighbours and entities filled in from relation endpoints all carry their scope: the two
+        # same-named urinalysis entities can be told apart
+        self.assertEqual(scopes, {"e1": "kb_1:7", "e2": "kb_1:9", "e3": "kb_1:7"})
+
+
+class GraphVectorWriteTests(unittest.TestCase):
+    """Writing graph vectors is the longest step of a build: the batch for reading the previous version and writing
+    the new one is separate from the embedding batch, only the payload fields needed to decide on reuse are
+    fetched, writes are not awaited batch by batch and the point count is checked once per collection; the pause
+    between embedding calls follows the configuration."""
+
+    @staticmethod
+    def _entity(i: int) -> dict:
+        return {"key": f"e{i}", "title": f"E{i}", "type": "t", "description": f"d{i}", "unit_ids": []}
+
+    def _fake_q(self, *, base: dict | None = None, lose_last_batch: bool = False):
+        calls = {"upsert": [], "retrieve": [], "points": {}}
+
+        class FakeQ:
+            def get_collections(self): return SimpleNamespace(collections=[])
+            def create_collection(self, collection_name, vectors_config): pass
+            def get_collection(self, collection_name):
+                return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=4))))
+            def create_payload_index(self, **kw): pass
+
+            def upsert(self, collection_name, points, wait):
+                calls["upsert"].append((len(points), wait))
+                if lose_last_batch and wait:
+                    return
+                calls["points"].setdefault(collection_name, []).extend(points)
+
+            def retrieve(self, collection_name, ids, with_payload, with_vectors):
+                calls["retrieve"].append((len(ids), with_payload, with_vectors))
+                return [base[i] for i in ids if i in (base or {})]
+
+            def scroll(self, collection_name, limit, offset, with_payload, with_vectors):
+                return list(calls["points"].get(collection_name, [])), None
+
+            def delete(self, collection_name, points_selector, wait): pass
+
+            def count(self, collection_name, exact):
+                return SimpleNamespace(count=len(calls["points"].get(collection_name, [])))
+
+        return FakeQ(), calls
+
+    def test_rows_are_written_in_large_batches_and_verified_once_at_the_end(self) -> None:
+        from kb_pipeline.graph import vectors
+
+        self.assertGreaterEqual(vectors.UPSERT_BATCH, 256)
+        rows = [self._entity(i) for i in range(5)]
+        pid = lambda i: vectors.point_id_for("v0", vectors.entity_id(f"e{i}"))
+        base = {pid(i): SimpleNamespace(id=pid(i), vector=[float(i)] * 4,
+                                        payload={"graph_type": "entity", "embed_sha": vectors.embed_sha(f"E{i}: d{i}"), "embed_model": "m"})
+                for i in (0, 1, 2, 4)}                                  # e3 is new
+        q, calls = self._fake_q(base=base)
+        embedded: list[list[str]] = []
+
+        def embed(texts):
+            embedded.append(list(texts))
+            return [[0.5] * 4 for _ in texts]
+
+        out = vectors.write_graph_vectors(q, embed, kb_id="kb_x", source_collection="kb_x", graph_version="v1",
+                                          bundle={"entities": rows}, units_by_id={}, vector_size=4, batch=2,
+                                          reuse_from={"entity": "graph_x_entity__v0"}, base_version="v0", embed_model="m")
+        self.assertEqual(calls["upsert"][:3], [(2, False), (2, False), (1, True)])      # only the last batch is awaited
+        self.assertEqual([n for n, _fields, _vec in calls["retrieve"]], [2, 2, 1])
+        fields = calls["retrieve"][0][1]
+        self.assertIsInstance(fields, list)                                             # not the whole payload
+        self.assertTrue({"embed_sha", "embed_model"} <= set(fields))
+        self.assertNotIn("search_text", fields)
+        self.assertEqual(embedded, [["E3: d3"]])                                        # only the row that cannot be reused is embedded
+        entity = out["collections"]["entity"]
+        self.assertEqual((entity["points"], entity["reused"], entity["embedded"]), (5, 4, 1))
+
+    def test_a_batch_that_never_landed_fails_the_final_count(self) -> None:
+        from kb_pipeline.graph import vectors
+
+        q, _calls = self._fake_q(lose_last_batch=True)
+        with self.assertRaisesRegex(RuntimeError, "point count mismatch: actual=2 expected=3"):
+            vectors.write_graph_vectors(q, lambda texts: [[0.5] * 4 for _ in texts], kb_id="kb_x", source_collection="kb_x",
+                                        graph_version="v1", bundle={"entities": [self._entity(i) for i in range(3)]},
+                                        units_by_id={}, vector_size=4, batch=2)
+
+    def test_the_build_embedder_follows_the_configured_pacing(self) -> None:
+        from kb_pipeline.graph.build import graph_embedder
+
+        settings = SimpleNamespace(embedding_base_url="http://e/v1", embedding_api_key="k", embedding_model_id="m",
+                                   embedding_dim=4, embedding_batch=20, embedding_retry=3, embedding_sleep_seconds=0.0)
+        client = graph_embedder(settings)
+        self.assertEqual((client.sleep_seconds, client.retry, client.batch_size), (0.0, 3, 20))
+
+    def test_the_build_embedder_honours_a_stop_after_each_request(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.embedding import client as embedding_client
+        from kb_pipeline.graph.build import GraphBuildInterrupted, graph_embedder
+
+        settings = SimpleNamespace(embedding_base_url="http://e/v1", embedding_api_key="k", embedding_model_id="m",
+                                   embedding_dim=4, embedding_batch=2, embedding_retry=3, embedding_sleep_seconds=0.0)
+        state = {"stop": False, "stop_at": None}
+        requests: list[list[str]] = []
+
+        class FakeClient:
+            def __init__(self, **kw):
+                self.batch_size = kw["batch_size"]
+
+            def embed(self, texts):
+                requests.append(list(texts))
+                if len(requests) == state["stop_at"]:
+                    state["stop"] = True                  # the stop signal lands in this request and the client's retries swallow it: the request returns normally
+                return [[float(len(t))] * 4 for t in texts]
+
+        def check_stop():
+            if state["stop"]:
+                raise GraphBuildInterrupted("stop")
+
+        titles = [f"t{i}" for i in range(5)]
+        with mock.patch.object(embedding_client, "EmbeddingClient", FakeClient):
+            embedder = graph_embedder(settings, check_stop)
+            self.assertEqual(embedder.embed(titles), [[2.0] * 4] * 5)
+            self.assertEqual(requests, [["t0", "t1"], ["t2", "t3"], ["t4"]])
+            requests.clear()
+            state["stop_at"] = 1
+            with self.assertRaises(GraphBuildInterrupted):
+                embedder.embed(titles)                    # the resolution phase embeds all titles in one call: no waiting until it is done
+            self.assertEqual(requests, [["t0", "t1"]])
+
+    def test_a_stop_between_the_named_vectors_of_a_batch_is_honoured(self) -> None:
+        from kb_pipeline.graph import vectors
+        from kb_pipeline.graph.build import GraphBuildInterrupted
+
+        q, calls = self._fake_q()
+        fact = {"id": "f1", "subject": "IC", "property": "Supply voltage", "symbol": "VCC", "min": "3.0", "max": "3.6",
+                "unit": "V", "conditions": {}}
+        state = {"stop": False}
+        embedded: list[list[str]] = []
+
+        def embed(texts):
+            embedded.append(list(texts))
+            state["stop"] = True                          # the stop signal lands in the first named vector's embedding and the client's retries swallow it
+            return [[0.5] * 4 for _ in texts]
+
+        def check_stop():
+            if state["stop"]:
+                raise GraphBuildInterrupted("stop")
+
+        with self.assertRaises(GraphBuildInterrupted):
+            vectors.write_graph_vectors(q, embed, kb_id="kb_x", source_collection="kb_x", graph_version="v1",
+                                        bundle={"specs": [fact]}, units_by_id={}, vector_size=4, check_stop=check_stop)
+        self.assertEqual((len(embedded), calls["upsert"]), (1, []))      # a fact batch is embedded three times: it stops after the first, the other two are skipped
+
+    def test_a_stop_during_the_base_lookup_does_not_turn_into_a_full_re_embed(self) -> None:
+        from kb_pipeline.graph import vectors
+        from kb_pipeline.graph.build import GraphBuildInterrupted
+
+        q, calls = self._fake_q()
+        state = {"stop": False}
+
+        def retrieve(collection_name, ids, with_payload, with_vectors):
+            state["stop"] = True                          # the stop signal lands in the call reading the previous version and the client wraps it in its own exception
+            raise ConnectionError("wrapped")
+
+        q.retrieve = retrieve
+
+        def check_stop():
+            if state["stop"]:
+                raise GraphBuildInterrupted("stop")
+
+        embedded: list = []
+        with self.assertRaises(GraphBuildInterrupted):
+            vectors.write_graph_vectors(q, lambda texts: embedded.append(texts) or [[0.5] * 4 for _ in texts], kb_id="kb_x",
+                                        source_collection="kb_x", graph_version="v1",
+                                        bundle={"entities": [self._entity(i) for i in range(3)]}, units_by_id={}, vector_size=4,
+                                        batch=2, reuse_from={"entity": "graph_x_entity__v0"}, base_version="v0",
+                                        check_stop=check_stop)
+        self.assertEqual((embedded, calls["upsert"]), ([], []))
+        # the previous version's collection really is gone (no stop signal): everything is re-embedded as before
+        state["stop"] = None
+        out = vectors.write_graph_vectors(q, lambda texts: [[0.5] * 4 for _ in texts], kb_id="kb_x", source_collection="kb_x",
+                                          graph_version="v1", bundle={"entities": [self._entity(i) for i in range(3)]},
+                                          units_by_id={}, vector_size=4, batch=2, reuse_from={"entity": "graph_x_entity__v0"},
+                                          base_version="v0", check_stop=lambda: None)
+        self.assertEqual((out["collections"]["entity"]["embedded"], out["collections"]["entity"]["reused"]), (3, 0))
+
+
+class StoreIndexTests(unittest.TestCase):
+    """Qdrant payload indexes and Neo4j composite indexes are only created for fields a filter uses: an index nobody
+    reads is maintained on every point written. A field a filter uses without an index (rel_path and block_id of the
+    main collection) makes the filter read the payload of every point."""
+
+    @staticmethod
+    def _keys(flt) -> set[str]:
+        out: set[str] = set()
+        for group in (flt.must, flt.should, flt.must_not):
+            for cond in group or []:
+                if hasattr(cond, "is_empty") and cond.is_empty is not None:
+                    out.add(cond.is_empty.key)
+                elif hasattr(cond, "has_id"):
+                    continue                      # by point id, no payload index involved
+                elif hasattr(cond, "key"):
+                    out.add(cond.key)
+                else:
+                    out |= StoreIndexTests._keys(cond)
+        return out
+
+    def _recording_q(self):
+        filters: list = []
+
+        class FakeQ:
+            def scroll(self, collection_name, scroll_filter=None, **kw):
+                filters.append(scroll_filter)
+                return [], None
+
+            def set_payload(self, collection_name, payload, points, **kw):
+                filters.append(points)
+
+            def count(self, collection_name, count_filter=None, exact=True):
+                filters.append(count_filter)
+                return SimpleNamespace(count=1)
+
+            def delete(self, collection_name, points_selector, wait=True):
+                filters.append(points_selector.filter)
+
+            def collection_exists(self, name):
+                return True
+
+        return FakeQ(), filters
+
+    def test_graph_collections_index_exactly_the_fields_their_filters_use(self) -> None:
+        from kb_pipeline.graph import recall
+        from kb_pipeline.vector.qdrant import GRAPH_PAYLOAD_INDEX_FIELDS, ensure_graph_collection
+
+        q, filters = self._recording_q()
+        recall.lexical_seeds(q, "graph_1_entity", "graph_1_relation", "tAS 的最小值是多少")
+        recall.spec_seeds(q, "graph_1_spec", None, "tAS 的最小值是多少")
+        filters.append(recall.seed_filter())
+        used = set().union(*(self._keys(f) for f in filters if f is not None))
+        self.assertEqual(used, {"title", "aliases", "source", "target", "symbol", "property", "boilerplate", "reference"})
+        self.assertEqual(set(GRAPH_PAYLOAD_INDEX_FIELDS), used)
+        created: list[str] = []
+        fake = SimpleNamespace(
+            get_collections=lambda: SimpleNamespace(collections=[]),
+            create_collection=lambda collection_name, vectors_config: None,
+            get_collection=lambda collection_name: SimpleNamespace(
+                config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=4)))),
+            create_payload_index=lambda collection_name, field_name, field_schema: created.append(field_name))
+        ensure_graph_collection(fake, "graph_1_entity__v1", 4)
+        self.assertEqual(set(created), used)
+
+    def test_the_main_collection_indexes_exactly_the_fields_its_filters_use(self) -> None:
+        from kb_pipeline.vector import qdrant as vq
+        from kb_search import channels
+
+        q, filters = self._recording_q()
+        filters.append(channels.ACTIVE_FILTER)
+        filters.append(channels.hint_filter({"doc_ids": ["kb_1:1"], "rel_paths": ["a/b.pdf"], "content_version": "v1"}))
+        payload = {"doc_id": "kb_1:1", "block_id": "b3", "chunk_index": 5, "content_version": "v1", "text": "| 1 | 2 |"}
+        channels.table_head(q, "kb_1", payload)
+        channels.neighbor_payloads(q, "kb_1", payload, span=2)
+        channels.context_range(q, "kb_1", doc_id="kb_1:1", chunk_from=0, chunk_to=3, content_version="v1")
+        filters += [vq.doc_filter("kb_1", 1), vq.active_doc_filter("kb_1", 1), vq.doc_version_filter("kb_1", 1, "v1"),
+                    vq.inactive_older_than_filter(100)]
+        vq.mark_old_versions_inactive(q, "kb_1", kb_id="kb_1", file_key=1, active_content_version="v1")
+        ids = vq.expired_inactive_point_ids(q, "kb_1", doc_id="kb_1:1", content_version="v1", cutoff_ts=100)
+        vq.delete_expired_inactive_points(q, "kb_1", ids or ["00000000-0000-0000-0000-000000000001"], 100)
+        vq.delete_malformed_inactive_points(q, "kb_1", 100)
+        vq.backfill_inactive_at(q, "kb_1", 100, dry_run=True)
+        used = set().union(*(self._keys(f) for f in filters if f is not None))
+        self.assertEqual(used, {"is_active", "doc_id", "rel_path", "content_version", "block_id", "chunk_index", "inactive_at"})
+        self.assertEqual(set(vq.PAYLOAD_INDEX_FIELDS), used)
+
+    def test_neo4j_keeps_only_the_indexes_that_queries_read(self) -> None:
+        from kb_pipeline.graph import neo4j_import as n4
+
+        statements: list[str] = []
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, statement, **params):
+                statements.append(statement)
+                return SimpleNamespace(consume=lambda: None)
+
+        n4.ensure_constraints(SimpleNamespace(session=lambda: FakeSession()))
+        indexes = {m.group(1): m.group(2) for s in statements
+                   for m in [re.match(r"CREATE INDEX (\w+) IF NOT EXISTS FOR \(n:(\w+)\) ON \(n\.kb_id, n\.graph_version, n\.(\w+)\)", s)] if m}
+        self.assertEqual(indexes, {"ak_entity_pagerank": "Entity", "ak_entity_id": "Entity", "ak_relation_id": "Relation"})
+        constraints = [s for s in statements if s.startswith("CREATE CONSTRAINT")]
+        self.assertEqual(len(constraints), 1 + len(n4.NODE_LABELS))                     # the uid unique constraint of each label stays
+        # recall and the neighbourhood endpoint fetch entities / relations by (kb_id, graph_version, id) and read the
+        # maximum pagerank: each of these three queries has an index to use
+        recall_src = _repo_file("app/kb_pipeline/graph/recall.py") + _repo_file("app/kb_search/graphwalk.py")
+        for label, prop in re.findall(r"\(\w+:(\w+) \{kb_id: \$kb, graph_version: \$gv, (\w+): ", recall_src):
+            self.assertIn((label, prop), {("Entity", "id"), ("Relation", "id")})
+
+
+class MentionAttributionInputTests(unittest.TestCase):
+    """The merge phase is the only point of a build that reads the main store again (chunk texts for entity
+    attribution). When a file of the same version is re-parsed during the build and its text replaced in place, the
+    new text must not be matched against the old extraction results."""
+
+    def test_chunks_whose_text_changed_after_the_freeze_fall_back_to_unit_level(self) -> None:
+        from kb_pipeline.graph.build import attribution_texts
+        from kb_pipeline.graph.merge import attribute_mentions
+
+        def ref(pid: str, text: str) -> ChunkRef:
+            return ChunkRef(point_id=pid, chunk_uid=f"u{pid}", doc_id="d", content_version="v1", chunk_index=0, block_id="b",
+                            block_type="text", section_path=["电气特性"], text=text, n_tokens=1)
+
+        ledger = [{"point_id": "p1", "text_sha": db.chunk_text_sha("VCC 的范围是 2.7 V 到 3.6 V")},
+                  {"point_id": "p2", "text_sha": db.chunk_text_sha("订购信息")},
+                  {"point_id": "p3", "text_sha": ""}]                                   # an old ledger has no fingerprint: not compared
+        payloads = [ref("p1", "VCC 的范围是 2.7 V 到 3.6 V"),
+                    ref("p2", "重新解析之后这一片变成了 VCC 的说明"),
+                    ref("p3", "封装")]
+        texts, sections, stale = attribution_texts(ledger, payloads)
+        self.assertEqual((sorted(texts), stale), (["p1", "p3"], 1))
+        self.assertEqual(sections["p1"], "电气特性")
+        unit = Unit(unit_id="u1", doc_id="d", rel_path="a.pdf", section_path=["电气特性"], block_ids=["b"],
+                    chunk_uids=["up1", "up2", "up3"], point_ids=["p1", "p2", "p3"], n_tokens=10, text="t", order=0)
+        entities = [{"key": "vcc", "title": "VCC", "aliases": [], "unit_ids": ["u1"]},
+                    {"key": "订购信息", "title": "订购信息", "aliases": [], "unit_ids": ["u1"]}]
+        rows = attribute_mentions(entities, {"u1": unit}, texts, chunk_sections=sections)
+        by_entity: dict[str, dict[str, int]] = {}
+        for r in rows:
+            by_entity.setdefault(r["entity_key"], {})[r["point_id"]] = r["count"]
+        self.assertEqual(by_entity["vcc"], {"p1": 1})                                     # p2, whose text changed, is not a hit
+        self.assertEqual(by_entity["订购信息"], {"p1": 0, "p2": 0, "p3": 0})              # a mismatch falls back to the whole unit
+        # text unchanged: all take part
+        same = attribution_texts(ledger, [ref("p1", "VCC 的范围是 2.7 V 到 3.6 V"), ref("p2", "订购信息")])
+        self.assertEqual((sorted(same[0]), same[2]), (["p1", "p2"], 0))

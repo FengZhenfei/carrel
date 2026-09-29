@@ -83,6 +83,42 @@ class ChatClientTests(unittest.TestCase):
         with self.assertRaises(LLMInterrupted):
             client.chat("q")
 
+    def test_run_parallel_reports_the_circuit_even_when_an_interrupted_worker_finishes_first(self) -> None:
+        """A circuit break halts the other threads by setting stop, and they raise LLMInterrupted; which result the
+        main thread receives first is not fixed. When the halted thread's arrives first, what is reported is still
+        the circuit break with its reason, not "stop requested"."""
+        import time
+
+        from kb_pipeline.graph.llm import LLMInterrupted
+
+        def chat(messages):
+            raise HTTPStatusError(503, "provider down")
+
+        client = _client(chat, attempts=1, circuit_fails=1, workers=2)
+
+        def work(item):
+            if item == "trips":
+                try:
+                    return client.chat("q")
+                except LLMCircuitOpen:
+                    time.sleep(0.3)             # the thread that tripped the circuit hands its result back a bit later
+                    raise
+            client.stop.wait(5)                 # the other thread waits in its backoff and is woken by the circuit break
+            raise LLMInterrupted("stop requested")
+
+        with self.assertRaises(LLMCircuitOpen) as ctx:
+            client.run_parallel(["trips", "waits"], work)
+        self.assertIn("provider down", str(ctx.exception))
+        # a stop without a circuit break (signal, pause) is still reported as an interruption
+        plain = _client(["x"], workers=2)
+
+        def stopped(item):
+            plain.stop.set()
+            raise LLMInterrupted("stop requested")
+
+        with self.assertRaises(LLMInterrupted):
+            plain.run_parallel(["a"], stopped)
+
 
 class EmptyResponseRetryTests(unittest.TestCase):
     def test_empty_responses_are_retried_once_only(self) -> None:
