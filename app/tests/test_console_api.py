@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from kb_pipeline import db
 from kb_pipeline.parsers.common import page_idx
@@ -49,11 +50,11 @@ class ApiLayerTests(unittest.TestCase):
         from unittest import mock
 
         client = self._client(
-            unenroll_info=mock.Mock(side_effect=KeyError("kb_404")),
+            get_kb_config=mock.Mock(side_effect=KeyError("kb_404")),
             reparse_kb=mock.Mock(side_effect=ValueError("知识库未开启")),
             kb_files=mock.Mock(side_effect=RuntimeError("qdrant 崩了")),
         )
-        self.assertEqual(client.get("/api/kbs/kb_404/unenroll_info").status_code, 404)
+        self.assertEqual(client.get("/api/kbs/kb_404/config").status_code, 404)
         r = client.post("/api/kbs/kb_1/reparse", json={})
         self.assertEqual(r.status_code, 422)
         self.assertIn("未开启", r.json()["detail"])
@@ -138,6 +139,31 @@ class ApiLayerTests(unittest.TestCase):
         self.assertEqual(client.put("/api/kbs/kb_1/config", json={"graph_llm": ["a"]}).status_code, 422)
         # A valid payload is accepted as usual
         self.assertEqual(client.put("/api/kbs/kb_1/config", json={"max_tokens": 800}).status_code, 200)
+
+    def test_endpoints_the_console_stopped_calling_are_gone(self) -> None:
+        """Endpoints the front end stopped calling after the redesign do not stay exposed on the LAN: one of them,
+        the preview that re-chunks with given parameters, re-ran parsing synchronously inside the web process. The
+        chunk preview drawer uses files/{id}/chunks, which reads the chunks already stored, and the job timeline
+        uses jobs/{id}; those two remain."""
+        from kb_server import service
+        from kb_server.api import router
+
+        paths = {route.path for route in router.routes}
+        for gone in ("/api/kbs/{kb_id}/chunk_preview", "/api/kbs/{kb_id}/jobs", "/api/kbs/{kb_id}/graph_builds",
+                     "/api/jobs/failed", "/api/kbs/{kb_id}/unenroll_info"):
+            self.assertNotIn(gone, paths)
+        for kept in ("/api/kbs/{kb_id}/files/{file_id}/chunks", "/api/jobs/{job_id}", "/api/kbs/{kb_id}/graph_preview"):
+            self.assertIn(kept, paths)
+        for name in ("chunk_preview", "kb_jobs", "graph_builds", "failed_jobs", "unenroll_info"):
+            self.assertFalse(hasattr(service, name), name)
+        client = self._client()
+        self.assertIn(client.post("/api/kbs/kb_1/chunk_preview", json={"file_id": "f"}).status_code, (404, 405))
+        self.assertEqual(client.get("/api/kbs/kb_1/jobs").status_code, 404)
+        self.assertEqual(client.get("/api/kbs/kb_1/graph_builds").status_code, 404)
+        self.assertEqual(client.get("/api/kbs/kb_1/unenroll_info").status_code, 404)
+        js = _repo_file("app/kb_server/static/app.js")
+        for gone in ("chunk_preview", "/graph_builds", "jobs/failed", "unenroll_info", "state.corpus"):
+            self.assertNotIn(gone, js, gone)
 
     def test_required_fields_and_unknown_service(self) -> None:
         from unittest import mock
@@ -670,6 +696,186 @@ class GraphPreviewTests(unittest.TestCase):
         self.assertIn("limit = 0 if limit <= 0 else max(10, min(limit, 3000))", svc)
 
 
+class GraphFileLoadTests(unittest.TestCase):
+    """The preview and the merge drawer read graph.json: for a large knowledge base the file is several hundred MB.
+    Read whole and then parsed, it took several GB in the web process for a moment and other endpoints did not
+    respond while it parsed; the cache kept a single copy and dropped the old one only after reading the new one, so
+    switching back and forth between two large knowledge bases re-read the file every time."""
+
+    GRAPH = {
+        "kb_id": "kb_1", "graph_version": "v1", "built_at": 1726000000, "schema": {"entity_types": ["device"]},
+        "documents": {"kb_1:1": {"rel_path": "手册/a.pdf", "date": "2026-01-02", "version": "B", "doc_type": "manual", "pages": 12}},
+        "unit_kinds": {"u1": "body", "u2": "listing"},
+        "entities": [
+            {"key": "a", "title": "存储器 𠮷", "type": "device", "upper": "entity", "frequency": 9, "doc_ids": ["kb_1:1"],
+             "description": "长" * 500, "descriptions": ["长" * 500, "别的说法"], "unit_ids": ["u1", "u2"], "aliases": ["SRAM"],
+             "pagerank": 0.61, "degree": 2, "types": {"device": 3}},
+            {"key": "kb_1:1::b", "title": "电压", "type": "parameter", "upper": "property", "frequency": 5, "doc_ids": ["kb_1:1"],
+             "scope": "kb_1:1", "description": "供电 \"VCC\"\\n3.3 V", "unit_ids": ["u1"]},
+            {"key": "c", "title": "目录", "type": "document", "upper": "document", "frequency": 40, "boilerplate": True},
+        ],
+        "relations": [
+            {"source_key": "a", "target_key": "kb_1:1::b", "source": "存储器", "target": "电压", "predicate": "has_parameter",
+             "strength_sum": 3, "description": "述" * 400, "descriptions": ["述" * 400], "weight": 7.5e-1, "unit_ids": ["u1"]},
+            {"source_key": "c", "target_key": "a", "predicate": "mentions", "strength_sum": 1, "npmi": -0.25},
+        ],
+        "mentions": [{"entity_key": "a", "point_id": "p1", "chunk_uid": "cu1", "count": 12345}] * 40,
+        "resolution_map": {"a2": "a"}, "resolution_judged": [["a", "c", "no"], ["a", "kb_1:1::b", "no"]],
+        "resolution_log": [{"kept": "a", "kept_title": "存储器", "merged": "a2", "merged_title": "SRAM 存储器", "source": "lexical", "category": "alias"}],
+        "resolution_rejected": [{"a_title": "甲", "b_title": "乙", "source": "embedding", "reason": "recheck", "verdict": "narrower"}],
+        "stats": {"units": 2, "resolution": {"candidates": 3, "yes": 1, "entities_before": 4, "entities_after": 3}, "llm": {"calls": 9}},
+        "pages": [{"page_id": "p", "markdown": "# 页\\n" + "文" * 300}], "specs": [], "conflicts": [],
+    }
+
+    def setUp(self) -> None:
+        from kb_server import service
+
+        service._GRAPH_JSON_CACHE.clear()
+        self.addCleanup(service._GRAPH_JSON_CACHE.clear)
+
+    def test_the_file_is_read_piece_by_piece_and_only_what_the_views_use_is_kept(self) -> None:
+        from unittest import mock
+
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "graph.json"
+            for layout in ({}, {"indent": 1}, {"separators": (",", ":"), "ensure_ascii": True}):
+                path.write_text(json.dumps(self.GRAPH, **{"ensure_ascii": False, **layout}), encoding="utf-8")
+                whole = json.loads(path.read_text(encoding="utf-8"))
+                for chars in (1, 3, 50, 1 << 20):           # wherever the buffer breaks, the result is the same
+                    with mock.patch.object(service, "_GRAPH_READ_CHARS", chars):
+                        pieces = list(service._iter_graph_json(path))
+                        slim = service._read_graph_json(path)
+                    self.assertEqual([p for p in pieces if p[0] == "mentions"], [("mentions", whole["mentions"][0], True)] * 40)
+                    self.assertIn(("graph_version", "v1", False), pieces)
+                    self.assertIn(("resolution_judged", ["a", "c", "no"], True), pieces)
+                    self.assertEqual(sorted(slim), ["documents", "entities", "relations", "resolution_log", "resolution_rejected", "stats"])
+                    self.assertEqual(sorted(slim["entities"][0]),
+                                     ["aliases", "description", "doc_ids", "frequency", "key", "title", "type", "upper"])
+                    self.assertEqual((len(slim["entities"][0]["description"]), len(slim["relations"][0]["description"])), (240, 160))
+                    self.assertEqual(slim["documents"], {"kb_1:1": {"rel_path": "手册/a.pdf", "date": "2026-01-02", "version": "B"}})
+                    self.assertEqual(slim["stats"], {"resolution": whole["stats"]["resolution"]})
+                    self.assertEqual((slim["resolution_log"], slim["resolution_rejected"]),
+                                     (whole["resolution_log"], whole["resolution_rejected"]))
+                    for view in ({"limit": 10}, {"limit": 0}, {"limit": 10, "q": "sram"}, {"limit": 10, "key": "kb_1:1::b"},
+                                 {"limit": 10, "upper": "property"}):
+                        self.assertEqual(service.graph_preview_pick(slim, **view), service.graph_preview_pick(whole, **view), view)
+            for broken in ('{"entities": [{"key": "a"}', "[1, 2]", '{"entities": [1 2]}', ""):      # an incomplete read raises instead of returning half a graph
+                path.write_text(broken, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    service._read_graph_json(path)
+
+    def test_memory_held_while_reading_does_not_grow_with_the_file(self) -> None:
+        import io
+        from unittest import mock
+
+        from kb_server import service
+
+        class Tracked(io.StringIO):
+            asked: list[int] = []
+
+            def read(self, size=-1):
+                self.asked.append(size)
+                return super().read(size)
+
+        graph = {"kb_id": "kb_1", "documents": {f"d{i}": {"rel_path": f"{i}.pdf"} for i in range(5)},
+                 "entities": [{"key": f"e{i}", "title": "名" * 20, "unit_ids": ["u1", "u2"]} for i in range(400)],
+                 "mentions": [{"entity_key": f"e{i}", "point_id": "p", "count": 1.5e3} for i in range(400)],
+                 "stats": {"resolution": {"yes": 1}}}
+        text = json.dumps(graph, ensure_ascii=False)
+        stream = Tracked(text)
+        with mock.patch.object(service, "_GRAPH_READ_CHARS", 64):
+            pieces = list(service._iter_graph_json(SimpleNamespace(open=lambda encoding: stream)))
+        self.assertEqual(len(pieces), 1 + 1 + 400 + 400 + 1)
+        self.assertGreater(len(text), 64 * 200)
+        # Each read asks for a small piece; only a single value larger than the buffer asks for more (the documents
+        # item is about 150 characters)
+        self.assertLessEqual(max(stream.asked), 64 * 4)
+
+    def test_graphs_are_cached_per_kb_within_a_budget_and_the_old_one_goes_first(self) -> None:
+        import os
+        from unittest import mock
+
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for name in ("a1", "a2", "b", "c"):
+                paths[name] = Path(tmp) / name / "graph.json"
+                paths[name].parent.mkdir()
+                paths[name].write_text(json.dumps({"entities": [{"key": name}], "pad": "x" * 1000}), encoding="utf-8")
+            size = paths["a1"].stat().st_size
+            held_while_reading: list[list[str]] = []
+            real = service._read_graph_json
+
+            def reader(path):
+                held_while_reading.append(sorted(service._GRAPH_JSON_CACHE))
+                return real(path)
+
+            with mock.patch.object(service, "_read_graph_json", side_effect=reader) as read, \
+                    mock.patch.object(service, "_GRAPH_CACHE_MAX_BYTES", size * 2 + 10):
+                first = service._load_graph_json("kb_a", paths["a1"])
+                self.assertIs(service._load_graph_json("kb_a", paths["a1"]), first)            # same version: not read again
+                service._load_graph_json("kb_b", paths["b"])
+                self.assertIs(service._load_graph_json("kb_a", paths["a1"]), first)            # another KB and back: still there
+                self.assertEqual(read.call_count, 2)
+                # A new version: the old copy is let go before the new one is read
+                second = service._load_graph_json("kb_a", paths["a2"])
+                self.assertEqual(second["entities"], [{"key": "a2", "description": ""}])
+                self.assertEqual(held_while_reading[-1], ["kb_b"])
+                # The same path rewritten (mtime changed) is read again too
+                os.utime(paths["a2"], (1, 1))
+                service._load_graph_json("kb_a", paths["a2"])
+                self.assertEqual(read.call_count, 4)
+                # Over the budget: the least recently viewed (kb_b) goes first, kb_a viewed just now stays
+                service._load_graph_json("kb_c", paths["c"])
+                self.assertEqual(held_while_reading[-1], ["kb_a"])
+                self.assertEqual(sorted(service._GRAPH_JSON_CACHE), ["kb_a", "kb_c"])
+                # A single graph over the budget on its own is still read; everything else makes room
+                with mock.patch.object(service, "_GRAPH_CACHE_MAX_BYTES", 10):
+                    service._load_graph_json("kb_b", paths["b"])
+                self.assertEqual(sorted(service._GRAPH_JSON_CACHE), ["kb_b"])
+            # Deleting the graph or the KB lets go of that KB's cached copy
+            for call, target in ((service.delete_graph, "kb_pipeline.maintenance.delete_graph_now"),
+                                 (service.delete_kb, "kb_pipeline.maintenance.delete_kb_now")):
+                service._GRAPH_JSON_CACHE["kb_b"] = ("p", 0.0, 1, {})
+                with mock.patch.object(service, "settings"), mock.patch(target, return_value={"errors": []}):
+                    call("kb_b")
+                self.assertNotIn("kb_b", service._GRAPH_JSON_CACHE)
+
+    def test_identical_requests_arriving_together_read_the_file_once(self) -> None:
+        import threading
+        from unittest import mock
+
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "graph.json"
+            path.write_text(json.dumps(self.GRAPH, ensure_ascii=False), encoding="utf-8")
+            real = service._read_graph_json
+            started = threading.Event()
+
+            def slow(p):
+                started.set()
+                time.sleep(0.2)
+                return real(p)
+
+            got: list[Any] = []
+            with mock.patch.object(service, "_read_graph_json", side_effect=slow) as read:
+                first = threading.Thread(target=lambda: got.append(service._load_graph_json("kb_1", path)))
+                first.start()
+                self.assertTrue(started.wait(5))
+                others = [threading.Thread(target=lambda: got.append(service._load_graph_json("kb_1", path))) for _ in range(3)]
+                for t in others:
+                    t.start()
+                for t in [first, *others]:
+                    t.join(10)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(len(got), 4)
+            self.assertTrue(all(g is got[0] for g in got))
+
+
 class ServiceDrawerBulkTests(unittest.TestCase):
     """2026-09-06: service status drawer — the "system services" group gains one-click restart all / stop all;
     timer tasks show only their last run time."""
@@ -835,10 +1041,7 @@ class ServiceDrawerBulkTests(unittest.TestCase):
         self.assertIn("h.reranker !== false && h.visual_reranker !== false", js)
         example = _repo_file("config/knowledge-base.env.example")
         self.assertIn("RERANKER_BASE_URL=", example)
-        self.assertIn("VISUAL_RERANKER_BASE_URL=", example)
-        src = _repo_file("app/kb_pipeline/config.py")
-        self.assertIn('os.getenv("RERANKER_BASE_URL", "http://127.0.0.1:8102/v1")', src)
-        self.assertIn('os.getenv("VISUAL_RERANKER_BASE_URL", "http://127.0.0.1:8104/v1")', src)
+        self.assertIn("VISUAL_RERANKER_BASE_URL=", example)   # the code defaults are checked through load_settings in ConfigLoadingTests
 
 
 class GraphPreviewClusterTests(unittest.TestCase):
@@ -1056,6 +1259,88 @@ class ConsoleI18nTests(unittest.TestCase):
                     missing.append(f"{rel}: {text}")
         self.assertEqual(missing, [])
 
+    # Where the errors the console API returns to the page come from: the whole API and service layers; in the
+    # pipeline only the functions the console can reach
+    _SERVER_MESSAGE_SOURCES = {
+        "app/kb_server/api.py": None, "app/kb_server/main.py": None, "app/kb_server/service.py": None,
+        "app/kb_pipeline/maintenance.py": {"stop_graph_build_now", "delete_graph_now", "delete_kb_now"},
+        "app/kb_pipeline/discovery.py": {"enroll", "adopt_directory"},
+        "app/kb_pipeline/limits.py": None,
+        "app/kb_pipeline/db.py": {"delete_llm"},
+        "app/kb_pipeline/graph/schema_flow.py": None,
+        "app/kb_pipeline/graph/build.py": {"resolve_llm_specs"},
+    }
+    # Shown as they are in both languages: low-level errors passed through verbatim (a missing key, an exception with
+    # its type name, a malformed graph.json) and the directory checks of adopt
+    _UNTRANSLATED_MESSAGES = {"not found: 12", "12: 12", "Expecting one of 12",
+                              "directory 12 does not exist under the mirror root", "12 already lives in 12"}
+
+    @classmethod
+    def _message_sample(cls, node) -> str | None:
+        """Error expression -> one sample message: a literal as it is, the variable slots of an f-string filled with
+        12, the two sides of a concatenation taken separately."""
+        import ast
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            return "".join(str(v.value) if isinstance(v, ast.Constant) else "12" for v in node.values)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = cls._message_sample(node.left), cls._message_sample(node.right)
+            return None if left is None and right is None else (left or "12") + (right or "12")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and len(node.args) == 2:
+            return cls._message_sample(node.args[1])          # X.get(key, fallback message)
+        return None
+
+    def _server_messages(self) -> list[tuple[str, int, str]]:
+        import ast
+
+        found = []
+        for rel, only in self._SERVER_MESSAGE_SOURCES.items():
+            tree = ast.parse(_repo_file(rel))
+            owner: dict[int, str] = {}
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for child in ast.walk(fn):
+                        owner.setdefault(id(child), fn.name)
+            for node in ast.walk(tree):
+                if only is not None and owner.get(id(node)) not in only:
+                    continue
+                expr = None
+                if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                    call = node.exc
+                    detail = [kw.value for kw in call.keywords if kw.arg == "detail"]
+                    expr = detail[0] if detail else (call.args[0] if call.args else None)
+                elif isinstance(node, ast.Call) and getattr(node.func, "id", "") == "JSONResponse":
+                    for kw in node.keywords:
+                        if kw.arg == "content" and isinstance(kw.value, ast.Dict):
+                            expr = next((v for k, v in zip(kw.value.keys, kw.value.values)
+                                         if isinstance(k, ast.Constant) and k.value == "detail"), None)
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "append"
+                      and getattr(node.func.value, "id", "") in ("errors", "warnings", "stale") and node.args):
+                    expr = node.args[0]
+                text = self._message_sample(expr) if expr is not None else None
+                if text:
+                    found.append((rel, node.lineno, text))
+        return found
+
+    def test_server_error_messages_translate(self) -> None:
+        """Server errors go through t(): in the Chinese UI the whole sentence maps back through the dictionary, or an
+        EN_ZH_PATTERNS entry matches it when it carries variables. test_server_messages_have_a_chinese_rendering only
+        sees plain literals; this one collects every error the console API can return, f-strings and concatenations
+        included, so a sentence with variables cannot reach the Chinese UI untranslated."""
+        values = self._dict_values()
+        i18n = _repo_file("app/kb_server/static/i18n.js")
+        block = i18n.split("const EN_ZH_PATTERNS = [", 1)[1].split("\n];", 1)[0]
+        patterns = [re.compile(m.group(1)) for m in re.finditer(r"^\s*\[/((?:[^/\\\n]|\\.)+)/, ", block, re.M)]
+        self.assertGreater(len(patterns), 50)
+        messages = self._server_messages()
+        self.assertGreater(len(messages), 60)
+        missing = [f"{rel}:{line} {text}" for rel, line, text in messages
+                   if text not in self._UNTRANSLATED_MESSAGES and text not in values
+                   and not any(p.search(text) for p in patterns)]
+        self.assertEqual(missing, [])
+
     def test_sidebar_search_box_aligns_with_its_header(self) -> None:
         """The generic input rule (width:100%) outranked .side-search, so the search box was once 20px wider than
         the header row and touched the right edge; the selector must beat it for the box to get the same 10px
@@ -1119,6 +1404,139 @@ class GraphPreviewRaceTests(unittest.TestCase):
         self.assertIn("state.gp.viewKey === viewKey", fn)
         self.assertNotIn("state.gp.pending", js)
         self.assertNotIn("state.gp.busy", js)
+
+
+def _js_function(js: str, head: str) -> str:
+    """Source of one top-level function in app.js (from its head to the next closing brace at column 0)."""
+    return js.split(head, 1)[1].split("\n}\n", 1)[0]
+
+
+class ConsoleFormAndDrawerStateTests(unittest.TestCase):
+    """The form draft stashed when switching KBs, the content cache of the side drawer, and the preview when the
+    latest build did not finish."""
+
+    def test_a_draft_is_only_what_was_edited_on_the_loaded_form(self) -> None:
+        """The form of a KB that is not enabled holds placeholder values (400 / 80 / empty prompt), and until the
+        config arrives it holds the previous KB's values. Stashed as a draft and filled back in once the KB is
+        enabled, they were shown instead of the saved config, and one more click on save wrote them. Only edits made
+        against the filled-in form are kept."""
+        js = _repo_file("app/kb_server/static/app.js")
+        stash = _js_function(js, "function stashDraft(dir) {")
+        self.assertIn("if (!dir || !formBase || formBase.dir !== dir) return;", stash)
+        self.assertIn("draftCache.delete(dir)", stash)                       # nothing edited, no draft kept
+        render = _js_function(js, "async function renderConfig() {")
+        self.assertIn("if (!active) draftCache.delete(kb.dir);", render)      # KB closed / deleted / not yet enabled: the draft is void
+        self.assertIn("if (!(active && formBase && formBase.dir === kb.dir)) formBase = null;", render)
+        filled = render.index("formBase = { dir: kb.dir, ...parseFormValues() };")
+        self.assertLess(render.index('$("#cfg-prompt").value = cfg.config.vlm_prompt || "";'), filled)   # counts only once filled in
+        self.assertLess(filled, render.index("restoreDraft(kb.dir)"))
+        self.assertIn('t("有未保存的修改")', render)                           # a draft filled back in must be visible
+        save = js.split('$("#cfg-save").addEventListener', 1)[1].split("\n});", 1)[0]
+        self.assertIn("formBase = { dir: kb.dir, ...parseFormValues() };", save)
+
+    def test_every_write_to_the_side_drawer_goes_through_the_html_cache(self) -> None:
+        """setHtml remembers what it last wrote into a container and skips an identical write. With direct innerHTML
+        writes mixed into the drawer the cache and the page disagreed: reopening the timeline of the same finished
+        job, the content equalled last time's, was judged "unchanged", and the drawer stayed at "Loading"."""
+        js = _repo_file("app/kb_server/static/app.js")
+        for head in ("async function openChunkDrawer(fileId) {", "function renderChunkPreview() {",
+                     "async function openMergesDrawer() {", "function renderMerges() {", "function openJob(jobId) {",
+                     "async function refreshJobDetail() {"):
+            body = _js_function(js, head)
+            self.assertNotIn(".innerHTML", body, head)
+            self.assertIn("setHtml(", body, head)
+
+    def test_preview_keeps_drawing_the_current_version_when_the_latest_build_did_not_finish(self) -> None:
+        """When the latest build failed or was paused, the version built before still serves search and the status
+        card still shows its size; the preview must not say "no version has been built yet"."""
+        js = _repo_file("app/kb_server/static/app.js")
+        fn = _js_function(js, "async function refreshGraphPreview(")
+        self.assertIn('const ok = !!version && !!kb.graph_status && kb.graph_status !== "disabled";', fn)
+        draw = _js_function(js, "function renderGraphPreview() {")
+        self.assertIn('kb.graph_status === "failed" || kb.graph_status === "stopped"', draw)
+        self.assertIn('t("画的是现行版本;最近一次建图没有完成")', draw)
+
+
+class ConsoleRaceAndFeedbackTests(unittest.TestCase):
+    """Button disabled states, late responses, leftovers on screen after switching KBs, and messages that did not
+    match what actually happened."""
+
+    def test_single_service_restart_keeps_its_button_disabled_across_redraws(self) -> None:
+        """The service panel is redrawn wholesale every few seconds. The disabled state of a single service's
+        "Restart" button was set only on the old node, so it was clickable again after about 2 seconds and the
+        database containers could be restarted a second time while starting up; the "database service" row has no
+        key of that name in /health either, so turning green was never seen. The disabled state is kept in a table,
+        turning green is judged by the row's own check, and the service must first be seen going down."""
+        js = _repo_file("app/kb_server/static/app.js")
+        health = js.split("async function _refreshHealth", 1)[1].split("\nasync function ", 1)[0]
+        self.assertIn('${busy || svcRestarting.has(key) ? "disabled" : ""}', health)
+        restart = _js_function(js, "async function onRestartService(ev) {")
+        self.assertIn("if (svcRestarting.has(key)) return;", restart)
+        self.assertIn("SERVICES.find(([, k]) => k === key)", restart)
+        self.assertIn("if ((mark.wentDown && up) || Date.now() > mark.until)", restart)
+        self.assertNotIn("state.health[key]", js)
+
+    def test_merges_drawer_drops_a_response_that_is_no_longer_wanted(self) -> None:
+        js = _repo_file("app/kb_server/static/app.js")
+        fn = _js_function(js, "async function openMergesDrawer() {")
+        self.assertIn("const seq = ++mergesReqSeq;", fn)
+        self.assertIn('seq !== mergesReqSeq || state.side.kind !== "merges" || selectedEntry()?.kb_id !== kb.kb_id', fn)
+        self.assertEqual(fn.count("if (stale()) return;"), 2)             # both the success and the failure path check
+
+    def test_preview_shows_loading_after_a_switch_and_sends_one_request_per_view(self) -> None:
+        """After a KB switch the canvas and legend kept the previous KB's graph until the new one arrived; while a
+        request for a view was in flight, every poll sent another identical one."""
+        js = _repo_file("app/kb_server/static/app.js")
+        reset = _js_function(js, "function resetWorkspace() {")
+        self.assertIn("loading: GP_PENDING", reset)
+        self.assertIn("renderGraphPreview();", reset)
+        fn = _js_function(js, "async function refreshGraphPreview(")
+        guard = fn.index("if (state.gp.loading === viewKey && Date.now() - state.gp.loadingAt < GP_LOAD_PATIENCE_MS) return;")
+        self.assertLess(guard, fn.index("const seq = ++gpReqSeq;"))
+        self.assertIn("if (!same) renderGraphPreview();", fn)
+        draw = _js_function(js, "function renderGraphPreview() {")
+        self.assertIn(': state.gp.loading ? t("载入中…")', draw)
+
+    def test_file_table_retry_says_so_when_a_job_is_already_running(self) -> None:
+        js = _repo_file("app/kb_server/static/app.js")
+        table = _js_function(js, "function renderFilesTable() {")
+        self.assertIn('toast(r.already_active ? t("已有任务在飞,不重复排队") : t("已重新排队"));', table)
+
+    def test_a_permanent_delete_is_visible_while_it_runs_and_reports_its_outcome(self) -> None:
+        """A permanent delete of a large KB takes minutes. The page used to only grey out the button, without a word;
+        users thought nothing happened and reloaded, the browser dropped the pending request and the completion
+        message never appeared. Now a click shows a message and the deleting state at once; the overview carries the
+        deleting state, so after a reload it still shows and polling runs at the busy pace; the outcome is reported
+        by the page that sent the request, or, when that request was lost, by the poll noticing the state changed."""
+        js = _repo_file("app/kb_server/static/app.js")
+        click = js.split('$("#cfg-delete").addEventListener("click"', 1)[1].split("\n});", 1)[0]
+        sent = click.index('api(`/kbs/${encodeURIComponent(kb.kb_id)}`, { method: "DELETE" })')
+        for before in ("pendingDeletes.add(kb.kb_id);", 't("正在彻底删除「{0}」,数据多的要几分钟", kb.dir)', 'kb.state = "deleting";',
+                       "renderKbNav();", "renderConfig();"):
+            self.assertLess(click.index(before), sent, before)                  # the page has changed before the request goes out
+        self.assertIn("if (!kb || !kb.kb_id || pendingDeletes.has(kb.kb_id)) return;", click)
+        self.assertIn("await refreshOverview(state.selected === kb.dir);", click)   # moved on to another KB while waiting: its form is not refilled
+        seen = _js_function(js, "function noteDeleteOutcomes(kbs) {")
+        self.assertIn('if (k.kb_id && pendingDeletes.has(k.kb_id)) k.state = "deleting";', seen)
+        self.assertIn("if (pendingDeletes.has(id)) continue;", seen)             # a page reports its own request, not twice
+        self.assertIn('now.state === "delete_failed"', seen)
+        poll = _js_function(js, "async function refreshOverview(")
+        self.assertLess(poll.index("noteDeleteOutcomes(data.kbs);"), poll.index("state.overview = data;"))
+        tick = _js_function(js, "async function tick() {")
+        self.assertIn('.some(k => k.state === "deleting")', tick)
+        render = _js_function(js, "async function renderConfig() {")
+        self.assertIn('|| kb.state === "deleting" || kb.state === "delete_failed";', render)       # the switch cannot be flipped
+        self.assertIn('$("#cfg-delete").disabled = !(kb.kb_id && !draft) || kb.state === "deleting";', render)
+        text = _js_function(js, "function kbStateText(kb) {")
+        self.assertLess(text.index('kb.state === "delete_failed"'), text.index("kb.gc_exempt"))    # no longer says "re-enable to restore"
+
+    def test_draft_form_load_checks_the_kb_has_not_changed(self) -> None:
+        """Switching to another KB while the draft branch waited for /limits and /llms filled the directory presets
+        into that KB's form afterwards."""
+        js = _repo_file("app/kb_server/static/app.js")
+        render = _js_function(js, "async function renderConfig() {")
+        draft = render.split("} else if (draft) {", 1)[1]
+        self.assertLess(draft.index("if (state.cfgKey !== key) return;"), draft.index('$("#cfg-max").value = dd.max_tokens ?? 400;'))
 
 
 class ConsoleFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCase):

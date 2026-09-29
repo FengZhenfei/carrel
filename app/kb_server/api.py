@@ -60,11 +60,6 @@ def enroll(payload: dict[str, Any]) -> dict[str, Any]:
     return _wrap(service.enroll, name, config if isinstance(config, dict) else None)
 
 
-@router.get("/kbs/{kb_id}/unenroll_info")
-def unenroll_info(kb_id: str) -> dict[str, Any]:
-    return _wrap(service.unenroll_info, kb_id)
-
-
 @router.post("/kbs/{kb_id}/adopt")
 def adopt_kb(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Recognise an unenrolled directory as the renamed form of this knowledge base (whose directory has
@@ -103,9 +98,10 @@ def graph_corpus(kb_id: str) -> dict[str, Any]:
 
 @router.post("/kbs/{kb_id}/graph_schema")
 def graph_schema(kb_id: str) -> dict[str, Any]:
-    """"Extract / re-extract labels now": synchronously runs 4 LLM passes to induce the graph build
-    constraints and returns suggestions only, without storing them. The console fills the form with the
-    result, and it takes effect only when the user reviews it and clicks save."""
+    """"Extract / re-extract labels now": synchronously runs a full label extraction (several LLM calls,
+    usually a minute or two); the extracted version is written into the version ring but does not take
+    effect. The console fills the form with the result, and it takes effect only when the user reviews it
+    and clicks save."""
     return _wrap(service.suggest_graph_schema, kb_id)
 
 
@@ -153,12 +149,6 @@ def file_chunks(kb_id: str, file_id: str) -> dict[str, Any]:
     return _wrap(service.file_chunks, kb_id, file_id)
 
 
-@router.get("/kbs/{kb_id}/jobs")
-def kb_jobs(kb_id: str, status: str = "all", limit: int = 200) -> dict[str, Any]:
-    """This knowledge base's job list (all / active / failed / done) + queue depth, for the "Jobs" tab."""
-    return _wrap(service.kb_jobs, kb_id, status, limit)
-
-
 @router.get("/kbs/{kb_id}/graph_preview")
 def graph_preview(kb_id: str, limit: int = 60, q: str = "", upper: str = "", key: str = "") -> dict[str, Any]:
     """A part of the current graph version (entities picked by degree + the relations between them;
@@ -172,29 +162,6 @@ def graph_merges(kb_id: str, limit: int = 2000) -> dict[str, Any]:
     """Entity merge log of the current version: every merged pair (merged into which / origin / kind of
     basis) and every blocked pair (reason), for the merge drawer of the "graph preview"."""
     return _wrap(service.graph_merges, kb_id, limit=limit)
-
-
-@router.get("/kbs/{kb_id}/graph_builds")
-def graph_builds(kb_id: str) -> dict[str, Any]:
-    """This knowledge base's graph build records: the mode, size, merge outcome and completed stages of
-    each run, for the "Graph" tab."""
-    return _wrap(service.graph_builds, kb_id)
-
-
-@router.post("/kbs/{kb_id}/chunk_preview")
-def chunk_preview(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Re-chunk an indexed file with the given parameters (which may be unsaved form values) and return
-    the diagnostics and the content of each chunk."""
-    file_id = str(payload.get("file_id") or "").strip()
-    if not file_id:
-        raise HTTPException(status_code=422, detail="file_id is required")
-    args: dict[str, int | None] = {}
-    for key in ("max_tokens", "overlap_tokens"):
-        value = payload.get(key)
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
-            raise HTTPException(status_code=422, detail=f"{key} must be an integer")
-        args[key] = value
-    return _wrap(service.chunk_preview, kb_id, file_id, **args)
 
 
 @router.get("/kbs/{kb_id}/config")
@@ -212,11 +179,6 @@ def put_kb_config(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 def reparse(kb_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     reason = str((payload or {}).get("reason") or "web console reparse")
     return _wrap(service.reparse_kb, kb_id, reason)
-
-
-@router.get("/jobs/failed")
-def failed_jobs() -> dict[str, Any]:
-    return service.failed_jobs()
 
 
 @router.get("/jobs/{job_id}")

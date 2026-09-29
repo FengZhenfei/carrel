@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from kb_pipeline import db
 from kb_pipeline.graph.llm import LLMCache
@@ -208,10 +209,10 @@ class LegacyLabelsSurviveFirstExtractionTests(unittest.TestCase):
 
     def test_pre_version_labels_are_materialised_before_the_new_one_lands(self) -> None:
         from kb_pipeline.limits import LEGACY_SCHEMA_VERSION_ID, push_schema_version
-        from kb_server.service import _ring_with_legacy
+        from kb_pipeline.graph.schema_flow import ring_with_legacy
 
         stored = {"graph_entity_types": ["organization", "signal"], "graph_language": "Chinese"}
-        ring = _ring_with_legacy(stored)
+        ring = ring_with_legacy(stored)
         self.assertEqual(len(ring), 1)
         self.assertEqual(ring[0]["id"], LEGACY_SCHEMA_VERSION_ID)
         self.assertEqual(ring[0]["entity_types"], ["organization", "signal"])
@@ -225,10 +226,11 @@ class LegacyLabelsSurviveFirstExtractionTests(unittest.TestCase):
         "keep as is" no-op -- materialising with it would put a version in the dropdown that does nothing
         when selected."""
         from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID, LEGACY_SCHEMA_VERSION_ID
-        from kb_server.service import _apply_schema_version, _ring_with_legacy
+        from kb_pipeline.graph.schema_flow import ring_with_legacy
+        from kb_server.service import _apply_schema_version
 
         self.assertNotEqual(LEGACY_SCHEMA_VERSION_ID, CURRENT_SCHEMA_VERSION_ID)
-        ring = _ring_with_legacy({"graph_entity_types": ["signal"], "graph_language": "Chinese"})
+        ring = ring_with_legacy({"graph_entity_types": ["signal"], "graph_language": "Chinese"})
         updates = {"graph_schema_active": LEGACY_SCHEMA_VERSION_ID}
         _apply_schema_version({"graph_schema_versions": ring}, updates)
         self.assertEqual(updates["graph_entity_types"], ["signal"])
@@ -237,26 +239,26 @@ class LegacyLabelsSurviveFirstExtractionTests(unittest.TestCase):
     def test_metadata_is_left_blank_rather_than_invented(self) -> None:
         """Nothing was recorded at the time. Inventing a plausible timestamp would make the whole version record
         untrustworthy -- and the entire value of rolling back a version rests on it being trustworthy."""
-        from kb_server.service import _ring_with_legacy
+        from kb_pipeline.graph.schema_flow import ring_with_legacy
 
-        entry = _ring_with_legacy({"graph_entity_types": ["signal"]})[0]
+        entry = ring_with_legacy({"graph_entity_types": ["signal"]})[0]
         self.assertIsNone(entry["created_at"])
         self.assertIsNone(entry["model"])
         self.assertIsNone(entry["sample_size"])
         self.assertTrue(entry["legacy"])
 
     def test_an_existing_ring_is_left_alone(self) -> None:
-        from kb_server.service import _ring_with_legacy
+        from kb_pipeline.graph.schema_flow import ring_with_legacy
 
         ring = [{"id": "v1", "entity_types": ["a"]}]
-        self.assertEqual(_ring_with_legacy(
+        self.assertEqual(ring_with_legacy(
             {"graph_schema_versions": ring, "graph_entity_types": ["b"]}), ring)
 
     def test_a_kb_that_never_had_labels_gets_no_phantom_version(self) -> None:
-        from kb_server.service import _ring_with_legacy
+        from kb_pipeline.graph.schema_flow import ring_with_legacy
 
-        self.assertEqual(_ring_with_legacy({}), [])
-        self.assertEqual(_ring_with_legacy({"graph_entity_types": []}), [])
+        self.assertEqual(ring_with_legacy({}), [])
+        self.assertEqual(ring_with_legacy({"graph_entity_types": []}), [])
 
 
 class SchemaVersionContractTests(unittest.TestCase):
@@ -993,6 +995,47 @@ class LlmDeletionDecouplingTests(unittest.TestCase):
         svc = _repo_file("app/kb_server/service.py")
         self.assertEqual(svc.count("env=_child_env("), 3)                 # two build Popens + the fallback script
 
+    def test_spawned_builds_run_at_batch_oom_priority(self) -> None:
+        """The console unit's oom_score_adj is 100 and child processes inherit it; before a build starts it is raised
+        back to 200 and the process is then replaced by the build, the same on both launch paths, with the command
+        line arguments passed through unchanged."""
+        import subprocess
+        import sys
+        from unittest import mock
+
+        from kb_server import service as svc_mod
+
+        launched: list[list[str]] = []
+
+        def popen(cmd, **kwargs):
+            launched.append(list(cmd))
+            if cmd[0] == "systemd-run" and len(launched) > 1:
+                raise FileNotFoundError("systemd-run")
+            return mock.Mock(pid=4242)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(state_db=Path(tmp) / "runtime" / "state" / "s.db", log_dir=Path(tmp) / "logs")
+            with mock.patch.object(svc_mod.subprocess, "Popen", side_effect=popen):
+                self.assertEqual(svc_mod._spawn_graph_build(cfg, "kb_001", append=True, force=True)["detached"], "systemd-scope")
+                self.assertEqual(svc_mod._spawn_graph_build(cfg, "kb_001")["detached"], "popen")
+        scoped, _, fallback = launched
+        wrapper = svc_mod.BATCH_OOM_SCORE
+        at = scoped.index(wrapper[0])
+        self.assertEqual(scoped[:3], ["systemd-run", "--user", "--scope"])
+        self.assertEqual(scoped[at:at + len(wrapper)], wrapper)
+        self.assertEqual(scoped[at + len(wrapper) + 1:][:2] + scoped[-5:], ["-m", "kb_pipeline", "graph", "append", "--source", "kb_001", "--force"])
+        self.assertEqual(fallback[:len(wrapper)], wrapper)
+        self.assertEqual(fallback[-4:], ["graph", "build", "--source", "kb_001"])
+        # Run the wrapper for real: the arguments (spaces included) arrive unchanged and nothing extra is printed; on a
+        # machine with /proc the child's score is at least 200
+        probe = ("import pathlib, sys; p = pathlib.Path('/proc/self/oom_score_adj'); "
+                 "print(sys.argv[1:], p.read_text().strip() if p.exists() else 'n/a', sep='|')")
+        out = subprocess.run(wrapper + [sys.executable, "-c", probe, "a b", "--x"], capture_output=True, text=True, timeout=30)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        argv, score = out.stdout.strip().split("|")
+        self.assertEqual(argv, "['a b', '--x']")
+        self.assertTrue(score == "n/a" or int(score) >= 200, score)
+
     def test_resolution_judge_batches_run_at_the_global_concurrency(self) -> None:
         """Decided by the user on 2026-09-12: entity-resolution judge batches no longer have their own cap of 5
         and follow KB_GRAPH_LLM_CONCURRENCY (the batches are independent of each other)."""
@@ -1377,15 +1420,23 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     mock.patch.object(maintenance, "_drop_neo4j_projection", return_value={}), \
                     mock.patch.object(maintenance, "_mineru_busy", return_value=None), \
                     mock.patch.object(maintenance, "_pgrep", return_value=False):
-                # Refuse to delete while a job is running
+                # Deleting terminates first, then deletes: with a job running under a valid lease whose holder cannot
+                # be confirmed dead (the lease carries no "host:pid"), the delete is refused, so a worker still alive
+                # cannot recreate the collection that was just deleted
                 with dbm.connect(state_db) as con:
-                    # A running job holds a valid lease; a status='running' row whose lease has expired is a
-                    # dead record left by a killed worker and must not block the delete (see C4)
                     con.execute("UPDATE jobs SET status='running', locked_until=? WHERE job_id='j1'",
                                 (int(time.time()) + 3600,))
                     con.commit()
-                with self.assertRaises(ValueError):
+                # The 10 seconds of waiting for the lease to be released run on a fake clock instead of real sleep
+                clock = mock.Mock(wraps=time)
+                started = time.time()
+                now = [started]
+                clock.time.side_effect = lambda: now[0]
+                clock.sleep.side_effect = lambda seconds: now.__setitem__(0, now[0] + seconds)
+                with mock.patch.object(maintenance, "time", clock), \
+                        self.assertRaisesRegex(ValueError, "Parse jobs could not be terminated"):
                     maintenance.delete_kb_now(stub, kb_id=source.kb_id)
+                self.assertGreaterEqual(now[0] - started, 10.0)                   # gave up only after the full wait
                 with dbm.connect(state_db) as con:
                     con.execute("UPDATE jobs SET status='queued' WHERE job_id='j1'")
                     con.commit()
@@ -1754,6 +1805,56 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     service.save_llm({"name": "m5", "base_url": "http://x/v1",
                                       "model_id": "mid", "protocol": "grpc"})
 
+    def test_connectivity_probe_does_not_hold_the_state_db_write_lock(self) -> None:
+        """Saving a model with the key cleared used to write the row first and then probe connectivity inside the
+        same uncommitted transaction: with a slow endpoint the probe takes tens of seconds, and the state
+        database's write lock was held all that time while parse and graph build writes waited. The probe now runs
+        outside the transaction; a failed probe changes nothing."""
+        import sqlite3
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite3"
+            dbm.init_db(state_db)
+            with dbm.connect(state_db) as con:
+                dbm.upsert_llm(con, name="m", base_url="http://a:8000/v1", api_key="sk-old", model_id="x")
+            stub = mock.Mock()
+            stub.state_db = state_db
+            seen: dict[str, Any] = {}
+
+            def probe(base_url, api_key, model_id, protocol="openai"):
+                seen["probe_key"] = api_key
+                other = sqlite3.connect(str(state_db), timeout=0.2)        # another process writes meanwhile
+                try:
+                    other.execute("INSERT INTO app_config(key, value, updated_at) VALUES('written-during-probe', '1', 0)")
+                    other.commit()
+                    seen["stored_key_during_probe"] = other.execute(
+                        "SELECT api_key FROM llm_registry WHERE name='m'").fetchone()[0]
+                finally:
+                    other.close()
+
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "_probe_llm", side_effect=probe):
+                saved = service.save_llm({"name": "m", "base_url": "http://b:8000/v1", "model_id": "x",
+                                          "api_key": "", "clear_api_key": True})
+            self.assertEqual(seen, {"probe_key": "", "stored_key_during_probe": "sk-old"})
+            self.assertFalse(saved["has_api_key"])
+            with dbm.connect(state_db) as con:
+                row = dbm.get_llm(con, "m")
+                self.assertEqual((row["api_key"], row["base_url"]), ("", "http://b:8000/v1"))
+                dbm.upsert_llm(con, name="k", base_url="http://a:8000/v1", api_key="sk-keep", model_id="x")
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "_probe_llm", side_effect=ValueError("Connectivity test failed: HTTP 500")):
+                with self.assertRaises(ValueError):
+                    service.save_llm({"name": "k", "base_url": "http://c:8000/v1", "model_id": "y",
+                                      "api_key": "", "clear_api_key": True})
+            with dbm.connect(state_db) as con:
+                row = dbm.get_llm(con, "k")
+            self.assertEqual((row["api_key"], row["base_url"], row["model_id"]), ("sk-keep", "http://a:8000/v1", "x"))
+
     def test_delete_cancels_pending_jobs_before_touching_storage(self) -> None:
         """C1: deleting a KB spans several external network calls, during which SQLite holds no write lock.
         Queued jobs must be cancelled and committed first, otherwise a worker started in that window would
@@ -1947,6 +2048,316 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
     def test_build_lock_covers_label_preparation_and_start_button_is_guarded(self) -> None:
         build = _repo_file("app/kb_pipeline/graph/build.py")
         self.assertEqual(build.count("lock.acquire()"), 1)
-        self.assertLess(build.index("lock.acquire()"), build.index("source, schema_auto = ensure_schema_before_build(settings, source)"))
+        self.assertLess(build.index("lock.acquire()"), build.index("source, schema_auto = ensure_schema_before_build(settings, source, stop=stop_event)"))
         js = _repo_file("app/kb_server/static/app.js")
         self.assertIn("if (buildStarting) return;", js)
+
+
+class HardDeleteLifecycleTests(unittest.TestCase):
+    """"Delete permanently": while it runs others can see it and cannot get in its way; one that did not finish is
+    carried on by the next maintenance run and cannot be switched back on as it is."""
+
+    def _kb(self, tmp: str, name: str = "库D"):
+        from kb_pipeline import discovery
+
+        root = Path(tmp)
+        state = root / "state.sqlite3"
+        if not state.exists():
+            db.init_db(state)
+        mirror = root / "mirror"
+        (mirror / name).mkdir(parents=True, exist_ok=True)
+        with db.connect(state) as con:
+            source, _ = discovery.enroll(con, mirror, name)
+            con.commit()
+        stub = SimpleNamespace(state_db=state, mirror_root=mirror, runtime_dir=root / "rt", graph_work_dir=root / "gw",
+                               cache_dir=root / "cache", qdrant_url="http://q", qdrant_api_key="", opensearch_url="http://o",
+                               neo4j_password="x", qdrant_inactive_retention_days=7, parse_enabled=True)
+        return stub, source
+
+    @staticmethod
+    def _stores(*, neo4j=None):
+        """Stubs for the external stores: by default everything deletes; an exception for neo4j makes the graph store
+        side fail."""
+        from contextlib import ExitStack
+        from unittest import mock
+
+        from kb_pipeline import maintenance
+
+        stack = ExitStack()
+        stack.enter_context(mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()))
+        stack.enter_context(mock.patch("kb_pipeline.vector.qdrant.delete_collection", return_value={"deleted": True}))
+        stack.enter_context(mock.patch("kb_pipeline.search_fts.delete_collection", return_value={"deleted": True}))
+        stack.enter_context(mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}))
+        stack.enter_context(mock.patch.object(maintenance, "_drop_neo4j_projection",
+                                              **({"side_effect": neo4j} if neo4j else {"return_value": {}})))
+        stack.enter_context(mock.patch.object(maintenance, "service_busy", return_value=(False, [])))
+        return stack
+
+    def _row(self, stub, kb_id: str):
+        with db.connect(stub.state_db) as con:
+            return con.execute("SELECT * FROM kb_sources WHERE kb_id = ?", (kb_id,)).fetchone()
+
+    def test_a_delete_that_partly_failed_is_retried_at_the_next_maintenance_run(self) -> None:
+        """When a delete fails, inactive_at records the moment of the delete, and it used to get the retention period
+        of an ordinary deactivated KB: the message said "retried at the next maintenance run", yet it waited the
+        full 7 days, and the text left undeleted stayed in the keyword index and the graph store 7 more days."""
+        from kb_pipeline import discovery, maintenance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            _, closed = self._kb(tmp, "刚关的库")
+            with db.connect(stub.state_db) as con:
+                discovery.mark_inactive(con, closed.kb_id, reason="unenrolled")
+                con.commit()
+            with self._stores(neo4j=RuntimeError("neo4j restarting")):
+                with self.assertRaises(maintenance.PartialDeleteError):
+                    maintenance.delete_kb_now(stub, kb_id=source.kb_id)
+            row = self._row(stub, source.kb_id)
+            self.assertEqual((row["status"], row["inactive_reason"]), ("inactive", "delete_failed"))
+            self.assertGreater(int(row["inactive_at"]), int(time.time()) - 60)          # deactivated just now, far from the end of retention
+            with self._stores():
+                result = maintenance.kb_sources_gc(stub, retention_days=7)               # the maintenance run that night
+            self.assertEqual([e["kb_id"] for e in result["dropped"]], [source.kb_id])    # the KB closed just now waits for its retention as usual
+            self.assertEqual(result["errors"], [])
+            self.assertIsNone(self._row(stub, source.kb_id))
+            self.assertIsNotNone(self._row(stub, closed.kb_id))
+
+    def test_a_delete_cut_short_by_a_restart_is_picked_up_too(self) -> None:
+        """The process died halfway through a delete and the registry row stayed at "deleting": maintenance carries on
+        deleting it as well, and a directory still on disk does not exempt it."""
+        from kb_pipeline import maintenance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            with db.connect(stub.state_db) as con:
+                con.execute("UPDATE kb_sources SET status='inactive', inactive_reason='deleting', inactive_at=? WHERE kb_id=?",
+                            (int(time.time()), source.kb_id))
+                con.commit()
+            with self._stores():
+                result = maintenance.kb_sources_gc(stub, retention_days=7)
+            self.assertEqual([e["kb_id"] for e in result["dropped"]], [source.kb_id])
+            self.assertIsNone(self._row(stub, source.kb_id))
+
+    def test_a_half_deleted_kb_cannot_be_reopened_or_adopted(self) -> None:
+        """For a KB whose delete failed the console used to say "removed (directory is back), re-enable to restore";
+        doing so revived a half-deleted KB: the state database already cleared, points still left in the external
+        stores. Now the overview reports "deletion unfinished", and re-enabling and adopting are both refused."""
+        from unittest import mock
+
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            (stub.mirror_root / "新名字").mkdir()
+            for reason in ("delete_failed", "deleting"):
+                with db.connect(stub.state_db) as con:
+                    con.execute("UPDATE kb_sources SET status='inactive', inactive_reason=?, inactive_at=? WHERE kb_id=?",
+                                (reason, int(time.time()) - 3 * 86400, source.kb_id))
+                    con.commit()
+                with mock.patch.object(service, "settings", return_value=stub):
+                    entry = {kb["dir"]: kb for kb in service.overview()["kbs"]}["库D"]
+                    self.assertEqual(entry["state"], "delete_failed", reason)
+                    self.assertNotIn("gc_exempt", entry)                       # not "the directory is back, never deleted"
+                    self.assertNotIn("gc_in_seconds", entry)                   # no countdown either: the next maintenance run deletes it
+                    with self.assertRaisesRegex(ValueError, "permanent deletion of .* has not finished"):
+                        service.enroll("库D")
+                    with self.assertRaisesRegex(ValueError, "permanent deletion of .* has not finished"):
+                        service.adopt_kb(source.kb_id, "新名字")
+                row = self._row(stub, source.kb_id)
+                self.assertEqual((row["status"], row["inactive_reason"], row["source_root"]), ("inactive", reason, "库D"))
+            # The branch where the directory is gone too reports "deletion unfinished" as well
+            (stub.mirror_root / "库D").rmdir()
+            with mock.patch.object(service, "settings", return_value=stub):
+                entry = {kb["dir"]: kb for kb in service.overview()["kbs"]}["库D"]
+            self.assertEqual(entry["state"], "delete_failed")
+            # An ordinary closed KB is not affected: it can be switched back on as usual
+            _, other = self._kb(tmp, "另一个库")
+            with db.connect(stub.state_db) as con:
+                discovery.mark_inactive(con, other.kb_id, reason="unenrolled")
+                _, outcome = discovery.enroll(con, stub.mirror_root, "另一个库")
+            self.assertEqual(outcome, "reactivated")
+
+    def test_delete_marks_the_row_and_holds_the_build_lock_until_it_is_done(self) -> None:
+        """Deleting a KB spans several external stores and takes minutes for a large one. It used to hold no build lock
+        and the registry row stayed active throughout: the scheduled check could start a build of the same KB in
+        that window, and the check before a build publishes could not tell the KB was being deleted."""
+        from unittest import mock
+
+        from kb_pipeline import maintenance
+        from kb_pipeline.graph.build import kb_still_active
+        from kb_pipeline.graph.lock import GraphBuildLock, build_lock_held, build_lock_path
+        from kb_pipeline.graph.schema_flow import SUGGEST_MARK_PREFIX
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            with db.connect(stub.state_db) as con:
+                db.record_graph_check(con, source.kb_id, {"kind": "none"})
+                db.set_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id, {"origin": "manual", "started_at": 1})
+                con.commit()
+            seen: dict[str, Any] = {}
+            real = maintenance._hard_delete_kb
+
+            def spy(settings, con, **kw):
+                seen["lock_held"] = build_lock_held(build_lock_path(stub))
+                row = self._row(stub, source.kb_id)                 # read on another connection: sees the committed state
+                seen["row"] = (row["status"], row["inactive_reason"])
+                seen["still_active"] = kb_still_active(stub, source.kb_id)
+                with self.assertRaises(RuntimeError):               # a build arriving now cannot take the lock
+                    GraphBuildLock(stub).acquire()
+                return real(settings, con, **kw)
+
+            with self._stores(), mock.patch.object(maintenance, "_hard_delete_kb", side_effect=spy):
+                entry = maintenance.delete_kb_now(stub, kb_id=source.kb_id)
+            self.assertEqual(seen, {"lock_held": True, "row": ("inactive", "deleting"), "still_active": False})
+            self.assertTrue(entry["forgotten"])
+            self.assertFalse(build_lock_held(build_lock_path(stub)))             # the lock is released once done
+            with db.connect(stub.state_db) as con:
+                self.assertIsNone(db.latest_graph_check(con, source.kb_id))      # ids are never reused, so these two would stay forever
+                self.assertIsNone(db.get_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id))
+            # A failed delete releases the lock too
+            stub2, source2 = self._kb(tmp, "库E")
+            with self._stores(neo4j=RuntimeError("boom")):
+                with self.assertRaises(maintenance.PartialDeleteError):
+                    maintenance.delete_kb_now(stub2, kb_id=source2.kb_id)
+            self.assertFalse(build_lock_held(build_lock_path(stub2)))
+
+    def test_scan_leaves_a_kb_that_is_being_deleted_alone(self) -> None:
+        """Once the registry row is marked as deleting, the scan that runs every minute took it for a deactivated KB and
+        queued a soft-delete job for every file: the whole collection is being torn down, so those jobs only fail and
+        retry, and pending jobs also make maintenance skip the KB. A closed KB is soft-deleted as usual."""
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli, discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, doomed = self._kb(tmp)
+            _, closed = self._kb(tmp, "关掉的库")
+            _, other = self._kb(tmp, "别的库")
+            for name in ("库D", "关掉的库", "别的库"):
+                doc = stub.mirror_root / name / "a.md"
+                doc.write_text(f"# {name}\n\n内容", encoding="utf-8")
+                os.utime(doc, (time.time() - 3600, time.time() - 3600))
+            stub.min_file_age_seconds = 30
+            args = argparse.Namespace(env_file=None, source=None, limit=None, verbose=False, dry_run=False, rehash=False,
+                                      requeue_failed=False, no_detect_deletes=False, force_kb_teardown=False,
+                                      exit_code_on_recent=False)
+
+            def scan() -> None:
+                stub.sources = discovery.enrolled_sources(stub.state_db, stub.mirror_root)
+                with mock.patch.object(cli, "load_settings", return_value=stub):
+                    self.assertEqual(cli.cmd_scan(args), 0)
+
+            scan()
+            with db.connect(stub.state_db) as con:
+                discovery.mark_inactive(con, closed.kb_id, reason="unenrolled")
+                con.commit()
+            for reason in ("deleting", "delete_failed"):
+                with db.connect(stub.state_db) as con:
+                    con.execute("UPDATE kb_sources SET status='inactive', inactive_reason=?, inactive_at=? WHERE kb_id=?",
+                                (reason, int(time.time()), doomed.kb_id))
+                    con.commit()
+                scan()
+                with db.connect(stub.state_db) as con:
+                    live = {str(r[0]): int(r[1]) for r in con.execute(
+                        "SELECT kb_id, COUNT(*) FROM files WHERE status != 'deleted' GROUP BY kb_id")}
+                    deletes = [str(r[0]) for r in con.execute("SELECT kb_id FROM jobs WHERE job_type = 'delete'")]
+                self.assertEqual(live, {doomed.kb_id: 1, other.kb_id: 1}, reason)
+                self.assertEqual(deletes, [closed.kb_id], reason)
+
+    def test_delete_is_refused_with_the_actual_reason_when_the_lock_is_taken(self) -> None:
+        from kb_pipeline import maintenance
+        from kb_pipeline.graph.lock import GraphBuildLock
+        from kb_pipeline.graph.schema_flow import SUGGEST_MARK_PREFIX
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            holder = GraphBuildLock(stub)
+            holder.acquire()
+            try:
+                with self._stores() as stores:
+                    with self.assertRaisesRegex(ValueError, "Another knowledge base is building its graph or being deleted"):
+                        maintenance.delete_kb_now(stub, kb_id=source.kb_id)
+                    # This KB's own build holds the lock and is still extracting labels, with no build record yet:
+                    # the message says so, not "another knowledge base"
+                    with db.connect(stub.state_db) as con:
+                        db.set_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id,
+                                          {"origin": "auto_blank", "started_at": int(time.time())})
+                        con.commit()
+                    with self.assertRaisesRegex(ValueError, "is extracting labels"):
+                        maintenance.delete_kb_now(stub, kb_id=source.kb_id)
+                    del stores
+                row = self._row(stub, source.kb_id)
+                self.assertEqual((row["status"], row["inactive_reason"]), ("active", None))      # refused = nothing touched
+            finally:
+                holder.release()
+
+    def test_overview_reports_a_delete_in_progress_and_a_second_click_is_turned_away(self) -> None:
+        """A permanent delete runs synchronously in the request thread. The page used to only grey out the button, and
+        after a reload not even that was left, so it looked as if nothing happened. While the delete runs the overview
+        reports deleting (visible after a reload or in another browser); once it is done or has failed it no longer
+        does."""
+        from unittest import mock
+
+        from kb_pipeline import discovery, maintenance
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            _, other = self._kb(tmp, "要建图的库")
+            with db.connect(stub.state_db) as con:
+                discovery.set_config(con, other.kb_id, {"graph_enabled": True, "graph_llm": {"extract": "m", "summarize": "m"}})
+                con.commit()
+            seen: dict[str, Any] = {}
+
+            def during(settings, *, kb_id):
+                seen["state"] = {kb["dir"]: kb for kb in service.overview()["kbs"]}["库D"]["state"]
+                try:
+                    service.delete_kb(kb_id)
+                except ValueError as exc:
+                    seen["second_click"] = str(exc)
+                with mock.patch.object(service, "build_lock_held", return_value=True):      # the delete holds the build lock throughout
+                    try:
+                        service.trigger_graph_build(other.kb_id)
+                    except ValueError as exc:
+                        seen["build_elsewhere"] = str(exc)
+                return {"kb_id": kb_id, "errors": []}
+
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "_spawn_graph_build", return_value={"started": True}) as spawn:
+                with mock.patch.object(maintenance, "delete_kb_now", side_effect=during):
+                    service.delete_kb(source.kb_id)
+                self.assertEqual(seen, {"state": "deleting",
+                                        "second_click": "This knowledge base is already being deleted; wait for it to finish",
+                                        "build_elsewhere": "Another knowledge base is being permanently deleted; build the graph when that finishes"})
+                spawn.assert_not_called()
+                self.assertEqual(service._KB_DELETING, set())
+                self.assertEqual({kb["dir"]: kb for kb in service.overview()["kbs"]}["库D"]["state"], "active")
+                failed = maintenance.PartialDeleteError(source.kb_id, {}, ["kb_001: neo4j projection drop failed"])
+                with mock.patch.object(maintenance, "delete_kb_now", side_effect=failed):
+                    with self.assertRaisesRegex(ValueError, "Deletion incomplete.*continues at the next maintenance run.*neo4j projection drop failed"):
+                        service.delete_kb(source.kb_id)
+                self.assertEqual(service._KB_DELETING, set())                     # removed on failure too, or it shows as deleting forever
+
+    def test_adopt_checks_the_directory_name_before_walking_it(self) -> None:
+        """Adopting a directory used to join the name into a path, walk the whole tree and checksum a sample before it
+        checked the name: a name of ".." or an absolute path walked outside the mirror first and was only then
+        refused."""
+        from unittest import mock
+
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, source = self._kb(tmp)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "a.md").write_text("x", encoding="utf-8")
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(discovery, "directory_match_report",
+                                      side_effect=AssertionError("walked before the name was checked")) as report:
+                for bad in ("..", "../outside", str(outside), "/", "不存在的目录", ".hidden"):
+                    with self.assertRaisesRegex(ValueError, "does not exist under the mirror root"):
+                        service.adopt_kb(source.kb_id, bad)
+                self.assertEqual(report.call_count, 0)

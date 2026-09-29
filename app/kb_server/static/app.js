@@ -30,11 +30,10 @@ let state = {
   // dirty: you touched the dropdown, or a version was just extracted. Only then does a save carry the
   // selection.
   graphSchema: { versions: [], active: "", savedActive: "", note: "", dirty: false, kbId: "" },
-  corpus: null,            // corpus size of the current KB (documents / chunks), for the chunks-per-unit estimate hint
   gp: { kbId: null, version: null, viewKey: null, data: null, pos: null, sim: null, hist: [], cur: -1, cam: { k: 1, tx: 0, ty: 0 },
-        at: 0, hover: null, drag: null, error: null, raf: 0 },   // graph preview: data, layout simulation, levels, zoom / pan; viewKey = KB + version + view parameters
+        at: 0, hover: null, drag: null, error: null, raf: 0, loading: null, loadingAt: 0 },   // graph preview: data, layout simulation, levels, zoom / pan; viewKey = KB + version + view parameters; loading = the viewKey of the request in flight
   files: { kbId: null, rows: [], at: 0, page: 1, sort: "path", dir: 1, etag: null },
-  jobs: { kbId: null, rows: [], queue: {}, at: 0, selected: null },
+  jobs: { selected: null },   // the job being viewed in the drawer
   preview: null,           // result of the most recent chunk preview
 };
 
@@ -227,6 +226,8 @@ function graphDot(kb) {
 
 function kbStateText(kb) {
   if (kb.state === "active") return t("已开启");
+  if (kb.state === "deleting") return t("正在彻底删除…");
+  if (kb.state === "delete_failed") return t("删除未完成 · 下次维护时接着删");
   if (kb.state === "inactive") {
     // Deactivated because the directory vanished, but the directory is back: GC skips it forever, so a day
     // count would be a lie. What matters here is the remedy -- the scan does not revive it automatically,
@@ -334,7 +335,8 @@ function renderKbNav() {
           ${bar != null ? `<span class="mini${busy ? "" : " graph"}"><i style="width:${Math.max(bar, 2)}%"></i></span>` : ""}
           <span class="lbl" title="${esc(tip)}">${esc(text)}</span></div>`;
       }
-    } else if (kb.state === "inactive" || kb.state === "directory_missing" || kb.state === "directory_linked") {
+    } else if (kb.state === "inactive" || kb.state === "directory_missing" || kb.state === "directory_linked"
+               || kb.state === "deleting" || kb.state === "delete_failed") {
       // Only states needing a human, like "removed · permanently deleted in N days", get a line; KBs that are
       // not enabled do not say "not enabled"
       sub = `<div class="kb-row-sub"><span>${esc(kbStateText(kb))}</span></div>`;
@@ -405,9 +407,10 @@ function resetWorkspace() {
   $("#fl-count").textContent = "";
   if (state.activePanel === "side") setPanel(null);   // the chunks / timeline in the drawer belong to the previous KB
   state.side = { kind: null, fileId: null };
-  state.gp = { ...state.gp, kbId: null, version: null, viewKey: null, data: null, pos: null, sim: null, hist: [], cur: -1, cam: { k: 1, tx: 0, ty: 0 }, hover: null, error: null };
+  state.gp = { ...state.gp, kbId: null, version: null, viewKey: null, data: null, pos: null, sim: null, hist: [], cur: -1, cam: { k: 1, tx: 0, ty: 0 }, hover: null, error: null,
+               loading: GP_PENDING };
+  renderGraphPreview();                               // canvas and legend still show the previous KB: clear them to "Loading..." first
   state.files = { ...state.files, kbId: null, rows: [], page: 1, etag: null };
-  state.jobs = { ...state.jobs, kbId: null, rows: [], queue: {} };
 }
 
 /* ── workspace tabs ──────────────────────────────────────── */
@@ -501,7 +504,8 @@ async function renderConfig() {
   name.textContent = kb ? kb.dir : t("未选择知识库");
   $("#sel-id").textContent = kb && kb.kb_id ? kb.kb_id : "";   // id: used for logs and the Qdrant collection name
   renderAdoptRow(kb, draft);
-  toggle.disabled = !kb || kb.state === "directory_missing" || kb.state === "directory_linked";
+  toggle.disabled = !kb || kb.state === "directory_missing" || kb.state === "directory_linked"
+    || kb.state === "deleting" || kb.state === "delete_failed";      // a half-deleted KB cannot be switched back on as it is
   toggle.checked = !!kb && (kb.state === "active" || draft);
 
   if (!kb) {
@@ -524,6 +528,7 @@ async function renderConfig() {
   }
 
   const active = kb.state === "active";
+  if (!active) draftCache.delete(kb.dir);   // a draft is unsaved edits of an enabled KB: once it is closed, deleted or not yet enabled, it must not be filled back in when the KB is enabled next
   if (active) {
     stats.innerHTML = `<span>${t("文件")} <b>${kb.files_total || kb.dir_files || 0}</b>${!kb.files_total && kb.dir_files ? `<span class="muted">(${t("等待扫描登记")})</span>` : ""}</span>
       <span style="color:var(--green)">${t("已入库")} <b>${kb.files_indexed}</b></span>
@@ -536,6 +541,10 @@ async function renderConfig() {
       ? t("先确认下方策略,点「保存配置」才会真正开启并开始解析;关闭开关可取消")
       : kb.state === "unenrolled"
         ? t("该知识库尚未开启:打开右上角开关,确认策略后开始解析")
+      : kb.state === "deleting"
+        ? t("正在彻底删除这个知识库,数据多的要几分钟;可以离开或刷新页面,删完这里会更新")
+      : kb.state === "delete_failed"
+        ? t("上次彻底删除没有完成:系统会在下次维护时接着删,也可以再点一次「删除知识库」;删完之前不能重新开启")
         : kbStateText(kb) + (kb.state === "inactive" ? t(";重新打开开关可恢复") : "");
     hint.style.display = "";
   }
@@ -589,7 +598,7 @@ async function renderConfig() {
       ? [phases, cache].filter(Boolean).join(" · ")
       : (halted && gb.cache_stale ? t("{0},缓存不可续用,这次是从头建", t(gb.cache_stale)) : "");
     gnote.textContent = text;
-    gnote.style.display = text ? "" : "none";
+    gnote.style.display = text ? "inline-block" : "none";   // .note is hidden by default in the stylesheet; clearing the value would not show it
   }
   $("#cfg-gpause").disabled = !(active && building);
   // Allow deletion whenever artifacts exist, even with the switch already off (turned off mid-build, or the
@@ -597,14 +606,17 @@ async function renderConfig() {
   // an orphan that cannot be cleaned up.
   $("#cfg-gdelete").disabled = !(active && (kb.graph_artifacts
     || (kb.graph_status && kb.graph_status !== "disabled")));
-  // Deletable only when enrolled (including the deactivated retention period); unenrolled / draft is greyed
-  // out (like the other buttons, not hidden)
-  $("#cfg-delete").disabled = !(kb.kb_id && !draft);
+  // Deletable only when enrolled (including the deactivated retention period and a delete that did not finish);
+  // unenrolled / draft and a KB being deleted are greyed out (like the other buttons, not hidden)
+  $("#cfg-delete").disabled = !(kb.kb_id && !draft) || kb.state === "deleting";
 
   if (state.toggling) return;   // switch request in flight: do not let polling flick it back for a moment
   const key = `${kb.dir}|${draft ? "draft" : kb.state}`;
   if (state.cfgKey !== key) {
     state.cfgKey = key;
+    // When the same enabled KB re-fetches its config the form still holds its own content; for another KB or
+    // state the form only counts once it is filled below
+    if (!(active && formBase && formBase.dir === kb.dir)) formBase = null;
     $("#cfg-note").style.display = "none";
     if (!active) refreshCorpusHint(null);   // the previous KB's "N documents, M chunks" must not linger under this KB's name
     if (active) {
@@ -648,7 +660,11 @@ async function renderConfig() {
         $("#cfg-ro").value = (c.graph_rebuild_operator || "or").toLowerCase();
         $("#cfg-gaa").checked = c.graph_auto_append !== false;
         $("#graph-fields").disabled = !c.graph_enabled;
-        restoreDraft(kb.dir);   // unsaved edits made earlier on this KB are still there on switching back
+        formBase = { dir: kb.dir, ...parseFormValues() };
+        if (restoreDraft(kb.dir)) {   // unsaved edits made earlier on this KB are still there on switching back
+          $("#cfg-note").textContent = t("有未保存的修改");
+          $("#cfg-note").style.display = "inline-block";   // .note is hidden by default in the stylesheet
+        }
         refreshCorpusHint(kb);  // no await: a slow count must not block the form
         refreshTab();           // draw once more when the form is ready: the graph tab's mode label reads the form
       } catch (e) {
@@ -659,11 +675,11 @@ async function renderConfig() {
       // Draft: prefill from the directory presets (if any) + global defaults, then wait for the user to
       // confirm
       const dd = kb.dir_defaults || {};
-      try {
-        const [lim, llms] = await Promise.all([api("/limits"), api("/llms")]);
-        state.llms = llms;
-        setChunkHint(lim);
-      } catch (e) { $("#cfg-max-hint").textContent = ""; }
+      let lim = null, llms = null;
+      try { [lim, llms] = await Promise.all([api("/limits"), api("/llms")]); } catch (e) { /* the range hint stays empty, the form is filled anyway */ }
+      if (state.cfgKey !== key) return;   // the KB was switched while waiting: do not fill this directory's presets into another KB's form
+      if (llms) state.llms = llms;
+      if (lim) setChunkHint(lim); else $("#cfg-max-hint").textContent = "";
       $("#cfg-max").value = dd.max_tokens ?? 400;
       $("#cfg-ov").value = dd.overlap_tokens ?? 80;
       setOverlapHint();
@@ -671,7 +687,6 @@ async function renderConfig() {
       $("#cfg-prompt").value = "";
       $("#cfg-guc").value = String(dd.graph_unit_chunks ?? 3);
       $("#cfg-ggl").value = String(dd.graph_max_gleanings ?? 1);
-      state.corpus = null;
       $("#cfg-ge").innerHTML = llmOptions(null, { fallback: true });
       $("#cfg-gs").innerHTML = llmOptions(null, { fallback: true });
       $("#cfg-gt").innerHTML = llmOptions(null, { fallback: true });
@@ -695,7 +710,6 @@ async function renderConfig() {
       $("#cfg-rp-n").value = ""; $("#cfg-rp-u").value = "p"; $("#cfg-ro").value = "or";
       setSchemaView(null); $("#cfg-gss").value = 8;
       $("#cfg-guc").value = "3"; $("#cfg-ggl").value = "1";
-      state.corpus = null;
       $("#graph-fields").disabled = true;
     }
   }
@@ -867,16 +881,21 @@ function requireInt(sel, label) {
 // restored on switching back. Not persisted, so the established "reload returns to the pre-save state"
 // semantics are unchanged.
 const draftCache = new Map();
+// Which KB's saved config the form is currently filled from, and the values filled in. Only edits made against it
+// count as a draft: the form of a KB that is not enabled holds placeholder values, and until the config arrives it
+// holds the previous KB's values; stashing those and filling them back in would cover the real config with other
+// values, and the next click on save would write them.
+let formBase = null;
+
+function parseFormValues() {
+  return { prompt: $("#cfg-prompt").value, max: $("#cfg-max").value, ov: $("#cfg-ov").value };
+}
 
 function stashDraft(dir) {
-  if (!dir) return;
-  const box = $("#cfg-prompt");
-  if (!box) return;
-  draftCache.set(dir, {
-    prompt: box.value,
-    max: $("#cfg-max").value,
-    ov: $("#cfg-ov").value,
-  });
+  if (!dir || !formBase || formBase.dir !== dir) return;
+  const now = parseFormValues();
+  if (now.prompt === formBase.prompt && now.max === formBase.max && now.ov === formBase.ov) draftCache.delete(dir);
+  else draftCache.set(dir, now);
 }
 
 function restoreDraft(dir) {
@@ -1009,6 +1028,7 @@ $("#cfg-save").addEventListener("click", async () => {
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectParseConfig() });
     toast(t("配置已保存,随自动扫描生效"));
     draftCache.delete(kb.dir);
+    formBase = { dir: kb.dir, ...parseFormValues() };   // what the form holds are now the saved values
     note.style.display = "none";
   } catch (e) { toast(t("保存失败: ") + t(e.message)); }
   // No forced refill: the form already holds the values just saved, and a refill would only wipe the other
@@ -1218,23 +1238,51 @@ $("#cfg-reparse").addEventListener("click", async () => {
   } catch (e) { toast(t("失败: ") + t(e.message)); }
 });
 
-$("#cfg-delete").addEventListener("click", async ev => {
+// A permanent delete runs synchronously on the server and takes minutes for a large KB (the graph store deletes
+// nodes in batches). pendingDeletes: delete requests this page sent that have not come back yet; deletingSeen: KBs
+// still being deleted in the previous overview round (kb_id -> directory name). One no longer being deleted in this
+// round has an outcome -- requests this page sent itself are reported by the click handler, those sent elsewhere
+// (the page was reloaded meanwhile, another window clicked) are reported here, otherwise minutes of waiting would
+// end without a word
+const pendingDeletes = new Set();
+const deletingSeen = {};
+function noteDeleteOutcomes(kbs) {
+  for (const k of kbs) {
+    if (k.kb_id && pendingDeletes.has(k.kb_id)) k.state = "deleting";     // also the moment after the request is sent, before the server has registered it
+    if (k.kb_id && k.state === "deleting") deletingSeen[k.kb_id] = k.dir;
+  }
+  for (const [id, dir] of Object.entries(deletingSeen)) {
+    const now = kbs.find(k => k.kb_id === id);
+    if (now && now.state === "deleting") continue;
+    delete deletingSeen[id];
+    if (pendingDeletes.has(id)) continue;
+    toast(now && now.state === "delete_failed" ? t("「{0}」删除未完成,系统会在下次维护时接着删", dir) : t("「{0}」已彻底删除", dir));
+  }
+}
+
+$("#cfg-delete").addEventListener("click", async () => {
   const kb = selectedEntry();
-  if (!kb || !kb.kb_id) return;
+  if (!kb || !kb.kb_id || pendingDeletes.has(kb.kb_id)) return;
   const busy = kb.jobs_active > 0 || kb.graph_status === "running";
   const ok = await confirmDialog(
     t("彻底删除「{0}」?\n\n此操作立即生效,不可恢复", kb.dir)
     + (busy ? t("\n\n正在运行的解析/建图任务会被终止,已入库内容与缓存一并清除") : ""),
     t("彻底删除"));
   if (!ok) return;
-  ev.target.disabled = true;
+  pendingDeletes.add(kb.kb_id);
+  toast(t("正在彻底删除「{0}」,数据多的要几分钟", kb.dir));
+  kb.state = "deleting";          // do not wait for the next poll: the sidebar and this page show the delete at once
+  renderKbNav();
+  renderConfig();
   try {
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}`, { method: "DELETE" });
     toast(t("「{0}」已彻底删除", kb.dir));
-    state.cfgKey = null;
   } catch (e) { toast(t("删除失败: ") + t(e.message)); }
-  ev.target.disabled = false;
-  await refreshOverview(true);   // the directory returns to the unenrolled state and the switch turns off with it
+  pendingDeletes.delete(kb.kb_id);
+  delete deletingSeen[kb.kb_id];
+  // The directory returns to the unenrolled state and the switch turns off with it. During the minutes of waiting
+  // the user may have moved on to edit another KB: refill the form only if this KB is still the one selected
+  await refreshOverview(state.selected === kb.dir);
 });
 
 /* ── files tab: table + filter / sort / pagination ─────────────── */
@@ -1370,8 +1418,8 @@ function renderFilesTable() {
     $$("[data-retry]", wrap).forEach(b => b.addEventListener("click", async ev => {
       ev.target.disabled = true;
       try {
-        await api("/files/retry", { method: "POST", body: { file_id: ev.target.dataset.retry } });
-        toast(t("已重新排队"));
+        const r = await api("/files/retry", { method: "POST", body: { file_id: ev.target.dataset.retry } });
+        toast(r.already_active ? t("已有任务在飞,不重复排队") : t("已重新排队"));
         await refreshFilesTab(true);
       } catch (e) { toast(t("失败: ") + t(e.message)); ev.target.disabled = false; }
     }));
@@ -1403,13 +1451,16 @@ async function openChunkDrawer(fileId) {
   state.side = { kind: "chunks", fileId };
   openSide("chunks", t("切块预览"));
   const out = $("#side-body");
-  out.innerHTML = `<div class="empty-state">${t("读取切片中…")}</div>`;
+  setHtml(out, `<div class="empty-state">${t("读取切片中…")}</div>`);
   try {
     const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/files/${encodeURIComponent(fileId)}/chunks`);
     if (state.side.kind !== "chunks" || state.side.fileId !== fileId) return;
     state.preview = { r, filter: "all" };
     renderChunkPreview();
-  } catch (e) { out.innerHTML = `<div class="empty-state" style="color:var(--red-text)">${esc(t(e.message))}</div>`; }
+  } catch (e) {
+    if (state.side.kind !== "chunks" || state.side.fileId !== fileId) return;
+    setHtml(out, `<div class="empty-state" style="color:var(--red-text)">${esc(t(e.message))}</div>`);
+  }
 }
 
 // Merged table cells (F02): table blocks flagged with high confidence; those split after screenshot check
@@ -1475,8 +1526,9 @@ function renderChunkPreview() {
         <span class="pv-peek">${esc(c.text.slice(0, 80).replace(/\s+/g, " "))}</span></summary>
       <pre>${esc(c.text)}</pre></details>`;
   }).join("");
-  $("#side-body").innerHTML = head + verdict + stats + filters + (cards || `<div class="empty-state">${t("没有符合筛选的切片")}</div>`) +
+  const html = head + verdict + stats + filters + (cards || `<div class="empty-state">${t("没有符合筛选的切片")}</div>`) +
     (r.truncated ? `<div class="hint">${t("只显示前 {0} 片", r.chunks.length)}</div>` : "");
+  if (!setHtml($("#side-body"), html)) return;
   $$("#side-body .pv-filters .chip").forEach(el => el.addEventListener("click", () => { state.preview.filter = el.dataset.f; renderChunkPreview(); }));
 }
 
@@ -1498,19 +1550,27 @@ async function openMergesDrawer() {
   state.side = { kind: "merges", fileId: null };
   openSide("merges", t("实体归并审计"));
   const out = $("#side-body");
-  out.innerHTML = `<div class="empty-state">${t("读取归并日志中…")}</div>`;
+  setHtml(out, `<div class="empty-state">${t("读取归并日志中…")}</div>`);
+  // The merge log of a large KB takes a dozen seconds or more to read, long enough to switch to another KB and open
+  // the drawer again: a response that is not the latest request's, or arrives after the KB changed, is dropped
+  const seq = ++mergesReqSeq;
+  const stale = () => seq !== mergesReqSeq || state.side.kind !== "merges" || selectedEntry()?.kb_id !== kb.kb_id;
   try {
     const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_merges`);
-    if (state.side.kind !== "merges") return;
+    if (stale()) return;
     state.merges = { r, q: "" };
     renderMerges();
-  } catch (e) { out.innerHTML = `<div class="empty-state" style="color:var(--red-text)">${esc(t(e.message))}</div>`; }
+  } catch (e) {
+    if (stale()) return;
+    setHtml(out, `<div class="empty-state" style="color:var(--red-text)">${esc(t(e.message))}</div>`);
+  }
 }
+let mergesReqSeq = 0;
 
 function renderMerges() {
   const { r, q } = state.merges || {};
   const host = $("#side-body");
-  if (!r || !r.version) { host.innerHTML = `<div class="empty-state">${t("还没有建成的图谱版本")}</div>`; return; }
+  if (!r || !r.version) { setHtml(host, `<div class="empty-state">${t("还没有建成的图谱版本")}</div>`); return; }
   const needle = (q || "").trim().toLowerCase();
   const hit = (...names) => !needle || names.some(n => String(n || "").toLowerCase().includes(needle));
   const merges = (r.merges || []).filter(m => hit(m.kept_title, m.merged_title));
@@ -1537,13 +1597,14 @@ function renderMerges() {
   const rows2 = rejected.slice(0, 500).map(m =>
     `<tr>${cell(m.a_title)}${cell(m.b_title)}${cell(t(MERGE_SOURCE_LABEL[m.source] || m.source))}${cell(rejectReason(m))}</tr>`).join("");
   const none = `<tr><td colspan="4" class="merge-none">${t("没有")}</td></tr>`;
-  host.innerHTML = head
+  const html = head
     + `<div class="tbl-wrap merge-wrap"><table class="merge-tbl">`
     + `<colgroup><col><col><col style="width:64px"><col style="width:150px"></colgroup>`
     + `<thead><tr><th>${t("实体")}</th><th>${t("并入实体")}</th><th>${t("来源")}</th><th>${t("依据")}</th></tr></thead><tbody>`
     + `<tr class="merge-sec"><td colspan="4">${t("合并实体")} <span class="n">${merges.length}</span></td></tr>${rows || none}`
     + `<tr class="merge-sec"><td colspan="4">${t("未合并实体")} <span class="n">${rejected.length}</span></td></tr>${rows2 || none}`
     + `</tbody></table></div>`;
+  if (!setHtml(host, html)) return;
   const input = $("#merge-q");
   input?.addEventListener("input", () => { state.merges.q = input.value; const pos = input.selectionStart; renderMerges(); const el = $("#merge-q"); el?.focus(); try { el?.setSelectionRange(pos, pos); } catch (e) {} });
   marqueeMergeCells(host);
@@ -1587,7 +1648,7 @@ function openJob(jobId) {
   state.jobs.selected = jobId;
   state.side = { kind: "job", fileId: null };
   openSide("job", t("任务时间线"));
-  $("#side-body").innerHTML = `<div class="empty-state">${t("载入中…")}</div>`;
+  setHtml($("#side-body"), `<div class="empty-state">${t("载入中…")}</div>`);
   refreshJobDetail();
 }
 
@@ -1927,9 +1988,11 @@ async function refreshGraphPreview(force = false) {
   // every poll (2026-09-06 health check B3). Old backends without the field fall back to graph_version.
   const gb0 = kb.graph_build || {};
   const version = gb0.active_graph_version || (kb.graph_status === "ok" ? gb0.graph_version : null) || null;
-  const ok = !!version && (kb.graph_status === "ok" || kb.graph_status === "running");
+  // When the latest build failed or was paused, the version built before is still there and search keeps using it,
+  // so the preview draws it as well; only a KB without the graph turned on draws nothing
+  const ok = !!version && !!kb.graph_status && kb.graph_status !== "disabled";
   if (!ok) {
-    state.gp = { ...state.gp, kbId: kb.kb_id, version: null, viewKey: null, data: null, pos: null, sim: null };
+    state.gp = { ...state.gp, kbId: kb.kb_id, version: null, viewKey: null, data: null, pos: null, sim: null, loading: null };
     renderGraphPreview();
     return;
   }
@@ -1943,22 +2006,31 @@ async function refreshGraphPreview(force = false) {
   const same = state.gp.viewKey === viewKey && !!state.gp.data;
   if (same && !force) return;
   if (same && force && Date.now() - state.gp.at < 5000) return;
+  // No new request while one for the same view is on its way: a large KB takes a dozen seconds or more the first
+  // time and polling comes round every few seconds, so every round used to send another identical request
+  if (state.gp.loading === viewKey && Date.now() - state.gp.loadingAt < GP_LOAD_PATIENCE_MS) return;
   const seq = ++gpReqSeq;
+  state.gp.loading = viewKey; state.gp.loadingAt = Date.now();
+  if (!same) renderGraphPreview();                          // until the new view's data arrives draw "Loading...", not the previous view's graph
   try {
     const params = new URLSearchParams({ limit: $("#gp-limit").value, q: view.q || "", key: view.key || "", upper: view.upper || "" });
     const d = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_preview?${params}`);
     if (seq !== gpReqSeq) return;                          // stale response: a newer request was sent since
     if (selectedEntry()?.kb_id !== kb.kb_id) return;
+    state.gp.loading = null;
     state.gp = { ...state.gp, kbId: kb.kb_id, version: d.version, viewKey, data: d, pos: null, sim: null, at: Date.now(), hover: null,
                  error: null, cam: { k: 1, tx: 0, ty: 0 } };
     renderGraphPreview();
   } catch (e) {
-    if (seq !== gpReqSeq) return;
+    if (seq !== gpReqSeq || selectedEntry()?.kb_id !== kb.kb_id) return;
+    state.gp.loading = null;
     state.gp.error = t("载入失败: ") + t(e.message);
     renderGraphPreview();
   }
 }
 let gpReqSeq = 0;
+const GP_PENDING = "pending";            // the KB was just switched and the preview request has not been sent yet
+const GP_LOAD_PATIENCE_MS = 60000;       // a request in flight that has not come back after this long is sent again by the next poll
 
 // Barnes-Hut quadtree: each cell records mass and coordinate sums; a distant cell counts as one point for
 // repulsion
@@ -2186,6 +2258,7 @@ function renderGraphPreview() {
   if (state.gp.error) { gpCanvasText(ctx, cssW, cssH, state.gp.error); setHtml(legend, ""); return; }
   if (!d || !d.nodes || !d.nodes.length) {
     gpCanvasText(ctx, cssW, cssH, !kb || !kb.graph_status || kb.graph_status === "disabled" ? t("开启并建成图谱后,这里画出现行版本的实体与关系")
+      : state.gp.loading ? t("载入中…")
       : d && d.version ? t("这一层没有可画的实体") : t("还没有建成的版本"));
     setHtml(legend, "");
     return;
@@ -2267,6 +2340,11 @@ function renderGraphPreview() {
     const cur = gpView();
     gpGo({ upper: cur.upper === el.dataset.upper ? "" : el.dataset.upper });
   }));
+  if (kb && (kb.graph_status === "failed" || kb.graph_status === "stopped")) {
+    ctx.font = "12px -apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif";
+    ctx.fillStyle = "#8a8f9c"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(t("画的是现行版本;最近一次建图没有完成"), 12, cssH - 12);
+  }
   // Layout not settled: keep computing and drawing next frame
   if (!sim.done && !state.gp.raf) state.gp.raf = requestAnimationFrame(() => {
     state.gp.raf = 0;
@@ -2716,7 +2794,6 @@ async function refreshCorpusHint(kb) {
   if (!el) return;
   if (!kb || kb.kb_id == null || kb.state !== "active" || !$("#cfg-graph").checked) {
     el.textContent = "";
-    state.corpus = null;
     return;
   }
   const key = state.cfgKey;
@@ -2724,7 +2801,6 @@ async function refreshCorpusHint(kb) {
   try {
     const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_corpus`);
     if (state.cfgKey !== key) return;   // the KB was switched meanwhile; do not write KB A's numbers under KB B's name
-    state.corpus = r;
     el.textContent = r.documents
       ? t("{0} 份文档共 {1} 个采样片段", r.documents, fmtNum(r.chunks))
       : t("该库还没有入库切片");
@@ -2794,7 +2870,7 @@ async function _refreshHealth() {
         // The parse service row carries the backend mode (vlm-engine / pipeline, chosen by the container from
         // the hardware); it is data, not translated
         + (key === "mineru" && h.mineru_backend ? `<span class="svc-meta" title="${esc(h.mineru_backend_source || "")}">${esc(h.mineru_backend)}</span>` : "")
-        + (managed.has(key) ? `<button class="svc-restart" data-svc="${key}" data-name="${name}" ${busy ? "disabled" : ""}>${t("重启")}</button>` : "")
+        + (managed.has(key) ? `<button class="svc-restart" data-svc="${key}" data-name="${name}" ${busy || svcRestarting.has(key) ? "disabled" : ""}>${t("重启")}</button>` : "")
         + `</div>`).join("")
       + (timers.length ? `<div class="svc-head">${t("定时任务")}</div>` + timers.map(tm =>
         `<div class="svc-row"><span class="dot ${timerDot(tm)}"></span>
@@ -2852,18 +2928,26 @@ async function onBulkService(action) {
   setTimeout(poll, 3000);
 }
 
+// Marks for single services being restarted: key -> { until, wentDown }. The panel is redrawn wholesale every few
+// seconds, so the buttons' disabled state is kept here rather than in the DOM
+const svcRestarting = new Map();
 async function onRestartService(ev) {
   const key = ev.target.dataset.svc, name = ev.target.dataset.name;
+  if (svcRestarting.has(key)) return;
   const parsing = state.overview?.parsing_active;
   const ok = await confirmDialog(
     t("确认重启「{0}」?\n\n重启期间该服务短暂不可用", t(name)) +
     (parsing ? t(",进行中的解析步骤会失败并自动重试") : "") +
     t(";状态点转绿即恢复完成。"), t("确认重启"));
   if (!ok) return;
+  const mark = { until: Date.now() + 30000, wentDown: false };
+  svcRestarting.set(key, mark);
   ev.target.disabled = true;
+  let sent = false;
   try {
     const r = await api(`/services/${encodeURIComponent(key)}/restart`, { method: "POST", body: {} });
     toast(t("重启指令已发出: ") + r.restarting.join(", "));
+    sent = true;
   } catch (e) {
     // The backend refuses once while work (parse or build) is running; show the real reason and let the
     // user decide
@@ -2872,21 +2956,21 @@ async function onRestartService(ev) {
       try {
         const r = await api(`/services/${encodeURIComponent(key)}/restart`, { method: "POST", body: { force: true } });
         toast(t("已强制重启: ") + r.restarting.join(", "));
+        sent = true;
       } catch (e2) { toast(t("重启失败: ") + t(e2.message)); }
     }
   }
-  // Keep the button disabled until the service's health probe turns green (or a 30-second fallback):
-  // docker restart can take tens of seconds, and previously the button became clickable again after
-  // 2 seconds when the panel was rebuilt, allowing repeated commands.
-  const until = Date.now() + 30000;
+  if (!sent) { svcRestarting.delete(key); refreshHealth(); return; }
+  // Keep the button disabled until this service is seen going down and turning green again (or a 30-second
+  // fallback): docker restart can take tens of seconds, and for the first seconds after the command the probe is
+  // still green, so looking only at "is it green now" would release it at once and allow repeated commands.
+  // Whether it turned green is judged by this row's own check (the database and rerank rows each cover several services)
+  const healthy = (SERVICES.find(([, k]) => k === key) || [])[2] || (() => true);
   const poll = async () => {
     await refreshHealth();
-    const ok = state.health && state.health[key] === true;
-    if (ok || Date.now() > until) {
-      const btn = document.querySelector(`.svc-restart[data-svc="${key}"]`);
-      if (btn) btn.disabled = false;
-      return;
-    }
+    const up = healthy(state.health || {}) === true;
+    if (!up) mark.wentDown = true;
+    if ((mark.wentDown && up) || Date.now() > mark.until) { svcRestarting.delete(key); refreshHealth(); return; }
     setTimeout(poll, 3000);
   };
   setTimeout(poll, 2000);
@@ -3084,6 +3168,7 @@ async function refreshOverview(forceConfig = false) {
     // An older response arriving late must not overwrite newer state (button actions and polling run
     // concurrently)
     if (seq !== overviewSeq) return;
+    noteDeleteOutcomes(data.kbs);
     state.overview = data;
     state.offlineStreak = 0;
     if (!state.selected && data.kbs.length) {
@@ -3124,7 +3209,8 @@ async function tick() {
   }
   firstTick = false;
   const kb = selectedEntry();
-  const busy = state.overview?.parsing_active || (kb && kb.graph_status === "running") || state.activePanel !== null;
+  const busy = state.overview?.parsing_active || (kb && kb.graph_status === "running") || state.activePanel !== null
+    || (state.overview?.kbs || []).some(k => k.state === "deleting");
   // Stretch to 60 seconds while the page is hidden; on returning to the foreground visibilitychange
   // restarts the chain without waiting for this timer
   clearTimeout(tickTimer);

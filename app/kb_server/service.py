@@ -8,6 +8,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -21,13 +22,8 @@ from kb_pipeline.config import (
 )
 from kb_pipeline.localfs import scanner
 from kb_pipeline.limits import (
-    normalize_parent_types,
-    normalize_predicates,
     CURRENT_SCHEMA_VERSION_ID,
-    LEGACY_SCHEMA_VERSION_ID,
     chunk_limits,
-    normalize_entity_types,
-    push_schema_version,
     validate_chunk_config,
     validate_graph_schema_config,
     validate_graph_tune_config,
@@ -42,11 +38,6 @@ from kb_pipeline.graph.lock import build_lock_held, build_lock_path
 from kb_pipeline.vector.qdrant import client as qdrant_client
 from kb_pipeline.vector.qdrant import ensure_collection
 
-GRAPH_LLM_STEPS = ("extract", "summarize")
-# Model slot used by "Extract labels now / again". It sits in graph_llm alongside the three graph build
-# steps but is **not** a prerequisite for building -- a graph can be built without it, you just cannot
-# click "Extract labels now / again".
-GRAPH_TUNE_STEP = "tune"
 _last_kick: dict[str, float] = {}
 
 
@@ -138,6 +129,10 @@ def kick_worker() -> str:
 # ── overview / progress ─────────────────────────────────────────────────
 
 _dir_count_cache: dict[str, tuple[float, int]] = {}
+# Knowledge bases this process is permanently deleting right now. The deletion runs synchronously in the
+# request thread and takes minutes for a large one: overview reports "deleting" from this set, so it shows
+# after a page reload or in another browser as well
+_KB_DELETING: set[str] = set()
 _rebuild_check_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 REBUILD_CHECK_TTL = 60.0
 
@@ -183,7 +178,7 @@ def _dir_file_count(mirror_root: Path, name: str, *, ttl: float = 30.0) -> int |
     try:
         for path in (mirror_root / name).rglob("*"):
             try:
-                if not path.is_file() or scanner.should_skip(path):
+                if not path.is_file() or scanner.should_skip(path, mirror_root / name):
                     continue
             except OSError:
                 continue
@@ -374,6 +369,17 @@ def _schema_suggest_info(con, kb_id: str) -> dict[str, Any] | None:
     return {"origin": mark.get("origin"), "started_at": started, "seconds": max(0, int(time.time() - started))}
 
 
+def _delete_state(row) -> str | None:
+    """A permanent delete in progress -> deleting; one that did not finish (a storage layer failed to delete, or
+    the process died halfway) -> delete_failed; neither -> None."""
+    if str(row["kb_id"]) in _KB_DELETING:
+        return "deleting"
+    reason = row["inactive_reason"] if "inactive_reason" in row.keys() else None
+    if str(row["status"]) != "active" and str(reason or "") in discovery.DELETE_PENDING_REASONS:
+        return "delete_failed"
+    return None
+
+
 def overview() -> dict[str, Any]:
     cfg = settings()
     dirs = discovery.discover_directories(cfg.mirror_root)
@@ -405,7 +411,12 @@ def overview() -> dict[str, Any]:
                 continue
             entry["kb_id"] = str(row["kb_id"])
             entry["collection"] = str(row["collection"])
-            if str(row["status"]) == "active":
+            deleting = _delete_state(row)
+            if deleting is not None:
+                # Not the inactive retention period: no countdown, cannot be re-enabled, and every maintenance
+                # run carries on deleting it
+                entry["state"] = deleting
+            elif str(row["status"]) == "active":
                 entry["state"] = "active"
                 stats = _kb_stats(con, entry["kb_id"])
                 entry.update(stats)
@@ -470,12 +481,13 @@ def overview() -> dict[str, Any]:
         for name, row in rows.items():
             still_active = str(row["status"]) == "active"
             linked = still_active and discovery.directory_admitted(cfg.mirror_root, name) == (False, "linked")
+            deleting = _delete_state(row)
             entry = {
                 "dir": name, "kb_id": str(row["kb_id"]), "collection": str(row["collection"]),
-                "state": ("directory_linked" if linked else "directory_missing") if still_active else "inactive",
+                "state": deleting or (("directory_linked" if linked else "directory_missing") if still_active else "inactive"),
                 "inactive_reason": row["inactive_reason"] if "inactive_reason" in row.keys() else None,
             }
-            if not still_active:
+            if not still_active and deleting is None:
                 # Directory really gone + deactivated = the retention period is genuinely running, and GC will
                 # hard-delete the collection, graph and index together when it expires. This is exactly the
                 # branch the countdown used to miss: it was shown on the branch where the directory still
@@ -682,53 +694,6 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
     return out
 
 
-_JOB_LIST_FILTERS = {
-    "all": "",
-    "active": " AND j.status IN ('running','queued','retry')",
-    "failed": " AND j.status IN ('failed','retry')",
-    "done": " AND j.status IN ('done','cancelled')",
-}
-
-
-def kb_jobs(kb_id: str, status: str = "all", limit: int = 200) -> dict[str, Any]:
-    """One knowledge base's job list plus its own queue depth, for the "Jobs" tab. Running jobs come first,
-    then failed / backing off (the ones a human needs to look at), then queued, and finally the history in
-    reverse chronological order."""
-    if status not in _JOB_LIST_FILTERS:
-        raise ValueError("status must be one of all / active / failed / done")
-    limit = max(1, min(int(limit), 1000))
-    cfg = settings()
-    with db.connect(cfg.state_db) as con:
-        rows = con.execute(
-            "SELECT j.job_id, j.file_id, j.job_type, j.status, j.stage, j.error, j.retry_count, "
-            "j.next_attempt_at, j.started_at, j.finished_at, j.created_at, j.updated_at, "
-            "j.cancel_requested, f.rel_path FROM jobs j LEFT JOIN files f ON f.file_id = j.file_id "
-            f"WHERE j.kb_id=? {_JOB_LIST_FILTERS[status]} "
-            "ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'retry' THEN 2 "
-            "WHEN 'queued' THEN 3 ELSE 4 END, j.updated_at DESC LIMIT ?",
-            (kb_id, limit),
-        ).fetchall()
-        depth = {r["status"]: int(r["n"]) for r in con.execute(
-            "SELECT status, COUNT(*) AS n FROM jobs WHERE kb_id=? AND job_type='parse' "
-            "AND status IN ('running','queued','retry') GROUP BY status", (kb_id,))}
-    now = int(time.time())
-    items = []
-    for r in rows:
-        st = str(r["status"])
-        items.append({
-            "job_id": str(r["job_id"]), "file_id": r["file_id"], "job_type": str(r["job_type"]),
-            "status": st, "stage": r["stage"],
-            "error": (str(r["error"])[:300] if r["error"] and st in ("failed", "retry") else None),
-            "retry_count": int(r["retry_count"] or 0),
-            "retry_in": max(0, int(r["next_attempt_at"] or 0) - now) if st == "retry" else None,
-            "started_at": r["started_at"], "finished_at": r["finished_at"],
-            "created_at": r["created_at"], "updated_at": r["updated_at"],
-            "cancel_requested": bool(r["cancel_requested"]),
-            "rel_path": r["rel_path"],
-        })
-    return {"jobs": items, "queue": {k: depth.get(k, 0) for k in ("running", "queued", "retry")}}
-
-
 def _col(row, name: str, default=None):
     """Works on sqlite3.Row and dict alike; a missing column (old records, hand-made rows in tests) yields
     the default."""
@@ -846,30 +811,6 @@ def _graph_build_summary(row, phases: list[dict[str, Any]], labels: dict[str, st
     }
 
 
-def graph_builds(kb_id: str, limit: int = 30) -> dict[str, Any]:
-    """One knowledge base's graph build records (newest first), for the history table on the "Graph" tab."""
-    from kb_pipeline.graph.build import GRAPH_PHASE_LABELS
-
-    labels = dict(GRAPH_PHASE_LABELS)
-    limit = max(1, min(int(limit), 200))
-    cfg = settings()
-    with db.connect(cfg.state_db) as con:
-        rows = con.execute(
-            "SELECT graph_build_id, graph_version, status, stage, started_at, finished_at, input_rows, "
-            "active_chunk_count, output_dir, manifest_json, error, build_kind FROM graph_builds "
-            "WHERE kb_id=? ORDER BY started_at DESC LIMIT ?", (kb_id, limit)).fetchall()
-        phases: dict[str, list[dict[str, Any]]] = {}
-        if rows:
-            marks = ",".join("?" for _ in rows)
-            for p in con.execute(
-                    f"SELECT graph_build_id, phase, done_at FROM graph_build_phases "
-                    f"WHERE graph_build_id IN ({marks}) ORDER BY done_at, rowid",
-                    [str(r["graph_build_id"]) for r in rows]):
-                phases.setdefault(str(p["graph_build_id"]), []).append(
-                    {"phase": str(p["phase"]), "done_at": int(p["done_at"])})
-    return {"builds": [_graph_build_summary(r, phases.get(str(r["graph_build_id"]), []), labels) for r in rows]}
-
-
 def _chunk_diag_brief(raw) -> dict[str, Any] | None:
     """The file list only needs the verdict: chunk count, mean length, whether acceptance passed and, if
     not, why."""
@@ -885,99 +826,6 @@ def _chunk_diag_brief(raw) -> dict[str, Any] | None:
         "chunks": int(stats.get("chunks") or 0),
         "tokens_mean": stats.get("tokens_mean"),
         "reasons": [str(r.get("message") or r.get("key")) for r in diag.get("reasons") or []],
-    }
-
-
-PREVIEW_CHUNK_LIMIT = 400
-
-
-def chunk_preview(kb_id: str, file_id: str, max_tokens: int | None = None,
-                  overlap_tokens: int | None = None) -> dict[str, Any]:
-    """Re-chunk an already parsed file with the current (or the form's still unsaved) chunking parameters and
-    return the diagnostics plus every chunk's content. Does not touch the vector store: MinerU results and
-    VLM descriptions both come from the parse cache, so only files that have already been indexed can be
-    previewed -- otherwise the document would really be sent to the GPU for parsing."""
-    import dataclasses
-
-    from kb_pipeline.chunking.chunker import blocks_to_chunks
-    from kb_pipeline.chunking.diagnose import chunk_diagnostics
-    from kb_pipeline.parsers.common import parser_profile_for_path
-    from kb_pipeline.parsers.errors import NonRetryableParseError
-    from kb_pipeline.pipeline.parse_job import _parse_blocks, parse_cache_dir, verify_source_file
-
-    cfg = settings()
-    source = next((s for s in cfg.sources.values() if s.kb_id == kb_id), None)
-    if source is None:
-        raise KeyError(kb_id)
-    with db.connect(cfg.state_db) as con:
-        row = db.get_file_by_id(con, file_id)
-    if row is None or str(row["kb_id"]) != kb_id:
-        raise KeyError(file_id)
-    if str(row["status"]) == "deleted":
-        raise ValueError("This file has been removed from the source")
-    path = Path(str(row["physical_path"]))
-    if not path.exists():
-        raise ValueError(f"Source file is not on disk: {path}")
-    try:
-        # The same boundary check as the worker: the directory was not swapped for a link and the file's real
-        # location is still inside the enrolled directory (the preview reads the source file as well)
-        verify_source_file(cfg, source, path)
-    except NonRetryableParseError as exc:
-        raise ValueError(str(exc)) from exc
-
-    if max_tokens is not None or overlap_tokens is not None:
-        mt = int(max_tokens if max_tokens is not None else source.max_tokens)
-        ov = int(overlap_tokens if overlap_tokens is not None else source.overlap_tokens)
-        if mt < 16:
-            raise ValueError("max_tokens must be at least 16")
-        if ov < 0 or ov >= mt:
-            raise ValueError("overlap_tokens must be between 0 and max_tokens")
-        source = dataclasses.replace(source, max_tokens=mt, overlap_tokens=ov)
-
-    content_version = str(row["content_version"])
-    cache_dir = parse_cache_dir(cfg, kb_id, int(row["file_key"]), content_version)
-    suffix = path.suffix.lower()
-    cached = {
-        ".pdf": cache_dir / "mineru" / "result.json",
-        ".docx": cache_dir / "mineru" / "docx-result.json",
-        ".pptx": cache_dir / "pptx_structure_input" / "structure-safe.json",
-    }.get(suffix)
-    if cached is not None and not cached.exists():
-        raise ValueError("This file has not finished parsing; the preview needs the parse cache, try again once it is indexed")
-
-    parser_profile = parser_profile_for_path(path)
-    blocks = _parse_blocks(cfg, source, path, cache_dir, parser_profile, row)
-    chunks = blocks_to_chunks(
-        kb_id=kb_id,
-        file_key=int(row["file_key"]),
-        content_version=content_version,
-        parser_profile=parser_profile,
-        blocks=blocks,
-        max_tokens=source.max_tokens,
-        overlap_tokens=source.overlap_tokens,
-    )
-    diag = chunk_diagnostics(chunks, max_tokens=source.max_tokens, blocks=blocks)
-    items = []
-    for c in chunks[:PREVIEW_CHUNK_LIMIT]:
-        b = c.block
-        items.append({
-            "chunk_index": c.chunk_index,
-            "tokens": c.token_count,
-            "block_id": b.block_id,
-            "block_type": b.block_type,
-            "page_idx": b.page_idx,
-            "page_end": b.metadata.get("page_end", b.page_idx),
-            "section_path": [str(x) for x in (b.metadata.get("section_path") or [])],
-            "table_flags": b.metadata.get("table_flags") or None, "table_repair": b.metadata.get("table_repair") or None,
-            "text": c.text,
-        })
-    return {
-        "file": {"file_id": file_id, "rel_path": str(row["rel_path"]), "parser_profile": parser_profile},
-        "max_tokens": source.max_tokens,
-        "overlap_tokens": source.overlap_tokens,
-        "diagnostics": diag,
-        "chunks": items,
-        "truncated": len(chunks) > PREVIEW_CHUNK_LIMIT,
     }
 
 
@@ -1035,16 +883,23 @@ def delete_kb(kb_id: str) -> dict[str, Any]:
     identical."""
     from kb_pipeline.maintenance import PartialDeleteError, delete_kb_now
 
+    if kb_id in _KB_DELETING:
+        raise ValueError("This knowledge base is already being deleted; wait for it to finish")
+    _KB_DELETING.add(kb_id)
     try:
+        _forget_graph_json(kb_id)
         return delete_kb_now(settings(), kb_id=kb_id)
     except PartialDeleteError as exc:
         # Some storage layers were not deleted: the registry row is kept as delete_failed for the next GC
         # round to retry; report that truthfully to the console instead of letting it show "permanently
         # deleted".
         raise ValueError(
-            "Deletion incomplete, these parts failed (the knowledge base is kept, retried at the next maintenance run): "
+            "Deletion incomplete, these parts failed (it continues at the next maintenance run, "
+            'or click "Delete knowledge base" again): '
             + "; ".join(exc.errors)
         )
+    finally:
+        _KB_DELETING.discard(kb_id)
 
 
 def adopt_kb(kb_id: str, dir_name: str) -> dict[str, Any]:
@@ -1056,6 +911,11 @@ def adopt_kb(kb_id: str, dir_name: str) -> dict[str, Any]:
     name = str(dir_name or "").strip()
     if not name:
         raise ValueError("Missing directory name")
+    # Check the directory name before building the match report: the report joins this name into a path, walks
+    # the whole tree and computes checksums, so a name like ".." or an absolute path would first walk outside
+    # the mirror and only then be refused
+    if name not in discovery.discover_directories(cfg.mirror_root):
+        raise ValueError(f"directory {name!r} does not exist under the mirror root")
     with db.connect(cfg.state_db) as con:
         report = discovery.directory_match_report(con, cfg.mirror_root, kb_id, name)
         source = discovery.adopt_directory(con, cfg.mirror_root, kb_id, name)
@@ -1065,23 +925,6 @@ def adopt_kb(kb_id: str, dir_name: str) -> dict[str, Any]:
     kick_worker()
     return {"kb_id": source.kb_id, "dir": name, "matched": report["matched"], "total": report["total"],
             "verified": report["verified"], "looks_like_rename": discovery.looks_like_rename(report)}
-
-
-def unenroll_info(kb_id: str) -> dict[str, Any]:
-    cfg = settings()
-    with db.connect(cfg.state_db) as con:
-        row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
-        if row is None:
-            raise KeyError(kb_id)
-        files = con.execute(
-            "SELECT COUNT(*) FROM files WHERE kb_id=? AND status != 'deleted'", (kb_id,)
-        ).fetchone()[0]
-    return {
-        "kb_id": kb_id,
-        "dir": str(row["source_root"]),
-        "files": int(files),
-        "retention_days": cfg.qdrant_inactive_retention_days,
-    }
 
 
 def unenroll(kb_id: str) -> dict[str, Any]:
@@ -1202,6 +1045,8 @@ def _validate_config(con, effective: dict[str, Any], updates: dict[str, Any], li
         effective.get("graph_entity_types"), effective.get("graph_tune_sample_size")))
     graph_llm = updates.get("graph_llm")
     if isinstance(graph_llm, dict):
+        from kb_pipeline.graph.build import GRAPH_LLM_STEPS, GRAPH_TUNE_STEP
+
         for step, name in graph_llm.items():
             if step not in GRAPH_LLM_STEPS and step != GRAPH_TUNE_STEP:
                 errors.append(f"Unknown graph step: {step}")
@@ -1235,14 +1080,6 @@ def schema_versions_view(effective: dict[str, Any]) -> dict[str, Any]:
         })
         active = CURRENT_SCHEMA_VERSION_ID
     return {"versions": versions, "active": active}
-
-
-def _ring_with_legacy(stored: dict[str, Any]) -> list[dict[str, Any]]:
-    """See kb_pipeline.graph.schema_flow.ring_with_legacy (moved there 2026-09-08: the pipeline itself also
-    has to add versions to the ring)."""
-    from kb_pipeline.graph.schema_flow import ring_with_legacy
-
-    return ring_with_legacy(stored)
 
 
 def _apply_schema_version(current: dict[str, Any], updates: dict[str, Any]) -> None:
@@ -1434,6 +1271,7 @@ def delete_graph(kb_id: str) -> dict[str, Any]:
     switch goes back to grey afterwards."""
     from kb_pipeline.maintenance import delete_graph_now
 
+    _forget_graph_json(kb_id)
     result = delete_graph_now(settings(), kb_id=kb_id)
     if result.get("errors"):
         raise ValueError(
@@ -1441,6 +1279,13 @@ def delete_graph(kb_id: str) -> dict[str, Any]:
             + "; ".join(str(e) for e in result["errors"])
         )
     return result
+
+
+# The console unit lowers its own oom_score_adj to the floor a user unit may set (100), and child processes
+# inherit it. A graph build is batch work and should be killed before the resident console and search services
+# when memory runs short, so it is raised to the batch units' 200 before starting (raising needs no privilege)
+# and then replaced in place by the build process.
+BATCH_OOM_SCORE = ["/bin/sh", "-c", '{ echo 200 > /proc/self/oom_score_adj; } 2>/dev/null; exec "$@"', "sh"]
 
 
 def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None = None,
@@ -1463,9 +1308,10 @@ def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None =
     # scope detached from web's lifecycle; fall back to Popen when systemd-run is unavailable.
     # Fallback wall-clock cap. The circuit breaker covers "the provider is down as a whole", not "everything
     # works but it is just slow"; without this line a console-started build has RuntimeMaxUSec=infinity and
-    # a genuinely stuck one never ends. The value must exceed the slowest normal build (kb_004 measured at
-    # about 23 hours); default 48 hours. On timeout systemd sends SIGTERM, which takes the existing signal
-    # wind-down: write cancelled, keep the cache.
+    # a genuinely stuck one never ends. The value must be far above one normal build (a full rebuild of the
+    # largest knowledge base measured 2-3 hours, several times that with lower concurrency); default 48 hours.
+    # On timeout systemd sends SIGTERM, which takes the existing signal wind-down: write cancelled, keep the
+    # cache.
     max_hours = os.environ.get("KB_GRAPH_BUILD_MAX_HOURS", "48")
     scope = ["systemd-run", "--user", "--scope", "--collect",
              f"--unit=kb-graph-build-{kb_id}-{int(time.time())}", "--quiet",
@@ -1473,14 +1319,14 @@ def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None =
     with log_path.open("ab") as log:
         try:
             proc = subprocess.Popen(
-                scope + build_cmd,
+                scope + BATCH_OOM_SCORE + build_cmd,
                 cwd=str(base_dir), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                 env=_child_env(env_file, base_dir),
             )
             detached = "systemd-scope"
         except (FileNotFoundError, OSError):
             proc = subprocess.Popen(
-                build_cmd,
+                BATCH_OOM_SCORE + build_cmd,
                 cwd=str(base_dir), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                 env=_child_env(env_file, base_dir),
             )
@@ -1565,7 +1411,7 @@ def _graph_action_gate(con, cfg: Settings, kb_id: str):
     effective.update(config)
     if not effective.get("graph_enabled"):
         raise ValueError("The knowledge graph is not turned on")
-    from kb_pipeline.graph.build import default_graph_llm
+    from kb_pipeline.graph.build import GRAPH_LLM_STEPS, default_graph_llm
 
     chosen = config.get("graph_llm") or {}
     missing = [s for s in GRAPH_LLM_STEPS if not str(chosen.get(s) or "").strip()]
@@ -1586,6 +1432,10 @@ def _graph_action_gate(con, cfg: Settings, kb_id: str):
     except Exception:
         lock_dir = None
     if lock_dir is not None and build_lock_held(lock_dir):
+        if _KB_DELETING:
+            # A permanent delete holds the build lock the whole time and takes minutes for a large knowledge
+            # base: it is the delete holding the lock, not some build
+            raise ValueError("Another knowledge base is being permanently deleted; build the graph when that finishes")
         raise ValueError("Another knowledge base is building its graph (only one build runs at a time); try again when it finishes")
     return row, config, latest
 
@@ -1651,13 +1501,6 @@ def trigger_graph_build(kb_id: str) -> dict[str, Any]:
     return _spawn_graph_build(cfg, kb_id, graph_version=resume_version)
 
 
-# Wall-clock cap for the four LLM calls (domain / language / persona / type table). This is a synchronous
-# endpoint -- the console needs the result to fill the form, so it is better to let a slow model hit the cap
-# and get a "switch to a faster model" hint than to leave the browser waiting forever. Measured: MiniMax M3
-# finishes a full prompt-tune (6+N calls) in 50 s, and there are only 4 calls here.
-_SUGGEST_TIMEOUT_SECONDS = 420
-
-
 def graph_corpus_stats(kb_id: str) -> dict[str, Any]:
     """Size of this knowledge base's graph corpus: active documents, active chunks, and the estimated number of
     units at the current unit size. The hint under "Sample size" in the console needs it -- only when the
@@ -1690,11 +1533,10 @@ def graph_corpus_stats(kb_id: str) -> dict[str, Any]:
     }
 
 
-# Wall-clock cap for the seven LLM calls (domain / language / persona / type table / parent types /
-# predicates / competency questions). This is a synchronous endpoint -- the console needs the result to
-# fill the form, so it is better to let a slow model hit the cap and get a "switch to a faster model" hint
-# than to leave the browser waiting forever. A flash-class model finishes the whole set in about 1-2 minutes.
-_SUGGEST_TIMEOUT_SECONDS = 600
+# Label extraction is a synchronous endpoint; a flash-class model finishes the whole set in about 1-2 minutes.
+# Past this duration only a log line is added afterwards, the request is not interrupted: the timeout and
+# retries of each single call are handled by ChatClient.
+_SUGGEST_SLOW_SECONDS = 600
 
 
 def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
@@ -1754,7 +1596,7 @@ def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
         raise
     except Exception as exc:
         raise ValueError(f"Extraction failed ({exc.__class__.__name__}): {str(exc)[:300]}") from exc
-    if time.time() - started > _SUGGEST_TIMEOUT_SECONDS:
+    if time.time() - started > _SUGGEST_SLOW_SECONDS:
         print(f"[web] suggest_graph_schema took {time.time() - started:.0f}s for {kb_id}", flush=True)
     with db.connect(cfg.state_db) as con:
         merged = dict(discovery.DEFAULTS)
@@ -1767,47 +1609,7 @@ def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
     return result
 
 
-# An extraction preview runs a single unit: 1 + gleaning rounds calls, a dozen or so seconds on a
-# flash-class model. This is a synchronous endpoint; the cap is set to the single-call timeout so the
-# browser never waits forever.
-_PREVIEW_TIMEOUT_SECONDS = 300
-
-
-def _graph_source_for_units(kb_id: str):
-    """Preconditions shared by the extraction preview and the unit list: the KB is enabled, the graph is on
-    and there are active chunks. Returns (cfg, source, config, ledger)."""
-    cfg = settings()
-    with db.connect(cfg.state_db) as con:
-        row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
-        if row is None:
-            raise KeyError(kb_id)
-        if str(row["status"]) != "active":
-            raise ValueError("The knowledge base is not enabled")
-        config = discovery.get_config(con, kb_id)
-        effective = dict(discovery.DEFAULTS)
-        effective.update(_dir_defaults(con, kb_id))
-        effective.update(config)
-        if not effective.get("graph_enabled"):
-            raise ValueError("The knowledge graph is not turned on")
-        ledger = db.active_chunk_refs(con, str(row["collection"]))
-    if not ledger:
-        raise ValueError("This knowledge base has no active chunks yet; finish parsing first")
-    source = discovery.build_source(
-        cfg.mirror_root, str(row["source_root"]), config,
-        kb_id=kb_id, collection=str(row["collection"]),
-    )
-    return cfg, source, config, ledger
-
-
-def _build_graph_units(cfg, source, ledger, q=None):
-    from kb_pipeline.graph.units import build_units, fetch_chunk_payloads
-
-    q = q or qdrant_client(cfg.qdrant_url, cfg.qdrant_api_key)
-    payloads = fetch_chunk_payloads(q, source.collection, ledger)
-    units = build_units(payloads, kb_id=source.kb_id, unit_chunks=source.graph_unit_chunks)
-    if not units:
-        raise ValueError("The active chunks have no text, nothing to extract from")
-    return units
+PREVIEW_CHUNK_LIMIT = 400
 
 
 def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> dict[str, Any]:
@@ -1862,21 +1664,143 @@ def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> d
 
 
 # ── graph preview: a subset of the current version's graph.json entities / relations for the console to draw ──
-_GRAPH_JSON_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# graph.json grows with the size of the knowledge base; a large one is several hundred MB. The preview and the
+# merge drawer only use a small part of it: a few fields of entities and relations, the document axis and the
+# merge log. Reading the whole file into a string and parsing it in one go takes several times the file size in
+# transient memory, and the whole web process stops responding while it parses. So it is read item by item,
+# dropping what is not needed as it goes, and the result is cached per knowledge base.
+_GRAPH_ENTITY_FIELDS = ("key", "title", "type", "upper", "parent_type", "frequency", "doc_ids", "description",
+                        "boilerplate", "scope", "aliases")
+_GRAPH_RELATION_FIELDS = ("source_key", "target_key", "predicate", "strength_sum", "description")
+_GRAPH_DOCUMENT_FIELDS = ("rel_path", "date", "version")
+_GRAPH_READ_CHARS = 1 << 20
+# The graph.json sizes of all cached knowledge bases add up to no more than this (what is kept takes memory of
+# the same order as the file size); beyond it the least recently viewed goes first
+_GRAPH_CACHE_MAX_BYTES = 1 << 30
+_GRAPH_JSON_CACHE: dict[str, tuple[str, float, int, dict[str, Any]]] = {}     # kb_id -> (path, mtime, file size, graph), in order of last use
+_GRAPH_JSON_LOCK = threading.Lock()
 
 
-def _load_graph_json(path: Path) -> dict[str, Any]:
-    """graph.json is two or three MB; keep one copy cached by path + mtime (a new version means a new path,
-    and the old copy is dropped)."""
-    key = str(path)
-    mtime = path.stat().st_mtime
-    hit = _GRAPH_JSON_CACHE.get(key)
-    if hit is not None and hit[0] == mtime:
-        return hit[1]
-    data = json.loads(path.read_text(encoding="utf-8"))
-    _GRAPH_JSON_CACHE.clear()
-    _GRAPH_JSON_CACHE[key] = (mtime, data)
-    return data
+def _iter_graph_json(path: Path):
+    """Read the contents of graph.json's top-level object item by item without holding the whole file in memory:
+    a value that is a list is yielded one element at a time as (key, element, True), any other value whole as
+    (key, value, False)."""
+    decoder = json.JSONDecoder()
+    with path.open(encoding="utf-8") as fh:
+        buf, pos, eof = "", 0, False
+
+        def more(chars: int) -> None:
+            nonlocal buf, pos, eof
+            chunk = fh.read(chars)
+            eof = not chunk
+            buf = buf[pos:] + chunk
+            pos = 0
+
+        def peek() -> str:
+            """Skip whitespace and return the next character (without consuming it); an empty string at the end."""
+            nonlocal pos
+            while True:
+                while pos < len(buf) and buf[pos] in " \t\r\n":
+                    pos += 1
+                if pos < len(buf):
+                    return buf[pos]
+                if eof:
+                    return ""
+                more(_GRAPH_READ_CHARS)
+
+        def value() -> Any:
+            nonlocal pos
+            peek()
+            while True:
+                try:
+                    obj, end = decoder.raw_decode(buf, pos)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                else:
+                    # Complete only when a delimiter follows: when the buffer breaks in the middle of a number, the
+                    # first half (the 1 of 1e-7) parses as a number on its own
+                    if eof or (end < len(buf) and buf[end] in " \t\r\n,:]}"):
+                        pos = end
+                        return obj
+                more(max(_GRAPH_READ_CHARS, len(buf) - pos))      # a value larger than the buffer: double the read each time instead of re-parsing from the start over and over
+
+        def take(expected: str) -> str:
+            nonlocal pos
+            ch = peek()
+            if not ch or ch not in expected:
+                raise json.JSONDecodeError(f"Expecting one of {expected!r}", buf, pos)
+            pos += 1
+            return ch
+
+        take("{")
+        if peek() == "}":
+            return
+        while True:
+            key = value()
+            take(":")
+            if peek() == "[":
+                pos += 1
+                if peek() == "]":
+                    pos += 1
+                else:
+                    while True:
+                        yield key, value(), True
+                        if take(",]") == "]":
+                            break
+            else:
+                yield key, value(), False
+            if take(",}") == "}":
+                return
+
+
+def _read_graph_json(path: Path) -> dict[str, Any]:
+    """The parts of graph.json the preview and the merge drawer use; same shape as the original file, and
+    graph_preview_pick accepts either."""
+    graph: dict[str, Any] = {"entities": [], "relations": [], "documents": {}, "resolution_log": [],
+                             "resolution_rejected": [], "stats": {}}
+    for key, value, is_item in _iter_graph_json(path):
+        if is_item and key == "entities" and isinstance(value, dict):
+            row = {k: value[k] for k in _GRAPH_ENTITY_FIELDS if k in value}
+            row["description"] = str(row.get("description") or "")[:240]
+            graph["entities"].append(row)
+        elif is_item and key == "relations" and isinstance(value, dict):
+            row = {k: value[k] for k in _GRAPH_RELATION_FIELDS if k in value}
+            row["description"] = str(row.get("description") or "")[:160]
+            graph["relations"].append(row)
+        elif is_item and key in ("resolution_log", "resolution_rejected"):
+            graph[key].append(value)
+        elif not is_item and key == "documents" and isinstance(value, dict):
+            graph["documents"] = {doc: {k: meta.get(k) for k in _GRAPH_DOCUMENT_FIELDS}
+                                  for doc, meta in value.items() if isinstance(meta, dict)}
+        elif not is_item and key == "stats" and isinstance(value, dict):
+            graph["stats"] = {"resolution": value.get("resolution")}
+    return graph
+
+
+def _load_graph_json(kb_id: str, path: Path) -> dict[str, Any]:
+    """The current version's graph of this knowledge base (slimmed down), cached per knowledge base: when the
+    version changed (path or mtime differ) the old copy is dropped before the new one is read.
+    One read at a time: when several identical requests arrive together, the later ones wait for the first to
+    finish reading and use its result instead of each reading the file again."""
+    stat = path.stat()
+    with _GRAPH_JSON_LOCK:
+        hit = _GRAPH_JSON_CACHE.pop(kb_id, None)
+        if hit is not None and hit[:2] == (str(path), stat.st_mtime):
+            _GRAPH_JSON_CACHE[kb_id] = hit
+            return hit[3]
+        hit = None          # let go of the old version first, so it does not sit in memory next to the new one
+        while _GRAPH_JSON_CACHE and sum(e[2] for e in _GRAPH_JSON_CACHE.values()) + stat.st_size > _GRAPH_CACHE_MAX_BYTES:
+            del _GRAPH_JSON_CACHE[next(iter(_GRAPH_JSON_CACHE))]
+        graph = _read_graph_json(path)
+        _GRAPH_JSON_CACHE[kb_id] = (str(path), stat.st_mtime, stat.st_size, graph)
+        return graph
+
+
+def _forget_graph_json(kb_id: str) -> None:
+    """When the graph or the knowledge base is deleted, its cached copy goes too."""
+    with _GRAPH_JSON_LOCK:
+        _GRAPH_JSON_CACHE.pop(kb_id, None)
 
 
 def _entity_upper(e: dict[str, Any]) -> str:
@@ -1981,7 +1905,7 @@ def graph_merges(kb_id: str, limit: int = 2000) -> dict[str, Any]:
     graph_file = graph_paths(cfg, source, version).graph_file
     if not graph_file.exists():
         raise ValueError(f"The graph artifacts of the current version {version} are not on disk ({graph_file.name}); rebuild the graph and try again")
-    graph = _load_graph_json(graph_file)
+    graph = _load_graph_json(kb_id, graph_file)
     limit = max(1, min(int(limit or 2000), 5000))
     merges = list(graph.get("resolution_log") or [])[:limit]
     rejected = list(graph.get("resolution_rejected") or [])[:limit]
@@ -2015,7 +1939,7 @@ def graph_preview(kb_id: str, limit: int = 60, q: str = "", upper: str = "", key
         raise ValueError(f"The graph artifacts of the current version {version} are not on disk ({graph_file.name}); rebuild the graph and try again")
     limit = int(limit if limit is not None else 60)
     limit = 0 if limit <= 0 else max(10, min(limit, 3000))
-    out = graph_preview_pick(_load_graph_json(graph_file), limit=limit, q=q, upper=upper, key=key)
+    out = graph_preview_pick(_load_graph_json(kb_id, graph_file), limit=limit, q=q, upper=upper, key=key)
     out["version"] = version
     out["build_kind"] = str(latest["build_kind"] or "full") if "build_kind" in latest.keys() else "full"
     return out
@@ -2037,7 +1961,7 @@ def reparse_kb(kb_id: str, reason: str = "web console reparse") -> dict[str, Any
     return {"requeued": count}
 
 
-# ── job details / failure panel ─────────────────────────────────
+# ── job details ─────────────────────────────────────────────
 
 _JOB_FIELDS = ("job_id", "kb_id", "file_id", "job_type", "status", "stage", "parser_profile", "retry_count",
                "next_attempt_at", "started_at", "finished_at", "created_at", "updated_at", "error",
@@ -2095,34 +2019,6 @@ def cancel_job(job_id: str) -> dict[str, Any]:
     with db.connect(cfg.state_db) as con:
         outcome = db.request_job_cancel(con, job_id, "Cancelled from the console")
     return {"job_id": job_id, "outcome": outcome}
-
-
-def failed_jobs(limit: int = 100) -> dict[str, Any]:
-    """Failed / backing-off parse jobs plus the queue depth, for the failure section of the "Parse status"
-    panel."""
-    cfg = settings()
-    with db.connect(cfg.state_db) as con:
-        rows = con.execute(
-            "SELECT j.job_id, j.kb_id, j.status, j.stage, j.error, j.retry_count, j.next_attempt_at, "
-            "j.updated_at, f.rel_path, f.file_id FROM jobs j LEFT JOIN files f ON f.file_id = j.file_id "
-            "WHERE j.job_type='parse' AND j.status IN ('failed','retry') "
-            "ORDER BY CASE j.status WHEN 'failed' THEN 0 ELSE 1 END, j.updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        depth = {r["status"]: int(r["n"]) for r in con.execute(
-            "SELECT status, COUNT(*) AS n FROM jobs WHERE job_type='parse' "
-            "AND status IN ('running','queued','retry') GROUP BY status")}
-    now = int(time.time())
-    items = []
-    for r in rows:
-        items.append({
-            "job_id": str(r["job_id"]), "kb_id": str(r["kb_id"]), "status": str(r["status"]),
-            "stage": r["stage"], "error": (str(r["error"])[:300] if r["error"] else None),
-            "retry_count": int(r["retry_count"] or 0),
-            "retry_in": max(0, int(r["next_attempt_at"] or 0) - now) if str(r["status"]) == "retry" else None,
-            "rel_path": r["rel_path"], "file_id": r["file_id"], "updated_at": r["updated_at"],
-        })
-    return {"jobs": items, "queue": {k: depth.get(k, 0) for k in ("running", "queued", "retry")}}
 
 
 def retry_file(file_id: str) -> dict[str, Any]:
@@ -2261,26 +2157,24 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
     if protocol not in ("openai", "anthropic"):
         raise ValueError("protocol must be 'openai' or 'anthropic'")
     cfg = settings()
+    clear_key = bool(payload.get("clear_api_key"))
+    api_key = "" if clear_key else str(payload.get("api_key") or "")
     with db.connect(cfg.state_db) as con:
         existing = db.get_llm(con, name)
-        api_key = str(payload.get("api_key") or "")
-        # Leaving the key empty while editing = keep the stored key; it is cleared only when clear_api_key is
-        # passed explicitly (endpoints that need no key, like a local vLLM, used to have no way to remove a
-        # key entered by mistake). Keeping it is limited to the same endpoint: if the address's scheme / host /
-        # port or the protocol changed, the old key must not follow to the new address and has to be
-        # re-entered.
-        if (api_key == "" and existing is not None and str(existing["api_key"] or "") and not payload.get("clear_api_key")
-                and (_endpoint_id(str(existing["base_url"] or "")) != _endpoint_id(base_url)
-                     or str(existing["protocol"] or "openai").lower() != protocol)):
-            raise ValueError("The endpoint or protocol changed; enter the API key again, or tick \"clear key\" for endpoints that need none")
-        if payload.get("clear_api_key"):
-            db.upsert_llm(con, name=name, base_url=base_url, api_key="",
-                          model_id=model_id, protocol=protocol)
-            con.execute("UPDATE llm_registry SET api_key='' WHERE name=?", (name,))
-            existing = db.get_llm(con, name)
-            api_key = ""
-        probe_key = api_key or (str(existing["api_key"] or "") if existing is not None else "")
-        _probe_llm(base_url, probe_key, model_id, protocol)
+    stored_key = str(existing["api_key"] or "") if existing is not None else ""
+    # Leaving the key empty while editing = keep the stored key; it is cleared only when clear_api_key is
+    # passed explicitly (endpoints that need no key, like a local vLLM, used to have no way to remove a
+    # key entered by mistake). Keeping it is limited to the same endpoint: if the address's scheme / host /
+    # port or the protocol changed, the old key must not follow to the new address and has to be
+    # re-entered.
+    if (api_key == "" and stored_key and not clear_key
+            and (_endpoint_id(str(existing["base_url"] or "")) != _endpoint_id(base_url)
+                 or str(existing["protocol"] or "openai").lower() != protocol)):
+        raise ValueError("The endpoint or protocol changed; enter the API key again, or tick \"clear key\" for endpoints that need none")
+    # The probe waits for the other end to answer, up to tens of seconds: it runs outside the write transaction
+    # so it does not hold the state database's write lock while parse and graph build writes wait
+    _probe_llm(base_url, "" if clear_key else (api_key or stored_key), model_id, protocol)
+    with db.connect(cfg.state_db) as con:
         db.upsert_llm(
             con,
             name=name,
@@ -2289,6 +2183,8 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
             model_id=model_id,
             protocol=protocol,
         )
+        if clear_key:
+            con.execute("UPDATE llm_registry SET api_key='' WHERE name=?", (name,))
         return _mask(db.get_llm(con, name))
 
 
