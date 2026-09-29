@@ -32,16 +32,19 @@ def resolve_entity(session: Any, kb_id: str, gv: str, *, entity_id: str | None, 
     key = str(name or "").strip().casefold()
     if not key:
         return []
+    # e.id IS NOT NULL does not change the result (every entity has an id); it is only there so that the plan uses
+    # the (kb_id, graph_version, id) index; without it the query is a label scan across all knowledge bases
     rows = session.run(
         "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) "
-        "WHERE coalesce(e.boilerplate, false) = false AND (toLower(e.title) = $name OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)) "
+        "WHERE e.id IS NOT NULL AND coalesce(e.boilerplate, false) = false "
+        "AND (toLower(e.title) = $name OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)) "
         "RETURN e.id AS id, e.title AS title, e.type AS type, e.parent_type AS parent_type, e.scope AS scope, e.description AS description, "
         "e.pagerank AS pagerank, e.degree AS degree, e.aliases AS aliases ORDER BY coalesce(e.pagerank, 0) DESC LIMIT 10",
         kb=kb_id, gv=gv, name=key).data()
     return [_entity_row(r) for r in rows]
 
 
-def dense_candidates(settings: Settings, source: KBSource, name: str, *, limit: int = CANDIDATE_LIMIT) -> list[dict[str, Any]]:
+def dense_candidates(settings: Settings, source: KBSource, name: str, *, limit: int = CANDIDATE_LIMIT, q: Any = None) -> list[dict[str, Any]]:
     """When the name has no exact match, take the few most similar entities from the entity collection
     by vector for the caller to choose from (with ids, so the next query can go by id directly)."""
     from kb_pipeline.graph.recall import _query_points, seed_filter
@@ -50,7 +53,8 @@ def dense_candidates(settings: Settings, source: KBSource, name: str, *, limit: 
     from .channels import embed_question
 
     vector = embed_question(settings, name, timeout=10.0)
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    if q is None:
+        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     rows = _query_points(q, graph_collection_alias(source.collection, "entity"), vector, int(limit), seed_filter())
     return [{"id": r.get("gr_id"), "title": r.get("title"), "type": r.get("type"), "scope": r.get("scope"),
              "description": str(r.get("description") or "")[:200], "score": round(float(r.get("_score") or 0.0), 4)} for r in rows]
@@ -145,19 +149,28 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]]) -> No
 
 
 def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entity_id: str | None, limit: int = 20,
-              types: list[str] | None = None, direction: str = "both", q: Any = None) -> dict[str, Any]:
+              types: list[str] | None = None, direction: str = "both", q: Any = None, driver: Any = None,
+              timeout: float | None = None) -> dict[str, Any]:
+    """q / driver: the Qdrant client and Neo4j driver shared by the service; without a driver one is
+    created here and closed afterwards. timeout: transaction timeout (seconds) of each Neo4j query, except
+    the point lookup of the active version number."""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
+    from kb_pipeline.graph.recall import TimedSession
 
     direction = direction if direction in ("both", "out", "in") else "both"
-    driver = neo4j_driver(settings)
+    own_driver = driver is None
+    if own_driver:
+        driver = neo4j_driver(settings)
     try:
         gv = active_neo4j_graph_version(driver, source.kb_id)
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
         with driver.session() as session:
+            if timeout:
+                session = TimedSession(session, timeout)
             matches = resolve_entity(session, source.kb_id, gv, entity_id=entity_id, name=entity)
             if not matches:
-                cands = dense_candidates(settings, source, entity or "") if entity else []
+                cands = dense_candidates(settings, source, entity or "", q=q) if entity else []
                 return {"kb_id": source.kb_id, "graph_version": gv, "found": False, "entity": None, "matches": [], "candidates": cands,
                         "neighbors": [], "note": "no entity with that title or alias; pick one of the candidates by id"}
             # Several entities with the same name (MACD in different scopes): take the one with the most
@@ -168,7 +181,8 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
             attach_evidence(session, source.kb_id, gv, rows)
             center["docs"] = entity_docs(session, source.kb_id, gv, str(center["id"]))
     finally:
-        driver.close()
+        if own_driver:
+            driver.close()
     backfill_evidence(q, source.collection, rows)
     return {"kb_id": source.kb_id, "graph_version": gv, "found": True, "entity": center, "matches": matches[1:], "candidates": [],
             "neighbors": rows, "count": len(rows), "direction": direction, "types": list(types or [])}

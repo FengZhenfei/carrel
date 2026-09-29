@@ -14,7 +14,9 @@ An optional JSON config is shown in [config.example.json](config.example.json). 
 
 Check the connection with `python3 "$SKILL_DIR/scripts/carrel_search.py" health` (optionally with `--base-url`). Authentication still uses the separately stored token.
 
-The command-level `--base-url` takes precedence over the environment and the config; `--timeout` overrides the config, defaulting to 60 seconds with no automatic retries. Global arguments go before the subcommand. 401/403 means the authentication must be fixed and a connection error means reachability must be checked; neither should be read as the knowledge base having no content.
+The command-level `--base-url` takes precedence over the environment and the config; `--timeout` overrides the config, defaulting to 60 seconds with no automatic retries. Global arguments go before the subcommand. 401/403 means the authentication must be fixed and a connection error means reachability must be checked; 503 means the service could not reach its own retrieval back ends (or its state database was busy) and the request can be retried later. None of these should be read as the knowledge base having no content.
+
+The service bounds each search by its request budget (`KB_SEARCH_REQUEST_BUDGET`, 45 seconds by default), below the client's default timeout; keep `--timeout` above the budget. When time runs short the service still answers, skipping the later stages (widening, reranking, neighbouring context) and listing them in `retrieval_summary.degraded`.
 
 Below, `$SKILL_DIR` is the actual skill directory and `$WORK_DIR` the existing working directory of the current task. These variables must be set by the caller; IDs/versions in JSON requests come from actual API responses and are never copied from placeholders.
 
@@ -59,7 +61,7 @@ Request sketch; omit the fields that are not actually needed:
 
 `hints.doc_ids/rel_paths/content_version` are hard filters and several fields intersect; do not guess full paths from file names. `block_types` is a soft preference. Check `hints_used/hints_ignored/hints_scope`; subject and date are not supported hard-filter keys.
 
-For image queries use `search --question "the actual image query" --image /absolute/path/query.png`; the script handles the base64 encoding. The raw image file is capped at 9,000,000 bytes, matching the API's base64 limit. Image-to-image results still need their textual constraints checked; do not assume that vector similarity already satisfies every combined image-and-text condition.
+For image queries use `search --question "the actual image query" --image /absolute/path/query.png`; the script handles the base64 encoding. The raw image file is capped at 9,000,000 bytes, matching the API's base64 limit. A file the service cannot read as an image is rejected with 422 (send PNG or JPEG). When the image vector cannot be computed, `retrieval_summary.degraded` contains a `visual_query` entry and the results come from the question text alone. Image-to-image results still need their textual constraints checked; do not assume that vector similarity already satisfies every combined image-and-text condition.
 
 ### Fetching context
 
@@ -95,7 +97,7 @@ python3 "$SKILL_DIR/scripts/carrel_search.py" crop --request "$WORK_DIR/crop.jso
 }
 ```
 
-`bbox` is given as 0–1 fractions or 0–1000 per-mille of the original image, not pixels; `pad` is 0–200 pixels. Look at the original image first, then locate the region. The original is saved with the service's raw bytes and the extension does not change the encoding; the returned `mime_type` is authoritative. Crops are output as PNG. The client returns the absolute path, content hash, source, dimensions and crop box; it does not hand the image to the model merely as base64 text.
+`point_id` is the UUID `point_id` of the image hit in `sources`, not its `chunk_uid`; any other value is rejected with 422. `bbox` is given as 0–1 fractions or 0–1000 per-mille of the original image, not pixels: values above 1000 are rejected and any value up to 1000 is read as per-mille, so pixel coordinates would silently select the wrong region; the pixel box actually cropped comes back as `crop_box`. `pad` is 0–200 pixels. Look at the original image first, then locate the region. The original is saved with the service's raw bytes and the extension does not change the encoding; the returned `mime_type` is authoritative. Crops are output as PNG. The client returns the absolute path, content hash, source, dimensions and crop box; it does not hand the image to the model merely as base64 text.
 
 ### Graph neighbourhood
 

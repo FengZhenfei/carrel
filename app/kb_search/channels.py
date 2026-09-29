@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import base64
 import io
+import math
+import re
+import threading
 from typing import Any
 
 import requests
+from opensearchpy import OpenSearch
 from qdrant_client import models
 
 from kb_pipeline import search_fts
@@ -23,6 +27,27 @@ ACTIVE_FILTER = models.Filter(must=[models.FieldCondition(key="is_active", match
 VISUAL_MAX_PIXELS = 1_000_000
 BM25_SOURCE = ["chunk_uid", "kb_id", "doc_id", "content_version", "chunk_index", "rel_path", "filename", "page_idx", "block_type"]
 IDENTIFIER_BOOST = 3.0
+
+
+def _secs(timeout: float | None) -> int | None:
+    """Qdrant takes timeouts in whole seconds only: round up, at least 1 second (a fraction of a second
+    computed from the remaining budget must not be truncated to 0)."""
+    return max(1, math.ceil(float(timeout))) if timeout else None
+
+
+_os_clients: dict[str, OpenSearch] = {}
+
+
+def os_client(url: str) -> OpenSearch:
+    """The search side's own OpenSearch client: no retry on timeout. The pipeline's client retries twice
+    more after a timeout, so a keyword channel job the caller has already abandoned could drag on for up
+    to 90 seconds, holding on to the shared thread pool all along. One retry is kept for connection
+    errors: after an OpenSearch restart an old pooled connection breaks on first use, and reconnecting
+    right away fixes it."""
+    cached = _os_clients.get(url)
+    if cached is None:
+        cached = _os_clients[url] = OpenSearch(hosts=[url], timeout=30, max_retries=1, retry_on_timeout=False)
+    return cached
 
 
 def query_text(question: str, instruction: str | None) -> str:
@@ -127,7 +152,7 @@ def vector_channel(q: Any, collection: str, vector: list[float], *, limit: int, 
     """Dense recall from the main collection: the named vector text, active points only (Q02: an
     unnamed vector on a named-vector collection is a straight 400, so using is always passed here)."""
     res = q.query_points(collection_name=collection, query=vector, using=TEXT_VECTOR, query_filter=query_filter or ACTIVE_FILTER,
-                         limit=int(limit), with_payload=True, timeout=int(timeout) if timeout else None)
+                         limit=int(limit), with_payload=True, timeout=_secs(timeout))
     return [{"point_id": str(p.id), "score": float(p.score), "payload": dict(p.payload or {})} for p in res.points]
 
 
@@ -151,11 +176,11 @@ def bm25_query(question: str, identifiers: list[str], filters: list[dict[str, An
 
 def bm25_channel(url: str, question: str, collection: str, *, limit: int, identifiers: list[str] | None = None,
                  timeout: float | None = None, filters: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    os_client = search_fts.client(url)
-    if not os_client.indices.exists(index=collection):
+    client = os_client(url)
+    if not client.indices.exists(index=collection, request_timeout=timeout):
         return []
     body = {"size": int(limit), "query": bm25_query(question, identifiers or [], filters), "_source": BM25_SOURCE}
-    response = os_client.search(index=collection, body=body, request_timeout=timeout) if timeout else os_client.search(index=collection, body=body)
+    response = client.search(index=collection, body=body, request_timeout=timeout)
     rows: list[dict[str, Any]] = []
     for hit in response.get("hits", {}).get("hits", []):
         rows.append({"point_id": str(hit.get("_id")), "score": float(hit.get("_score") or 0.0), "payload": dict(hit.get("_source") or {})})
@@ -166,7 +191,8 @@ PROFILE_FIELDS = ["body", "title", "visual", "filename", "path"]
 PROFILE_MAX_TERMS = 16
 
 
-def lexical_profile(url: str, question: str, collections: list[str], *, max_terms: int = PROFILE_MAX_TERMS) -> dict[str, Any]:
+def lexical_profile(url: str, question: str, collections: list[str], *, max_terms: int = PROFILE_MAX_TERMS,
+                    timeout: float | None = None) -> dict[str, Any]:
     """Raw material for knowledge-base-level lexical evidence (Q20): the question is split into tokens
     by the same cjk analyzer as the index (Chinese bigrams, Latin words, numbers), and a single msearch
     counts how many chunks each token appears in per knowledge base and how many chunks each knowledge
@@ -174,11 +200,11 @@ def lexical_profile(url: str, question: str, collections: list[str], *, max_term
     Raw BM25 scores are not comparable across indexes (a topic word has the lowest IDF precisely in the
     knowledge base of that topic); chunk density is the quantity that can be compared across knowledge
     bases."""
-    os_client = search_fts.client(url)
-    existing = [c for c in collections if os_client.indices.exists(index=c)]
+    client = os_client(url)
+    existing = [c for c in collections if client.indices.exists(index=c, request_timeout=timeout)]
     if not existing:
         return {"terms": {}, "sizes": {}}
-    analyzed = os_client.indices.analyze(body={"analyzer": "cjk", "text": question})
+    analyzed = client.indices.analyze(body={"analyzer": "cjk", "text": question}, request_timeout=timeout)
     terms: list[str] = []
     for t in analyzed.get("tokens") or []:
         tok = str(t.get("token") or "").strip()
@@ -193,7 +219,7 @@ def lexical_profile(url: str, question: str, collections: list[str], *, max_term
         body.append({"size": 0, "query": {"multi_match": {"query": tok, "fields": PROFILE_FIELDS, "type": "phrase"}}, "aggs": agg})
     body.append({"index": target})
     body.append({"size": 0, "query": {"match_all": {}}, "aggs": agg})
-    responses = os_client.msearch(body=body).get("responses") or []
+    responses = client.msearch(body=body, request_timeout=timeout).get("responses") or []
 
     def buckets(resp: dict[str, Any]) -> dict[str, int]:
         rows = ((resp.get("aggregations") or {}).get("by_index") or {}).get("buckets") or []
@@ -205,19 +231,51 @@ def lexical_profile(url: str, question: str, collections: list[str], *, max_term
     return out
 
 
+NEO4J_IDLE_CHECK_SECONDS = 10.0
+_driver_lock = threading.Lock()
+_driver: dict[str, Any] = {"key": None, "driver": None}
+
+
+def shared_driver(settings: Settings) -> Any:
+    """The Neo4j driver shared by the search process (thread-safe, with its own connection pool): the
+    graph channel no longer creates, verifies and closes a driver on every query. A connection idle for
+    more than a few seconds is probed before use, so dead connections left in the pool by a Neo4j restart
+    are not used to run queries; when the connection details change the driver is replaced."""
+    from neo4j import GraphDatabase
+
+    key = (settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    with _driver_lock:
+        if _driver["driver"] is not None and _driver["key"] == key:
+            return _driver["driver"]
+        if not settings.neo4j_password:
+            raise RuntimeError("Neo4j password is not configured. Set NEO4J_PASSWORD in config/knowledge-base.env.")
+        old = _driver["driver"]
+        _driver["driver"] = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password),
+                                                 liveness_check_timeout=NEO4J_IDLE_CHECK_SECONDS)
+        _driver["key"] = key
+        if old is not None:
+            old.close()
+        return _driver["driver"]
+
+
 def graph_channel(settings: Settings, source: KBSource, question: str, *, limit: int, hops: int,
-                  vector: list[float] | None = None, lexical_only: bool = False) -> dict[str, Any]:
+                  vector: list[float] | None = None, lexical_only: bool = False, q: Any = None,
+                  timeout: float | None = None) -> dict[str, Any]:
     """Graph channel as candidate expansion (Q04): calls graph_query and takes only chunk ids and graph
     scores as features; entities / relations / facts / pages are brought back separately for the
     evidence tables. Any failure (alias version mismatch, Neo4j unreachable, graph collection missing)
     only skips the graph channel and the query proceeds as usual. vector: pass the question vector in
     if already computed (saves one embedding); lexical_only: the embedding service is down, use
-    lexical seeds only (Q19)."""
+    lexical seeds only (Q19). q: the Qdrant client shared by the service (creating one each time starts
+    a compatibility-check thread and builds an SSL context, a cost multiplied under concurrency).
+    timeout: transaction timeout of each Neo4j query; the database terminates it when time is up, so an
+    abandoned job does not keep holding a thread."""
     from kb_pipeline.graph.recall import graph_query
 
     try:
         res = graph_query(settings, source, question, hops=int(hops), chunk_limit=int(limit), candidate_limit=int(limit),
-                          with_text=True, vector=vector, lexical_only=lexical_only)
+                          with_text=True, vector=vector, lexical_only=lexical_only, q=q, driver=shared_driver(settings),
+                          timeout=timeout)
     except Exception as exc:
         return {"chunks": [], "skipped": f"{type(exc).__name__}: {str(exc)[:160]}"}
     chunks = [{"point_id": str(c.get("point_id")), "score": float(c.get("graph_score") or c.get("score") or 0.0),
@@ -283,21 +341,40 @@ def visual_channel(q: Any, collection: str, vector: list[float], *, limit: int, 
     """Visual channel (Q17): fetch active image chunks by the visual vector; Qdrant naturally omits
     points that have no visual vector."""
     res = q.query_points(collection_name=collection, query=vector, using=VISUAL_VECTOR, query_filter=query_filter or ACTIVE_FILTER,
-                         limit=int(limit), with_payload=True, timeout=int(timeout) if timeout else None)
+                         limit=int(limit), with_payload=True, timeout=_secs(timeout))
     return [{"point_id": str(p.id), "score": float(p.score), "payload": dict(p.payload or {})} for p in res.points]
 
 
-def table_head(q: Any, collection: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """When a table continuation chunk is hit, find the lowest-index chunk of the same block (doc_id +
-    content_version + block_id) -- that is where the header lives (Q16); returns None when the hit is
-    itself the first chunk, the text already carries a HEADER label, or the block has only one chunk."""
+_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{3,}")
+
+
+def table_context(text: str) -> list[str]:
+    """The lines of a markdown table chunk that are not data rows: lead-in lines outside the table (table
+    title, table note), the header row and the separator row; empty when there is no separator row (not a
+    markdown table)."""
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    sep = next((i for i, ln in enumerate(lines) if _TABLE_SEP_RE.match(ln)), None)
+    if sep is None:
+        return []
+    return [ln for i, ln in enumerate(lines) if i <= sep or not ln.startswith("|")]
+
+
+def table_head(q: Any, collection: str, payload: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any] | None:
+    """When a table continuation chunk is hit, find the first chunk of the same block (doc_id +
+    content_version + block_id) -- that is where the table title and header live (Q16). Returns None when
+    the hit is itself the first chunk, the text already carries a HEADER label (every chunk of a native
+    table does), or the block has only one chunk; markdown tables repeat the header in every chunk when
+    split, so when the hit already contains all lead-in and header lines of the first chunk it also
+    returns None rather than spending evidence budget for nothing. The first chunk is the first one in
+    ascending chunk_index order: an unordered scroll returns points by id, and when a block has more
+    than one page of earlier chunks it would hand back some chunk from the middle of the table."""
     block_id = payload.get("block_id")
     doc_id = payload.get("doc_id")
     idx = payload.get("chunk_index")
     if not block_id or doc_id is None or idx is None:
         return None
     text = str(payload.get("text") or "")
-    if "HEADER:" in text[:400] or "列名:" in text[:400]:
+    if "HEADER:" in text[:400]:
         return None
     must: list[Any] = [
         models.FieldCondition(key="is_active", match=models.MatchValue(value=True)),
@@ -307,25 +384,27 @@ def table_head(q: Any, collection: str, payload: dict[str, Any]) -> dict[str, An
     ]
     if payload.get("content_version"):
         must.append(models.FieldCondition(key="content_version", match=models.MatchValue(value=str(payload["content_version"]))))
-    points, _ = q.scroll(collection_name=collection, scroll_filter=models.Filter(must=must), limit=16, with_payload=True, with_vectors=False)
-    rows = []
-    for p in points:
-        pl = dict(p.payload or {})
-        pl["point_id"] = str(p.id)
-        rows.append(pl)
-    if not rows:
+    points, _ = q.scroll(collection_name=collection, scroll_filter=models.Filter(must=must), limit=1, with_payload=True, with_vectors=False,
+                         order_by=models.OrderBy(key="chunk_index", direction=models.Direction.ASC), timeout=_secs(timeout))
+    if not points:
         return None
-    return min(rows, key=lambda r: int(r.get("chunk_index") or 0))
+    head = dict(points[0].payload or {})
+    head["point_id"] = str(points[0].id)
+    context = table_context(str(head.get("text") or ""))
+    own = {ln.strip() for ln in text.splitlines()}
+    if context and all(ln in own for ln in context):
+        return None
+    return head
 
 
-def fetch_payloads(q: Any, collection: str, point_ids: list[str]) -> dict[str, dict[str, Any]]:
+def fetch_payloads(q: Any, collection: str, point_ids: list[str], *, timeout: float | None = None) -> dict[str, dict[str, Any]]:
     """Fetch payloads from the main collection by point_id; deactivated points are not returned (Q02:
     retrieval always follows the published version)."""
     ids = [pid for pid in dict.fromkeys(str(p) for p in point_ids) if pid]
     out: dict[str, dict[str, Any]] = {}
     for start in range(0, len(ids), 256):
         batch = ids[start:start + 256]
-        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=True, with_vectors=False):
+        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=True, with_vectors=False, timeout=_secs(timeout)):
             payload = dict(rec.payload or {})
             if payload.get("is_active") is False:
                 continue
@@ -333,20 +412,7 @@ def fetch_payloads(q: Any, collection: str, point_ids: list[str]) -> dict[str, d
     return out
 
 
-def point_states(q: Any, collection: str, point_ids: list[str]) -> dict[str, bool]:
-    """Whether the source points still exist and are active (Codex S03): the points that graph-side
-    facts / pages refer to may already be deactivated after a re-parse and before the incremental merge.
-    Only the is_active field is fetched, dozens of ids per call."""
-    ids = [pid for pid in dict.fromkeys(str(p) for p in point_ids) if pid]
-    out: dict[str, bool] = {pid: False for pid in ids}
-    for start in range(0, len(ids), 256):
-        batch = ids[start:start + 256]
-        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=["is_active"], with_vectors=False):
-            out[str(rec.id)] = bool((rec.payload or {}).get("is_active", True))
-    return out
-
-
-def point_meta(q: Any, collection: str, point_ids: list[str]) -> dict[str, dict[str, Any]]:
+def point_meta(q: Any, collection: str, point_ids: list[str], *, timeout: float | None = None) -> dict[str, dict[str, Any]]:
     """Active state and document identity (doc_id / rel_path / content_version) of the source points:
     under a constrained query, derived evidence is checked against it for scope (Codex R1). Missing
     points are recorded as active=False."""
@@ -354,14 +420,15 @@ def point_meta(q: Any, collection: str, point_ids: list[str]) -> dict[str, dict[
     out: dict[str, dict[str, Any]] = {pid: {"active": False} for pid in ids}
     for start in range(0, len(ids), 256):
         batch = ids[start:start + 256]
-        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=["is_active", "doc_id", "rel_path", "content_version"], with_vectors=False):
+        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=["is_active", "doc_id", "rel_path", "content_version"],
+                              with_vectors=False, timeout=_secs(timeout)):
             pl = rec.payload or {}
             out[str(rec.id)] = {"active": bool(pl.get("is_active", True)), "doc_id": pl.get("doc_id"), "rel_path": pl.get("rel_path"),
                                 "content_version": pl.get("content_version")}
     return out
 
 
-def neighbor_payloads(q: Any, collection: str, payload: dict[str, Any], *, span: int) -> list[dict[str, Any]]:
+def neighbor_payloads(q: Any, collection: str, payload: dict[str, Any], *, span: int, timeout: float | None = None) -> list[dict[str, Any]]:
     """Active chunks of the same document and version whose chunk_index is within +-span, sorted by
     index (Q07 neighbourhood backfill, never crossing a document boundary)."""
     doc_id = payload.get("doc_id")
@@ -381,7 +448,7 @@ def neighbor_payloads(q: Any, collection: str, payload: dict[str, Any], *, span:
     if version:
         must.append(models.FieldCondition(key="content_version", match=models.MatchValue(value=str(version))))
     points, _ = q.scroll(collection_name=collection, scroll_filter=models.Filter(must=must), limit=2 * span + 2,
-                         with_payload=True, with_vectors=False)
+                         with_payload=True, with_vectors=False, timeout=_secs(timeout))
     rows = []
     for p in points:
         pl = dict(p.payload or {})

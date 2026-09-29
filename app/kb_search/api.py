@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hmac
+import io
+import json
+import sys
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -16,8 +20,9 @@ def require_token(request: Request) -> None:
     requests are accepted."""
     _, ss, _ = service.runtime()
     if ss.token:
-        header = request.headers.get("authorization") or ""
-        if header.strip() != f"Bearer {ss.token}":
+        header = (request.headers.get("authorization") or "").strip()
+        given = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if not given or not hmac.compare_digest(given.encode(), ss.token.encode()):      # comparison time does not depend on how many characters were guessed right
             raise HTTPException(status_code=401, detail="missing or invalid bearer token")
         return
     host = request.client.host if request.client else ""
@@ -55,7 +60,7 @@ class NeighborsRequest(BaseModel):
 class CropRequest(BaseModel):
     kb_id: str
     point_id: str
-    bbox: list[float] = Field(min_length=4, max_length=4)   # 0-1 fractions, 0-1000 per-mille or pixels
+    bbox: list[float] = Field(min_length=4, max_length=4)   # 0-1 fractions or 0-1000 per-mille; pixels are not accepted (any value up to 1000 is read as per-mille)
     pad: int = Field(default=16, ge=0, le=200)
 
 
@@ -66,6 +71,8 @@ def _wrap(fn, *args, **kwargs):
         raise HTTPException(status_code=404, detail=f"not found: {exc}")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except service.RetrievalUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 def _decode_image(b64: str | None) -> bytes | None:
@@ -75,9 +82,18 @@ def _decode_image(b64: str | None) -> bytes | None:
     if raw.startswith("data:"):
         raw = raw.split(",", 1)[1] if "," in raw else ""
     try:
-        return base64.b64decode(raw, validate=False)
+        data = base64.b64decode(raw, validate=False)
     except Exception:
         raise HTTPException(status_code=422, detail="image_b64 is not valid base64")
+    try:
+        from PIL import Image
+
+        Image.open(io.BytesIO(data)).verify()
+    except Exception:
+        # An unreadable image (corrupt, not an image, a format without an installed decoder) is rejected here;
+        # otherwise the visual channel is silently skipped and the result comes from the question text alone
+        raise HTTPException(status_code=422, detail="image_b64 is not an image this service can read (send PNG or JPEG)")
+    return data
 
 
 def _image_response(img: dict[str, Any]) -> Response:
@@ -97,10 +113,30 @@ def catalog(refresh: bool = False) -> dict[str, Any]:
     return service.catalog(force=refresh)
 
 
+def _log_search(out: dict[str, Any]) -> None:
+    """Every search that returns a result leaves one line on the server: timings, degraded entries, widening
+    and rerank state. If degradation were only written into the response, the degradation rate and slow
+    requests could not be traced afterwards. The question text is not logged (in a health knowledge base the
+    question itself is private); degraded entries hold only knowledge base names, channel names and
+    exception types. The whole line is written at once (written in two parts, the lines of concurrent
+    requests would run together); failing to write the log must not fail a search that is already done."""
+    try:
+        s = (out.get("retrieval_summary") if isinstance(out, dict) else None) or {}
+        line = {"timings_ms": s.get("timings_ms"), "kbs": len(s.get("kbs") or []), "widened": (s.get("routing") or {}).get("widened"),
+                "rerank": s.get("rerank"), "evidence_state": s.get("evidence_state"), "hits": (s.get("sources") or {}).get("hits"),
+                "image_query": s.get("image_query"), "degraded": s.get("degraded") or []}
+        sys.stdout.write("[search.request] " + json.dumps(line, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 @router.post("/search", dependencies=[Depends(require_token)])
 def search(req: SearchRequest) -> dict[str, Any]:
-    return _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context,
-                 explain=req.explain, image_bytes=_decode_image(req.image_b64))
+    out = _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context,
+                explain=req.explain, image_bytes=_decode_image(req.image_b64))
+    _log_search(out)
+    return out
 
 
 @router.post("/context", dependencies=[Depends(require_token)])

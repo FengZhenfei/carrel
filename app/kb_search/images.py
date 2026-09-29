@@ -10,6 +10,7 @@ import hashlib
 import io
 import re
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,15 @@ MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp
 
 
 def locate(q: Any, collection: str, point_id: str) -> dict[str, Any]:
-    """Fetch an image chunk's payload by point_id; a non-image chunk or a missing point raises KeyError."""
-    recs = q.retrieve(collection_name=collection, ids=[str(point_id)], with_payload=True, with_vectors=False)
+    """Fetch an image chunk's payload by point_id; a non-image chunk or a missing point raises KeyError.
+    A point_id that is not a UUID (a chunk_uid passed in its place, say) is a bad argument and raises
+    ValueError: handed to the main store as is, it would only come back as a 400 and turn into a 500 for
+    the caller."""
+    try:
+        point_id = str(uuid.UUID(str(point_id)))
+    except ValueError:
+        raise ValueError(f"point_id must be a UUID (sources[].point_id), got {str(point_id)[:80]!r}")
+    recs = q.retrieve(collection_name=collection, ids=[point_id], with_payload=True, with_vectors=False)
     if not recs:
         raise KeyError(f"point {point_id} not found in {collection}")
     payload = dict(recs[0].payload or {})
@@ -252,8 +260,10 @@ def original_image(settings: Any, payload: dict[str, Any]) -> dict[str, Any]:
 def resolve_bbox(bbox: list[float], width: int, height: int) -> tuple[int, int, int, int]:
     """Two notations for the box: all values within 0-1 are fractions, otherwise values within 0-1000
     are per-mille (the grounding convention); pixel coordinates are not accepted (the image the caller
-    saw may have been downscaled, so pixels would not line up). Returns a pixel box (already clamped to
-    the image)."""
+    saw may have been downscaled, so pixels would not line up). Values above 1000 are rejected outright;
+    pixel values up to 1000 cannot be told apart from per-mille and are all read as per-mille, and the box
+    actually cropped is returned in the X-Crop-Box response header. Returns a pixel box (already clamped
+    to the image)."""
     if not bbox or len(bbox) != 4:
         raise ValueError("bbox must be [x1, y1, x2, y2]")
     vals = [float(v) for v in bbox]

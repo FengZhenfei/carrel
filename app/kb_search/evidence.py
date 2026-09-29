@@ -82,7 +82,8 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
     nxt = sorted((p for p in neighbors if int(p.get("chunk_index", -1)) > idx and str(p.get("block_type") or "") in STITCHABLE_BLOCKS),
                  key=lambda p: int(p["chunk_index"]))
     pieces: dict[int, dict[str, Any]] = {idx: {"text": text, "point_id": row.get("point_id"), "chunk_index": idx,
-                                               "page_idx": row.get("page_idx"), "position": row.get("position")}}
+                                               "page_idx": row.get("page_idx"), "position": row.get("position"),
+                                               "degraded": row.get("degraded")}}
     total = len(text)
     order = []
     for i in range(max(len(prev), len(nxt))):
@@ -97,7 +98,7 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
         if not t or total + len(t) + 1 > max_chars:
             continue
         pieces[int(p["chunk_index"])] = {"text": t, "point_id": p.get("point_id"), "chunk_index": int(p["chunk_index"]),
-                                         "page_idx": p.get("page_idx"), "position": position(p)}
+                                         "page_idx": p.get("page_idx"), "position": position(p), "degraded": p.get("degraded")}
         total += len(t) + 1
     if len(pieces) == 1:
         return False
@@ -105,9 +106,12 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
     row["text"] = "\n".join(pieces[k]["text"] for k in keys)
     row["token_count"] = count_tokens(row["text"])
     # Every piece can be cited on its own (Codex S03): a stitched-in neighbour carries its own point_id
-    # / chunk index / page number / position string
+    # / chunk index / page number / position string; when a neighbour sits on a page whose parse was
+    # degraded, its text is now part of this row, so the degraded marker is carried along with it
     row["stitched"] = {"chunk_from": keys[0], "chunk_to": keys[-1], "own_chars": len(text),
-                       "pieces": [{k: v for k, v in pieces[i].items() if k != "text"} | {"chars": len(pieces[i]["text"])} for i in keys]}
+                       "pieces": [{k: v for k, v in pieces[i].items() if k != "text" and (k != "degraded" or v)} | {"chars": len(pieces[i]["text"])}
+                                  for i in keys]}
+    row["degraded"] = row.get("degraded") or next((pieces[i]["degraded"] for i in keys if pieces[i].get("degraded")), None)
     return True
 
 
@@ -295,16 +299,15 @@ def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "scor
         toks = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in rest]
         chosen_toks = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in picked]
         remaining = list(range(len(rest)))
+        # Each candidate's highest similarity to the entries already picked: every newly picked entry is compared
+        # once, instead of recomputing against all picked entries in every round
+        sim = [max((jaccard(toks[i], t) for t in chosen_toks), default=0.0) for i in remaining]
         while remaining and len(picked) < k:
-            best_i, best_v = remaining[0], None
-            for i in remaining:
-                sim = max((jaccard(toks[i], t) for t in chosen_toks), default=0.0)
-                v = lam * rel[i] - (1.0 - lam) * sim
-                if best_v is None or v > best_v:
-                    best_i, best_v = i, v
+            best_i = max(remaining, key=lambda i: lam * rel[i] - (1.0 - lam) * sim[i])
             picked.append(rest[best_i])
-            chosen_toks.append(toks[best_i])
             remaining.remove(best_i)
+            for i in remaining:
+                sim[i] = max(sim[i], jaccard(toks[i], toks[best_i]))
     toks_all = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in picked]
     pairs = [(i, j) for i in range(len(toks_all)) for j in range(i + 1, len(toks_all))]
     redundancy = round(sum(jaccard(toks_all[i], toks_all[j]) for i, j in pairs) / len(pairs), 4) if pairs else 0.0
@@ -389,7 +392,9 @@ def spec_rows(specs: list[dict[str, Any]], *, source_ns: dict[str, int], limit_h
     ("30(2024), 31(2025)") and conflict markers; numeric filtering trusts only fields whose kinds is
     scalar, and kinds is passed through as-is here. point_active: whether the source points are still
     active (Codex S03): a fact whose source points are all deactivated is marked verified=False and
-    gets no hint, rather than silently passing as a current fact."""
+    gets no hint, rather than silently passing as a current fact. Conclusions rest only on source points
+    that were actually checked: when none could be checked (the main store did not return them) the
+    answer is "unknown", not "no longer valid"."""
     series: dict[str, list[dict[str, Any]]] = {}
     for sp in specs:
         key = str(sp.get("series_key") or "")
@@ -401,9 +406,10 @@ def spec_rows(specs: list[dict[str, Any]], *, source_ns: dict[str, int], limit_h
         row = dict(sp)
         pids = [str(p) for p in (sp.get("point_ids") or [])]
         row["sources"] = sorted({source_ns[p] for p in pids if p in source_ns})
-        if point_active is not None and pids:
-            active = [p for p in pids if point_active.get(p, p in source_ns)]
-            row["sources_active"] = f"{len(active)}/{len(pids)}"
+        checked = [p for p in pids if p in point_active or p in source_ns] if point_active is not None else []
+        if checked:
+            active = [p for p in checked if point_active.get(p, True)]
+            row["sources_active"] = f"{len(active)}/{len(checked)}"
             row["verified"] = bool(active)
         else:
             row["verified"] = None if not pids else bool(row["sources"]) or None
@@ -428,7 +434,9 @@ def page_rows(pages: list[dict[str, Any]], *, subjects: list[str], text_budget_t
     """Compiled page table (Q12): pages of the named subjects come first; the body text is given only
     for timeline pages and subject pages with series rows, cut to the total budget, the rest get only
     the overview; every row is marked compiled=True as a reminder that it is second-hand knowledge,
-    and answers cite pages together with chunks."""
+    and answers cite pages together with chunks. A page whose source points are all deactivated
+    (verified=False) gets no body text: it was compiled from content that has since been deleted or
+    replaced, so only the overview is kept as a lead."""
     subj = [s.casefold() for s in subjects if s]
 
     def named(pg: dict[str, Any]) -> int:
@@ -441,14 +449,14 @@ def page_rows(pages: list[dict[str, Any]], *, subjects: list[str], text_budget_t
     for pg in ordered:
         row = {k: v for k, v in pg.items() if k != "text"}
         row["compiled"] = True
-        pids = [str(p) for p in (pg.get("point_ids") or [])]
-        if point_active is not None and pids:
-            active = [p for p in pids if point_active.get(p, False)]
-            row["sources_active"] = f"{len(active)}/{len(pids)}"
+        checked = [str(p) for p in (pg.get("point_ids") or []) if str(p) in point_active] if point_active is not None else []
+        if checked:                                 # conclusions rest only on checked source points; a page none of whose points were checked is not marked
+            active = [p for p in checked if point_active[p]]
+            row["sources_active"] = f"{len(active)}/{len(checked)}"
             row["verified"] = bool(active)
         kind = str(pg.get("kind") or "")
         text = str(pg.get("text") or "")
-        wants_text = text and (kind == "timeline" or (kind == "subject" and (pg.get("series") or [])))
+        wants_text = text and row.get("verified") is not False and (kind == "timeline" or (kind == "subject" and (pg.get("series") or [])))
         if wants_text:
             n = count_tokens(text)
             if used + n <= text_budget_tokens:

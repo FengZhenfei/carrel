@@ -24,6 +24,7 @@ from kb_pipeline.vector.qdrant import graph_alias_targets, graph_collection_alia
 from .channels import ACTIVE_FILTER
 
 DOC_SAMPLE = 20
+DEGRADED_TTL = 15.0  # a catalog built while the main store was out of reach is trusted only this long (seconds): after recovery it must not keep claiming "no graph" for ten minutes
 TOP_N = 3            # knowledge base evidence is the mean of each channel's top few chunks: a single top score is easily inflated by one chunk of coincidentally similar boilerplate, the mean of the top 3 is steadier
 _lock = threading.Lock()
 _cache: dict[str, Any] = {"at": 0.0, "entries": []}
@@ -49,37 +50,56 @@ def _doc_sample(con: Any, collection: str) -> list[str]:
 
 def build_catalog(settings: Settings, q: Any) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
+    down: str | None = None         # main store unreachable or timing out: the remaining knowledge bases are not tried, every attempt would wait for the timeout
     with db.connect(settings.state_db) as con:
         for kb_id, source in sorted(settings.sources.items()):
             profile = dict(getattr(source, "graph_profile", None) or {})
             schema = _active_schema(con, kb_id)
-            try:
-                chunks = int(q.count(collection_name=source.collection, count_filter=ACTIVE_FILTER, exact=True).count)
-            except Exception:
-                chunks = 0
+            chunks, entity_target, failed = 0, None, down
+            if failed is None:
+                try:
+                    chunks = int(q.count(collection_name=source.collection, count_filter=ACTIVE_FILTER, exact=True).count)
+                except Exception as exc:
+                    status = getattr(exc, "status_code", None)          # with a status code the main store answered with an error that concerns only this knowledge base
+                    if status != 404:                                    # 404 means the collection does not exist yet (knowledge base just opened): really 0 chunks
+                        failed = type(exc).__name__
+                        down = failed if status is None else None
             docs = int(con.execute("SELECT COUNT(DISTINCT file_id) FROM chunks WHERE collection = ? AND status = 'active'",
                                    (source.collection,)).fetchone()[0])
-            try:
-                targets = graph_alias_targets(q, source.collection, ("entity",))
-                entity_target = targets.get(graph_collection_alias(source.collection, "entity"))
-            except Exception:
-                entity_target = None
+            if failed is None:
+                try:
+                    targets = graph_alias_targets(q, source.collection, ("entity",))
+                    entity_target = targets.get(graph_collection_alias(source.collection, "entity"))
+                except Exception as exc:
+                    failed = type(exc).__name__
+                    down = failed if getattr(exc, "status_code", None) is None else None
             entries.append({
                 "kb_id": kb_id, "name": str(source.source_root), "collection": source.collection,
                 "language": getattr(source, "graph_language", None), "domain": schema["domain"], "persona": schema["persona"],
                 "subject_types": list(profile.get("subject_types") or []), "axis": profile.get("axis"),
                 "entity_types": list(getattr(source, "graph_entity_types", None) or [])[:40],
                 "chunks": chunks, "docs": docs, "docs_sample": _doc_sample(con, source.collection),
-                "has_graph": bool(entity_target),
+                # between a knowledge base being emptied and its graph being retired (the next graph maintenance
+                # check) the alias still points at the old graph: without active documents the graph channel is skipped
+                "has_graph": bool(entity_target) and docs > 0,
                 "graph_version": (str(entity_target).split("__", 1)[1] if entity_target and "__" in str(entity_target) else None),
             })
+            if failed:
+                # chunks that cannot be counted and a graph alias that cannot be seen mean "unknown", not "0 chunks,
+                # no graph": whether there is a graph is recorded as unknown, and search still tries the graph channel
+                entries[-1].update({"chunks": None, "has_graph": None, "degraded": f"qdrant: {failed}"})
     return entries
 
 
 def get_catalog(settings: Settings, q: Any, *, ttl: float, force: bool = False) -> list[dict[str, Any]]:
+    """The catalog is cached for ttl; it is rebuilt at once when the set of enabled knowledge bases changes
+    (one opened or closed), and a catalog built while the main store was out of reach is cached only briefly."""
     with _lock:
-        if not force and _cache["entries"] and time.time() - float(_cache["at"]) < ttl:
-            return _cache["entries"]
+        entries = _cache["entries"]
+        if not force and entries and {e["kb_id"] for e in entries} == set(settings.sources):
+            keep = min(ttl, DEGRADED_TTL) if any(e.get("degraded") for e in entries) else ttl
+            if time.time() - float(_cache["at"]) < keep:
+                return entries
         entries = build_catalog(settings, q)
         _cache["entries"], _cache["at"] = entries, time.time()
         return entries

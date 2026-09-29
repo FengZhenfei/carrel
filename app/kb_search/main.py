@@ -32,8 +32,11 @@ def run() -> None:
 
     from kb_pipeline.config import load_settings
 
+    from . import service
+
     try:
         load_settings()
+        service.runtime()       # read the settings once while the env file has just been loaded into the process environment: only now can we tell which KB_SEARCH_* keys were set explicitly
     except Exception as exc:
         print(f"[search] load_settings failed at startup: {exc!r}; the service still starts and reports the error through its API", flush=True)
     uvicorn.run(create_app(), host=os.getenv("KB_SEARCH_HOST", "0.0.0.0"), port=int(os.getenv("KB_SEARCH_PORT", "9810")),

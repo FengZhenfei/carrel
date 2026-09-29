@@ -9,9 +9,14 @@ Requests carrying an image (image-to-image): the visual channel probes every kno
 part in the selection, and visual candidates are exempt from the text rerank threshold and get slots
 reserved by visual score (Codex S02). The whole service shares one bounded thread pool, every stage
 collects results against a deadline, and a slow channel is only recorded as degraded instead of
-holding up the whole request (Codex S06)."""
+holding up the whole request (Codex S06).
+The whole request also has a time budget: each stage gets the smaller of its own timeout and the
+remaining budget; when the budget runs short there is no widening and no neighbourhood backfill, and
+each such gap is recorded in degraded. Calls from the search process to Qdrant / OpenSearch / Neo4j
+are all bounded, so an abandoned job ends on its own when its time is up."""
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -19,22 +24,24 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
+from qdrant_client import QdrantClient
+
 from kb_pipeline.config import Settings, load_settings
-from kb_pipeline.vector.qdrant import client as qdrant_client
 
 from . import catalog as catalog_mod
 from . import channels
-from .config import SearchSettings, load_search_settings
+from .config import SearchSettings, env_file_values, load_search_settings
 from .evidence import assemble_sources, doc_aggs, numbered, page_rows, select_hits, spec_rows
 from .fusion import interleave, rrf_merge
 from .rerank import Reranker, rerank
 
-_state: dict[str, Any] = {"settings": None, "search": None, "q": None, "at": 0.0, "pool": None, "pool_size": 0}
+_state: dict[str, Any] = {"settings": None, "search": None, "q": None, "q_key": None, "at": 0.0, "pool": None, "pool_size": 0,
+                          "explicit": None}       # explicit: KB_SEARCH_* keys set explicitly in the process environment (recognised on the first settings read)
 _state_lock = threading.Lock()
 SETTINGS_TTL = 60.0
 
-ENTITY_FIELDS = ("id", "title", "type", "scope", "score", "hop", "via", "docs", "description")
-RELATION_FIELDS = ("id", "source", "type", "target", "score", "hop", "via", "description")
+ENTITY_FIELDS = ("id", "title", "type", "scope", "score", "hop", "via", "docs", "description", "verified", "sources_active")
+RELATION_FIELDS = ("id", "source", "type", "target", "score", "hop", "via", "description", "verified", "sources_active")
 SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "verified", "series_text", "conflict", "conflict_note",
                "subject", "property", "symbol", "concept", "value", "min", "typ", "max", "unit", "unit_canonical", "flag", "ref_min", "ref_max",
                "when", "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
@@ -45,15 +52,47 @@ PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncate
 CROSS_DOC_RE = re.compile(r"(两份|两个文档|各自|各有|各是|分别|都有|都是|对比|比较|区别|差异|异同|共同|哪几份|每份|每个文档)")
 
 
+def _search_env(env_file: Any) -> dict[str, str] | None:
+    """Current values of KB_SEARCH_*; None when the env file cannot be read. load_env_file uses setdefault:
+    the process environment keeps the values read the first time and later edits of the file cannot
+    override them, so changing a parameter or rotating the token needed a restart, and the old token stayed
+    valid until then. Here the values are taken from the file's current content every time, and a key
+    deleted from the file returns to its default. Keys set explicitly in the process environment (command
+    line, systemd Environment=) still take precedence, following load_env_file's rule: on the first read
+    the file has just been loaded into the process environment, so the keys that disagree with the file
+    are the explicitly set ones."""
+    current = env_file_values(env_file)
+    if current is None:
+        return None
+    current = {k: v for k, v in current.items() if k.startswith("KB_SEARCH_")}
+    if _state["explicit"] is None:
+        _state["explicit"] = frozenset(k for k, v in os.environ.items() if k.startswith("KB_SEARCH_") and current.get(k) != v)
+    return {**current, **{k: os.environ[k] for k in _state["explicit"] if k in os.environ}}
+
+
 def runtime() -> tuple[Settings, SearchSettings, Any]:
-    """Settings and the Qdrant client: the env is re-read once a minute (knowledge base toggles and
-    parameter changes need no restart)."""
+    """Settings and the Qdrant client, re-read once a minute: knowledge base toggles come from the state
+    database and KB_SEARCH_* follows the env file's current content, so changing either needs no restart.
+    The listen address / port are bound at startup and the pipeline's keys (service addresses etc.) are
+    read only at startup; those two kinds still need a restart. When the env file cannot be read for a
+    moment (it is being rewritten) the previous settings are kept: that must not reset the token and the
+    parameters to their defaults."""
     with _state_lock:
         if _state["settings"] is None or time.time() - float(_state["at"]) > SETTINGS_TTL:
             settings = load_settings()
             _state["settings"] = settings
-            _state["search"] = load_search_settings()
-            _state["q"] = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+            env = _search_env(settings.env_file)
+            if env is not None or _state["search"] is None:
+                _state["search"] = load_search_settings(env)
+            # One client for the whole service (the graph channel uses it too), not rebuilt while the connection
+            # details are unchanged; no version compatibility check: that would start another thread and build
+            # another HTTP client. The timeout follows the search scale rather than the 120 s used when building
+            timeout = max(1, int(_state["search"].channel_timeout))
+            key = (settings.qdrant_url, settings.qdrant_api_key, timeout)
+            if _state["q"] is None or _state["q_key"] != key:
+                _state["q"] = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key, timeout=timeout,
+                                           check_compatibility=False)
+                _state["q_key"] = key
             _state["at"] = time.time()
         return _state["settings"], _state["search"], _state["q"]
 
@@ -74,16 +113,32 @@ def _collect(jobs: dict[Any, Future], deadline: float) -> dict[Any, tuple[bool, 
     TimeoutError and abandoned (the call in the thread finishes as usual, it is just no longer waited
     for)."""
     out: dict[Any, tuple[bool, Any]] = {}
+    started = time.time()
     for key, fut in jobs.items():
-        remaining = deadline - time.time()
         try:
-            out[key] = (True, fut.result(timeout=max(0.01, remaining)))
+            out[key] = (True, fut.result(timeout=max(0.01, deadline - time.time())))
         except FutureTimeout:
             fut.cancel()
-            out[key] = (False, TimeoutError(f"deadline exceeded ({remaining:.1f}s left)"))
+            out[key] = (False, TimeoutError(f"deadline exceeded after {time.time() - started:.1f}s"))
         except Exception as exc:
             out[key] = (False, exc)
     return out
+
+
+def _left(cap: float, until: float) -> float:
+    """How long this step may still take (seconds): the smaller of its own cap and what is left of the
+    whole request's budget; 0 once the budget is spent."""
+    return max(0.0, min(float(cap), until - time.time()))
+
+
+BUDGET_SPENT = "request budget exhausted"
+
+
+class RetrievalUnavailable(RuntimeError):
+    """Not a single candidate came back because the back ends were out of reach, not because the knowledge
+    base has nothing: the vector and keyword channels failed on every knowledge base, or not one
+    candidate's text could be fetched. Answering "no relevant content" then would be a false report; the
+    API answers 503."""
 
 
 def _err(exc: BaseException) -> str:
@@ -118,7 +173,7 @@ def catalog(force: bool = False) -> dict[str, Any]:
 
 
 def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], question: str, vector: list[float] | None,
-           identifiers: list[str], *, with_profile: bool, image_bytes: bytes | None = None,
+           identifiers: list[str], *, with_profile: bool, until: float, image_bytes: bytes | None = None,
            hint: dict[str, Any] | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """The two cheap channels (vector, keyword) fetch candidates from the given knowledge bases in
     parallel; with auto routing a knowledge-base-level lexical evidence count is taken along the way,
@@ -128,25 +183,26 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
     out: dict[str, dict[str, Any]] = {kb: {"text": [], "bm25": [], "channels": {}, "degraded": []} for kb in kb_ids}
     profile: dict[str, Any] = {"lexical": None, "visual_vector": None, "visual": "disabled"}
     pool = _pool(ss)
-    deadline = time.time() + float(ss.channel_timeout)
+    timeout = _left(ss.channel_timeout, until) or 1.0          # probing is a step that must happen: however tight the budget, it gets 1 second
+    deadline = time.time() + timeout
     qfilter = channels.hint_filter(hint) if hint else None
     os_filters = channels.hint_os_filters(hint) if hint else None
     jobs: dict[tuple[str, str], Future] = {}
     for kb in kb_ids:
         src = settings.sources[kb]
         if vector is not None:
-            jobs[(kb, "text")] = pool.submit(channels.vector_channel, q, src.collection, vector, limit=ss.vector_k, timeout=ss.channel_timeout,
+            jobs[(kb, "text")] = pool.submit(channels.vector_channel, q, src.collection, vector, limit=ss.vector_k, timeout=timeout,
                                              query_filter=qfilter)
         else:
             out[kb]["channels"]["text"] = {"skipped": "embedding unavailable"}
         jobs[(kb, "bm25")] = pool.submit(channels.bm25_channel, settings.opensearch_url, question, src.collection,
-                                         limit=ss.bm25_k, identifiers=identifiers, timeout=ss.channel_timeout, filters=os_filters)
+                                         limit=ss.bm25_k, identifiers=identifiers, timeout=timeout, filters=os_filters)
     if with_profile:
         jobs[("*", "profile")] = pool.submit(channels.lexical_profile, settings.opensearch_url, question,
-                                             [settings.sources[kb].collection for kb in kb_ids])
+                                             [settings.sources[kb].collection for kb in kb_ids], timeout=timeout)
     if ss.visual_enabled and getattr(settings, "visual_embedding_enabled", True):
         jobs[("*", "visual_vector")] = pool.submit(channels.embed_visual_query, settings, text=None if image_bytes else question,
-                                                   image_bytes=image_bytes, timeout=ss.visual_timeout)
+                                                   image_bytes=image_bytes, timeout=_left(ss.visual_timeout, until) or 1.0)
     results = _collect(jobs, deadline)
     for (kb, name), (ok, val) in results.items():
         if kb == "*":
@@ -170,12 +226,14 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
             profile["visual_vector"], profile["visual"] = val, "ok"
         else:
             profile["visual"] = f"skipped: {_err(val)[:80]}"
+            profile["visual_error"] = type(val).__name__
     if image_bytes and profile["visual_vector"] is not None:
         # Request carrying an image: the visual channel probes every knowledge base and its evidence
         # takes part in the selection (Codex S02)
+        timeout = _left(ss.channel_timeout, until) or 1.0
         vjobs = {kb: pool.submit(channels.visual_channel, q, settings.sources[kb].collection, profile["visual_vector"],
-                                 limit=ss.visual_k, timeout=ss.channel_timeout, query_filter=qfilter) for kb in kb_ids}
-        for kb, (ok, val) in _collect(vjobs, time.time() + float(ss.channel_timeout)).items():
+                                 limit=ss.visual_k, timeout=timeout, query_filter=qfilter) for kb in kb_ids}
+        for kb, (ok, val) in _collect(vjobs, time.time() + timeout).items():
             if ok:
                 out[kb]["visual"] = val
                 out[kb]["channels"]["visual"] = {"candidates": len(val)}
@@ -186,26 +244,31 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
     return out, profile
 
 
-def _graph_probe(settings: Settings, ss: SearchSettings, kb_ids: list[str], entries: dict[str, dict[str, Any]],
-                 question: str, vector: list[float] | None) -> dict[str, dict[str, Any]]:
+def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], entries: dict[str, dict[str, Any]],
+                 question: str, vector: list[float] | None, until: float) -> dict[str, dict[str, Any]]:
     """The graph channel runs only on knowledge bases that have a graph (one without a graph simply
     lacks this channel, no switch needed); a failure or timeout only skips the graph channel. The
     question vector is passed in to save one embedding; when the embedding service is down only lexical
     seeds are used (Q19)."""
     out: dict[str, dict[str, Any]] = {}
-    graph_kbs = [kb for kb in kb_ids if entries.get(kb, {}).get("has_graph")]
+    # Knowledge bases where it is unknown whether there is a graph (the main store was out of reach when the
+    # catalog was built) are tried anyway: without a graph the graph channel reports the skip itself
+    graph_kbs = [kb for kb in kb_ids if entries.get(kb, {}).get("has_graph") is not False]
     if not graph_kbs:
         return out
+    timeout = _left(ss.channel_timeout, until)
+    if timeout <= 0:
+        return {kb: {"chunks": [], "skipped": BUDGET_SPENT} for kb in graph_kbs}
     pool = _pool(ss)
     jobs = {kb: pool.submit(channels.graph_channel, settings, settings.sources[kb], question, limit=ss.graph_k, hops=ss.graph_hops,
-                            vector=vector, lexical_only=vector is None) for kb in graph_kbs}
-    for kb, (ok, val) in _collect(jobs, time.time() + float(ss.channel_timeout)).items():
+                            vector=vector, lexical_only=vector is None, q=q, timeout=timeout) for kb in graph_kbs}
+    for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"chunks": [], "skipped": _err(val)}
     return out
 
 
 def _visual_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], vector: list[float] | None,
-                  probe: dict[str, dict[str, Any]], hint: dict[str, Any] | None = None) -> dict[str, Any]:
+                  probe: dict[str, dict[str, Any]], hint: dict[str, Any] | None = None, *, until: float) -> dict[str, Any]:
     """The visual channel (Q17) queries only the chosen knowledge bases; those already queried in the
     probe stage (requests carrying an image) are reused directly; without a visual vector the whole
     channel is skipped."""
@@ -214,14 +277,17 @@ def _visual_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[s
         return out
     pool = _pool(ss)
     qfilter = channels.hint_filter(hint) if hint else None
+    timeout = _left(ss.channel_timeout, until)
     jobs = {}
     for kb in kb_ids:
         if "visual" in probe.get(kb, {}):
             out[kb] = probe[kb]["visual"]
+        elif timeout <= 0:
+            out[kb] = {"skipped": BUDGET_SPENT}
         else:
-            jobs[kb] = pool.submit(channels.visual_channel, q, settings.sources[kb].collection, vector, limit=ss.visual_k, timeout=ss.channel_timeout,
+            jobs[kb] = pool.submit(channels.visual_channel, q, settings.sources[kb].collection, vector, limit=ss.visual_k, timeout=timeout,
                                    query_filter=qfilter)
-    for kb, (ok, val) in _collect(jobs, time.time() + float(ss.channel_timeout)).items():
+    for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"skipped": _err(val)}
     return out
 
@@ -253,16 +319,24 @@ def _fuse(kb: str, probe: dict[str, Any], graph: dict[str, Any] | None, visual: 
     return {"fused": fused, "channels": stats, "degraded": degraded, "graph": None if (graph or {}).get("skipped") else graph}
 
 
-def _backfill(q: Any, settings: Settings, cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _backfill(q: Any, settings: Settings, ss: SearchSettings, cands: list[dict[str, Any]], *, until: float,
+              degraded: list[str]) -> list[dict[str, Any]]:
     """Fill in payloads before the rerank (BM25 / graph channels carry ids only); deactivated points are
-    dropped here."""
+    dropped here. A knowledge base whose payloads cannot be fetched (timeout, main store unreachable) is
+    recorded as degraded: candidates carrying only an id have no text and can only be dropped, those that
+    already carry a payload go on as usual."""
     by_kb: dict[str, list[dict[str, Any]]] = {}
     for c in cands:
         by_kb.setdefault(str(c["kb_id"]), []).append(c)
     kept: list[dict[str, Any]] = []
     for kb_id, rows in by_kb.items():
         need = [c["point_id"] for c in rows if not (c.get("payload") or {}).get("text")]
-        found = channels.fetch_payloads(q, settings.sources[kb_id].collection, need) if need else {}
+        found: dict[str, dict[str, Any]] = {}
+        if need:
+            try:
+                found = channels.fetch_payloads(q, settings.sources[kb_id].collection, need, timeout=_left(ss.channel_timeout, until) or 1.0)
+            except Exception as exc:
+                degraded.append(f"{kb_id}:backfill: {type(exc).__name__}")
         for c in rows:
             if not (c.get("payload") or {}).get("text"):
                 pl = found.get(c["point_id"])
@@ -365,17 +439,20 @@ def _groups(chosen: list[str], per_kb: dict[str, dict[str, Any]], buckets: dict[
 
 
 def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups: list[list[dict[str, Any]]],
-          buckets: dict[str, Any] | None = None, *, image_query: bool = False, hint: dict[str, Any] | None = None) -> dict[str, Any]:
+          buckets: dict[str, Any] | None = None, *, until: float, image_query: bool = False,
+          hint: dict[str, Any] | None = None) -> dict[str, Any]:
     """Several groups: round-robin interleaving so every group gets a share; a single group: the top
     rerank_n of the fusion order directly. After payload backfill, cross-encoder rerank with threshold
     and floor (Q06 / Q19). Candidates carrying only an id get their text at backfill, so bucketing is
     redone here once. In a request carrying an image, visual channel candidates are exempt from the
-    text threshold (Codex S02)."""
+    text threshold (Codex S02). Once the budget is spent there is no rerank, which is handled like an
+    unavailable rerank (fall back to the fusion order, record the degradation)."""
     if len(groups) > 1:
         cands = interleave(groups, limit=ss.rerank_n)
     else:
         cands = list(groups[0][:ss.rerank_n]) if groups else []
-    cands = _backfill(q, settings, cands)
+    degraded: list[str] = []
+    cands = _backfill(q, settings, ss, cands, until=until, degraded=degraded)
     if hint:
         cands = [c for c in cands if channels.hint_allows(hint, c.get("payload") or {})]   # candidates that bypassed the filter (graph channel etc.) are screened by the same constraints
     if buckets:
@@ -385,10 +462,17 @@ def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups:
     status, error, ordered, floor_used = "disabled", None, cands, None
     if rerank_active(settings, ss) and cands:
         try:
-            scores = rerank(Reranker(settings.reranker_base_url, timeout=ss.rerank_timeout), question, cands,
-                            window_tokens=ss.rerank_window_tokens, overlap_tokens=ss.rerank_overlap_tokens)
-            for c, s in zip(cands, scores):
-                c["score_rerank"] = round(float(s), 4)
+            # When ranking again after widening, the candidates of the knowledge bases chosen in the first round
+            # already have scores (same question, same text): only new candidates are sent to be scored
+            fresh = [c for c in cands if c.get("score_rerank") is None]
+            if fresh:
+                timeout = _left(ss.rerank_timeout, until)
+                if timeout <= 0:
+                    raise TimeoutError(BUDGET_SPENT)
+                scores = rerank(Reranker(settings.reranker_base_url, timeout=timeout), question, fresh,
+                                window_tokens=ss.rerank_window_tokens, overlap_tokens=ss.rerank_overlap_tokens)
+                for c, s in zip(fresh, scores):
+                    c["score_rerank"] = round(float(s), 4)
             ordered = sorted(cands, key=lambda c: -float(c.get("score_rerank") or 0.0))
             status = "ok"
             if ss.rerank_threshold > 0:
@@ -403,7 +487,7 @@ def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups:
                     ordered = kept
         except Exception as exc:
             status, error, ordered = "skipped", f"rerank: {type(exc).__name__}", cands
-    return {"cands": cands, "ordered": ordered, "status": status, "error": error, "floor": floor_used}
+    return {"cands": cands, "ordered": ordered, "status": status, "error": error, "floor": floor_used, "degraded": degraded}
 
 
 def _final_scores(ordered: list[dict[str, Any]], ss: SearchSettings, *, reranked: bool, image_query: bool = False,
@@ -477,6 +561,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     if not question:
         raise ValueError("question is empty")
     settings, ss, q = runtime()
+    until = t0 + float(ss.request_budget) if ss.request_budget > 0 else float("inf")
     image_query = bool(image_bytes)
     hint_used, hint_ignored = channels.parse_hints(hints)
     doc_hint = {k: v for k, v in hint_used.items() if k != "block_types"} or None
@@ -484,11 +569,15 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     degraded: list[str] = []
     entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl)
     by_id = {e["kb_id"]: e for e in entries}
+    stale = next((e["degraded"] for e in entries if e.get("degraded")), None)
+    if stale:
+        degraded.append(f"catalog: {stale}")
     identifiers = channels.question_identifiers(question)
     vector: list[float] | None = None
     t = time.time()
     try:
-        vector = channels.embed_question(settings, question, timeout=ss.embed_timeout, instruction=ss.query_instruction or None)
+        vector = channels.embed_question(settings, question, timeout=_left(ss.embed_timeout, until) or 1.0,
+                                         instruction=ss.query_instruction or None)
     except Exception as exc:
         degraded.append(f"embedding: {type(exc).__name__}")
     timings["embed_ms"] = int((time.time() - t) * 1000)
@@ -505,8 +594,8 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             raise ValueError("no knowledge base enrolled")
         routing = None
     t = time.time()
-    probe, profile = _probe(settings, ss, q, probed, question, vector, identifiers, with_profile=routing is None, image_bytes=image_bytes,
-                            hint=doc_hint)
+    probe, profile = _probe(settings, ss, q, probed, question, vector, identifiers, with_profile=routing is None, until=until,
+                            image_bytes=image_bytes, hint=doc_hint)
     timings["probe_ms"] = int((time.time() - t) * 1000)
     if routing is None:
         routing = catalog_mod.route(catalog_mod.library_evidence(probe, profile.get("lexical")), max_kbs=ss.route_max_kbs,
@@ -515,17 +604,23 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         routing["terms"] = profile.get("terms") or []
         if profile.get("skipped"):
             routing["lexical"] = f"skipped: {profile['skipped']}"
+            degraded.append("lexical_profile: " + str(profile["skipped"]).split(":", 1)[0])      # the selection lacked lexical evidence
+    if image_query and profile.get("visual_vector") is None:
+        # A request carrying an image relies on the visual channel: the image vector could not be computed (8103
+        # unavailable, image unreadable, visual channel off), so this search really went by the question text alone
+        degraded.append("visual_query: " + str(profile.get("visual_error") or profile.get("visual")))
     routing["probed"] = probed
     chosen = [k for k in routing["chosen"] if k in probe]
     # The graph / visual channels run only on the chosen knowledge bases, then fusion per knowledge base
     t = time.time()
-    graphs = _graph_probe(settings, ss, chosen, by_id, question, vector)
-    visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint)
+    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until)
+    visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint, until=until)
     per_kb: dict[str, dict[str, Any]] = {kb: _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k) for kb in chosen}
     timings["recall_ms"] = int((time.time() - t) * 1000)
     buckets = _detect_buckets(question, chosen, per_kb, max_buckets=ss.quota_max_buckets)
     t = time.time()
-    ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n), buckets, image_query=image_query, hint=doc_hint)
+    ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n), buckets, until=until,
+                   image_query=image_query, hint=doc_hint)
     timings["rerank_ms"] = int((time.time() - t) * 1000)
     # Widening: the knowledge bases chosen by auto routing yield no decent evidence (no candidates, or
     # every rerank score below the floor) -> add the graph channel for the remaining knowledge bases,
@@ -533,22 +628,37 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     routing["widened"] = False
     rest = [k for k in probed if k not in chosen]
     if ss.route_widen and routing["mode"] == "auto" and rest and (not ranked["cands"] or ranked["status"] == "below_threshold"):
-        t = time.time()
-        graphs.update(_graph_probe(settings, ss, rest, by_id, question, vector))
-        visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint))
-        for kb in rest:
-            per_kb[kb] = _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k)
-        chosen = chosen + rest
-        buckets = _detect_buckets(question, chosen, per_kb, max_buckets=ss.quota_max_buckets)
-        ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n), buckets, image_query=image_query, hint=doc_hint)
-        routing["widened"] = True
-        routing["chosen"] = chosen
-        timings["widen_ms"] = int((time.time() - t) * 1000)
+        # Widening repeats the graph channel and the rerank (over more knowledge bases): when the remaining budget
+        # is less than those two stages took in the first round there is no widening, and the first round's
+        # conclusion is returned as usual
+        if until - time.time() < (timings["recall_ms"] + timings["rerank_ms"]) / 1000.0:
+            degraded.append("budget: widen skipped")
+        else:
+            t = time.time()
+            graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until))
+            visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint, until=until))
+            for kb in rest:
+                per_kb[kb] = _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k)
+            wide_buckets = _detect_buckets(question, chosen + rest, per_kb, max_buckets=ss.quota_max_buckets)
+            wide = _rank(settings, ss, q, question, _groups(chosen + rest, per_kb, wide_buckets, ss.rerank_n), wide_buckets, until=until,
+                         image_query=image_query, hint=doc_hint)
+            if wide["error"] and ranked["status"] == "below_threshold":
+                # The rerank after widening did not happen (timeout, budget spent): the first round's "everything
+                # below the floor" conclusion still stands and must not be displaced by an unranked set of candidates
+                degraded.append(f"widen: {wide['error']}")
+                for c in ranked["cands"]:          # the widening round rewrote the bucket tags: restore them from the first round's buckets
+                    c["bucket"] = _bucket_of(c, buckets["mode"], buckets["keys"]) if buckets else None
+            else:
+                chosen, buckets, ranked = chosen + rest, wide_buckets, wide
+                routing["widened"] = True
+                routing["chosen"] = chosen
+            timings["widen_ms"] = int((time.time() - t) * 1000)
     for kb in chosen:
         degraded.extend(per_kb[kb]["degraded"])
     for kb in probed:
         if kb not in chosen:
             degraded.extend(x for x in probe[kb]["degraded"] if x not in degraded)    # degradation in the probe stage affects the selection, so it is reported too
+    degraded.extend(ranked["degraded"])
     if ranked["error"]:
         degraded.append(ranked["error"])
     cands, ordered, rerank_status = ranked["cands"], ranked["ordered"], ranked["status"]
@@ -560,21 +670,40 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     hits, selection = select_hits(ordered, k, buckets=buckets, min_hits=ss.quota_min_hits,
                                   mmr_lambda=ss.mmr_lambda if ss.mmr_enabled else None,
                                   priority_key="score_visual" if image_query else None, priority_n=ss.visual_quota if image_query else 0)
+    if not hits:
+        recall_down = all("skipped" in (probe[kb]["channels"].get(name) or {}) for kb in probed for name in ("text", "bm25"))
+        if recall_down or (not cands and any(":backfill:" in x for x in degraded)):
+            raise RetrievalUnavailable("retrieval backends unavailable: " + "; ".join(degraded)[:300])
     # Evidence
     t = time.time()
 
+    context_gaps: list[str] = []
+
+    def context_call(fn: Any, row: dict[str, Any], empty: Any, **kw: Any) -> Any:
+        """Neighbour / table-head chunks are a bonus: once the budget is spent they are not fetched, and when
+        they cannot be fetched (timeout, main store hiccup) that does not bring down the whole request; either
+        way one degraded entry is recorded."""
+        timeout = _left(ss.channel_timeout, until)
+        if timeout <= 0:
+            context_gaps.append("budget: context skipped")
+            return empty
+        try:
+            return fn(q, settings.sources[str(row.get("kb_id"))].collection, row, timeout=timeout, **kw)
+        except Exception as exc:
+            context_gaps.append(f"context: {type(exc).__name__}")
+            return empty
+
     def neighbors(row: dict[str, Any], span: int) -> list[dict[str, Any]]:
-        kb = str(row.get("kb_id"))
-        return channels.neighbor_payloads(q, settings.sources[kb].collection, row, span=span)
+        return context_call(channels.neighbor_payloads, row, [], span=span)
 
     def head_of(row: dict[str, Any]) -> dict[str, Any] | None:
-        kb = str(row.get("kb_id"))
-        return channels.table_head(q, settings.sources[kb].collection, row)
+        return context_call(channels.table_head, row, None)
 
     sources, src_stats = assemble_sources(
         hits, budget_tokens=ss.context_tokens, neighbors=neighbors if with_context else None,
         table_head=head_of if with_context else None, stitch=(ss.stitch_min_chars, ss.stitch_max_chars) if with_context else None,
         neighbor_span=ss.neighbor_span)
+    degraded.extend(dict.fromkeys(context_gaps))
     timings["evidence_ms"] = int((time.time() - t) * 1000)
     source_ns = {str(r.get("point_id")): int(r["n"]) for r in sources}
     entities: list[dict[str, Any]] = []
@@ -598,16 +727,17 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         rows.sort(key=lambda r: -float(r.get("score") or 0.0))
     specs = specs[:24]
     # Source point verification for derived evidence (Codex S03 / R1): whether the points that facts /
-    # pages refer to are still active and which document they belong to; a point already in Sources
-    # uses its payload directly
+    # pages / entities / relations refer to are still active and which document they belong to; a point
+    # already in Sources uses its payload directly
     meta: dict[str, dict[str, Any]] = {str(r.get("point_id")): {"active": True, "doc_id": r.get("doc_id"), "rel_path": r.get("rel_path"),
                                                                  "content_version": r.get("content_version")} for r in sources}
     t = time.time()
     for kb in chosen:
-        want = {str(p) for row in specs + pages if row.get("kb_id") == kb for p in (row.get("point_ids") or [])} - set(meta)
+        want = {str(p) for row in specs + pages + entities + relations if row.get("kb_id") == kb for p in (row.get("point_ids") or [])} - set(meta)
         if want:
             try:
-                meta.update(channels.point_meta(q, settings.sources[kb].collection, sorted(want)))
+                meta.update(channels.point_meta(q, settings.sources[kb].collection, sorted(want),
+                                                timeout=_left(ss.channel_timeout, until) or 1.0))
             except Exception as exc:
                 degraded.append(f"{kb}:point_meta: {type(exc).__name__}")
     timings["verify_ms"] = int((time.time() - t) * 1000)
@@ -638,6 +768,16 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         entities = kept_entities
         hints_scope["relations_omitted"] = len(relations)
         relations = []
+    # Entities / relations carry representative source points (one per document): when all are deactivated the
+    # row comes only from content that has been deleted or replaced and the graph catches up only with its next
+    # version, so it is marked and must not serve as a current basis; rows whose source points could not be
+    # checked (the main store did not return them) are not marked
+    for row in entities + relations:
+        pids = [str(p) for p in (row.get("point_ids") or []) if str(p) in point_active]
+        if pids:
+            active = sum(1 for p in pids if point_active[p])
+            row["sources_active"] = f"{active}/{len(pids)}"
+            row["verified"] = active > 0
     specs = spec_rows(specs, source_ns=source_ns, limit_hints=ss.spec_hint_limit, point_active=point_active)
     subjects = list(buckets["keys"]) if buckets and buckets.get("mode") == "subject" else []
     pages = page_rows(pages, subjects=subjects, text_budget_tokens=ss.page_text_tokens, point_active=point_active)[:6]
@@ -724,5 +864,6 @@ def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | N
         raise KeyError(kb_id)
     if not entity and not entity_id:
         raise ValueError("entity or entity_id is required")
-    return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction, q=q)
+    return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
+                               q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 

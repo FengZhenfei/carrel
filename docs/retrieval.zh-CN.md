@@ -19,6 +19,8 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 
 令牌保存在客户端环境变量或独立令牌文件中。服务端使用 `KB_SEARCH_TOKEN`，客户端使用上述 `CARREL_` 变量。服务端没有设置令牌时，受保护接口只接受本机调用；`/health` 无需认证。
 
+运行中的服务每分钟重读一次 `config/knowledge-base.env` 里的 `KB_SEARCH_*`，改了令牌或参数一分钟内生效，无需重启，换下的旧令牌随即失效。监听地址和端口仍需重启才生效；在服务自身环境中显式设置的键优先于文件。
+
 ## HTTP 接口
 
 | 接口 | 用途 |
@@ -33,6 +35,8 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 
 控制台在端口 9800 使用独立的 `/api` 管理接口，智能体通常连接端口 9810 的检索服务。
 
+目录缓存 `KB_SEARCH_CATALOG_TTL` 秒（默认 60），开启或关闭知识库时立即重建。只有库里还有活跃文档时 `has_graph` 才为 true。建目录时某个库的向量库读不出来（集合尚未创建按空库处理），该条目的 `chunks` 和 `has_graph` 为 `null` 并带 `degraded` 说明，检索照常尝试它的图谱，这份目录约 15 秒后重建。
+
 ### 检索
 
 ```bash
@@ -44,7 +48,9 @@ curl -sS http://127.0.0.1:9810/search \
 
 示例中的 shell 变量需包含服务端配置的令牌；未设置令牌的本机部署可省略 Authorization 请求头。
 
-`question` 必填。可选的 `kbs` 用于限定知识库，不传时自动路由；实际编号通过 `/catalog` 获取。`top_k` 范围为 1–50。`context` 是是否补取邻近内容的布尔开关；`explain` 返回检索诊断信息。图片查询可以提供 `image_b64`，或使用客户端的 `--image` 参数。
+`question` 必填。可选的 `kbs` 用于限定知识库，不传时自动路由；实际编号通过 `/catalog` 获取。`top_k` 范围为 1–50。`context` 是是否补取邻近内容的布尔开关；`explain` 返回检索诊断信息。图片查询可以提供 `image_b64`，或使用客户端的 `--image` 参数；服务读不出图片的上传会以 HTTP 422 拒绝（请发送 PNG 或 JPEG）。
+
+每次请求有一个时间预算 `KB_SEARCH_REQUEST_BUDGET` 秒（默认 45，设为 `0` 表示不限），调用方的超时应大于它。每个阶段可用的时间取它自身的超时与剩余预算中较小的一个。预算不足时不再放宽到其他知识库；预算用完后也不再重排（保持融合顺序）、不补取邻近内容。这些情况都会记入 `retrieval_summary.degraded`。如果向量通道和关键词通道在所有知识库上都失败，或候选原文一条也取不回来，导致没有任何结果，`/search` 返回 HTTP 503，而不是空结果。
 
 `hints` 支持四个字段：
 
@@ -73,7 +79,7 @@ curl -sS http://127.0.0.1:9810/search \
 
 范围使用切块序号，传入返回的内容版本即可回查同一版文档。
 
-`/image` 在镜像 PDF 版本与切块一致、且图像支持可用时使用 PDF 原图，否则可回退到解析缓存。`X-Image-Source` 表示实际来源。`/crop` 接受 `kb_id`、`point_id`、`bbox` 和可选的 `pad`；坐标使用归一化比例或千分比。先查看图片，再确定裁剪范围，详见 [图片接口参考](../skills/carrel-search/references/api.md)。
+`/image` 在镜像 PDF 版本与切块一致、且图像支持可用时使用 PDF 原图，否则可回退到解析缓存。`X-Image-Source` 表示实际来源。`/crop` 接受 `kb_id`、`point_id`、`bbox` 和可选的 `pad`。两个接口都使用 `sources` 中返回的 UUID 形式的 `point_id`，其他取值以 HTTP 422 拒绝。`bbox` 使用 0–1 比例或 0–1000 千分比，不接受像素：大于 1000 的数值直接拒绝，不超过 1000 的数值一律按千分比读取。实际裁剪的范围由 `X-Crop-Box` 返回。先查看图片，再确定裁剪范围，详见 [图片接口参考](../skills/carrel-search/references/api.md)。
 
 ### 查询图谱关系
 
@@ -97,11 +103,22 @@ curl -sS http://127.0.0.1:9810/search \
 
 首先检查 `retrieval_summary.evidence_state`：`accepted`、`diagnostic` 或 `unranked`。当 `no_relevant_content=true` 时，返回的候选不足以支持答案。重排不可用时可能返回 `unranked`；服务错误与不可用通道会在诊断字段中单独报告。
 
-事实与页面还需检查 `verified` 和 `sources_active`。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。返回的事实按序列归组。
+事实、页面、实体和关系还需检查 `verified` 和 `sources_active`；实体和关系按代表性来源点核验，每份文档一个。文档删除或重新解析后，图谱要到下一个版本才会跟上；在此之前，来源全部失效的条目标为 `verified=false`，不能作为现行依据，这类事实不给线索，这类页面不附正文。来源点未能核验的条目不做标记。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。返回的事实按序列归组。
 
 `text_truncated` 表示可能需要补取原文，`stitched.pieces` 给出拼接片段的位置。来源正文受 `KB_SEARCH_CONTEXT_TOKENS` 限制，编译页面另受 `KB_SEARCH_PAGE_TEXT_TOKENS` 限制，这两个预算独立于 `top_k`。被省略的条件、表头或上下文影响结论时，可调用 `/context` 补取。
 
-不可用阶段通过 `retrieval_summary.degraded` 报告。服务可能退回融合顺序、关键词候选或剩余检索通道；响应会记录可用通道和可引用的来源位置。
+不可用阶段通过 `retrieval_summary.degraded` 报告。服务可能退回融合顺序、关键词候选或剩余检索通道；响应会记录可用通道和可引用的来源位置。常见条目：
+
+| 条目 | 含义 |
+|---|---|
+| `visual_query: …` | 图片查询的图片向量没有算出来，结果只来自问题文字 |
+| `catalog: …` | 建目录时读不到向量库，切块数与图谱状态未知 |
+| `lexical_profile: …` | 选择知识库时缺少词法证据 |
+| `<kb>:graph`、`<kb>:visual`、`rerank: TimeoutError` | 该阶段失败、超时或没有剩余预算；重排退回融合顺序 |
+| `budget: widen skipped` | 剩余预算不足，没有放宽到其他知识库 |
+| `budget: context skipped`、`context: …` | 没有补取邻近切块或表头 |
+| `<kb>:backfill: …` | 候选原文取不回来，没有原文的候选被丢弃 |
+| `widen: rerank: …` | 放宽后的重排失败，保留首轮「全部低于下限」的结论 |
 
 ## 检索评测
 
@@ -113,6 +130,6 @@ cd app
   --out ../runtime/eval/result.json --auto
 ```
 
-`--auto` 使用自动路由，不使用题目预先指定的知识库。评测输出切片与文档命中率、MRR、预期答案检查、文档覆盖、负例表现、延迟、错误，以及相对上次结果的变化。
+`--auto` 使用自动路由，不使用题目预先指定的知识库。评测输出切片与文档命中率、MRR、预期答案检查、文档覆盖、负例表现、延迟、错误，以及相对上次结果的变化。重新解析会改变切块的 point ID，因此开跑前会核对切片金标：金标切片一个都不在了的题目计入 `stale_gold`，不计入 hit@k 和 MRR，文档金标与预期答案照常判定。要恢复切片口径，重新运行 `make-set`。
 
 `kb search make-set` 可调用知识库的抽取模型生成题集初稿。审核问题和预期证据后，可在选定的资料与模型配置上运行评测。

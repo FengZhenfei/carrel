@@ -9,6 +9,11 @@ import requests
 
 from .text import clean_for_rerank, head_line, windows
 
+# Shared by the whole process: connections are reused and the model name is resolved once, instead of opening
+# a new connection and asking /models first on every rerank
+_session = requests.Session()
+_model_ids: dict[str, str] = {}       # /models address -> resolved model name
+
 
 class Reranker:
     def __init__(self, base_url: str, *, model_id: str = "", timeout: float = 20.0) -> None:
@@ -21,19 +26,24 @@ class Reranker:
     def resolve_model(self) -> str:
         if self.model_id:
             return self.model_id
-        resp = requests.get(self.models_url, timeout=min(5.0, self.timeout))
+        cached = _model_ids.get(self.models_url)
+        if cached:
+            return cached
+        resp = _session.get(self.models_url, timeout=min(5.0, self.timeout))
         resp.raise_for_status()
         data = resp.json().get("data") or []
         if not data:
             raise RuntimeError("reranker lists no model")
-        self.model_id = str(data[0].get("id"))
-        return self.model_id
+        model_id = _model_ids[self.models_url] = str(data[0].get("id"))
+        return model_id
 
     def score(self, query: str, documents: list[str]) -> list[float]:
         if not documents:
             return []
         body = {"model": self.resolve_model(), "query": query, "documents": documents}
-        resp = requests.post(self.url, json=body, timeout=self.timeout)
+        resp = _session.post(self.url, json=body, timeout=self.timeout)
+        if not resp.ok:
+            _model_ids.pop(self.models_url, None)       # when the service switched models the old name is rejected: resolve again next time
         resp.raise_for_status()
         results = resp.json().get("results") or []
         out = [0.0] * len(documents)
