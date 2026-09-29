@@ -1535,6 +1535,61 @@ class MirrorBoundaryTests(unittest.TestCase):
                 verify_source_file(settings, source, mirror / "kb" / "synthetic.txt")       # explicitly allowed: the target is the boundary
         src = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
         self.assertLess(src.index("verify_source_file(settings, source, path)"), src.index("_parse_blocks(settings, source, path"))
+        # the console's chunk preview reads source files too, so it applies the same check before parsing
+        preview = _repo_file("app/kb_server/service.py")
+        preview = preview[preview.index("def chunk_preview("):]
+        self.assertLess(preview.index("verify_source_file(cfg, source, path)"), preview.index("_parse_blocks(cfg, source, path"))
+
+    def test_each_job_reads_the_source_from_the_registry(self) -> None:
+        """2026-09-29 audit: one worker process runs several jobs; with only the source snapshot taken at start-up
+        a renamed directory is checked against its old name and the job is judged non-retryable, and chunk
+        settings changed in the console have no effect. Every job reads the registry by kb_id; a base that is
+        not enrolled cancels the job."""
+        from kb_pipeline import discovery
+        from kb_pipeline.parsers.errors import NonRetryableParseError
+        from kb_pipeline.pipeline.parse_job import JobCancelled, _source_for_file, verify_source_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mirror = base / "mirror"; (mirror / "OldName").mkdir(parents=True)
+            state = base / "state.db"; db.init_db(state)
+            with db.connect(state) as con:
+                discovery.init_schema(con)
+                con.execute(
+                    "INSERT INTO kb_sources(kb_id, source_root, collection, status, first_seen_at, last_seen_at, config_json) "
+                    "VALUES('kb_001', 'OldName', 'kb_001', 'active', 1, 1, ?)",
+                    (json.dumps({"max_tokens": 400, "overlap_tokens": 80}),))
+            stale = KBSource(kb_id="kb_001", collection="kb_001", source_root="OldName", source_type="local_mirror",
+                             max_tokens=400, overlap_tokens=80, physical_base=mirror / "OldName")
+            settings = SimpleNamespace(mirror_root=mirror, state_db=state, sources={"kb_001": stale})
+            # the directory is renamed and the scan has adopted it; the console also changed the chunk size
+            (mirror / "OldName").rename(mirror / "NewName")
+            doc = mirror / "NewName" / "doc.md"; doc.write_text("x", encoding="utf-8")
+            with db.connect(state) as con:
+                con.execute("UPDATE kb_sources SET source_root = 'NewName', config_json = ? WHERE kb_id = 'kb_001'",
+                            (json.dumps({"max_tokens": 256, "overlap_tokens": 32}),))
+            with patch.dict(os.environ, {"KB_MIRROR_ALLOW_LINKED_DIRS": ""}):
+                with self.assertRaises(NonRetryableParseError):
+                    verify_source_file(settings, stale, doc)                     # what the stale snapshot used to do
+                fresh = _source_for_file(settings, "kb_001")
+                self.assertEqual((fresh.source_root, fresh.max_tokens, fresh.overlap_tokens), ("NewName", 256, 32))
+                verify_source_file(settings, fresh, doc)                         # passes with the registry's current row
+            with db.connect(state) as con:
+                con.execute("UPDATE kb_sources SET status = 'inactive' WHERE kb_id = 'kb_001'")
+            settings.sources = {}
+            with self.assertRaisesRegex(JobCancelled, "not enrolled or has been disabled"):
+                _source_for_file(settings, "kb_001")                             # not a failure: nothing to retry, nothing to block
+            # a source outside the mirror (KB_EXTRA_SOURCES_JSON) keeps its own directory as the boundary
+            extra_dir = base / "elsewhere"; extra_dir.mkdir()
+            inside = extra_dir / "a.md"; inside.write_text("a", encoding="utf-8")
+            extra = KBSource(kb_id="kb_900", collection="kb_900", source_root="elsewhere", source_type="local_mirror",
+                             max_tokens=400, overlap_tokens=80, physical_base=extra_dir)
+            settings.sources = {"kb_900": extra}
+            self.assertIs(_source_for_file(settings, "kb_900"), extra)
+            with patch.dict(os.environ, {"KB_MIRROR_ALLOW_LINKED_DIRS": ""}):
+                verify_source_file(settings, extra, inside)
+                with self.assertRaisesRegex(NonRetryableParseError, "outside the enrolled directory"):
+                    verify_source_file(settings, extra, doc)
         # the two other readers of mirrored files apply the same boundary
         self.assertIn("return path if inside_boundary(path, base.resolve()) else None", _repo_file("app/kb_pipeline/graph/build.py"))
         self.assertIn("if not inside_boundary(p, (Path(settings.mirror_root) / top).resolve()):", _repo_file("app/kb_search/images.py"))

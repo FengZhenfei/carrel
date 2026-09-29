@@ -81,8 +81,11 @@ async function api(path, opts = {}) {
     headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  const sentWith = authHeaders().Authorization || "";
   let res = await send();
-  if (res.status === 401 && await askToken()) res = await send();
+  // several requests go out together on first load; once one of them has obtained the token the others resend
+  // with it instead of asking again
+  if (res.status === 401 && ((authHeaders().Authorization || "") !== sentWith || await askToken())) res = await send();
   if (!res.ok) {
     let detail = res.statusText || `HTTP ${res.status}`;   // statusText is empty under HTTP/2
     try {
@@ -1268,8 +1271,11 @@ async function refreshFilesTab(force = false) {
     // Send the last ETag: unchanged content gets a 304 from the server and the whole table is neither sent
     // nor redrawn (every 2 s while parsing; health check D5)
     const sameKb = state.files.kbId === kb.kb_id;
-    const res = await fetch(`/api/kbs/${encodeURIComponent(kb.kb_id)}/files`,
+    const load = () => fetch(`/api/kbs/${encodeURIComponent(kb.kb_id)}/files`,
       { headers: { ...authHeaders(), ...(sameKb && state.files.etag ? { "If-None-Match": state.files.etag } : {}) } });
+    const sentWith = authHeaders().Authorization || "";
+    let res = await load();
+    if (res.status === 401 && ((authHeaders().Authorization || "") !== sentWith || await askToken())) res = await load();
     if (selectedEntry()?.kb_id !== kb.kb_id) return;   // the KB was switched meanwhile
     if (res.status === 304 && sameKb) { state.files.at = Date.now(); return; }
     if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);

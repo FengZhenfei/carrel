@@ -902,7 +902,8 @@ def chunk_preview(kb_id: str, file_id: str, max_tokens: int | None = None,
     from kb_pipeline.chunking.chunker import blocks_to_chunks
     from kb_pipeline.chunking.diagnose import chunk_diagnostics
     from kb_pipeline.parsers.common import parser_profile_for_path
-    from kb_pipeline.pipeline.parse_job import _parse_blocks, parse_cache_dir
+    from kb_pipeline.parsers.errors import NonRetryableParseError
+    from kb_pipeline.pipeline.parse_job import _parse_blocks, parse_cache_dir, verify_source_file
 
     cfg = settings()
     source = next((s for s in cfg.sources.values() if s.kb_id == kb_id), None)
@@ -917,6 +918,12 @@ def chunk_preview(kb_id: str, file_id: str, max_tokens: int | None = None,
     path = Path(str(row["physical_path"]))
     if not path.exists():
         raise ValueError(f"Source file is not on disk: {path}")
+    try:
+        # The same boundary check as the worker: the directory was not swapped for a link and the file's real
+        # location is still inside the enrolled directory (the preview reads the source file as well)
+        verify_source_file(cfg, source, path)
+    except NonRetryableParseError as exc:
+        raise ValueError(str(exc)) from exc
 
     if max_tokens is not None or overlap_tokens is not None:
         mt = int(max_tokens if max_tokens is not None else source.max_tokens)

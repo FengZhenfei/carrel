@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from pathlib import Path
@@ -623,24 +624,62 @@ def verify_source_file(settings: Settings, source, path: Path) -> None:
     from ..discovery import directory_admitted
     from ..localfs.scanner import inside_boundary
 
-    admitted, why = directory_admitted(Path(settings.mirror_root), str(source.source_root))
-    if not admitted:
-        if why == "linked":
+    mirror_dir = Path(settings.mirror_root) / str(source.source_root)
+    base = getattr(source, "physical_base", None)
+    if base is not None and os.path.abspath(str(base)) != os.path.abspath(str(mirror_dir)):
+        # A source outside the mirror (KB_EXTRA_SOURCES_JSON): its own enrolled directory is the boundary,
+        # under the same link policy
+        from ..discovery import linked_dirs_allowed
+
+        base = Path(base)
+        if base.is_symlink() and not linked_dirs_allowed():
             raise NonRetryableParseError(
-                f"Knowledge base directory {source.source_root!r} is a symbolic link; "
+                f"Knowledge base directory {str(base)!r} is a symbolic link; "
                 "set KB_MIRROR_ALLOW_LINKED_DIRS=1 to read linked directories"
             )
-        raise NonRetryableParseError(f"Knowledge base directory {source.source_root!r} is missing")
-    root = (Path(settings.mirror_root) / str(source.source_root)).resolve()
+        if not base.is_dir():
+            raise NonRetryableParseError(f"Knowledge base directory {str(base)!r} is missing")
+        root = base.resolve()
+    else:
+        admitted, why = directory_admitted(Path(settings.mirror_root), str(source.source_root))
+        if not admitted:
+            if why == "linked":
+                raise NonRetryableParseError(
+                    f"Knowledge base directory {source.source_root!r} is a symbolic link; "
+                    "set KB_MIRROR_ALLOW_LINKED_DIRS=1 to read linked directories"
+                )
+            raise NonRetryableParseError(f"Knowledge base directory {source.source_root!r} is missing")
+        root = mirror_dir.resolve()
     if not inside_boundary(path, root):
         raise NonRetryableParseError(f"File {path} is outside the enrolled directory (symbolic link); not parsed")
 
 
 def _source_for_file(settings: Settings, kb_id: str):
-    for source in settings.sources.values():
+    """The knowledge base configuration for this job, read from the registry by kb_id at the start of every job.
+    One worker process runs up to 10 jobs in a row; with only the settings.sources snapshot taken at start-up,
+    jobs picked up after the console changed the chunk size or the prompt are still parsed with the old values,
+    and after the directory of a base was renamed the boundary is checked against the old name, the job is
+    judged non-retryable and the scan keeps the file blocked (2026-09-29 audit). The snapshot is only consulted
+    when the registry has no such base (extra sources outside the mirror). In neither place: the base is not
+    enrolled or has been disabled, and the job is cancelled -- a retry would change nothing, and a failure
+    would block the automatic requeue after the base is enabled again."""
+    from .. import discovery
+
+    row = None
+    try:
+        with db.connect(settings.state_db) as con:
+            row = con.execute("SELECT * FROM kb_sources WHERE kb_id = ? AND status = 'active'", (kb_id,)).fetchone()
+    except (sqlite3.Error, TypeError, AttributeError):
+        row = None                        # no registry yet (before the migration) or a test stub without a state db
+    if row is not None:
+        try:
+            return discovery.source_from_row(Path(settings.mirror_root), row)
+        except Exception as exc:
+            raise NonRetryableParseError(f"The configuration of knowledge base {kb_id} cannot be read; not parsed: {exc!r}") from exc
+    for source in (getattr(settings, "sources", None) or {}).values():
         if source.kb_id == kb_id:
             return source
-    raise RuntimeError(f"unknown kb_id={kb_id}")
+    raise JobCancelled(f"Knowledge base {kb_id} is not enrolled or has been disabled; job cancelled")
 
 
 def _profile_for_path(path: Path) -> str:
