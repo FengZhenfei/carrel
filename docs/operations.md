@@ -25,6 +25,15 @@ lifecycle. Re-enabling during retention can restore it. Folder rename detection
 can retain the same ID; ambiguous matches can be resolved through the console's
 adopt action.
 
+Deleting a knowledge base stops its running parse and graph jobs, then removes
+its indexes, graph data, state, and caches at once, without the retention
+period. The base is shown as being deleted until that finishes. If a store
+could not be cleared, the base is shown as not fully deleted and cannot be
+re-enabled or adopted; the next nightly maintenance run finishes the deletion,
+or you can delete it again. A deletion holds the graph build lock: no graph
+build starts while it runs, and a base cannot be deleted while another one is
+building its graph.
+
 The console's administrative API lives under `/api` on port 9800. Writes
 must come from the console's own origin, and every call needs the token when
 `KB_WEB_TOKEN` is set (see
@@ -36,11 +45,11 @@ are defined in [`kb_server/api.py`](../app/kb_server/api.py).
 | `GET /api/overview`, `/api/health`, `/api/limits` | Sidebar state, service health, chunking limits of the embedding model |
 | `POST /api/enroll`; `POST /api/kbs/{kb_id}/adopt`, `unenroll`; `DELETE /api/kbs/{kb_id}` | Enable a folder, adopt a renamed one, disable or delete a base |
 | `GET` / `PUT /api/kbs/{kb_id}/config` | Read and save the per-base settings |
-| `POST /api/kbs/{kb_id}/parse_now`, `reparse`, `chunk_preview` | Queue new files, re-parse everything, preview chunking |
-| `GET /api/kbs/{kb_id}/files`, `files/{file_id}/chunks`, `jobs` | File states, one file's chunks, job timeline |
+| `POST /api/kbs/{kb_id}/parse_now`, `reparse` | Queue new files, re-parse everything |
+| `GET /api/kbs/{kb_id}/files`, `files/{file_id}/chunks` | File states, one file's chunks |
 | `POST /api/kbs/{kb_id}/graph_schema`, `graph_build`, `graph_append`, `graph_pause`; `DELETE /api/kbs/{kb_id}/graph` | Extract labels, build, append, pause, delete the graph |
-| `GET /api/kbs/{kb_id}/graph_preview`, `graph_merges`, `graph_builds`, `graph_corpus` | Current graph, merge records, build history, corpus size |
-| `GET /api/jobs/failed`, `/api/jobs/{job_id}`; `POST /api/jobs/{job_id}/cancel`, `/api/files/retry` | Failed jobs, one job, cancel, retry |
+| `GET /api/kbs/{kb_id}/graph_preview`, `graph_merges`, `graph_corpus` | Current graph, merge records, corpus size |
+| `GET /api/jobs/{job_id}`; `POST /api/jobs/{job_id}/cancel`, `/api/files/retry` | One job and its timeline, cancel, retry |
 | `GET` / `POST /api/llms`; `DELETE /api/llms/{name}` | Model registry (keys are write-only) |
 | `POST /api/services/{key}/restart`, `restart_all`, `stop_all` | Service controls for the rows in `KB_CONSOLE_SERVICES` |
 
@@ -82,14 +91,16 @@ model weights, memory settings, and container logs.
 | `carrel-scan.timer` | 30 seconds, then every minute | Scan and queue file changes |
 | `carrel-worker.timer` | 1 minute, then every 5 minutes | Process queued ingestion work |
 | `carrel-graph-rebuild.timer` | 10 minutes, then every 2 hours | Incremental graph updates or policy-triggered rebuilds |
-| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup parse-assets-gc` (followed by `cleanup graph-gc`, the keep-N graph-version GC): expired inactive index points, parse assets, old job rows and disabled libraries past retention. Graph versions are pruned by the build itself (`GRAPH_GC_KEEP_VERSIONS`) and by `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` |
-| `carrel-cache-weekly.timer` | 1 hour, then every 7 days | Rotate project caches |
+| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup parse-assets-gc`, then `cleanup graph-gc`: inactive index points past retention with their chunk rows and parse assets, files deleted longer ago than the undo window, old job rows, disabled libraries past retention and unfinished deletions; graph versions beyond the active one plus N-1 (`GRAPH_GC_KEEP_VERSIONS`, regardless of age, the same rule a finished build applies) |
+| `carrel-cache-weekly.timer` | 1 hour, then every 7 days | Rotate project caches; drop cached picture descriptions and visual vectors that no picture in the parse cache refers to any more |
 | `carrel-logs-monthly.timer` | 2 hours, then every 30 days | Rotate logs |
 
-The console and search API run as persistent services. Timers use relative
-intervals rather than calendar times. Maintenance can defer while ingestion,
-graph building, or synchronization is active. Repeated deferrals produce exit
-75 and a visible failed-unit state; see `scripts/lib/kb-maint-defer.sh`.
+The console and search API run as persistent services. Under memory pressure
+the batch units are killed before them (`OOMScoreAdjust` 200 against 100).
+Timers use relative intervals rather than calendar times. Maintenance can defer
+while ingestion, graph building, or synchronization is active. Repeated
+deferrals produce exit 75 and a visible failed-unit state; see
+`scripts/lib/kb-maint-defer.sh` and the [systemd guide](../deployment/systemd/README.md#busy-yield).
 
 Maintenance covers project data by default. Set `KB_HOST_HOUSEKEEPING=1` to
 also clear user-level uv/pip caches and prune Docker caches.
@@ -110,7 +121,8 @@ Run `app/.venv/bin/kb --help` and each subcommand's `--help` for arguments.
 | `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | Graph version baseline, rollback to a kept earlier version, and Neo4j projection |
 | `graph query/factcheck/status` | Graph inspection and evaluation |
 | `search eval/make-set` | Retrieval evaluation and question-set preparation |
-| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/graph-gc/parse-assets-gc [--dry-run]` | Retention and maintenance (what the timers run) |
+| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc [--dry-run]` | Maintenance status and the cleanups the timers run |
+| `cleanup qdrant-gc/qdrant-graph-gc/neo4j-graph-gc [--dry-run]` | Manual tools: `qdrant-gc` deletes expired inactive points only; the other two prune graph versions by age (the two graph retention-days keys) |
 | `reset --source kb_NNN [--all] --yes` | Wipe one base's state, caches and indexes and recreate its collection |
 
 When systemd manages the worker, trigger its unit to run an ingestion pass. For example, using an actual knowledge-base ID:
@@ -133,7 +145,8 @@ and build state.
 
 | Symptom | Check |
 |---|---|
-| Files stay queued | `KB_PARSE_ENABLED`, worker logs, active locks, and whether model endpoints are configured and reachable |
+| Files stay queued | `KB_PARSE_ENABLED`, worker logs, active locks, and whether model endpoints are configured and reachable. A job that cannot connect to a service it needs, such as the parser or a model endpoint, returns to the queue without using up a retry and waits twice as long each time; after `KB_JOB_MAX_RETRIES` such rounds it fails like any other error |
+| A deleted base shows as not fully deleted | A store could not be cleared: check Qdrant, OpenSearch, and Neo4j, then delete it again or let the nightly maintenance finish it |
 | Graph build reports an existing lock | Check for an active build; the flock is released when its process exits |
 | Maintenance exits with 75 | Consecutive deferrals because the system is busy; inspect ingestion, graph, sync, and Qdrant status |
 | Image processing fails | Check the image-description endpoint and, if enabled, the visual embedding endpoint separately |
@@ -163,8 +176,9 @@ deployment is a separate step, described in [Retrieval](retrieval.md#evaluate-re
 - Console strings belong in the `static/i18n.js` language dictionary. File names
   and entity names retain their source language.
 - Static frontend edits need no service restart. Python changes require
-  restarting the affected application service. Check active work first:
-  console-hosted previews and label extraction can be interrupted.
+  restarting the affected application service. Check active work first: a
+  label extraction running inside the console is lost, and a knowledge-base
+  deletion is interrupted until the nightly maintenance finishes it.
 - After editing systemd templates, run `./scripts/install-systemd.sh --check`
   to inspect differences, then reinstall the units as needed.
 - Use synthetic regression fixtures and keep runtime data and credentials

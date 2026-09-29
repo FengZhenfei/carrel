@@ -7,6 +7,9 @@ After=network-online.target
 TimeoutStartSec=1800
 Environment=PYTHONUNBUFFERED=1
 Type=oneshot
+# Batch job: under memory pressure it is killed before the always-on console and search service (100).
+# Written out rather than left to the systemd default.
+OOMScoreAdjust=200
 WorkingDirectory=__CARREL_HOME__
 Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
 Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env

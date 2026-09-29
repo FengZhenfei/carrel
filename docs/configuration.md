@@ -21,6 +21,11 @@ Restart running application services after changing environment settings. On
 Linux, restart `carrel-web.service` and `carrel-search.service` when their
 settings change; new scan and worker processes read the updated file. Let
 active processing finish before restarting it. See [Operations](operations.md).
+The search service is the exception for its own `KB_SEARCH_*` keys: it re-reads
+the file every minute, so a changed parameter or token applies without a
+restart. Its listening address and port, and the keys of the other sections
+(such as the model endpoints), still need one, and a key set explicitly in the
+service's environment takes precedence over the file.
 
 ## Model endpoints
 
@@ -81,18 +86,19 @@ copying.
 | Paths | `KB_LOCAL_BASE_DIR`, `KB_MIRROR_ROOT`, `KB_STATE_DB`, `KB_RUNTIME_DIR`, `KB_CACHE_DIR`, `KB_LOG_DIR`, `KB_GRAPH_WORK_DIR` | Defaults are relative to the installed project |
 | Stores | `QDRANT_URL`, `QDRANT_API_KEY`, `OPENSEARCH_URL`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | Match the deployed services |
 | Parsing | `MINERU_SERVICE_URL`, `MINERU_BACKEND`, `MINERU_LANG`, `KB_PARSE_ENABLED`, `KB_MIN_FILE_AGE_SECONDS` | `MINERU_BACKEND=auto` reads the parser container's backend decision |
-| Jobs | `KB_JOB_MAX_RETRIES`, `KB_JOB_RETRY_BASE_SECONDS`, `KB_JOB_RETRY_MAX_SECONDS`, `KB_PARSE_JOB_LEASE_SECONDS`, `KB_METADATA_JOB_LEASE_SECONDS` | Retry and lease settings |
-| Retention | `QDRANT_INACTIVE_RETENTION_DAYS`, `KB_CACHE_ROTATION_KEEP`, `KB_LOG_ROTATION_KEEP_MONTHS`, `KB_VLM_CACHE_MAX_AGE_DAYS` | Index, cache, log, and caption retention |
+| Jobs | `KB_JOB_MAX_RETRIES`, `KB_JOB_RETRY_BASE_SECONDS`, `KB_JOB_RETRY_MAX_SECONDS`, `KB_PARSE_JOB_LEASE_SECONDS`, `KB_METADATA_JOB_LEASE_SECONDS` | Retry and lease settings. A job that cannot connect to a service it needs goes back to the queue without using up a retry: it waits the base delay, twice as long each following time up to the maximum, and fails after `KB_JOB_MAX_RETRIES` such rounds |
+| Retention | `QDRANT_INACTIVE_RETENTION_DAYS`, `KB_CACHE_ROTATION_KEEP`, `KB_LOG_ROTATION_KEEP_MONTHS` | Undo window for deletions (7 days in the template), cache and log rotations kept. Cached picture descriptions and visual vectors have no age limit: the weekly cleanup drops an entry once no picture in the parse cache refers to it |
 | Graphs | `GRAPH_GC_KEEP_VERSIONS`, `GRAPH_GC_GRACE_SECONDS`, `QDRANT_GRAPH_COLLECTION_RETENTION_DAYS`, `NEO4J_GRAPH_RETENTION_DAYS`, `GRAPH_NEO4J_IMPORT_*` | Versions kept per base: the active one plus N-1 older ones regardless of age; the newest paused / failed version is kept for resuming and does not count towards N (roll back with `kb graph rollback --source <key> --graph-version <old>`: the target has to be a finished build whose collections still match the recorded point counts, `--force` switches to an unfinished one); the two retention-days keys only affect the manual days-only tools; Neo4j import |
 | Graph models | `KB_GRAPH_LLM_CONCURRENCY`, `KB_GRAPH_LLM_TIMEOUT`, `KB_GRAPH_CIRCUIT_FAILS` | Concurrency, timeout, and circuit breaker |
 | Console | `KB_WEB_HOST`, `KB_WEB_PORT`, `KB_WEB_TOKEN`, `KB_CONSOLE_SERVICES` | Default address is `127.0.0.1:9800`; managed service rows default to `database,mineru` |
-| Search | `KB_SEARCH_HOST`, `KB_SEARCH_PORT`, `KB_SEARCH_TOKEN`, `KB_SEARCH_TOP_K`, `KB_SEARCH_RERANK`, `KB_SEARCH_CONTEXT_TOKENS`, `KB_SEARCH_ROUTE_MAX_KBS`, `KB_SEARCH_ROUTE_GAP`, `KB_SEARCH_ROUTE_FLOOR`, other `KB_SEARCH_*` | Bind address and token, result count, reranking, context budget; automatic routing queries the bases within GAP of the best evidence score (at most MAX_KBS) and flags the result weak below FLOOR |
+| Search | `KB_SEARCH_HOST`, `KB_SEARCH_PORT`, `KB_SEARCH_TOKEN`, `KB_SEARCH_TOP_K`, `KB_SEARCH_RERANK`, `KB_SEARCH_CONTEXT_TOKENS`, `KB_SEARCH_REQUEST_BUDGET`, `KB_SEARCH_ROUTE_MAX_KBS`, `KB_SEARCH_ROUTE_GAP`, `KB_SEARCH_ROUTE_FLOOR`, other `KB_SEARCH_*` | Bind address and token, result count, reranking, context budget, time budget of a whole request (keep it below the caller's timeout); automatic routing queries the bases within GAP of the best evidence score (at most MAX_KBS) and flags the result weak below FLOOR |
 
-Every key has a default in the code, and the search keys in the template carry
-those same defaults, so a key only matters once you change it (a test keeps the
-two in step). The full list of search keys, with what each threshold means, is
-in [`app/kb_search/config.py`](../app/kb_search/config.py); the search
-service's `/health` reports whether reranking and the visual channel are active.
+Every key has a default in the code. The template lists every search key with
+its code default, commented out except the address and the token, so the
+calibrated defaults apply until you uncomment one (a test keeps the two in
+step). What each threshold means is explained in
+[`app/kb_search/config.py`](../app/kb_search/config.py); the search service's
+`/health` reports whether reranking and the visual channel are active.
 
 ## Per-knowledge-base settings
 
@@ -122,7 +128,10 @@ are handled separately: the next scan can requeue affected files automatically.
   is unauthenticated and returns operational metadata. Its reachability follows
   the service's listening address and network access rules.
 - **Stores and model servers:** the supplied Compose ports bind to loopback.
-  Set bind addresses according to the intended network access.
+  Set bind addresses according to the intended network access. Loopback keeps
+  other machines out, not web pages opened in a browser on the same host:
+  Qdrant's CORS is off for that reason, but the bundled Qdrant has no API key,
+  so do not browse the web on the host that runs the stack.
 - **Model data:** documents, chunks, and images are sent to the endpoints you
   configure. Hosted endpoints receive that content; local endpoints process it
   within your infrastructure.

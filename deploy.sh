@@ -306,7 +306,7 @@ prepare_dirs() {
   # create them root-owned. OpenSearch runs as uid 1000 inside its container
   # and cannot chown, so its data dir is made world-writable when it is new.
   local d
-  for d in runtime/mirror runtime/media runtime/mineru-output runtime/qdrant_data runtime/opensearch/data \
+  for d in runtime/mirror runtime/mineru-output runtime/qdrant_data runtime/opensearch/data \
            runtime/neo4j/data runtime/neo4j/logs runtime/neo4j/plugins runtime/neo4j/import models/mineru logs; do
     mkdir -p "$ROOT/$d"
   done
@@ -358,7 +358,7 @@ app_install() {
     log "installing the optional pdf-images extra (PyMuPDF, AGPL-3.0; see NOTICE.md)"
   fi
   "$ROOT/app/.venv/bin/python" -m pip install -q -e "$ROOT/app$extras" pytest
-  mkdir -p "$ROOT/runtime/mirror" "$ROOT/runtime/media" "$ROOT/logs"
+  mkdir -p "$ROOT/runtime/mirror" "$ROOT/logs"
   log "initialising the state database"
   (cd "$ROOT/app" && KB_ENV_FILE="$APP_ENV" KB_LOCAL_BASE_DIR="$ROOT" ./.venv/bin/kb init-db)
 }

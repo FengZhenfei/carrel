@@ -11,12 +11,21 @@
 # and is included through COMPOSE_FILE in that `.env`.
 name: carrel
 
+# json-file has no size limit by default and a log is only cleared when its
+# container is recreated; keep at most 3 x 50 MB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 x-vllm-common: &vllm-common
   image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.21.0}
   restart: unless-stopped
   ipc: host
   gpus: all
   profiles: ["local-models"]
+  logging: *default-logging
   environment:
     VLLM_USE_DEEP_GEMM: "${VLLM_USE_DEEP_GEMM:-0}"
   networks:
@@ -53,13 +62,13 @@ services:
       - --dtype
       - "${QWEN3_EMBEDDING_DTYPE:-bfloat16}"
       - --gpu-memory-utilization
-      - "${QWEN3_EMBEDDING_GPU_MEMORY_UTILIZATION:-0.05}"
+      - "${QWEN3_EMBEDDING_GPU_MEMORY_UTILIZATION:-0.10}"
       - --max-model-len
-      - "${QWEN3_EMBEDDING_MAX_MODEL_LEN:-4096}"
+      - "${QWEN3_EMBEDDING_MAX_MODEL_LEN:-8192}"
       - --max-num-seqs
-      - "${QWEN3_EMBEDDING_MAX_NUM_SEQS:-12}"
+      - "${QWEN3_EMBEDDING_MAX_NUM_SEQS:-32}"
       - --max-num-batched-tokens
-      - "${QWEN3_EMBEDDING_MAX_NUM_BATCHED_TOKENS:-16384}"
+      - "${QWEN3_EMBEDDING_MAX_NUM_BATCHED_TOKENS:-49152}"
       - --host
       - 0.0.0.0
       - --port
@@ -89,13 +98,13 @@ services:
       - --dtype
       - "${QWEN3_RERANKER_DTYPE:-bfloat16}"
       - --gpu-memory-utilization
-      - "${QWEN3_RERANKER_GPU_MEMORY_UTILIZATION:-0.05}"
+      - "${QWEN3_RERANKER_GPU_MEMORY_UTILIZATION:-0.10}"
       - --max-model-len
-      - "${QWEN3_RERANKER_MAX_MODEL_LEN:-8192}"
+      - "${QWEN3_RERANKER_MAX_MODEL_LEN:-12288}"
       - --max-num-seqs
-      - "${QWEN3_RERANKER_MAX_NUM_SEQS:-12}"
+      - "${QWEN3_RERANKER_MAX_NUM_SEQS:-16}"
       - --max-num-batched-tokens
-      - "${QWEN3_RERANKER_MAX_NUM_BATCHED_TOKENS:-24576}"
+      - "${QWEN3_RERANKER_MAX_NUM_BATCHED_TOKENS:-49152}"
       - --host
       - 0.0.0.0
       - --port
@@ -109,7 +118,6 @@ services:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_EMBEDDING_PORT:-8103}:8000"
     volumes:
       - "${QWEN3_VL_EMBEDDING_MODEL_PATH:-../../models/Qwen3-VL-Embedding-2B}:/models/Qwen3-VL-Embedding-2B:ro"
-      - "${RAG_MEDIA_PATH:-../../runtime/media}:/media:ro"
     command:
       - vllm
       - serve
@@ -140,8 +148,6 @@ services:
       - '{"max_pixels":${QWEN3_VL_EMBEDDING_MAX_PIXELS:-3686400}}'
       - --media-io-kwargs
       - '{"video":{"num_frames":${QWEN3_VL_EMBEDDING_MAX_FRAMES:-32}}}'
-      - --allowed-local-media-path
-      - /media
       - --host
       - 0.0.0.0
       - --port
@@ -156,7 +162,6 @@ services:
     volumes:
       - "${QWEN3_VL_RERANKER_MODEL_PATH:-../../models/Qwen3-VL-Reranker-2B}:/models/Qwen3-VL-Reranker-2B:ro"
       - "${QWEN3_VL_RERANKER_TEMPLATE_PATH:-./assets/qwen3_vl_reranker.jinja}:/templates/qwen3_vl_reranker.jinja:ro"
-      - "${RAG_MEDIA_PATH:-../../runtime/media}:/media:ro"
     command:
       - vllm
       - serve
@@ -188,8 +193,6 @@ services:
       - '{"max_pixels":${QWEN3_VL_RERANKER_MAX_PIXELS:-3686400}}'
       - --media-io-kwargs
       - '{"video":{"num_frames":${QWEN3_VL_RERANKER_MAX_FRAMES:-32}}}'
-      - --allowed-local-media-path
-      - /media
       - --host
       - 0.0.0.0
       - --port
@@ -203,7 +206,6 @@ services:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_INSTRUCT_PORT:-8105}:8000"
     volumes:
       - "${QWEN3_VL_INSTRUCT_MODEL_PATH:-../../models/Qwen3-VL-8B-Instruct-FP8}:/models/Qwen3-VL-8B-Instruct-FP8:ro"
-      - "${RAG_MEDIA_PATH:-../../runtime/media}:/media:ro"
     command:
       - vllm
       - serve
@@ -219,7 +221,7 @@ services:
       - --max-model-len
       - "${QWEN3_VL_INSTRUCT_MAX_MODEL_LEN:-8192}"
       - --max-num-seqs
-      - "${QWEN3_VL_INSTRUCT_MAX_NUM_SEQS:-8}"
+      - "${QWEN3_VL_INSTRUCT_MAX_NUM_SEQS:-6}"
       - --max-num-batched-tokens
       - "${QWEN3_VL_INSTRUCT_MAX_NUM_BATCHED_TOKENS:-16384}"
       - --limit-mm-per-prompt
@@ -228,8 +230,6 @@ services:
       - "${QWEN3_VL_INSTRUCT_MM_PROCESSOR_CACHE_GB:-1}"
       - --mm-processor-kwargs
       - '{"max_pixels":${QWEN3_VL_INSTRUCT_MAX_PIXELS:-3686400}}'
-      - --allowed-local-media-path
-      - /media
       - --enforce-eager
       - --host
       - 0.0.0.0
@@ -257,6 +257,7 @@ services:
     container_name: carrel-mineru
     restart: unless-stopped
     ipc: host
+    logging: *default-logging
     ports:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${MINERU_PORT:-8765}:8000"
     volumes:
@@ -302,12 +303,17 @@ services:
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.2}
     container_name: carrel-qdrant
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${QDRANT_BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
     environment:
       TZ: "${TZ:-UTC}"
       RUN_MODE: "${QDRANT_RUN_MODE:-production}"
       QDRANT__TELEMETRY_DISABLED: "${QDRANT_TELEMETRY_DISABLED:-true}"
+      # The image enables CORS and echoes any Origin back: the port only binds
+      # loopback, yet a web page in a browser on this host could still read and
+      # write across origins. Only backend clients use it, so it is off.
+      QDRANT__SERVICE__ENABLE_CORS: "false"
     volumes:
       - "${QDRANT_DATA_PATH:-../../runtime/qdrant_data}:/qdrant/storage:rw"
     mem_limit: "${QDRANT_MEM_LIMIT:-4g}"
@@ -330,6 +336,7 @@ services:
     image: ${NEO4J_IMAGE:-neo4j:5.26.28-community}
     container_name: carrel-neo4j
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:${NEO4J_HTTP_PORT:-7474}:7474"
       - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:${NEO4J_BOLT_PORT:-7687}:7687"
@@ -339,6 +346,10 @@ services:
       NEO4J_server_memory_heap_max__size: "${NEO4J_HEAP_MAX_SIZE:-2G}"
       NEO4J_server_memory_pagecache_size: "${NEO4J_PAGECACHE_SIZE:-1G}"
       NEO4J_dbms_usage__report_enabled: "${NEO4J_USAGE_REPORT_ENABLED:-false}"
+      # A single community-edition node has no online backup, so the
+      # transaction logs only serve crash recovery; the image default of
+      # "2 days 2G" fills up to 2 GB after every large graph-version delete.
+      NEO4J_db_tx__log_rotation_retention__policy: "1 files"
     volumes:
       - "${NEO4J_DATA_PATH:-../../runtime/neo4j/data}:/data:rw"
       - "${NEO4J_LOGS_PATH:-../../runtime/neo4j/logs}:/logs:rw"
@@ -360,6 +371,7 @@ services:
     image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.7.0}
     container_name: carrel-opensearch
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${OPENSEARCH_BIND_ADDRESS:-127.0.0.1}:${OPENSEARCH_PORT:-9200}:9200"
     environment:
@@ -371,6 +383,12 @@ services:
       node.name: carrel-opensearch
       network.host: 0.0.0.0
       bootstrap.memory_lock: "true"
+      # Query insights are on by default and keep the text of search requests
+      # in top_queries-* indices for 7 days, which deleting a knowledge base
+      # does not clear; nothing here needs them.
+      search.insights.top_queries.latency.enabled: "false"
+      search.insights.top_queries.cpu.enabled: "false"
+      search.insights.top_queries.memory.enabled: "false"
       DISABLE_SECURITY_PLUGIN: "true"
       DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI: "true"
       DISABLE_INSTALL_DEMO_CONFIG: "true"

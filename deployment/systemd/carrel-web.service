@@ -16,6 +16,12 @@ Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
 ExecStart=__CARREL_HOME__/app/.venv/bin/python -m kb_server
 Restart=always
 RestartSec=3
+# Under memory pressure the kernel picks its victim by oom_score_adj plus memory use: user units default to
+# 200 and containers to 0, so whichever process was growing, the always-on console and search service were
+# killed first. A user unit cannot go below 100 (the user manager's own value; lower needs privileges). The
+# batch units (parsing, graph builds, cleanups) are set to 200, so they are killed before the always-on
+# services; each of them has its own retry or resume.
+OOMScoreAdjust=100
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

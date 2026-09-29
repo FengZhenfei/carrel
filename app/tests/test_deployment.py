@@ -333,39 +333,33 @@ class DeploymentAssetTests(unittest.TestCase):
 
 
 class SearchTemplateDefaultsTests(unittest.TestCase):
-    """The search block of config/knowledge-base.env.example carries the code defaults of
-    app/kb_search/config.py. deploy.sh copies the template into the live env file, so a value that
-    drifted there would silently override a tuned default (the fourth review of 2026-09-28 found five
-    such keys); the deliberate exception is documented in the template itself."""
+    """The search block of config/knowledge-base.env.example lists every search key of
+    app/kb_search/config.py with its code default. Only the address and the token are live lines; the
+    tuning keys stay commented out, so the calibrated defaults apply until someone uncomments one.
+    deploy.sh copies the template into the live env file, so a listed value that drifted from the code
+    would override a tuned default as soon as it is uncommented (the fourth review of 2026-09-28 found
+    five such keys while they were still live lines)."""
 
     def test_template_search_values_are_the_code_defaults(self) -> None:
-        template: dict[str, str] = {}
-        for line in _read("config/knowledge-base.env.example").splitlines():
-            m = re.match(r"^(KB_SEARCH_[A-Z0-9_]+)=(.*)$", line)
-            if m:
-                template[m.group(1)] = m.group(2).strip()
-        source = _read("app/kb_search/config.py")
-        defaults: dict[str, tuple[str, str]] = {}
-        for m in re.finditer(r"_(int|float|bool)\(\"(KB_SEARCH_[A-Z0-9_]+)\",\s*([^)]+)\)", source):
-            defaults[m.group(2)] = (m.group(1), m.group(3).strip())
-        for m in re.finditer(r"os\.getenv\(\"(KB_SEARCH_[A-Z0-9_]+)\",\s*\"([^\"]*)\"", source):
-            defaults[m.group(1)] = ("str", m.group(2))
+        from dataclasses import asdict
+
+        from kb_search.config import load_search_settings
+
+        text = _read("config/knowledge-base.env.example")
+        template = {key: value.strip() for key, value in re.findall(r"(?m)^#?\s*(KB_SEARCH_[A-Z0-9_]+)=(.*)$", text)}
         self.assertGreaterEqual(len(template), 10)
-        self.assertEqual(sorted(k for k in template if k not in defaults), [],
-                         "the template names search keys the code never reads")
-        drift = []
-        for key, raw in template.items():
-            kind, default = defaults[key]
-            if kind == "int":
-                same = int(raw) == int(default)
-            elif kind == "float":
-                same = abs(float(raw) - float(default)) < 1e-9
-            elif kind == "bool":
-                same = (raw.lower() not in ("0", "false", "no", "off")) == (default == "True")
-            else:
-                same = raw == default
-            if not same:
-                drift.append(f"{key}: template={raw!r} code={default!r}")
+        self.assertEqual(re.findall(r"(?m)^(KB_SEARCH_[A-Z0-9_]+)=", text),
+                         ["KB_SEARCH_HOST", "KB_SEARCH_PORT", "KB_SEARCH_TOKEN"])
+        named = set(re.findall(r"\"(KB_SEARCH_[A-Z0-9_]+)\"", _read("app/kb_search/config.py")))
+        self.assertEqual(sorted(set(template) - named), [], "the template names search keys the code never reads")
+        self.assertEqual(sorted(named - set(template)), [], "the template leaves out search keys the code reads")
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("KB_SEARCH_")}
+        with mock.patch.dict(os.environ, clean, clear=True):
+            defaults = asdict(load_search_settings())
+        with mock.patch.dict(os.environ, {**clean, **template}, clear=True):
+            listed = asdict(load_search_settings())
+        drift = [f"{name}: template={listed[name]!r} code={value!r}" for name, value in defaults.items()
+                 if listed[name] != value]
         self.assertEqual(drift, [])
 
 

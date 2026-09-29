@@ -139,7 +139,9 @@ for authentication, response status, and citations.
 
 The console binds to localhost by default. For LAN access, set both
 `KB_WEB_HOST` and `KB_WEB_TOKEN`. Configure `KB_SEARCH_TOKEN` before using
-protected search endpoints remotely.
+protected search endpoints remotely. The stores and model servers listen on
+loopback only, which keeps other machines out but not web pages opened in a
+browser on the same host, so avoid browsing the web there.
 
 Documents and images are sent to the model endpoints you configure. Local
 endpoints keep model processing within your own infrastructure.

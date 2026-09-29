@@ -23,8 +23,10 @@ The console operates these processes; agents consume the retrieval API.
    chunk text with its built-in `cjk` analyser, so two-character Chinese terms
    match directly. Source text is retained in the payload.
 5. **Maintain state.** Parser versions determine when reprocessing is needed.
-   Leases, retries, cancellation checks, and caches support interrupted work.
-   Old content versions become inactive and expire through maintenance tasks.
+   Leases, retries, cancellation checks, and caches support interrupted work;
+   a job that cannot connect to a service it needs goes back to the queue
+   without counting as a failed attempt. Old content versions become inactive
+   and expire through maintenance tasks.
 
 The parser backend is selected by the deployed MinerU container. GPU and CPU
 routes differ; the application can read that decision with

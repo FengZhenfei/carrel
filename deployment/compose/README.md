@@ -35,7 +35,9 @@ compose. Everything below explains what it decided and how to change it.
 | `TZ` | The host's timezone. |
 
 Delete `.env` and re-run `deploy.sh` to detect again; edit it to override.
-Every other key is documented in `.env.example`.
+Every other key is documented in `.env.example`, and the defaults in
+`docker-compose.yml` are the same values, so a key missing from `.env` falls
+back to what the example says.
 
 ## The parser container
 
@@ -85,7 +87,14 @@ done
 `KB_CONSOLE_SERVICES` and enables the visual vectors in
 `config/knowledge-base.env`. The `*_GPU_MEMORY_UTILIZATION` fractions in
 `.env.example` were tuned for a 121 GB unified-memory machine; scale them up
-on a card with less memory.
+on a card with less memory. On that machine the five model servers take 0.65
+of the memory, about 0.71 together with the parser's share; with unified
+memory this is system RAM, and it cannot be swapped out.
+
+When such a machine boots, the model servers profile the shared memory at the
+same time, so some of them restart a few times before Docker's restart backoff
+staggers them. They settle on their own: treat `healthy`, not the restart
+count, as the sign that they are up.
 
 ## Data locations
 
@@ -98,16 +107,33 @@ All bind mounts are relative to this directory, so they land in the checkout:
 | Neo4j data / logs / plugins / import | `runtime/neo4j/` |
 | MinerU weights and config | `models/mineru/` |
 | MinerU output, decision file | `runtime/mineru-output/` |
-| media handed to the vision models | `runtime/media/` |
 
 Some of these are created root-owned by the containers; `deploy.sh purge
 --data` removes them through a throwaway container when plain `rm` cannot.
+
+Pictures reach the vision models inside the request (base64), so those
+containers mount no media directory, only their weights (and the reranker's
+chat template). Two store settings keep the data small:
+
+- Neo4j keeps a single transaction log file. A community-edition node has no
+  online backup, so the logs only serve crash recovery, and the image default
+  of two days / 2 GB fills up after large graph-version deletions.
+- OpenSearch's query insights are off. Left on, they keep the text of search
+  requests in `top_queries-*` indices for seven days, and deleting a knowledge
+  base does not clear them.
 
 ## Network
 
 Every port binds `127.0.0.1`. The console (9800) and the search API (9810)
 are started by the app, not by compose. Changing a `*_BIND_ADDRESS` to
 `0.0.0.0` exposes an unauthenticated store or free GPU inference to the LAN.
+
+Loopback keeps other machines out, not a browser running on this host: a web
+page opened here can send requests to `127.0.0.1`. Qdrant's CORS is disabled
+(`QDRANT__SERVICE__ENABLE_CORS=false`) so that such a page cannot read the
+corpus or delete collections across origins. Qdrant still has no API key and
+does not check the `Host` header, so do not browse the web on the host that
+runs the stack.
 
 ## Health and logs
 
@@ -119,6 +145,11 @@ curl -s localhost:8765/health         # parser
 curl -s localhost:6333/healthz        # qdrant
 curl -s 'localhost:9200/_cluster/health?pretty'
 ```
+
+Every container logs through Docker's `json-file` driver capped at three 50 MB
+files, so `docker logs` holds the recent part only. Changes to the compose
+settings take effect when a container is recreated; re-running `./deploy.sh`
+does that for the services whose settings changed.
 
 ## Updating and removing
 

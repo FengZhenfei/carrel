@@ -18,6 +18,8 @@
 
 关闭知识库会停用其索引并进入保留期管理，保留期内重新启用可以恢复。目录改名识别成功时保留原编号，有歧义时可在控制台执行“沿用”操作。
 
+删除知识库会先终止该库正在运行的解析和建图任务，再立即清除它的索引、图谱数据、状态和缓存，不经过保留期。删除完成前，控制台将其显示为正在删除；某个存储服务没能清理干净时，显示为删除未完成，此时不能重新启用或沿用，下一轮夜间维护会接着删，也可以再执行一次删除。删除期间持有建图锁：删除进行时不会开始新的建图，其他知识库正在建图时也不能删除。
+
 控制台管理 API 位于端口 9800 的 `/api` 路径。写操作必须来自控制台自身的源；设置了 `KB_WEB_TOKEN` 后，所有调用都要携带令牌，见 [配置说明](configuration.zh-CN.md#访问控制与数据处理)。请求体的字段定义见 [`kb_server/api.py`](../app/kb_server/api.py)。
 
 | 路由 | 用途 |
@@ -25,11 +27,11 @@
 | `GET /api/overview`、`/api/health`、`/api/limits` | 侧栏状态、服务健康、向量模型决定的切块上限 |
 | `POST /api/enroll`；`POST /api/kbs/{kb_id}/adopt`、`unenroll`；`DELETE /api/kbs/{kb_id}` | 启用目录、沿用改名目录、关闭或删除知识库 |
 | `GET` / `PUT /api/kbs/{kb_id}/config` | 读取和保存单库设置 |
-| `POST /api/kbs/{kb_id}/parse_now`、`reparse`、`chunk_preview` | 立即排队新文件、整库重新解析、切块预览 |
-| `GET /api/kbs/{kb_id}/files`、`files/{file_id}/chunks`、`jobs` | 文件状态、单个文件的切块、任务时间线 |
+| `POST /api/kbs/{kb_id}/parse_now`、`reparse` | 立即排队新文件、整库重新解析 |
+| `GET /api/kbs/{kb_id}/files`、`files/{file_id}/chunks` | 文件状态、单个文件的切块 |
 | `POST /api/kbs/{kb_id}/graph_schema`、`graph_build`、`graph_append`、`graph_pause`；`DELETE /api/kbs/{kb_id}/graph` | 抽取标签、建图、增量并入、暂停、删除图谱 |
-| `GET /api/kbs/{kb_id}/graph_preview`、`graph_merges`、`graph_builds`、`graph_corpus` | 当前图谱、归并记录、构建历史、语料规模 |
-| `GET /api/jobs/failed`、`/api/jobs/{job_id}`；`POST /api/jobs/{job_id}/cancel`、`/api/files/retry` | 失败任务、单个任务、取消、重试 |
+| `GET /api/kbs/{kb_id}/graph_preview`、`graph_merges`、`graph_corpus` | 当前图谱、归并记录、语料规模 |
+| `GET /api/jobs/{job_id}`；`POST /api/jobs/{job_id}/cancel`、`/api/files/retry` | 单个任务及其时间线、取消、重试 |
 | `GET` / `POST /api/llms`；`DELETE /api/llms/{name}` | 模型注册表（密钥只写不读） |
 | `POST /api/services/{key}/restart`、`restart_all`、`stop_all` | 对 `KB_CONSOLE_SERVICES` 列出的服务行做重启与停止 |
 
@@ -66,11 +68,11 @@ journalctl --user -u carrel-web --since -5min
 | `carrel-scan.timer` | 30 秒后首次执行，之后每分钟 | 扫描变化并排队 |
 | `carrel-worker.timer` | 1 分钟后首次执行，之后每 5 分钟 | 消费入库任务 |
 | `carrel-graph-rebuild.timer` | 10 分钟后首次执行，之后每 2 小时 | 增量更新，或按策略整库重建 |
-| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 运行 `kb cleanup parse-assets-gc`（随后跑 `cleanup graph-gc`，按留 N 版规则清理图谱版本）：清理保留期已过的失活索引点、解析资产、旧任务记录和已关闭的知识库。图版本由建图收尾阶段（`GRAPH_GC_KEEP_VERSIONS`）以及 `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` 清理 |
-| `carrel-cache-weekly.timer` | 1 小时后首次执行，之后每 7 天 | 轮换项目缓存 |
+| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 运行 `kb cleanup parse-assets-gc`，随后运行 `cleanup graph-gc`：清理超过保留期的失活索引点及其切块记录和解析资产、删除时间超过撤销窗口的文件、旧任务记录、超过保留期的已关闭知识库以及没删完的知识库；图版本只留现行版加 N−1 个（`GRAPH_GC_KEEP_VERSIONS`，不看天数，与建图收尾同一条规则） |
+| `carrel-cache-weekly.timer` | 1 小时后首次执行，之后每 7 天 | 轮换项目缓存；解析缓存里已经没有对应图片的图片描述和视觉向量缓存随之删除 |
 | `carrel-logs-monthly.timer` | 2 小时后首次执行，之后每 30 天 | 轮换日志 |
 
-控制台和检索 API 作为常驻服务运行。定时器按相对间隔执行，不使用日历时刻。入库、建图或同步繁忙时，维护任务可以延后；连续多次延后会以退出码 75 显示失败状态，策略见 `scripts/lib/kb-maint-defer.sh`。
+控制台和检索 API 作为常驻服务运行，内存紧张时批处理单元先于它们被终止（`OOMScoreAdjust` 分别为 200 和 100）。定时器按相对间隔执行，不使用日历时刻。入库、建图或同步繁忙时，维护任务可以延后；连续多次延后会以退出码 75 显示失败状态，策略见 `scripts/lib/kb-maint-defer.sh` 和 [systemd 文档](../deployment/systemd/README.md#busy-yield)。
 
 默认维护只处理项目资产。清理用户级 uv/pip 缓存或 Docker 缓存需显式设置 `KB_HOST_HOUSEKEEPING=1`。
 
@@ -90,7 +92,8 @@ journalctl --user -u carrel-web --since -5min
 | `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | 图版本基线、回退到保留的旧版本、Neo4j 投影管理 |
 | `graph query/factcheck/status` | 图谱检查与评测 |
 | `search eval/make-set` | 检索评测与题集准备 |
-| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/graph-gc/parse-assets-gc [--dry-run]` | 保留期与维护操作（定时器跑的就是这些） |
+| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc [--dry-run]` | 维护状态，以及定时器自动运行的清理 |
+| `cleanup qdrant-gc/qdrant-graph-gc/neo4j-graph-gc [--dry-run]` | 手动工具：`qdrant-gc` 只删过期的失活点；另外两个按天数清理图版本（对应两个图谱保留天数参数） |
 | `reset --source kb_NNN [--all] --yes` | 清空指定知识库的状态、缓存和索引并重建其集合 |
 
 由 systemd 管理 worker 时，通过对应服务单元触发一轮入库。以下编号需替换成实际知识库编号：
@@ -108,7 +111,8 @@ systemctl --user start --no-block carrel-worker.service
 
 | 现象 | 检查方向 |
 |---|---|
-| 文件一直排队 | `KB_PARSE_ENABLED`、worker 日志、活动锁，以及模型接口是否已配置且可用 |
+| 文件一直排队 | `KB_PARSE_ENABLED`、worker 日志、活动锁，以及模型接口是否已配置且可用。任务连不上所需的服务（如解析服务或模型接口）时会退回队列，不计重试次数，等待时间逐次加倍；这样退回达到 `KB_JOB_MAX_RETRIES` 次后，按普通错误记为失败 |
+| 删除后显示删除未完成 | 有存储服务没能清理干净：检查 Qdrant、OpenSearch 和 Neo4j，然后再删除一次，或等夜间维护接着删 |
 | 建图提示已有锁 | 确认是否存在运行中的构建；flock 随进程退出释放 |
 | 维护退出码为 75 | 系统繁忙导致连续延后，检查入库、建图、同步和 Qdrant 状态 |
 | 图片处理失败 | 分别检查图片描述接口，以及已启用的视觉向量接口 |
@@ -131,6 +135,6 @@ cd app
 
 - 修改解析器输出后，应更新 `parsers/common.py` 中相应的档案或版本号，让受影响文档重新处理。
 - 控制台文案需加入 `static/i18n.js` 中英字典；文件名、实体名保留原始语言。
-- 静态前端变更无需重启服务；Python 变更需重启受影响的应用服务。重启前应确认活动任务，控制台内执行的预览和标签抽取可能被中断。
+- 静态前端变更无需重启服务；Python 变更需重启受影响的应用服务。重启前应确认活动任务：控制台内执行的标签抽取会丢失，正在进行的知识库删除会中断，之后由夜间维护接着完成。
 - 修改 systemd 模板后，先用 `./scripts/install-systemd.sh --check` 检查差异，再按需重新安装单元。
 - 回归夹具使用合成数据，运行资料与凭据保存在源码目录之外。`app/tests/test_deployment.py` 包含隐私检查，机器专属的扫描规则放在仓库外。

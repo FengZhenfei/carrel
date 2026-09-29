@@ -4,13 +4,17 @@ Description=Carrel: graph maintenance check (append new documents, rebuild polic
 After=network-online.target
 
 [Service]
-# A graph build can take tens of hours. This used to be 43200 (12 hours), shorter than one normal build:
-# kb_004 measured about 23 hours, so via the timer path it would be SIGTERMed halfway. Aligned with the
-# console path's KB_GRAPH_BUILD_MAX_HOURS at 48 hours. A yield (this KB is parsing) no longer sleeps and
-# retries inside the script; the next round (2 hours later) comes by itself.
+# Only a backstop for a real hang, so far above one normal build: a full rebuild of the largest knowledge base
+# measured 2-3 hours (2026-09, hosted LLM at concurrency 128), and lower concurrency or a slower provider
+# stretches that several times over. Aligned with the console path's KB_GRAPH_BUILD_MAX_HOURS at 48 hours.
+# A yield (this KB is parsing) does not sleep and retry inside the script; the next round (2 hours later)
+# comes by itself.
 TimeoutStartSec=172800
 Environment=PYTHONUNBUFFERED=1
 Type=oneshot
+# Batch job: under memory pressure it is killed before the always-on console and search service (100).
+# Written out rather than left to the systemd default.
+OOMScoreAdjust=200
 WorkingDirectory=__CARREL_HOME__
 Environment=KB_LOCAL_BASE_DIR=__CARREL_HOME__
 Environment=KB_ENV_FILE=__CARREL_HOME__/config/knowledge-base.env
