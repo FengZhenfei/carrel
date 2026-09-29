@@ -95,6 +95,12 @@ def mineru_pdf_blocks(
         elif any(token in typ for token in ("image", "figure", "chart", "picture")) or image_path:
             block_type = "chart" if "chart" in typ else "image"
             latex = None
+        elif "code" in typ or "algorithm" in typ:
+            # A code listing / algorithm box: a block of its own, not merged with the prose around it
+            # (pdf_enhanced.is_mergeable_text_block), chunked line by line; its caption (code_caption) is
+            # attached by caption_of below
+            block_type = "code"
+            latex = None
         elif "title" in typ or level is not None:
             # Lines MinerU marked with text_level also become title blocks (previously only those
             # recognised by layout inference did): the chunker breaks before headings using the

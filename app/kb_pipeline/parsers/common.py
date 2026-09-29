@@ -280,7 +280,12 @@ def grid_to_markdown(rows: list[list[str]] | None) -> str | None:
 
 def item_text(item: dict[str, Any], *, fallback_json: bool = False) -> str:
     values: list[str] = []
-    for key in ("text", "content", "orig", "caption", "latex", "md", "markdown", "html", "table_body", "name"):
+    # code_body: the text of MinerU's code listings / algorithm boxes ({"type": "code", "sub_type": "code" |
+    # "algorithm", "code_body", "code_caption"}) lives entirely in this key. It used not to be read: such items
+    # yielded an empty string, have no image, and were skipped as a whole, caption included, without a line in
+    # the log; on one deployment 23 documents had lost about 667k characters, some technical books nearly half
+    # of their text (2026-09-29 audit)
+    for key in ("text", "content", "orig", "caption", "latex", "md", "markdown", "html", "table_body", "code_body", "name"):
         value = item.get(key)
         if isinstance(value, str) and value.strip():
             if key in {"html", "table_body"}:

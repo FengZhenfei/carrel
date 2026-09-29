@@ -1581,6 +1581,53 @@ class ParserDetailTests(unittest.TestCase):
         self.assertEqual([name for name, *_ in sheets], ["Data"])
         self.assertEqual([values[0] for _, values in sheets[0][1]], ["name", "a", "b"])
 
+    def test_xlsx_read_is_bounded_by_the_cells_that_hold_content(self) -> None:
+        """2026-09-29 audit: a sheet with a whole row formatted has max_column 16384; building cells row by row up
+        to it costs about 4.7 MB per row, tens of GB for a few thousand rows. The read stops at the last row and
+        column with content; what is read is the same as without the bound."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        from kb_pipeline.parsers import native_table
+        from kb_pipeline.parsers.native_table import read_xlsx_rows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "styled.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Data"
+            ws.append(["group", "name", "count"])
+            for i in range(1, 41):
+                ws.append(["alpha" if i == 1 else None, f"n{i}", i])
+            ws.merge_cells("A2:A41")                                   # a category label merged downwards: every row carries it
+            ws.cell(row=2, column=16384).font = Font(bold=True)        # formatting out to column XFD, no value
+            ws.cell(row=9000, column=2).font = Font(bold=True)         # formatting far below the data, no value
+            wb.save(path)
+            seen: list[dict] = []
+            original = native_table.load_workbook_compat
+
+            def spy(*args, **kwargs):
+                book = original(*args, **kwargs)
+                for sheet in book.worksheets:
+                    real = sheet.iter_rows
+
+                    def bounded(*a, _real=real, **k):
+                        seen.append(dict(k))
+                        return _real(*a, **k)
+
+                    sheet.iter_rows = bounded
+                return book
+
+            with patch.object(native_table, "load_workbook_compat", spy):
+                sheets = read_xlsx_rows(path)
+        self.assertEqual(seen, [{"max_row": 41, "max_col": 3}])        # the declared range is 9000 rows x 16384 columns
+        name, rows, _spans = sheets[0]
+        self.assertEqual((name, len(rows)), ("Data", 41))
+        self.assertEqual(rows[0], (1, ["group", "name", "count"]))
+        self.assertEqual(rows[1], (2, ["alpha", "n1", "1"]))
+        self.assertEqual(rows[40], (41, ["alpha", "n40", "40"]))       # the value filled down the merged range is still there
+        self.assertTrue(all(len(values) == 3 for _, values in rows))
+
     def test_vlm_prompt_language_follows_the_kb(self) -> None:
         """D2: when the KB's output language is known, the image caption prompt names that language; if no
         language has been extracted, follow the language of the text in the image."""
@@ -1618,6 +1665,45 @@ class PdfReportParseTests(unittest.TestCase):
                          "1、安装前请核对支架型号…\n2、螺栓按对角顺序拧紧…")
         self.assertEqual(item_text({"type": "list", "list_items": []}), "")
         self.assertEqual(item_text({"type": "text", "text": "正文", "list_items": ["a"]}), "正文\na")
+
+    def test_mineru_code_blocks_are_indexed(self) -> None:
+        """2026-09-29 audit: the text of MinerU's code listings / algorithm boxes is in code_body; it used to yield
+        an empty string and the item was skipped as a whole, caption included. Every code item now becomes a code
+        block with its caption, and the chunks carry the code."""
+        from unittest import mock
+
+        from kb_pipeline.chunking.chunker import blocks_to_chunks
+        from kb_pipeline.parsers import mineru_pdf
+        from kb_pipeline.parsers.common import item_text
+        from kb_pipeline.parsers.pdf_enhanced import is_mergeable_text_block
+
+        code = "def area(r):\n    return 3.14 * r * r"
+        self.assertEqual(item_text({"type": "code", "sub_type": "code", "code_body": code, "page_idx": 3}), code)
+        self.assertEqual(item_text({"type": "code", "code_body": "  "}), "")
+        payload = {"content_list": [
+            {"type": "text", "text": "Chapter 3 Areas", "text_level": 1, "page_idx": 3},
+            {"type": "text", "text": "The function below returns the area of a circle.", "page_idx": 3},
+            {"type": "code", "sub_type": "code", "code_body": code, "code_caption": ["Listing 3-1 Circle area"], "page_idx": 3,
+             "bbox": [10, 20, 300, 80]},
+            {"type": "code", "sub_type": "algorithm", "code_body": "Input: radius r\nOutput: area S\n1. S <- pi * r * r", "page_idx": 4},
+            {"type": "code", "sub_type": "code", "code_body": "", "page_idx": 4},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(mineru_pdf, "call_mineru_sync", return_value=payload):
+            blocks = mineru_pdf.mineru_pdf_blocks(mineru_url="http://x", path=Path(tmp) / "book.pdf", cache_dir=Path(tmp))
+        kinds = [(b.block_type, b.metadata.get("source_type")) for b in blocks]
+        self.assertEqual(kinds, [("title", "text"), ("text", "text"), ("code", "code"), ("code", "code")])   # an empty code item is still skipped
+        listing, algorithm = blocks[2], blocks[3]
+        self.assertEqual((listing.text, listing.caption, listing.page_idx), (code, "Listing 3-1 Circle area", 4))   # pages count from 1
+        self.assertIn("S <- pi * r * r", algorithm.text)
+        self.assertEqual(listing.metadata["section_path"], ["Chapter 3 Areas"])                       # under its chapter
+        self.assertFalse(is_mergeable_text_block(listing))                                           # not merged with the prose around it
+        chunks = blocks_to_chunks(kb_id="kb_x", file_key=1, content_version="v", parser_profile="p", blocks=blocks,
+                                  max_tokens=400, overlap_tokens=0)
+        text = "\n".join(c.text for c in chunks)
+        self.assertIn("CAPTION: Listing 3-1 Circle area", text)
+        self.assertIn("def area(r):\n    return 3.14 * r * r", text)                                  # the code keeps its lines
+        self.assertIn("Input: radius r", text)
 
     def test_split_tables_are_merged_back(self) -> None:
         """A lab report split across pages: the piece on the next page without a header (or with the header

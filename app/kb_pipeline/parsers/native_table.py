@@ -85,6 +85,29 @@ def vertical_spans(ranges: Iterable[tuple[int, int, int, int]], *, max_rows: int
     return spans
 
 
+def _xlsx_content_extent(ws: Any) -> tuple[int, int]:
+    """The range of the sheet that really holds content: (last row, last column). ws.max_row / ws.max_column
+    depend on the farthest cell that appears in the XML, even an empty cell that only carries a style: a sheet
+    with a whole row formatted has max_column 16384, and in non-read-only mode iter_rows builds that many Cell
+    objects for every row, about 4.7 MB per row and tens of GB for a few thousand rows (2026-09-29 audit: a
+    157 KB file read with 508 MB). Only cells with a value are counted here; the value of a merged range sits
+    in its top-left cell, the rows it is filled down to are added by the caller. When the internal cell table
+    is not available (a different openpyxl implementation) the declared range is returned."""
+    cells = getattr(ws, "_cells", None)
+    if not isinstance(cells, dict):
+        return int(ws.max_row or 0), int(ws.max_column or 0)
+    last_row = last_col = 0
+    for (row_no, col_no), cell in cells.items():
+        value = cell.value
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if row_no > last_row:
+            last_row = row_no
+        if col_no > last_col:
+            last_col = col_no
+    return last_row, last_col
+
+
 def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], dict[int, int]]]:
     try:
         wb = load_workbook_compat(str(path), data_only=True, read_only=False)
@@ -101,7 +124,7 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
             # (A1:A1048576 is one Excel/WPS click away) would otherwise build
             # a ~1M-entry dict per merge before a single row is read.
             used_rows = int(ws.max_row or 0)
-            used_cols = int(ws.max_column or 0)
+            content_rows, content_cols = _xlsx_content_extent(ws)
             for merged in ws.merged_cells.ranges:
                 min_col, min_row, max_col, max_row = merged.bounds
                 value = normalize_cell(ws.cell(min_row, min_col).value)
@@ -121,7 +144,11 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                     merged_values[(row_no, min_col)] = value
             rows: list[tuple[int, list[str]]] = []
             empty_run = 0
-            for row in ws.iter_rows():
+            # Read only up to the last row / column with content (rows a merged range is filled down to count
+            # as content): no cells are built for formatted but empty areas
+            last_row = max([content_rows] + [row_no for row_no, _col in merged_values])
+            last_col = max([content_cols] + [col_no for _row, col_no in merged_values])
+            for row in (ws.iter_rows(max_row=last_row, max_col=last_col) if last_row > 0 and last_col > 0 else ()):
                 if row and row[0].row in hidden_rows:
                     continue
                 values: list[str] = []
