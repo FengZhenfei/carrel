@@ -1315,7 +1315,8 @@ def build_graph(
                     }
                     print(f"[graph] schema account: version={schema_entry.get('id')} written={written} "
                           f"confirmed_pairs={len(observed.get('confirmed') or [])}", flush=True)
-        print(f"[graph] build published kb={source.kb_id}({source.source_root}) version={graph_version}", flush=True)
+        if should_activate:
+            print(f"[graph] build published kb={source.kb_id}({source.source_root}) version={graph_version}", flush=True)
 
         # -- 8. Clean up -- the version is recorded as done: a failing clean-up step only goes into the manifest,
         # a stop signal ends the remaining clean-up, and neither changes the terminal state
