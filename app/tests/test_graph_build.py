@@ -1469,6 +1469,25 @@ class IncrementalAppendTests(unittest.TestCase):
         self.assertEqual(calls[first_node], ("nodes", 5000))                              # the node round starts from the original batch size
         self.assertEqual(remaining, {"rels": 0, "nodes": 0})
 
+    def test_resumed_build_recomputes_the_same_corpus_fingerprint(self) -> None:
+        """2026-09-29 audit: a resumed build reads the chunk ledger back from graph_build_chunks; without text_sha the
+        corpus fingerprint recomputed at the end differs from the one recorded at the start, so the build cannot
+        be resumed once more, and for a resumed version used as baseline "corpus unchanged, skip" never holds."""
+        from kb_pipeline.graph.build import source_snapshot_hash
+
+        chunks = [{"point_id": f"p{i}", "chunk_uid": f"u{i}", "doc_id": "d1", "content_version": "v1",
+                   "block_id": f"b{i}", "block_start": None, "block_end": None, "text_sha": db.chunk_text_sha(f"text {i}")}
+                  for i in range(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                build_id = db.begin_graph_build(con, source_key="k", kb_id="kb_1", source_collection="kb_1",
+                                                graph_version="v-1", cache_fingerprint="fp")
+                db.replace_graph_build_chunks(con, build_id, chunks)
+                refs = db.graph_build_chunk_refs(con, build_id)
+        self.assertEqual(sorted(r["text_sha"] for r in refs), sorted(c["text_sha"] for c in chunks))
+        self.assertEqual(source_snapshot_hash(refs), source_snapshot_hash(chunks))
+
     def test_unsuccessful_graph_versions_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "s.db"

@@ -283,7 +283,20 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 if str(row["status"]) == "active" and discovery.directory_admitted(settings.mirror_root, str(row["source_root"])) == (False, "linked"):
                     print(f"[scan] kb refused: {row['kb_id']} ({row['source_root']}) is a symbolic link; left untouched")
                     continue
-                gone = discovery.source_from_row(settings.mirror_root, row)
+                try:
+                    gone = discovery.source_from_row(settings.mirror_root, row)
+                except Exception as exc:
+                    # A base whose configuration cannot be read (edited by hand, old data): enrolled_sources
+                    # already skips it, and here too only this one base is skipped. A directory that is still
+                    # there has not "vanished": it is neither deactivated nor queued for deletion. When the
+                    # directory is really gone the source is built with an empty configuration, just to
+                    # address the deletes by id
+                    if str(row["status"]) == "active" and discovery.directory_admitted(settings.mirror_root, str(row["source_root"]))[0]:
+                        print(f"[scan] kb skipped: {row['kb_id']} ({row['source_root']}): bad config: {exc!r}", file=sys.stderr, flush=True)
+                        skipped_kb_ids.add(str(row["kb_id"]))
+                        continue
+                    gone = discovery.build_source(settings.mirror_root, str(row["source_root"]), {},
+                                                  kb_id=str(row["kb_id"]), collection=str(row["collection"]))
                 if str(row["status"]) == "active":
                     print(f"[scan] kb vanished: {gone.kb_id} ({gone.source_root}); marking inactive, queueing deletes dry_run={args.dry_run}")
                     if not args.dry_run:
@@ -329,7 +342,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 )
                 seen_ids.add(file.file_key)
                 update_stats(stats, change_type, job_id)
-                if args.verbose:
+                # Unchanged files are not listed one by one: a round every minute with a line per file made up
+                # more than nine tenths of the user journal (2026-09-29 audit); add --list-unchanged to see all
+                if args.verbose and (change_type != "unchanged" or getattr(args, "list_unchanged", False)):
                     print(f"  {change_type:16s} {file.source_path}")
             if not args.no_detect_deletes and args.limit is None:
                 deleted, delete_jobs = schedule_deletes_for_source(
@@ -1140,7 +1155,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return 75 when supported files are still younger than KB_MIN_FILE_AGE_SECONDS",
     )
-    scan.add_argument("--verbose", action="store_true")
+    scan.add_argument("--verbose", action="store_true", help="List every file whose state changed")
+    scan.add_argument("--list-unchanged", action="store_true", help="With --verbose: list unchanged files as well")
     scan.add_argument(
         "--rehash",
         action="store_true",

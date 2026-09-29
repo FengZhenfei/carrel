@@ -338,7 +338,13 @@ def facts_phase_gate(failed: list[tuple[Any, BaseException]], *, partial_ok: boo
     anyway and nobody knew facts were missing (Codex review F03). Raising lets run_phase retry (successful units
     are cached, only the failed ones are called again); if retries still fail, the operator sets
     KB_GRAPH_FACTS_PARTIAL_OK=1 to explicitly accept a partial release, with the failed units still listed in
-    stats."""
+    stats.
+    Units the provider rejected for their content (LLMInputRejected: content inspection, length) do not count
+    as failed, the same rule as in the extraction phase: only a different input would change the outcome, so
+    they are a loss inherent to the corpus. Counted, a single table unit stopped by the provider's inspection
+    made every later append and rebuild of the base fail in the facts phase and the graph stopped updating
+    (2026-09-29 audit)."""
+    failed = [(u, err) for u, err in failed if not isinstance(err, LLMInputRejected)]
     if not failed or partial_ok:
         return
     ids = ", ".join(str(getattr(u, "unit_id", u)) for u, _ in failed[:8])
@@ -1032,7 +1038,11 @@ def build_graph(
             det = deterministic_extractor(settings, source, units)
             det_fact_units = [u for u in units if det.route(u) in ("config", "structured_md")]
             det_ids = {u.unit_id for u in det_fact_units}
-            todo_units = [u for u in units if u.unit_id not in det_ids and wants_facts(u, kinds.get(u.unit_id))]
+            # Units handled by the rule extractor (code, config, structured markdown) never go to the model for
+            # facts: regex alternations, `str | None`, and the tables in test fixtures and prompt examples push the
+            # share of pipe lines over the threshold, and fixture data and examples were published as facts
+            # (2026-09-29 audit)
+            todo_units = [u for u in units if not det.wants(u) and wants_facts(u, kinds.get(u.unit_id))]
             doc_paths = {u.doc_id: u.rel_path for u in units}       # document paths are evidence of subject identity (Li Hua/checkup report/…, ZK7C1049GN/…)
             subjects = document_subjects(graph.get("entities") or [], subject_types=(graph.get("profile") or {}).get("subject_types") or (),
                                          documents=doc_paths)
@@ -1073,6 +1083,10 @@ def build_graph(
                 failed = [(u, err) for u, _, err in outcomes if err is not None]
                 for unit, err in failed[:5]:
                     print(f"[graph] facts unit {unit.unit_id} ({unit.rel_path}) failed: {err!r}", flush=True)
+                rejected_units = [u.unit_id for u, err in failed if isinstance(err, LLMInputRejected)]
+                if rejected_units:
+                    print(f"[graph] facts: {len(rejected_units)} units rejected by the provider (content inspection / length); "
+                          "they carry no facts and do not fail the phase", flush=True)
                 malformed_units = [u.unit_id for u, err in failed if isinstance(err, LLMMalformedResponse)]
                 fact_units = det_fact_units + todo_units
                 with db.connect(settings.state_db) as con:
@@ -1121,6 +1135,7 @@ def build_graph(
                     # next resume calls them again)
                     "malformed_json": len(malformed_units), "malformed_units": malformed_units[:50],
                     "failed_unit_ids": [u.unit_id for u, _ in failed][:50],
+                    "rejected_units": len(rejected_units), "rejected_unit_ids": rejected_units[:50],
                     "truncated_units": [u.unit_id for u in fact_units
                                         if int((rows.get(u.unit_id) or {}).get("stats", {}).get("truncated") or 0)][:50],
                     # Units still incomplete after the split-in-half retry: the build completes as usual but is

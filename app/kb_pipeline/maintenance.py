@@ -895,7 +895,7 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
         # Also prune long-finished jobs and failure records (with 4000-character stack traces); the state
         # database used to only ever grow
         totals["job_history_pruned"] = db.prune_job_history(
-            con, retention_days=max(retention_days, int(os.getenv("KB_JOB_HISTORY_DAYS", "30"))))
+            con, retention_days=max(retention_days, int(os.getenv("KB_JOB_HISTORY_DAYS", "30"))), dry_run=dry_run)
         for collection in collections:
             try:
                 # Points whose payload lost doc_id/content_version can never be

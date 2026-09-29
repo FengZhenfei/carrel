@@ -574,7 +574,10 @@ def graph_build_chunk_refs(con: sqlite3.Connection, graph_build_id: str) -> list
     return [
         dict(row)
         for row in con.execute(
-            "SELECT point_id, chunk_uid, doc_id, content_version, block_id, block_start, block_end "
+            # text_sha has to come along: a resumed build recomputes the corpus fingerprint from this ledger at
+            # the end; without it the result differs from the one recorded at the start and the build cannot be
+            # resumed once more (2026-09-29 audit)
+            "SELECT point_id, chunk_uid, doc_id, content_version, block_id, block_start, block_end, text_sha "
             "FROM graph_build_chunks WHERE graph_build_id = ? ORDER BY doc_id, chunk_uid",
             (graph_build_id,),
         )
@@ -984,13 +987,29 @@ def get_file_by_path(con: sqlite3.Connection, kb_id: str, source_path: str) -> s
     ).fetchone()
 
 
-def prune_job_history(con: sqlite3.Connection, *, retention_days: int = 30) -> dict[str, int]:
+def prune_job_history(con: sqlite3.Connection, *, retention_days: int = 30, dry_run: bool = False) -> dict[str, int]:
     """Clean up long-finished jobs and failure records. These rows used to be deleted only when a knowledge
     base or file was deleted: failure records carry a 4000-character stack trace, every full re-parse
     adds N rows, the state database only ever grew, and every console poll runs statistics over this
-    table."""
+    table. With dry_run the rows are counted, not deleted."""
     cutoff = now_ts() - max(1, retention_days) * 86400
     removed: dict[str, int] = {}
+    if dry_run:
+        removed["failures"] = int(con.execute(
+            "SELECT COUNT(*) FROM failures WHERE resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)).fetchone()[0])
+        removed["jobs"] = int(con.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?",
+            (cutoff,)).fetchone()[0])
+        # events that only become orphans once their job is deleted count as well
+        removed["job_events"] = int(con.execute(
+            "SELECT COUNT(*) FROM job_events WHERE job_id NOT IN (SELECT job_id FROM jobs WHERE NOT "
+            "(status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?))", (cutoff,)).fetchone()[0])
+        try:
+            removed["ingest_runs"] = int(con.execute(
+                "SELECT COUNT(*) FROM ingest_runs WHERE COALESCE(finished_at, started_at) < ?", (cutoff,)).fetchone()[0])
+        except sqlite3.OperationalError:
+            removed["ingest_runs"] = 0
+        return removed
     cur = con.execute(
         "DELETE FROM failures WHERE resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,))
     removed["failures"] = int(cur.rowcount or 0)

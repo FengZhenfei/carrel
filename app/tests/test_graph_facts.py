@@ -1387,6 +1387,18 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         with self.assertRaisesRegex(RuntimeError, "failed for 2 units.*u-1, u-2.*KB_GRAPH_FACTS_PARTIAL_OK"):
             facts_phase_gate(failed, partial_ok=False)
         facts_phase_gate(failed, partial_ok=True)
+        # 2026-09-29 audit: a unit the provider rejected for its content is a loss inherent to the corpus, the same
+        # rule as in the extraction phase; it does not fail the facts phase
+        from kb_pipeline.graph.llm import LLMInputRejected
+
+        rejected = [(SimpleNamespace(unit_id="u-3"), LLMInputRejected("Content Exists Risk"))]
+        facts_phase_gate(rejected, partial_ok=False)
+        with self.assertRaisesRegex(RuntimeError, "failed for 2 units.*u-1, u-2"):
+            facts_phase_gate(failed + rejected, partial_ok=False)          # real failures still stop the phase, rejections are not counted
+        build_src = _repo_file("app/kb_pipeline/graph/build.py")
+        self.assertIn('"rejected_units": len(rejected_units)', build_src)
+        # units handled by the rule extractor (code, config, structured markdown) never go to the model for facts
+        self.assertIn("todo_units = [u for u in units if not det.wants(u) and wants_facts(u, kinds.get(u.unit_id))]", build_src)
         self.assertIn("facts-v3", _repo_file("app/kb_pipeline/graph/facts.py"))     # bumped to v3 on 09-07 when facts gained axis / bound fields
         self.assertNotEqual(facts_fingerprint(spec), "")
         src = _repo_file("app/kb_pipeline/graph/build.py")

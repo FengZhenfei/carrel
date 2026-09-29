@@ -357,6 +357,60 @@ class ScanBoundaryTests(unittest.TestCase):
                     outside_rows = con.execute("SELECT COUNT(*) FROM files WHERE source_path LIKE '%synthetic%'").fetchone()[0]
                 self.assertEqual((status, files, deletes, outside_rows), ("active", 1, 0, 0))
 
+    def test_scan_skips_a_kb_with_broken_config_and_lists_only_changes(self) -> None:
+        """2026-09-29 audit: one base whose config_json cannot be read made the whole scan raise and exit, and every
+        base stopped ingesting; without the exception that base would have been taken for a vanished directory,
+        deactivated and queued for deletion. Only that base is skipped now. Also: --verbose lists the files
+        whose state changed, not every unchanged one."""
+        import argparse
+        from unittest import mock
+
+        from kb_pipeline import cli, discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "mirror"; root.mkdir()
+            for name in ("base-a", "base-b"):
+                (root / name).mkdir()
+                doc = root / name / "a.md"; doc.write_text(f"# {name}\n\ncontent", encoding="utf-8")
+                os.utime(doc, (time.time() - 3600, time.time() - 3600))
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                a, _ = discovery.enroll(con, root, "base-a"); b, _ = discovery.enroll(con, root, "base-b"); con.commit()
+            args = argparse.Namespace(env_file=None, source=None, limit=None, verbose=True, dry_run=False, rehash=False,
+                                      requeue_failed=False, no_detect_deletes=False, force_kb_teardown=False,
+                                      exit_code_on_recent=False)
+            settings = self._settings(root, state)
+            settings.sources = discovery.enrolled_sources(state, root)
+            out = io.StringIO()
+            with mock.patch.object(cli, "load_settings", return_value=settings), redirect_stdout(out):
+                self.assertEqual(cli.cmd_scan(args), 0)
+            self.assertEqual(len([l for l in out.getvalue().splitlines() if l.startswith("  ") and "a.md" in l]), 2)   # two new files
+            with db.connect(state) as con:
+                for row in con.execute("SELECT file_id, content_version FROM files").fetchall():      # as if both were indexed
+                    db.mark_file_indexed(con, str(row["file_id"]), str(row["content_version"]), parser_profile_for_path(Path("a.md")))
+                con.execute("UPDATE jobs SET status = 'done', finished_at = ?", (int(time.time()),))
+                con.execute("UPDATE kb_sources SET config_json = ? WHERE kb_id = ?",
+                            (json.dumps({"graph_rebuild_interval": "weekly"}), a.kb_id))
+                with self.assertRaises(Exception):
+                    discovery.source_from_row(root, con.execute("SELECT * FROM kb_sources WHERE kb_id = ?", (a.kb_id,)).fetchone())
+            settings.sources = discovery.enrolled_sources(state, root)
+            self.assertEqual(set(settings.sources), {b.kb_id})                     # the base with the broken config is not a source
+            out = io.StringIO()
+            with mock.patch.object(cli, "load_settings", return_value=settings), redirect_stdout(out):
+                self.assertEqual(cli.cmd_scan(args), 0)                            # the round completes as usual
+            self.assertEqual([l for l in out.getvalue().splitlines() if l.startswith("  ") and "a.md" in l], [])   # unchanged files are not listed
+            self.assertIn("unchanged=1", out.getvalue())
+            with db.connect(state) as con:
+                status = con.execute("SELECT status FROM kb_sources WHERE kb_id=?", (a.kb_id,)).fetchone()[0]
+                files = con.execute("SELECT COUNT(*) FROM files WHERE kb_id=? AND status!='deleted'", (a.kb_id,)).fetchone()[0]
+                deletes = con.execute("SELECT COUNT(*) FROM jobs WHERE job_type='delete'").fetchone()[0]
+            self.assertEqual((status, files, deletes), ("active", 1, 0))           # not deactivated, nothing queued for deletion
+            args.list_unchanged = True
+            out = io.StringIO()
+            with mock.patch.object(cli, "load_settings", return_value=settings), redirect_stdout(out):
+                self.assertEqual(cli.cmd_scan(args), 0)
+            self.assertEqual(len([l for l in out.getvalue().splitlines() if l.startswith("  unchanged") and "a.md" in l]), 1)
+
     def test_scan_survives_a_closed_kb(self) -> None:
         """2026-09-06: with a KB in the closed state, the deactivated placeholder tuple had one field fewer than the
         scan tuple, so the scan crashed every minute and new files of other KBs could not get in either."""

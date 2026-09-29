@@ -511,6 +511,39 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
             self.assertEqual({e["kb_id"] for e in result["dropped"]}, {a.kb_id})
 
 
+class JobHistoryDryRunTests(unittest.TestCase):
+    """2026-09-29 audit: cleanup parse-assets-gc --dry-run still deleted the jobs, failures and events older than
+    30 days. A dry run counts and deletes nothing."""
+
+    def test_dry_run_counts_and_deletes_nothing(self) -> None:
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from kb_pipeline import db
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            old = int(time.time()) - 90 * 86400
+            with db.connect(state) as con:
+                for job_id, status, when in (("j-old", "done", old), ("j-new", "done", int(time.time())), ("j-run", "running", old)):
+                    con.execute(
+                        "INSERT INTO jobs(job_id, kb_id, collection, job_type, status, priority, "
+                        "next_attempt_at, created_at, updated_at, finished_at) "
+                        "VALUES(?, 'kb', 'c', 'parse', ?, 100, 0, 1, ?, ?)",
+                        (job_id, status, when, when if status == "done" else None))
+                con.commit()
+                before = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                planned = db.prune_job_history(con, retention_days=30, dry_run=True)
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], before)      # nothing was deleted
+                self.assertEqual(planned["jobs"], 1)
+                removed = db.prune_job_history(con, retention_days=30)
+                self.assertEqual(removed["jobs"], planned["jobs"])                                  # the real run deletes what the dry run counted
+                self.assertEqual({r[0] for r in con.execute("SELECT job_id FROM jobs")}, {"j-new", "j-run"})
+        src = _repo_file("app/kb_pipeline/maintenance.py")
+        self.assertIn('int(os.getenv("KB_JOB_HISTORY_DAYS", "30"))), dry_run=dry_run)', src)
+
+
 class GraphGcSafetyNetTests(unittest.TestCase):
     """Nightly graph-gc: shares the build lock with builds and skips the whole round while one runs; bases without
     a graph are left alone."""
