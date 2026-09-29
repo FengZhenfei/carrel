@@ -55,11 +55,11 @@ def mineru_docx_blocks(
 
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     blocks: list[ParsedBlock] = []
-    seen: set[tuple[str, str, str, int | None]] = set()
     sections = SectionTracker()
-    # Document-level heading correction (recurring labels and list items are not headings; unnumbered
-    # headings hang under numbered ones), see headings.HeadingResolver
-    resolver = HeadingResolver(item_text(i) for i in content if heading_level(i) and label_of(i) in ("text", "title"))
+    # Document-level heading correction (recurring labels and list items are not headings); the levels come
+    # from Word styles, so unnumbered headings are not pushed one level down, see headings.HeadingResolver
+    resolver = HeadingResolver((item_text(i) for i in content if heading_level(i) and label_of(i) in ("text", "title")),
+                               trust_parser_levels=True)
     count = 0
     for item in content:
         raw_type = label_of(item)
@@ -89,11 +89,11 @@ def mineru_docx_blocks(
         else:
             block_type = "text"
 
+        # No de-duplication by content: content_list is one flat list in document order, and a paragraph, table
+        # or picture that the original repeats (a "Solution" line under each of several questions, the same
+        # parameter table in two sections) is content. Keyed on "type + first 160 characters", only the first
+        # occurrence in the whole document used to be kept, and the copy in a later section was silently dropped
         page = page_idx(item)
-        key = (block_type, text[:160], Path(image_path).name if image_path else "", page)
-        if key in seen:
-            continue
-        seen.add(key)
         count += 1
         blocks.append(
             ParsedBlock(

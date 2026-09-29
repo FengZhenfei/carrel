@@ -15,7 +15,7 @@ from typing import Any
 
 from ..models import ParsedBlock
 
-PROFILE = "py-symbols-v1"
+PROFILE = "py-symbols-v2"
 _SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.")
 
 
@@ -99,7 +99,11 @@ def _start_line(node: ast.AST) -> int:
 
 
 def python_symbol_blocks(source: str, *, parser_profile: str = PROFILE, doc_type: str = "py") -> list[ParsedBlock]:
-    lines = source.splitlines()
+    # Lines must be split the same way ast numbers them: only at newlines. str.splitlines also breaks at form
+    # feeds, \x85, U+2028 and the like, and a single one in the file shifts the text taken by line number for
+    # every symbol after it
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    lines = source.split("\n")
     tree = ast.parse(source)
     covered = [False] * (len(lines) + 1)
     symbols: list[tuple[int, int, dict[str, Any], list[str]]] = []   # (start, end, meta, section_path)

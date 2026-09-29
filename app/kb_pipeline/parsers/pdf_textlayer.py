@@ -9,7 +9,8 @@ only digits and Latin text. PyMuPDF reads the text layer in full and ships CJK f
   2. render only the lost pages with PyMuPDF into image pages, send them through MinerU once more and splice the
      result back into the corresponding pages; other pages are untouched;
   3. pages that are still lost get `degraded` on their blocks, carried through the chunk payload to
-     `sources[].degraded` in search results.
+     `sources[].degraded` in search results. When the resend hits a transient failure (MinerU unreachable,
+     5xx) the job first goes through its normal retries; only its last attempt indexes the file as degraded.
 Spot check: a 7-page ECG report had 640 CJK characters in the text layer of 6 pages and MinerU kept 7; after the
 rendered pass all 6 pages came back. Without PyMuPDF the whole check is skipped and behaviour is unchanged.
 Page numbers follow the pipeline convention, 1-based (common.page_idx adds one to MinerU's 0-based index);
@@ -41,11 +42,11 @@ def text_layer_cjk_by_page(path: Path) -> dict[int, int] | None:
     """CJK characters in the text layer of each page (1-based); None when PyMuPDF is missing or the file
     cannot be read, which skips the check."""
     try:
-        import fitz  # PyMuPDF, optional dependency
+        import pymupdf  # PyMuPDF, optional dependency
     except ImportError:
         return None
     try:
-        with fitz.open(str(path)) as doc:
+        with pymupdf.open(str(path)) as doc:
             return {i + 1: cjk_count(page.get_text()) for i, page in enumerate(doc)}
     except Exception:
         return None
@@ -87,7 +88,7 @@ def _box_fraction(box: list[float], width: float, height: float) -> tuple[float,
 def page_detail(page: Any, boxes: list[list[float]]) -> tuple[int, int]:
     """CJK characters of one page's text layer outside figure regions, and how many of them are drawn with
     non-embedded fonts."""
-    import fitz
+    import pymupdf
 
     fonts = page.get_fonts(full=True)
     nonembedded = {str(f[3]).split("+", 1)[-1] for f in fonts if f[1] == "n/a"} | {str(f[4]).split("+", 1)[-1] for f in fonts if f[1] == "n/a"}
@@ -95,7 +96,7 @@ def page_detail(page: Any, boxes: list[list[float]]) -> tuple[int, int]:
     rects = []
     for box in boxes:
         x0, y0, x1, y1 = _box_fraction(box, width, height)
-        rects.append(fitz.Rect(x0 * width, y0 * height, x1 * width, y1 * height))
+        rects.append(pymupdf.Rect(x0 * width, y0 * height, x1 * width, y1 * height))
     total = non = 0
     for block in page.get_text("dict").get("blocks", []):
         for line in block.get("lines", []):
@@ -103,7 +104,7 @@ def page_detail(page: Any, boxes: list[list[float]]) -> tuple[int, int]:
                 count = cjk_count(span.get("text", ""))
                 if not count:
                     continue
-                rect = fitz.Rect(span["bbox"])
+                rect = pymupdf.Rect(span["bbox"])
                 if rect.get_area() > 0 and any((rect & fig).get_area() > 0.5 * rect.get_area() for fig in rects):
                     continue
                 total += count
@@ -116,12 +117,12 @@ def page_details(path: Path, pages: list[int], boxes: dict[int, list[list[float]
     """Confirm candidate pages one by one (reads fonts and spans, slower than text_layer_cjk_by_page, hence
     candidates only)."""
     try:
-        import fitz
+        import pymupdf
     except ImportError:
         return {}
     out: dict[int, tuple[int, int]] = {}
     try:
-        with fitz.open(str(path)) as doc:
+        with pymupdf.open(str(path)) as doc:
             for page_no in pages:
                 if 1 <= page_no <= doc.page_count:
                     out[page_no] = page_detail(doc[page_no - 1], boxes.get(page_no, []))
@@ -133,10 +134,10 @@ def page_details(path: Path, pages: list[int], boxes: dict[int, list[list[float]
 def render_pages(path: Path, pages: list[int], out: Path, *, dpi: int = RENDER_DPI, quality: int = RENDER_JPEG_QUALITY) -> Path:
     """Render the given pages as JPEG image pages (MuPDF supplies CJK fallback fonts) into one small PDF; page
     sizes are kept and the page order follows `pages`."""
-    import fitz
+    import pymupdf
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    with fitz.open(str(path)) as doc, fitz.open() as rendered:
+    with pymupdf.open(str(path)) as doc, pymupdf.open() as rendered:
         for page_no in pages:
             page = doc[page_no - 1]
             pix = page.get_pixmap(dpi=dpi)
@@ -200,10 +201,16 @@ def splice_rendered(blocks: list[ParsedBlock], rendered: list[ParsedBlock], page
 
 
 def repair_lost_text_layer(blocks: list[ParsedBlock], *, path: Path, rendered_path: Path,
-                           parse_rendered: Callable[[Path], list[ParsedBlock]],
-                           layer: dict[int, int] | None = None, detail: DetailFn | None = None) -> tuple[list[ParsedBlock], dict[str, Any]]:
+                           parse_rendered: Callable[[Path], list[ParsedBlock]] | None,
+                           layer: dict[int, int] | None = None, detail: DetailFn | None = None,
+                           raise_transient: bool = False) -> tuple[list[ParsedBlock], dict[str, Any]]:
     """Lost-text check with per-page fallback. Returns (blocks to use, diagnostics): lost_before are the confirmed
-    lost pages, recovered the pages the rendered pass brought back, lost the pages still lost at the end."""
+    lost pages, recovered the pages the rendered pass brought back, lost the pages still lost at the end.
+    With parse_rendered None the pages are only checked, not repaired, and lost pages stay lost. raise_transient:
+    a transient failure of the second parse (connection failure, 5xx) is raised so the job goes through its
+    normal retries -- degrading in place would index the file as usual, scan would then judge it unchanged and
+    those pages would never get another chance; an explicit rejection by MinerU (4xx) and a rendering failure
+    would fail the same way on retry, so they always degrade in place."""
     info: dict[str, Any] = {"checked": False, "candidates": [], "lost_before": [], "recovered": [], "lost": [], "rendered": False}
     layer = text_layer_cjk_by_page(path) if layer is None else layer
     if not layer:
@@ -220,12 +227,18 @@ def repair_lost_text_layer(blocks: list[ParsedBlock], *, path: Path, rendered_pa
     lost = sorted(need)
     info["lost_before"] = lost
     info["lost"] = lost
-    if not lost:
+    if not lost or parse_rendered is None:
         return blocks, info
     try:
         render_pages(path, lost, rendered_path)
+    except Exception as exc:              # rendering failed: keep the original result, lost pages still get degraded
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return blocks, info
+    try:
         rendered = parse_rendered(rendered_path)
-    except Exception as exc:              # rendering or the second parse failed: keep the original, lost pages still get degraded
+    except Exception as exc:
+        if raise_transient and not getattr(exc, "deterministic", False):
+            raise
         info["error"] = f"{type(exc).__name__}: {exc}"
         return blocks, info
     info["rendered"] = True

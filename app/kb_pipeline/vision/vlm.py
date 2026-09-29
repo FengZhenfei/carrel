@@ -12,6 +12,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from ..parsers.errors import JobCancelled, service_unreachable
 from .images import DEFAULT_MAX_PIXELS
 from .images import image_data_url as _image_data_url
 
@@ -618,8 +619,8 @@ def caption_image(
             data["confidence"] = "low"
             data["vlm_runaway"] = True
     data["vlm_cache_hit"] = False
-    # A degraded retry (verbatim forced empty) and an all-empty result are not written to the 180-day
-    # cache: otherwise the same image with the same prompt would never get another attempt at a full
+    # A degraded retry (verbatim forced empty) and an all-empty result are not written to the cache:
+    # otherwise the same image with the same prompt would never get another attempt at a full
     # transcription -- one service hiccup would freeze this image's description as the crippled
     # version forever.
     degraded = bool(data.get("vlm_degraded_retry"))
@@ -680,6 +681,12 @@ def caption_images_parallel(
             try:
                 results[job_id] = future.result()
             except Exception as exc:
+                if service_unreachable(exc):
+                    # The model service cannot be reached: the remaining images need not be tried, the whole
+                    # run stops; the worker then returns the job to the queue until the service is ready
+                    print(f"[vlm] endpoint unreachable, caption run stopped at {completed}/{len(jobs)}: {exc!r}", flush=True)
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
                 # This used to swallow the exception whole into results[job_id]["error"] and stop
                 # there: the log only carried the upstream summary vlm_failed=N/M, and nobody could
                 # see the real cause. Yet one failed image is enough to keep a whole document out of
@@ -699,6 +706,11 @@ def caption_images_parallel(
             if progress_cb is not None:
                 try:
                     progress_cb(completed, len(jobs))
+                except JobCancelled:
+                    # The job was cancelled: images not yet started are no longer sent to the model, the ones in
+                    # flight are allowed to finish; the cancellation goes back to the parse job unchanged
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
                 except Exception:
                     pass  # progress reporting must never fail a caption run
     return results

@@ -16,7 +16,7 @@ def decode_text_bytes(data: bytes) -> str:
     """utf-8 first (self-validating), then gb18030 (supersets gbk/gb2312),
     then lossy utf-8 as the last resort. The old errors="ignore" read deleted
     every multi-byte GBK sequence, silently stripping all CJK from legacy
-    files; read_csv_rows always had this ladder -- text/markdown/html now
+    files; the csv reader always had this ladder -- text/markdown/html now
     share it."""
     # BOM first: gb18030 accepts almost any byte sequence, so a UTF-16 file (common for
     # .txt/.csv exported from Windows) would decode into mojibake and get stored as body text.
@@ -579,6 +579,12 @@ def parser_profile_for_path(path: Path) -> str:
     dropped wholesale; a table split across pages into a header-less fragment is merged back into the
     previous one; QR codes / barcodes / icons / signatures are folded into the body, and photos with a
     substantive description (ultrasound image pages) are no longer folded away as decorative images.
+    pdf v14->v15 / docx v9->v10 / py-symbols, code-symbols v1->v2 / md v2->v3 / other text types v1->v2,
+    2026-09-30: integer chapter numbers ("4 Technical requirements") count as numbered headings and docx
+    style headings are no longer demoted; a heading at the end of a block is no longer lost (every type
+    that goes through prose chunking) and travels with the body text below it when merging; tables that
+    span three or more pages are merged back; code is split into lines the same way the syntax tree
+    numbers them, and a decorator belongs to the definition it decorates.
     """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
@@ -586,25 +592,29 @@ def parser_profile_for_path(path: Path) -> str:
         # back (F03), cross-page page ranges enter the payload (F09), conflicts between in-image text
         # and estimated values resolve to the text and leave a trace (F01), runaway repetitive
         # descriptions are collapsed / retried
-        return "pdf-mineru-table-vlm-v14"
+        return "pdf-mineru-table-vlm-v15"
     if suffix == ".pptx":
-        return "pptx-mineru-slide-vlm-v3"
+        return "pptx-mineru-slide-vlm-v4"     # v4 (2026-09-30): repeated content on a slide is no longer de-duplicated
     if suffix == ".docx":
-        return "docx-mineru-ooxml-vlm-v9"
+        # v10 (2026-09-30): repeated paragraphs / tables / images are no longer de-duplicated; native charts
+        # become a data table read series by series, placed back in their section
+        return "docx-mineru-ooxml-vlm-v10"
     if suffix == ".doc":
         return "doc-unsupported-v1"
     if suffix == ".html":
-        return "html-dom-v1"
+        return "html-dom-v2"          # v2 (2026-09-30): tables follow their section with its section path, cells spanning rows / columns are filled in
     if suffix in {".md", ".markdown"}:
-        return "md-sections-v2"       # v2 (2026-09-04): frontmatter parsed into fields and given its own block
+        return "md-sections-v3"       # v2 (2026-09-04): frontmatter parsed into fields and given its own block
     if suffix == ".py":
-        return "py-symbols-v1"        # 2026-09-04: chunked by function / class / method, blocks carry symbol metadata
+        return "py-symbols-v2"        # 2026-09-04: chunked by function / class / method, blocks carry symbol metadata
     from .code_symbols import LANGUAGE_BY_SUFFIX
 
     if suffix in LANGUAGE_BY_SUFFIX:
-        return "code-symbols-v1"      # 2026-09-05: tree-sitter chunking by symbol (JS/TS/Go/Java/Rust/C/C++/C#/PHP/Ruby/Swift/Kotlin/Scala/Shell/Lua/PowerShell)
+        return "code-symbols-v2"      # 2026-09-05: tree-sitter chunking by symbol (JS/TS/Go/Java/Rust/C/C++/C#/PHP/Ruby/Swift/Kotlin/Scala/Shell/Lua/PowerShell)
     if suffix in {".xlsx", ".xls", ".csv"}:
-        return "table-native-v3"      # v3: newlines inside cells are flattened, one record per line
+        # v4 (2026-09-30): percentages / dates are written as the sheet displays them, split rows no longer carry
+        # the whole header, long cells are split, and the notes before the header are neither truncated nor repeated
+        return "table-native-v4"
     if suffix in IMAGE_SUFFIXES:
         return "image-vlm-v1"
-    return f"{infer_doc_type(path.name)}-native-v1"
+    return f"{infer_doc_type(path.name)}-native-v2"

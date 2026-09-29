@@ -48,7 +48,6 @@ def mineru_pptx_blocks(
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     slide_by_index = normalize_pptx_slide_indexes(content)
     blocks: list[ParsedBlock] = []
-    seen: set[tuple[str, int | None, str, str]] = set()
     count = 0
     for idx, item in enumerate(content):
         raw_type = label_of(item)
@@ -69,11 +68,9 @@ def mineru_pptx_blocks(
         else:
             block_type = "text"
 
+        # No de-duplication by content: short labels repeated on one slide (four cards all saying "Supported")
+        # are part of the layout, see mineru_docx
         slide_idx = slide_by_index.get(idx)
-        key = (block_type, slide_idx, text[:160], Path(image_path).name if image_path else "")
-        if key in seen:
-            continue
-        seen.add(key)
         count += 1
         blocks.append(
             ParsedBlock(

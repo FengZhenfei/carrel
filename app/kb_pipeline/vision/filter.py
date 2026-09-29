@@ -29,12 +29,12 @@ def conservative_decorative_filter(
     *,
     width: int | None,
     height: int | None,
-    repeated_count: int = 1,
     object_name: str = "",
 ) -> DecorativeDecision:
+    """Decorative images that can be settled before calling the model: very small icons, or files whose name
+    says they are a background / divider. The rest (logos, watermarks, stamps) is judged by the model in its
+    description (the decorative field of the vlm result)."""
     name = object_name.lower()
-    if repeated_count >= 5 and any(token in name for token in ("logo", "watermark")):
-        return DecorativeDecision(True, "repeated_logo_or_watermark")
     if width is not None and height is not None:
         if width < 80 and height < 80:
             return DecorativeDecision(True, "tiny_icon")

@@ -3,8 +3,9 @@
 Advisory only, never blocking -- parsing and indexing proceed as usual, the verdict is stored in
 files.chunk_diag_json for the console to display, and the "chunk preview" uses the same statistics. The
 rules borrow from WeKnora's ValidateChunks, with thresholds rewritten for our "split within a block,
-never across blocks" model: tables are split by row and images are one chunk per block, so their length
-is inherently not bounded by max_tokens and they take no part in the fragment verdict.
+never across blocks" model: an image is one chunk per block, so its length is not bounded by max_tokens;
+tables are split by row, and the last row or two left over are naturally short, so they take no part in
+the fragment verdict.
 """
 from __future__ import annotations
 
@@ -16,11 +17,14 @@ from typing import Any
 from ..headings import infer_heading_level, is_short_lead_in
 from ..models import ParsedBlock, UnifiedChunk
 
-# Block types whose length is not bounded by max_tokens: tables (rows never split), images (one per chunk)
-EXEMPT_BLOCK_TYPES = frozenset({"table", "vision", "image", "chart"})
-# Types additionally exempt from the fragment verdict: code is chunked by symbol and small methods are short
-# anyway; slides are chunked by page, and a title-only page is still a page
-TINY_EXEMPT_BLOCK_TYPES = EXEMPT_BLOCK_TYPES | frozenset({"code", "slide"})
+# Block types whose length is not bounded by max_tokens: images (one per chunk). Tables are not among them:
+# a row over the budget is split by cell and a cell over the budget by token, so an over-long table chunk
+# means chunking went wrong, and an over-long chunk is rejected by the embedding service
+EXEMPT_BLOCK_TYPES = frozenset({"vision", "image", "chart"})
+# Types additionally exempt from the fragment verdict: tables are split by row and the last row or two left
+# over are short anyway; code is chunked by symbol and small methods are short anyway; slides are chunked by
+# page, and a title-only page is still a page
+TINY_EXEMPT_BLOCK_TYPES = EXEMPT_BLOCK_TYPES | frozenset({"table", "code", "slide"})
 # Over-budget tolerance: sentence packing is off by a few percent, only beyond this factor is it a problem
 OVER_TOLERANCE = 1.25
 # An image chunk whose text (VLM / MinerU recognition) exceeds the budget by this factor means the

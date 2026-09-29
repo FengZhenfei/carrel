@@ -8,10 +8,14 @@ from ..models import ParsedBlock
 from ..utils import infer_doc_type
 from ..vision.images import IMAGE_SUFFIXES
 from ..vision.vlm import compose_prompt
+from .errors import NonRetryableParseError
 from .visual_blocks import enrich_blocks_with_vlm
 
 
 IMAGE_FILE_PROFILE = "image-vlm-v1"
+# Skip reasons that mean the picture itself cannot be sent to the model: retrying changes nothing. A missing
+# API key or a cached copy that has gone missing are environment problems and are not listed here
+PERMANENT_SKIP_REASONS = {"unreadable_image", "degenerate_aspect"}
 
 
 def parse_image_file(
@@ -36,10 +40,12 @@ def parse_image_file(
     second (parse_job), text vector from the description.
     """
     if path.suffix.lower() not in IMAGE_SUFFIXES:
-        raise RuntimeError(f"not an image file: {path.name}")
-    try:
-        from PIL import Image
+        raise NonRetryableParseError(f"not an image file: {path.name}")
+    from PIL import Image
 
+    with path.open("rb") as probe:        # cannot open / read (permissions, disk): an environment problem, retried as usual; the checks below test the picture itself
+        probe.read(1)
+    try:
         with Image.open(path) as image:
             image.verify()
         with Image.open(path) as image:
@@ -47,7 +53,7 @@ def parse_image_file(
             image_format = (image.format or "").upper()
             mode = image.mode
     except Exception as exc:
-        raise RuntimeError(f"unreadable image file {path.name}: {exc!r}") from exc
+        raise NonRetryableParseError(f"unreadable image file {path.name}: {exc!r}") from exc
 
     asset_dir = cache_dir / "image"
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -94,13 +100,15 @@ def parse_image_file(
     # For an embedded figure a failed caption costs one block's description;
     # for a standalone image it is the whole document, so fail the job and let
     # the worker's retry schedule try again instead of indexing a blank. A
-    # skip (missing API key, unreadable bytes that slipped past verify) is
-    # the same outcome for a standalone file: no description, no vector.
+    # skip is the same outcome for a standalone file: no description, no
+    # vector. When the picture itself is the reason (unreadable bytes that
+    # slipped past verify, an aspect ratio the model rejects) a retry cannot
+    # change anything, so the job fails for good instead of backing off.
     status = str(block.metadata.get("vlm_status") or "")
     if status == "failed":
         raise RuntimeError(f"VLM caption failed for image file {path.name}: {block.metadata.get('vlm_error')}")
     if status == "skipped":
-        raise RuntimeError(
-            f"VLM caption skipped for image file {path.name}: {block.metadata.get('vlm_skip_reason')}"
-        )
+        reason = block.metadata.get("vlm_skip_reason")
+        error = NonRetryableParseError if reason in PERMANENT_SKIP_REASONS else RuntimeError
+        raise error(f"VLM caption skipped for image file {path.name}: {reason}")
     return [block]

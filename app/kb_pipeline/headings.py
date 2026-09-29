@@ -42,6 +42,14 @@ _NUMBERED_RE = re.compile(r"^\s*(?:[1-9]\d*|[IVX]{1,5})\.\s+(\S.*)$")
 # books). Both parts are 1-2 digit numbers followed by the title text; "2020-2021 fiscal year" has 4-digit
 # years and does not count, and "1-5 V" is blocked by the unit rule below
 _DASHED_RE = re.compile(r"^\s*(\d{1,2})-(\d{1,2})(?:\s+|(?=[一-鿿]))(\S.*)$")
+# "2 Overview", "4 Technical requirements": integer chapter numbers followed by a space (national standards,
+# industry specifications and papers are written this way). Phrases that open with a quantity ("3 package
+# types", "8 bit microcontrollers") look exactly the same, so this stays out of infer_heading_level: it is only
+# accepted when the parser already marked the line as a heading and the chapter number continues from what
+# came before, see HeadingResolver
+_INTEGER_RE = re.compile(r"^\s*(\d{1,2})\s+(\S.*)$")
+CHAPTER_GAP = 2       # how far an integer chapter number may run ahead of the previous chapter: 2 = one unmarked chapter in between still connects
+_LEADING_NUMBER_RE = re.compile(r"^\s*§?\s*(\d{1,3})(?!\d)")
 # Typographic markup in headings: markdown bold / underline / inline code / strikethrough, Obsidian highlight
 # "==📅 2026-05-27=="
 _MARKUP_RE = re.compile(r"\*\*|__|`|~~")
@@ -194,14 +202,34 @@ class HeadingResolver:
     (KEYWORD / Note: / Key points) as headings. Three corrections: list-item shapes are not headings; a
     text that appears as a heading ≥ repeat_limit times in the document is a label and is demoted to
     body text; when a numbered heading precedes, an unnumbered heading counts as its next level (in a
-    book, "Standard SQL" is a subsection of "1-3 SQL overview", not a sibling chapter). docx levels come
-    from Word styles and are trustworthy as they are, so only the first two apply.
+    book, "Standard SQL" is a subsection of "1-3 SQL overview", not a sibling chapter). An integer chapter
+    number such as "4 Technical requirements" that continues from what came before is a numbered heading
+    too and is not demoted by the third rule.
+
+    trust_parser_levels (docx): the levels come from Word styles, so the third rule is skipped -- otherwise,
+    once an unstyled body paragraph shaped like "2.3 xxx" is recovered as a heading, every level-1 heading
+    after it would be demoted.
     """
 
-    def __init__(self, title_texts: Iterable[str] = (), *, repeat_limit: int = 3) -> None:
+    def __init__(self, title_texts: Iterable[str] = (), *, repeat_limit: int = 3,
+                 trust_parser_levels: bool = False) -> None:
         counts = Counter(clean_heading_text(t) for t in title_texts if clean_heading_text(t))
         self.labels = {t for t, n in counts.items() if n >= repeat_limit}
+        self.trust_parser_levels = trust_parser_levels
         self.numbered_level: int | None = None
+        self.chapter: int | None = None      # chapter number of the latest numbered heading ("3.1 Definitions" -> 3)
+        self.pending: int | None = None      # the last integer chapter number that did not connect
+
+    def _continues_chapters(self, number: int) -> bool:
+        """An integer chapter number continues from what came before: it follows the previous chapter (one
+        unmarked chapter in between still counts); or it follows the last integer chapter number that did not
+        connect -- the break was earlier, and the sequence picks up again from here; or the document has no
+        numbered heading yet and the numbering starts at 0 / 1."""
+        if self.chapter is not None and self.chapter < number <= self.chapter + CHAPTER_GAP:
+            return True
+        if self.pending is not None and number == self.pending + 1:
+            return True
+        return number <= 1 and self.numbered_level is None
 
     def resolve(self, parser_level: int | None, text: str) -> tuple[int | None, bool]:
         clean = clean_heading_text(text)
@@ -213,9 +241,20 @@ class HeadingResolver:
         level, inferred = resolve_heading_level(parser_level, text)
         if level is None:
             return None, False
-        if infer_heading_level(text) is not None:
+        numbered = infer_heading_level(text) is not None
+        integer = None if numbered or parser_level is None else _INTEGER_RE.match(clean)
+        if integer and not _UNIT_AFTER_NUMBER_RE.fullmatch(integer.group(2)):      # "5 V" is a value
+            numbered = self._continues_chapters(int(integer.group(1)))
+            self.pending = None if numbered else int(integer.group(1))
+        elif numbered:
+            self.pending = None
+        if numbered:
             self.numbered_level = level    # a numbered heading: later unnumbered headings hang under it
-        elif parser_level is not None and self.numbered_level is not None and level <= self.numbered_level:
+            number = _LEADING_NUMBER_RE.match(clean)
+            if number:
+                self.chapter = int(number.group(1))
+        elif (parser_level is not None and not self.trust_parser_levels
+                and self.numbered_level is not None and level <= self.numbered_level):
             level = self.numbered_level + 1
         return level, inferred
 

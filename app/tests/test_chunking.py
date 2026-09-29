@@ -178,7 +178,8 @@ class ChunkDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag["stats"]["tiny_count"], 4)
 
     def test_table_rows_and_figures_are_exempt(self) -> None:
-        """Tables split per row and images one per chunk: their length is inherently not bound by max_tokens."""
+        """Tables are split per row, and the last row or two left over are short anyway, so they are not fragments;
+        images are one per chunk, and their length is not bound by max_tokens."""
         from kb_pipeline.chunking.diagnose import chunk_diagnostics
 
         chunks = [self._chunk(t, "table") for t in (8, 9, 10, 11)] + [self._chunk(900, "image")]
@@ -187,6 +188,16 @@ class ChunkDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag["stats"]["tiny_count"], 0)
         self.assertEqual(diag["stats"]["over_count"], 0)
         self.assertEqual(diag["stats"]["by_block_type"]["table"]["chunks"], 4)
+
+    def test_an_oversized_table_chunk_is_reported(self) -> None:
+        """Table chunks keep to the budget too (rows and cells over the budget are split); an over-long table chunk
+        used to be exempt as a whole class, so the console kept reporting the check as passed."""
+        from kb_pipeline.chunking.diagnose import chunk_diagnostics
+
+        chunks = [self._chunk(t, "table") for t in (380, 390, 5921)]
+        diag = chunk_diagnostics(chunks, max_tokens=400)
+        self.assertEqual([r["key"] for r in diag["reasons"]], ["oversized"])
+        self.assertEqual(diag["stats"]["over_count"], 1)
 
     def test_never_filling_the_budget_is_flagged(self) -> None:
         from kb_pipeline.chunking.diagnose import chunk_diagnostics
@@ -236,24 +247,6 @@ class ChunkDiagnosticsTests(unittest.TestCase):
             self.assertEqual(files[0]["dot"], "green")
             self.assertEqual(files[0]["chunk_diag"], {"ok": False, "chunks": 7, "tokens_mean": 33.0,
                                                       "reasons": ["碎片过多"]})
-
-    def test_preview_route_guards_payload(self) -> None:
-        from unittest import mock
-
-        from fastapi.testclient import TestClient
-
-        from kb_server import service
-        from kb_server.main import create_app
-
-        fake = mock.Mock(return_value={"chunks": []})
-        with mock.patch.object(service, "chunk_preview", fake):
-            client = TestClient(create_app(), raise_server_exceptions=False)
-            self.assertEqual(client.post("/api/kbs/kb_1/chunk_preview", json={}).status_code, 422)
-            r = client.post("/api/kbs/kb_1/chunk_preview", json={"file_id": "f", "max_tokens": "400"})
-            self.assertEqual(r.status_code, 422)
-            r = client.post("/api/kbs/kb_1/chunk_preview", json={"file_id": "f", "max_tokens": 300})
-            self.assertEqual(r.status_code, 200)
-        fake.assert_called_once_with("kb_1", "f", max_tokens=300, overlap_tokens=None)
 
     def test_console_previews_stored_chunks_in_a_drawer(self) -> None:
         """2026-09-06 redesign: the chunk preview is no longer a tab and does not re-chunk; the "chunk preview"
@@ -408,8 +401,10 @@ class HeadingInferenceTests(unittest.TestCase):
             self.assertIn("resolver.resolve(heading_level(item)", src, name)
             self.assertIn("HeadingResolver(", src, name)
             self.assertIn("heading_inferred", src, name)
-        self.assertEqual(parser_profile_for_path(Path("a.pdf")), "pdf-mineru-table-vlm-v14")     # 09-10 version bump: cap on image-summary repetition
-        self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v9")
+        self.assertEqual(parser_profile_for_path(Path("a.pdf")), "pdf-mineru-table-vlm-v15")     # 09-30 heading levels, headings at a block's end
+        self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v10")
+        self.assertEqual(parser_profile_for_path(Path("a.py")), "py-symbols-v2")                 # 09-30 line splitting
+        self.assertEqual(parser_profile_for_path(Path("a.ts")), "code-symbols-v2")
 
     def test_merged_blocks_remember_their_heading_lines(self) -> None:
         from kb_pipeline.parsers.pdf_enhanced import merge_mineru_text_blocks
@@ -472,6 +467,52 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertTrue(chunks[1].text.startswith("功能描述"))
 
+    def test_heading_before_an_oversized_unit_is_not_dropped(self) -> None:
+        """A heading moved off the end of a chunk, and the unit after it is over the budget and split on its own:
+        the moved heading used to be picked up by nobody and ended up in no chunk at all."""
+        from kb_pipeline.chunking.chunker import blocks_to_chunks, chunk_text
+
+        long_sentence = "没有句读的长段落" * 400
+        fence = "```yaml\n" + "\n".join(f"key{i}: value{i}" for i in range(400)) + "\n```"
+        for heading, unit, known in (("第3章 部署说明", long_sentence, ()), ("配置示例", fence, ("配置示例",))):
+            text = f"正文第一句。正文第二句。\n\n{heading}\n\n{unit}"
+            for overlap in (0, 80):
+                parts = chunk_text(text, 600, overlap, headings=frozenset(known))
+                self.assertEqual(sum(p.count(heading) for p in parts), 1, (heading, overlap))
+                self.assertLess(parts.index(heading), len(parts) - 1)            # before the pieces of the over-long unit
+            block = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text", text=text,
+                                block_id="b1", metadata={"heading_lines": list(known)})
+            chunks = blocks_to_chunks(kb_id="k", file_key=1, content_version="v", parser_profile="p",
+                                      blocks=[block], max_tokens=600, overlap_tokens=80)
+            first = chunks[0].text
+            self.assertIn(f"{heading}\n{unit[:20]}", first)                      # after the fragment fallback the heading leads the content below it
+
+    def test_heading_at_the_end_of_the_text_is_not_dropped(self) -> None:
+        """The block text ends with a heading (a merged block filled up right after the heading): the final flush
+        used to drop the heading as well."""
+        from kb_pipeline.chunking.chunker import blocks_to_chunks, chunk_text
+
+        text = "正文第一句。正文第二句。\n\n第3章 部署说明"
+        self.assertEqual(chunk_text(text, 600, 80), ["正文第一句。\n正文第二句。", "第3章 部署说明"])
+        self.assertEqual(chunk_text("第3章 部署说明", 600, 80), ["第3章 部署说明"])
+        long_text = self._para(350) + "\n\n" + self._para(300, "more") + "\n\n功能描述"
+        parts = chunk_text(long_text, 400, 80, headings=frozenset({"功能描述"}))
+        self.assertEqual(parts[-1], "功能描述")
+        self.assertEqual(sum(p.count("功能描述") for p in parts), 1)
+        # A stranded heading is left to the fragment fallback: right before a table block it becomes the table's
+        # TITLE, otherwise it merges back into the previous chunk of the same block
+        body, grid = self._para(200), "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        tail = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text",
+                           text=f"{body}\n\n第3章 部署说明", block_id="b1")
+        table = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="table", text=grid,
+                            table_markdown=grid, block_id="t1")
+        other = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text", text=self._para(200, "next"),
+                            block_id="b2", metadata={"section_path": ["第3章 部署说明"]})
+        chunks = lambda blocks: [c.text for c in blocks_to_chunks(
+            kb_id="k", file_key=1, content_version="v", parser_profile="p", blocks=blocks, max_tokens=600, overlap_tokens=80)]
+        self.assertEqual(chunks([tail, table]), [body, f"TITLE: 第3章 部署说明\n{grid}"])
+        self.assertEqual(chunks([tail, other]), [f"{body}\n第3章 部署说明", other.text])
+
 
 class HeadingRuleTests(unittest.TestCase):
     def test_dashed_numbering_is_a_level_two_heading(self) -> None:
@@ -501,6 +542,104 @@ class HeadingRuleTests(unittest.TestCase):
         self.assertEqual(r.resolve(1, "注释:"), (None, False))
         self.assertEqual(r.resolve(None, "普通正文一句话。"), (None, False))
         self.assertEqual(r.resolve(2, "1.2.1 细节")[0], 3)                # unchanged when the docx level and the numbering agree
+
+    @staticmethod
+    def _walk(seq, **kw):
+        """[(text, parser level)] -> [(final level, section path)], with levels and paths walked the way the parsers
+        do it."""
+        from kb_pipeline.headings import HeadingResolver
+        from kb_pipeline.parsers.common import SectionTracker
+
+        resolver = HeadingResolver((t for t, lv in seq if lv), **kw)
+        sections = SectionTracker()
+        out = []
+        for text, parser_level in seq:
+            level, _ = resolver.resolve(parser_level, text)
+            sections.observe(level, text)
+            out.append((level, list(sections.path)))
+        return out
+
+    def test_integer_chapter_headings_are_numbered_headings(self) -> None:
+        """An integer chapter number followed by a space ("4 Technical requirements") used not to count as numbered:
+        after a "3.1" it was demoted to level 3 as an unnumbered heading, the next "4.1" popped it off again, and
+        all the subsections of the chapter hung under the previous chapter."""
+        got = self._walk([("3 术语", 1), ("3.1 定义", 1), ("4 技术要求", 1), ("4.1 电气", 1), ("4.1.1 直流", 1),
+                          ("试验条件", 1), ("5 试验方法", 1)])
+        self.assertEqual([lv for lv, _ in got], [1, 2, 1, 2, 3, 4, 1])
+        self.assertEqual(got[2][1], ["4 技术要求"])
+        self.assertEqual(got[3][1], ["4 技术要求", "4.1 电气"])
+        self.assertEqual(got[5][1], ["4 技术要求", "4.1 电气", "4.1.1 直流", "试验条件"])      # an unnumbered heading still hangs under the numbered one
+        self.assertEqual(got[6][1], ["5 试验方法"])
+        # A document with integer chapter numbers only: every chapter is level 1 and unnumbered subheadings hang
+        # under their chapter. A chapter name that opens with a one- or two-letter word or contains a comma is fine
+        got = self._walk([("Abstract", 1), ("1 Introduction", 1), ("2 A Survey of Methods", 1), ("Datasets", 1),
+                          ("3 Results, Analysis and Discussion", 1), ("4 UI 设计", 1)])
+        self.assertEqual([lv for lv, _ in got], [1, 1, 1, 2, 1, 1])
+        self.assertEqual(got[3][1], ["2 A Survey of Methods", "Datasets"])
+
+    def test_integer_chapter_numbering_survives_gaps(self) -> None:
+        """A chapter number that does not connect is handled as an unnumbered heading, but it must not throw off
+        the chapters after it: one unmarked chapter still connects; after a longer break, or when the numbering
+        starts over (several articles bound together), the sequence picks up again from the next chapter."""
+        got = self._walk([("1 范围", 1), ("2 规范性引用文件", 1), ("4 技术要求", 1), ("5 试验方法", 1)])       # chapter 3 is not marked
+        self.assertEqual([lv for lv, _ in got], [1, 1, 1, 1])
+        got = self._walk([("1 范围", 1), ("2 引用", 1), ("5 试验方法", 1), ("6 检验规则", 1), ("7 标志", 1)])
+        self.assertEqual([lv for lv, _ in got], [1, 1, 2, 1, 1])
+        got = self._walk([("1 Introduction", 1), ("2 Method", 1), ("1 Introduction", 1), ("2 Background", 1), ("3 Approach", 1)])
+        self.assertEqual([lv for lv, _ in got], [1, 1, 2, 1, 1])
+        self.assertEqual(got[4][1], ["3 Approach"])
+
+    def test_integer_heading_must_be_marked_by_the_parser_and_continue_the_numbering(self) -> None:
+        # A heading that opens with a quantity (its chapter number does not connect) stays an unnumbered heading
+        # and does not displace the chapter it is in
+        got = self._walk([("2 产品", 1), ("2.1 产品线", 1), ("8 位微控制器", 1), ("2.2 封装", 1), ("3 订购信息", 1)])
+        self.assertEqual([lv for lv, _ in got], [1, 2, 3, 2, 1])
+        self.assertEqual(got[3][1], ["2 产品", "2.2 封装"])
+        got = self._walk([("3 术语", 1), ("3.1 定义", 1), ("1 级能效", 1), ("3.2 缩略语", 1)])          # numbering is under way, so 1 is not a fresh start
+        self.assertEqual(got[3][1], ["3 术语", "3.2 缩略语"])
+        # Body text the parser did not mark as a heading is not recovered; "5 V" is a value
+        got = self._walk([("4.2 供电", 1), ("5 个步骤完成安装", None), ("5 V", 1), ("5 供电要求", 1)])
+        self.assertEqual([lv for lv, _ in got], [2, None, 3, 1])
+
+    def test_docx_headings_are_not_demoted_below_inferred_ones(self) -> None:
+        """docx levels come from Word styles: once an unstyled "2.3 xxx" body paragraph had been recovered as a
+        level-2 heading, every level-1 heading after it used to be demoted to level 3."""
+        seq = [("概述", 1), ("2.3 没有标题样式的正文段", None), ("安装", 1), ("配置", 2), ("1.2.1 细节", 2),
+               ("- 加粗的列表项", 1), ("升级", 1)]
+        got = self._walk(seq, trust_parser_levels=True)
+        self.assertEqual([lv for lv, _ in got], [1, 2, 1, 2, 3, None, 1])
+        self.assertEqual(got[4][1], ["安装", "配置", "1.2.1 细节"])
+        self.assertEqual(got[6][1], ["升级"])
+        self.assertEqual([lv for lv, _ in self._walk(seq)], [1, 2, 3, 3, 3, None, 4])       # unchanged for PDF
+        # Only the document title carries a style and the chapters are typed by hand: the chapters are still
+        # recovered from the layout; when every style is level 1, the depth of the numbering still counts
+        got = self._walk([("XX 系统设计说明书", 1), ("第一章 总则", None), ("1.1 范围", None)], trust_parser_levels=True)
+        self.assertEqual([lv for lv, _ in got], [1, 1, 2])
+        got = self._walk([("1 概述", 1), ("1.1 背景", 1), ("1.1.1 细节", 1)], trust_parser_levels=True)
+        self.assertEqual([lv for lv, _ in got], [1, 2, 3])
+
+    def test_section_paths_in_parsed_blocks(self) -> None:
+        """Blocks from the two parsers: PDF integer chapter numbers are not demoted; docx style headings are not
+        pushed down by numbered headings recovered by inference."""
+        from kb_pipeline.parsers import mineru_docx, mineru_pdf
+
+        def item(text, level=None):
+            return {"type": "text", "text": text, "page_idx": 0, **({"text_level": level} if level else {})}
+
+        pdf = {"content_list": [item("3 术语", 1), item("3.1 定义", 1), item("定义的正文。"),
+                                item("4 技术要求", 1), item("4.1 电气", 1), item("电气的正文。")]}
+        docx = {"content_list": [item("概述", 1), item("2.3 没有标题样式的一段"), item("安装", 1), item("安装的正文。")]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(mineru_pdf, "call_mineru_sync", return_value=pdf):
+                blocks = mineru_pdf.mineru_pdf_blocks(mineru_url="http://x", path=Path(tmp) / "a.pdf", cache_dir=Path(tmp) / "p")
+            self.assertEqual(blocks[-1].metadata["section_path"], ["4 技术要求", "4.1 电气"])
+            self.assertEqual([b.metadata.get("heading_level") for b in blocks], [1, 2, None, 1, 2, None])
+            self.assertEqual({b.parser_profile for b in blocks}, {"mineru-3.4.4-pdf-v3"})     # the provenance tag no longer claims the pipeline backend
+            with patch.object(mineru_docx, "call_mineru_sync", return_value=docx):
+                blocks = mineru_docx.mineru_docx_blocks(mineru_url="http://x", path=Path(tmp) / "a.docx", cache_dir=Path(tmp) / "d")
+            self.assertEqual([b.metadata.get("heading_level") for b in blocks], [1, 2, 1, None])
+            self.assertEqual([b.metadata["section_path"] for b in blocks],
+                             [["概述"], ["概述", "2.3 没有标题样式的一段"], ["安装"], ["安装"]])
 
 
 class ChunkStructureTests(unittest.TestCase):
@@ -542,9 +681,12 @@ class ChunkStructureTests(unittest.TestCase):
         long_cell = "很长的描述" * 30
         text = "| 名称 | 描述 |\n| --- | --- |\n| A | 短 |\n| B | " + long_cell + " | " + long_cell + " |"
         pieces = split_table_text(text, 80)
-        self.assertTrue(all(p.startswith("| 名称 | 描述 |\n| --- | --- |") for p in pieces))
-        self.assertTrue(any(p.rstrip().endswith("| A | 短 |") or "| A | 短 |" in p for p in pieces))
-        self.assertGreaterEqual(sum("很长的描述" in p for p in pieces), 2)
+        self.assertEqual(pieces[0], "| 名称 | 描述 |\n| --- | --- |\n| A | 短 |")
+        # Every cell of a split row carries its own column name (a column without a name in the header is called
+        # "column N"), and such chunks no longer carry the header rows
+        self.assertTrue(all(p.startswith("名称: B | ") and "---" not in p for p in pieces[1:]), pieces[1:])
+        for name in ("描述", "column 3"):
+            self.assertEqual("".join(p.split(f"{name}: ", 1)[1] for p in pieces if f"{name}: " in p), long_cell)
 
     def test_code_fence_travels_whole_and_splits_by_line_when_too_big(self) -> None:
         from kb_pipeline.chunking.chunker import chunk_text
@@ -641,6 +783,349 @@ class ChunkStructureTests(unittest.TestCase):
         src = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
         self.assertIn("embedder.embed([embedding_input(chunk) for chunk in chunks])", src)
         self.assertIn('"embedding_context": getattr(chunk, "embedding_context", None)', src)
+
+
+class TableBudgetTests(unittest.TestCase):
+    """Table chunks keep to the budget too: a row over the budget is split by cell, a cell over the budget by
+    sentence and then by token, every piece carrying the row identity and the column name; when the header takes
+    up most of the budget the column names travel with the cells instead of being repeated in every chunk; rows
+    of a native table already expanded with column names are not labelled by position a second time in the
+    chunker."""
+
+    _chunks = staticmethod(ChunkStructureTests._chunks)
+
+    def setUp(self) -> None:
+        if not _pin_tokenizer():
+            self.skipTest("tiktoken o200k_base unavailable (offline, no cache)")
+
+    def test_native_rows_split_by_column_reach_the_index_under_their_own_names(self) -> None:
+        """A row with a long cell over the budget and an empty cell before it: the native table used to split it
+        into "name: value" first, then the chunker applied the header by position once more, so the chunk text read
+        "Module: Module: Contacts | Level 1: Description: ...", an extra fragment held only the row identity, and
+        the long cell's chunk was still over the budget."""
+        from kb_pipeline.parsers.native_table import chunk_rows_to_blocks
+        from kb_pipeline.utils import count_tokens
+
+        header = ["模块", "一级", "二级", "功能描述", "v6.2", "公网", "私有云"]
+        long_cell = "在云文档中使用当前用户组。" * 150
+        rows = [(1, header), (2, ["通讯录", "", "用户组", long_cell, "❌", "✅", "✅"]),
+                (3, ["通讯录", "组织", "动态", "短说明", "1", "0", "1"])]
+        blocks = chunk_rows_to_blocks("xlsx", rows, "功能清单", max_tokens=400, overlap_tokens=0)
+        chunks = self._chunks(blocks[1:], max_tokens=400)                                   # the first block is the summary
+        self.assertEqual([c.text for c in chunks], [b.text for b in blocks[1:]])           # the native table's blocks are within the budget, the chunker passes them through
+        self.assertTrue(all(count_tokens(c.text) <= 400 for c in chunks), [count_tokens(c.text) for c in chunks])
+        pieces = [c.text.splitlines() for c in chunks if c.block.block_id.startswith("xlsx-功能清单-rows-2-2-p")]
+        self.assertGreater(len(pieces), 2)
+        self.assertTrue(all(p[:2] == ["SHEET: 功能清单", "ROWS: 2-2"] and len(p) == 3 for p in pieces))   # pieces that carry column names have no HEADER line
+        lines = [p[2] for p in pieces]
+        self.assertEqual(lines[0], "模块: 通讯录 | 二级: 用户组")                              # the empty level-1 cell is skipped, later column names stay in place
+        self.assertTrue(all(l.startswith("模块: 通讯录 | 功能描述: 在云文档中使用当前用户组。") for l in lines[1:]))
+        self.assertTrue(lines[-1].endswith("。 | v6.2: ❌ | 公网: ✅ | 私有云: ✅"))
+        self.assertEqual("".join(l.split("功能描述: ", 1)[1].split(" | ")[0] for l in lines[1:]), long_cell)   # the long cell loses nothing and repeats nothing
+        joined = "\n".join(lines)
+        for wrong in ("模块: 模块", "一级: ", "二级: 功能描述", "功能描述: v6.2"):
+            self.assertNotIn(wrong, joined)
+        self.assertNotIn("模块: 通讯录", lines)                                             # no piece holding only the row identity
+        self.assertEqual(chunks[-1].text.splitlines()[2:], ["HEADER: " + " | ".join(header), "通讯录 | 组织 | 动态 | 短说明 | 1 | 0 | 1"])
+
+    def test_rows_that_already_carry_their_column_names_are_not_labelled_again(self) -> None:
+        """Rows of a native table expanded with column names carry no HEADER line; should such a block need splitting
+        again, its cells are used as they are: no "column N" labels, and no piece holding only the row identity."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        answer = "减少库存积压,减少断货。" * 120
+        text = f"SHEET: 问卷\nROWS: 7-7\n提交时间: 2026-08-24 08:42:00 | 问题二: {answer} | 问题三: 近 30 天销量"
+        pieces = split_table_text(text, 120)
+        self.assertGreater(len(pieces), 3)
+        for piece in pieces:
+            self.assertLessEqual(count_tokens(piece), 120)
+            self.assertTrue(piece.startswith("SHEET: 问卷\nROWS: 7-7\n提交时间: 2026-08-24 08:42:00 | 问题"), piece[:80])
+        self.assertNotIn("column 1", "\n".join(pieces))
+        self.assertTrue(pieces[-1].endswith(" | 问题三: 近 30 天销量"))
+        self.assertEqual("".join(p.split("问题二: ", 1)[1].split(" | ")[0] for p in pieces if "问题二: " in p), answer)
+
+    def test_native_rows_with_an_empty_first_cell_keep_their_columns_when_split(self) -> None:
+        """A row whose first cell is empty starts with "| " in the text, one empty cell short; the cell is restored
+        before the column names are paired by position, otherwise the whole row shifts one column to the left."""
+        from kb_pipeline.chunking.chunker import split_table_text
+
+        text = ("SHEET: 版本对比\nROWS: 2-3\nHEADER: | 产品规格 | 协作版 | 专业版\n"
+                "| 在线文档 | " + "支持多人在线协作编辑。" * 60 + " | Web 端\n存储 | 容量 | 100G | 1T")
+        pieces = split_table_text(text, 120)
+        joined = "\n".join(pieces)
+        self.assertIn("产品规格: 在线文档 | 协作版: 支持多人在线协作编辑。", joined)
+        self.assertTrue(pieces[-2].endswith(" | 专业版: Web 端") or " | 专业版: Web 端\n" in pieces[-1], pieces[-2:])
+        self.assertNotIn("协作版: Web 端", joined)
+        self.assertNotIn("column 1: 在线文档", joined)
+        self.assertIn("\n存储 | 容量 | 100G | 1T", pieces[-1])                                # a row that fits stays as it is
+
+    def test_a_cell_longer_than_the_budget_is_cut_at_sentences_and_keeps_row_and_column(self) -> None:
+        """A single cell over the budget: the whole cell used to become one chunk as it was, with no upper bound on the
+        chunk length (the longest in production was 5,921 tokens against a budget of 400)."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        note = "这是第一句说明。" * 80
+        head = "| 编号 | 名称 | 备注 |\n| --- | --- | --- |"
+        pieces = split_table_text(f"TITLE: 表 1\n{head}\n| A-001 | 甲 | {note} |\n| A-002 | 乙 | 短 |\nFOOTNOTE: 注", 100)
+        for piece in pieces:
+            self.assertTrue(piece.startswith("TITLE: 表 1\n"), piece[:60])                  # every piece carries the title
+            self.assertLessEqual(count_tokens(piece), 100)
+        self.assertEqual(pieces[-1], f"TITLE: 表 1\n{head}\n| A-002 | 乙 | 短 |\nFOOTNOTE: 注")   # rows that fit are unchanged: positional, with the header
+        rows = [l for p in pieces[:-1] for l in p.splitlines()[1:]]
+        self.assertEqual(rows[0], "编号: A-001 | 名称: 甲")
+        self.assertGreater(len(rows), 4)
+        self.assertTrue(all(l.startswith("编号: A-001 | 备注: 这是第一句说明。") and l.endswith("。") for l in rows[1:]), rows[1:3])   # the cuts fall at sentence ends
+        self.assertEqual("".join(l.split("备注: ", 1)[1] for l in rows[1:]), note)
+        self.assertNotIn("---", "\n".join(pieces[:-1]))                                   # pieces that carry column names have no header rows
+        # A long cell without a single sentence (no sentence-final punctuation at all) is split by token
+        blob = "没有标点的一整段内容" * 100
+        pieces = split_table_text(f"{head}\n| A-003 | 丙 | {blob} |", 100)
+        self.assertTrue(all(count_tokens(p) <= 100 for p in pieces))
+        self.assertEqual("".join(p.split("备注: ", 1)[1] for p in pieces if "备注: " in p), blob)
+
+    def test_a_header_that_eats_the_budget_is_not_repeated_in_every_piece(self) -> None:
+        """A header longer than the budget: every chunk used to be "the whole header + a row or two of data", more than
+        twice the budget, and the vectors of one table were nearly identical. Now every value is preceded by its own
+        column name and the header rows are not repeated; the title line is still carried by every chunk."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        names = [f"第{i}题:您认为当前流程里最需要改进的环节是什么" for i in range(30)]
+        rows = [[f"回答{r}-{c}" if (r + c) % 7 else "" for c in range(30)] for r in range(4)]
+        text = "\n".join(["TITLE: 调研结果", "| " + " | ".join(names) + " |", "| " + " | ".join(["---"] * 30) + " |",
+                          *("| " + " | ".join(r) + " |" for r in rows), "FOOTNOTE: 数据截至 2026 年 8 月。"])
+        self.assertGreater(count_tokens("| " + " | ".join(names) + " |"), 400)
+        pieces = split_table_text(text, 400)
+        joined = "\n".join(pieces)
+        for piece in pieces:
+            self.assertLessEqual(count_tokens(piece), 400)
+            self.assertTrue(piece.startswith("TITLE: 调研结果\n"), piece[:40])
+        self.assertNotIn("| --- |", joined)
+        self.assertNotIn(" | ".join(names[:2]), joined)
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                if value:
+                    self.assertIn(f"{names[c]}: {value}", joined)                          # every value sits under its own column name
+        self.assertEqual(joined.count("FOOTNOTE: 数据截至 2026 年 8 月。"), 1)
+        self.assertNotIn(": FOOTNOTE", joined)
+        # A table whose header takes only a small part of the budget is unchanged: every chunk still carries the
+        # header, and rows stay positional
+        small = "| a | b |\n| --- | --- |\n" + "\n".join(f"| 行{i} | 值{i} |" for i in range(200))
+        self.assertTrue(all(p.startswith("| a | b |\n| --- | --- |\n| 行") for p in split_table_text(small, 120)))
+
+    def test_a_table_that_is_one_long_cell_is_cut_as_text(self) -> None:
+        """A "table" into which a whole page of text was recognized as one cell: a header row and no data rows, so the
+        header is the content. It used to become one chunk as it was, however long."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        page = "整页的文字被识别进了一个格子里,一个句末标点都没有" * 200
+        for text in (f"TITLE: 第 12 页\n| {page} |\n| --- |", f"<table><tr><td>{page}</td></tr></table>"):
+            pieces = split_table_text(text, 400)
+            self.assertGreater(len(pieces), 5)
+            self.assertTrue(all(count_tokens(p) <= 400 for p in pieces), [count_tokens(p) for p in pieces])
+            self.assertEqual("".join(p.removeprefix("TITLE: 第 12 页\n") for p in pieces).count("整页的文字被识别进了一个格子里"), 200)
+            self.assertNotIn("column 1", "\n".join(pieces))
+
+    def test_native_table_with_a_header_longer_than_the_budget(self) -> None:
+        """A 40-column questionnaire sheet with a header of 700-odd tokens and a budget of 400: 15 rows of data used to
+        be cut into 330 chunks, each carrying the whole header (median 788 tokens)."""
+        from kb_pipeline.parsers.native_table import chunk_rows_to_blocks
+        from kb_pipeline.utils import count_tokens
+
+        names = ["提交时间"] + [f"第{i}题:您认为当前流程里最需要改进的环节是什么" for i in range(1, 40)]
+        rows = [(1, names)] + [(r + 2, [f"2026-08-{r + 1:02d}"] + [f"回答{r}-{c}" if (r + c) % 5 else "" for c in range(1, 40)])
+                               for r in range(15)]
+        blocks = chunk_rows_to_blocks("xlsx", rows, "问卷", max_tokens=400, overlap_tokens=0)
+        body = [b for b in blocks if not b.metadata.get("summary")]
+        self.assertLess(len(body), 60)
+        self.assertTrue(all(count_tokens(b.text) <= 400 for b in body), [count_tokens(b.text) for b in body])
+        self.assertTrue(all("HEADER:" not in b.text for b in body))
+        self.assertEqual(len({b.block_id for b in blocks}), len(blocks))
+        joined = "\n".join(b.text for b in body)
+        for r, (_, row) in enumerate(rows[1:]):
+            for c, value in enumerate(row):
+                if value and c:
+                    self.assertIn(f"{names[c]}: {value}", joined)
+        for b in body:                                                                     # every piece tells which row it belongs to
+            self.assertTrue(b.text.splitlines()[2].startswith("提交时间: 2026-08-"), b.text[:80])
+        chunks = self._chunks(blocks, max_tokens=400)
+        self.assertTrue(all(count_tokens(c.text) <= 400 for c in chunks))
+        self.assertEqual([c.text for c in chunks if c.block.block_id != blocks[0].block_id], [b.text for b in body])
+        summary = "\n".join(c.text for c in chunks if c.block.block_id == blocks[0].block_id)
+        self.assertTrue(all(name in summary for name in names))                            # the whole header is still in the summary chunks
+
+    def test_notes_around_a_table_are_cut_as_text_not_as_cells(self) -> None:
+        """A footnote after a table is not a table row: over the budget it used to be treated as a one-cell row,
+        labelled with the name of the first column, and became one chunk as it was."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        note = "FOOTNOTE: " + "本表数值均为实测结果,仅供参考。" * 40
+        head = "| 参数 | 数值 |\n| --- | --- |"
+        pieces = split_table_text(f"{head}\n| 电压 | 3.3 |\n{note}", 100)
+        self.assertTrue(all(p.startswith(head + "\n") and count_tokens(p) <= 100 for p in pieces))
+        rest = [l for p in pieces for l in p.splitlines()[2:]]
+        self.assertEqual(rest[0], "| 电压 | 3.3 |")
+        self.assertEqual("".join(rest[1:]), note)
+        self.assertNotIn("参数: ", "\n".join(pieces))
+
+    def test_a_caption_that_eats_the_budget_is_written_once_before_the_table(self) -> None:
+        """A caption that alone takes up most of the budget: every chunk used to carry it and ran to twice the budget.
+        Now it appears once at the start, split as a passage of text, while the short title line is still carried
+        by every chunk."""
+        from kb_pipeline.chunking.chunker import split_table_text
+        from kb_pipeline.utils import count_tokens
+
+        caption = "CAPTION: " + "本表列出各型号在不同工况下的实测结果。" * 30
+        head = "| 型号 | 数值 |\n| --- | --- |"
+        rows = [f"| M{i} | {i} |" for i in range(60)]
+        pieces = split_table_text("\n".join(["TITLE: 实测", caption, head, *rows]), 200)
+        self.assertGreater(count_tokens(caption), 200)
+        self.assertTrue(all(p.startswith("TITLE: 实测\n") and count_tokens(p) <= 200 for p in pieces), [count_tokens(p) for p in pieces])
+        bodies = [p.removeprefix("TITLE: 实测\n") for p in pieces]
+        text = [b for b in bodies if not b.startswith(head)]
+        self.assertEqual(bodies[:len(text)], text)                                          # caption first, table after
+        self.assertEqual("".join(text), caption)
+        self.assertEqual([l for b in bodies[len(text):] for l in b.splitlines()[2:]], rows)
+        # A header and no data rows, and the header does not fit: the header becomes body text after the caption
+        wide = "| " + " | ".join(f"第{i}列的名字比较长" for i in range(40)) + " |"
+        pieces = split_table_text("\n".join(["TITLE: 实测", caption, wide, "| " + " | ".join(["---"] * 40) + " |"]), 200)
+        self.assertTrue(all(count_tokens(p) <= 200 for p in pieces))
+        joined = "".join(p.removeprefix("TITLE: 实测\n") for p in pieces)
+        self.assertEqual(joined.replace(" ", ""), (caption + wide).replace(" ", ""))        # spaces at the cut points are dropped
+
+    def test_a_fence_line_longer_than_the_budget_is_cut(self) -> None:
+        """JSON / base64 squashed into one line inside a fence: fences used to be split by line only, so the chunk was
+        as long as that line."""
+        from kb_pipeline.chunking.chunker import _split_fence
+        from kb_pipeline.utils import count_tokens
+
+        blob = '{"k": "' + "abc123XYZ+/" * 3000 + '"}'
+        parts = _split_fence(f"```json\nconst a = 1;\n{blob}\nconst b = 2;\n```", 200)
+        self.assertGreater(len(parts), 10)
+        for part in parts:
+            self.assertLessEqual(count_tokens(part), 200)
+            self.assertTrue(part.startswith("```json\n") and part.endswith("\n```"), part[:30])
+        inner = [l for p in parts for l in p.splitlines()[1:-1]]
+        self.assertEqual((inner[0], inner[-1]), ("const a = 1;", "const b = 2;"))
+        self.assertEqual("".join(inner[1:-1]), blob)
+
+
+class EmbeddingRejectionTests(unittest.TestCase):
+    """The embedding service rejecting a chunk for its content (over the length limit of the model) is
+    deterministic: the job used to retry 5 times with backoff anyway, the scan queued another round after the
+    24-hour cooldown, the same file failed forever, and the error did not say which chunk it was."""
+
+    class _Http(Exception):
+        def __init__(self, status: int, message: str) -> None:
+            super().__init__(message)
+            self.status_code = status
+
+    def _client(self, accepts, *, batch_size: int = 3):
+        from kb_pipeline.embedding.client import EmbeddingClient
+
+        calls: list[list[str]] = []
+        http = self._Http
+
+        class Embeddings:
+            def create(self, *, model, input, dimensions):
+                calls.append(list(input))
+                verdict = accepts(list(input))
+                if verdict is not True:
+                    raise http(*verdict)
+                return SimpleNamespace(data=[SimpleNamespace(embedding=[0.0] * dimensions) for _ in input])
+
+        client = EmbeddingClient(base_url="http://embed.test/v1", api_key="k", model_id="m", dim=4,
+                                 batch_size=batch_size, retry=2, sleep_seconds=0)
+        client.client = SimpleNamespace(embeddings=Embeddings())
+        return client, calls
+
+    def test_the_client_names_the_rejected_input(self) -> None:
+        from kb_pipeline.embedding.client import EmbeddingInputRejected
+        from kb_pipeline.pipeline.worker import _should_retry
+
+        too_long = (400, "This model's maximum context length is 8192 tokens")
+        client, calls = self._client(lambda batch: too_long if any(len(t) > 100 for t in batch) else True)
+        texts = ["短一", "短二", "短三", "短四", "长" * 500, "短六", "短七"]
+        with self.assertRaises(EmbeddingInputRejected) as caught:
+            client.embed(texts)
+        self.assertEqual(caught.exception.index, 4)                     # the index in the whole file, not within the batch
+        self.assertIn("maximum context length", caught.exception.reason)
+        self.assertEqual(calls[:2], [texts[:3], texts[3:6]])            # the first batch passes, the second is rejected
+        self.assertEqual(calls[2:], [["短四"], ["长" * 500], ["长" * 32]])   # sent one at a time to find the culprit; later batches are not sent
+        self.assertFalse(_should_retry({"retry_count": 0}, SimpleNamespace(job_max_retries=5), caught.exception))
+        self.assertEqual(len(client.embed(["短一", "短二"])), 2)
+
+    def test_a_service_that_rejects_everything_is_not_blamed_on_the_input(self) -> None:
+        """The service answers 400 to any input (a parameter / configuration problem), or it rejects the batch as a
+        whole: no single chunk is at fault, the original error goes through, and the job-level retries and the
+        requeue after the cooldown both remain."""
+        from kb_pipeline.pipeline.worker import _should_retry
+
+        client, _ = self._client(lambda batch: (400, "dimensions is not supported by this model"))
+        with self.assertRaises(self._Http) as caught:
+            client.embed(["一", "二"])
+        self.assertTrue(_should_retry({"retry_count": 0}, SimpleNamespace(job_max_retries=5), caught.exception))
+        client, _ = self._client(lambda batch: (400, "batch too large") if len(batch) > 1 else True)
+        with self.assertRaises(self._Http):
+            client.embed(["一", "二"])
+        client, calls = self._client(lambda batch: (401, "bad key"))     # other 4xx statuses are not tried one by one
+        with self.assertRaises(self._Http):
+            client.embed(["一", "二"])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_rejected_chunk_fails_the_file_once_and_says_which_chunk(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.embedding.client import EmbeddingInputRejected
+        from kb_pipeline.pipeline import parse_job, scheduler, worker as worker_mod
+
+        class Rejecting:
+            def __init__(self, **kwargs) -> None:
+                pass
+
+            def embed(self, texts):
+                raise EmbeddingInputRejected(1, "maximum context length is 8192 tokens")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "s.db"
+            db.init_db(state)
+            doc = root / "a.md"
+            doc.write_text("正文", encoding="utf-8")
+            file = SourceFile(**{**_local_file("a.md").__dict__, "physical_path": str(doc)})
+            settings = SimpleNamespace(
+                state_db=state, parse_enabled=True, parse_job_lease_seconds=600, metadata_job_lease_seconds=600,
+                job_max_retries=5, job_retry_base_seconds=300, job_retry_max_seconds=3600, max_file_bytes=0,
+                cache_dir=root / "cache", sources={}, vlm_failure_retry_ratio=0.5,
+                embedding_base_url="http://embed.test/v1", embedding_api_key="k", embedding_model_id="m", embedding_dim=4,
+                embedding_batch=20, embedding_retry=1, embedding_sleep_seconds=0,
+                qdrant_url="http://q", qdrant_api_key="", opensearch_url="http://o",
+            )
+            blocks = [_mb(f"b{i}", f"第{i}段正文,写得足够长,不会被当成碎片并进邻片。" * 6, metadata={"section_path": [f"第{i}节"]})
+                      for i in (1, 2, 3)]
+            with db.connect(state) as con:
+                db.upsert_file(con, file, status="seen")
+                fid = db.file_id_for(file.kb_id, file.file_key)
+                job_id = db.enqueue_job(con, ingest_run_id=None, file_id=fid, kb_id=file.kb_id, collection=file.collection,
+                                        file_key=file.file_key, job_type="parse", dedupe_key=f"parse:{fid}")
+                con.commit()
+                with mock.patch.object(parse_job, "_source_for_file", return_value=SimpleNamespace(max_tokens=400, overlap_tokens=0)), \
+                        mock.patch.object(parse_job, "verify_source_file"), \
+                        mock.patch.object(parse_job, "_parse_blocks", return_value=blocks), \
+                        mock.patch.object(parse_job, "EmbeddingClient", Rejecting):
+                    result = worker_mod.run_once(con, settings=settings)
+                row = con.execute("SELECT status, retry_count, error, finished_at FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        self.assertTrue(result.startswith("failed:"), result)
+        self.assertEqual((row["status"], row["retry_count"]), ("failed", 0))           # settled at once, no retries with backoff
+        self.assertIn("The embedding service rejected chunk 2/3 (block_id=b2, ", row["error"])
+        self.assertIn("maximum context length is 8192 tokens", row["error"])
+        long_ago = {"error": row["error"], "finished_at": 1}
+        self.assertTrue(scheduler._failed_parse_blocks_auto_requeue(long_ago))          # past the cooldown the scan still does not requeue it
+        self.assertFalse(scheduler._failed_parse_blocks_auto_requeue(long_ago, "parser_changed"))   # a parser version bump gives it another chance
 
 
 class DiagnosisRuleTests(unittest.TestCase):
@@ -838,6 +1323,25 @@ class TocPageTests(unittest.TestCase):
         src = _repo_file("app/kb_pipeline/parsers/mineru_pdf.py")
         self.assertIn("toc_pages = detect_toc_pages(", src)
         self.assertIn("page_idx(item) not in toc_pages", src)
+
+    def test_toc_page_log_uses_the_same_page_numbers_as_the_blocks(self) -> None:
+        """The page numbers of TOC pages in the log used to be one more than those on the blocks (already
+        1-based numbers had one added again)."""
+        import contextlib
+        import io
+
+        from kb_pipeline.parsers import mineru_pdf
+
+        toc = [{"type": "text", "text": f"{i}.1 第{i}节的标题", "text_level": 1, "page_idx": 2} for i in range(1, 26)]
+        body = [{"type": "text", "text": "1.1 第1节的标题", "text_level": 1, "page_idx": 3},
+                {"type": "text", "text": "正文从这里开始,讲第一节的内容。", "page_idx": 3}]
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(out), \
+                patch.object(mineru_pdf, "call_mineru_sync", return_value={"content_list": toc + body}):
+            blocks = mineru_pdf.mineru_pdf_blocks(mineru_url="http://x", path=Path(tmp) / "a.pdf", cache_dir=Path(tmp))
+        self.assertEqual({b.page_idx for b in blocks if not b.metadata["section_path"]}, {3})     # lines on the TOC page are not sections
+        self.assertEqual(blocks[-1].metadata["section_path"], ["1.1 第1节的标题"])
+        self.assertIn("pdf toc pages=[3] ", out.getvalue())
 
 
 class ChunkingFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCase):

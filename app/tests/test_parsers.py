@@ -3,6 +3,7 @@ captions / code files."""
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,23 @@ class ParserRegressionTests(unittest.TestCase):
             empty_pdf.write_bytes(b"")
             self.assertTrue(_is_intentionally_empty(empty_text))
             self.assertFalse(_is_intentionally_empty(empty_pdf))
+
+    def test_empty_files_of_every_text_suffix_are_valid(self) -> None:
+        """.mjs / .cjs / .lua / .cxx / .hh are supported by scan and parse, yet they were missing from the table of
+        suffixes whose files may legitimately be empty: an empty placeholder file was recorded as a parse failure,
+        while an equally empty .js finished normally."""
+        from kb_pipeline.localfs.scanner import SUPPORTED_EXTS
+        from kb_pipeline.parsers.router import parse_native
+        from kb_pipeline.vision.images import IMAGE_SUFFIXES
+
+        binary = {".pdf", ".pptx", ".docx", ".xlsx", ".xls", *IMAGE_SUFFIXES}
+        with tempfile.TemporaryDirectory() as tmp:
+            for suffix in sorted(SUPPORTED_EXTS - binary - {".html"}):          # an empty .html parses into a block holding only the title
+                path = Path(tmp) / f"empty{suffix}"
+                path.write_text("\n", encoding="utf-8")
+                self.assertTrue(_is_intentionally_empty(path), suffix)
+            for suffix in (".mjs", ".lua", ".hh"):
+                self.assertEqual(parse_native(Path(tmp) / f"empty{suffix}"), [], suffix)
 
     def test_nested_special_html_block_is_not_duplicated(self) -> None:
         html_text = """
@@ -135,6 +153,35 @@ class ParseCacheTests(unittest.TestCase):
         self.assertFalse(third["vlm_cache_hit"])
         self.assertEqual(len(calls), 2)
 
+    def test_mineru_request_defaults_to_the_engine_this_image_ships(self) -> None:
+        """Without MINERU_BACKEND the request carries the backend the parser container published (a backend the
+        parser cannot serve is rejected with 409); an explicit setting takes effect as usual."""
+        from kb_pipeline.parsers import service_clients
+
+        sent: list[dict] = []
+
+        class FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, url, *, files, data, timeout):
+                sent.append(dict(data))
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"md_content": "# 标题"})
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(service_clients, "_local_service_session", FakeSession), \
+                patch.dict(os.environ, {"MINERU_REUSE_CACHE": "0", "MINERU_INFO_FILE": str(Path(tmp) / "carrel-mineru.json")}):
+            (Path(tmp) / "carrel-mineru.json").write_text(json.dumps({"backend": "vlm-engine"}), encoding="utf-8")
+            source = Path(tmp) / "a.pdf"
+            source.write_bytes(b"%PDF-1.4")
+            os.environ.pop("MINERU_BACKEND", None)
+            service_clients.call_mineru_sync("http://127.0.0.1:8765", source, Path(tmp) / "o.json", Path(tmp) / "o.md")
+            os.environ["MINERU_BACKEND"] = "pipeline"
+            service_clients.call_mineru_sync("http://127.0.0.1:8765", source, Path(tmp) / "o.json", Path(tmp) / "o.md")
+        self.assertEqual([d["backend"] for d in sent], ["vlm-engine", "pipeline"])
+
 
 class MarkdownRoutingTests(unittest.TestCase):
     def test_markdown_splits_on_headings_and_carries_section_path(self) -> None:
@@ -158,7 +205,7 @@ class MarkdownRoutingTests(unittest.TestCase):
             p.write_text("# A\n\nx\n\n## B\n\ny\n", encoding="utf-8")
             blocks = parse_native(p)
         self.assertEqual(len(blocks), 2)
-        self.assertEqual(blocks[0].parser_profile, "md-sections-v2")
+        self.assertEqual(blocks[0].parser_profile, "md-sections-v3")
         self.assertEqual(blocks[1].metadata["section_path"], ["A", "B"])
 
 
@@ -226,11 +273,16 @@ class TableHeaderTests(unittest.TestCase):
         rows = self._rows(header, *[[f"值{i}" for i in range(20)] for _ in range(30)], ["长", long_cell])
         blocks = chunk_rows_to_blocks("xlsx", rows, "sheet", max_tokens=200, overlap_tokens=0)
         body = [b for b in blocks if not b.metadata.get("summary")]
-        self.assertTrue(all("HEADER:" in b.text for b in body))
-        # the block text (prefix included) respects max_tokens except where a
-        # single cell alone exceeds it; such rows are split at cell boundaries
-        normal = [b for b in body if "这是一个非常长" not in b.text]
-        self.assertTrue(all(count_tokens(b.text) <= 200 for b in normal), [count_tokens(b.text) for b in normal])
+        pieces = [b for b in body if "这是一个非常长" in b.text]
+        self.assertTrue(all("HEADER:" in b.text for b in body if b not in pieces))
+        # the block text (prefix included) respects max_tokens; a row that alone
+        # exceeds it is split at cell boundaries, an over-long cell by sentence
+        self.assertTrue(all(count_tokens(b.text) <= 200 for b in body), [count_tokens(b.text) for b in body])
+        # every split piece already carries the column names and the row identity, not the whole header
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(b.text.splitlines()[2].startswith("列0: 长 | 列1: 这是一个非常长的功能描述单元格。") for b in pieces))
+        self.assertTrue(all("HEADER:" not in b.text for b in pieces))
+        self.assertEqual("".join(b.text.splitlines()[2].split("列1: ", 1)[1] for b in pieces), long_cell)   # nothing lost, nothing repeated
 
 
 class ImageNormalizationTests(unittest.TestCase):
@@ -397,6 +449,45 @@ class ImageFileParserTests(unittest.TestCase):
                 image_file.parse_image_file(path=bad, cache_dir=Path(tmp) / "c", vlm_base_url="u",
                                             vlm_api_key="k", vlm_model_id="m", vlm_concurrency=1)
 
+    def test_failures_that_a_retry_cannot_fix_do_not_retry(self) -> None:
+        """A broken image, a strip the model cannot take: these used to raise a plain exception, were retried 5
+        times with backoff, and once the cooldown was over the scan queued them again. A failed model call or a
+        missing API key remain retryable."""
+        from PIL import Image
+
+        from kb_pipeline.parsers import image_file
+        from kb_pipeline.pipeline.worker import _should_retry
+
+        settings = SimpleNamespace(job_max_retries=5)
+        job = {"retry_count": 0}
+
+        def failure(path, api_key="k"):
+            with self.assertRaises(RuntimeError) as caught:
+                image_file.parse_image_file(path=path, cache_dir=path.parent / "cache", vlm_base_url="u",
+                                            vlm_api_key=api_key, vlm_model_id="m", vlm_concurrency=1)
+            return _should_retry(job, settings, caught.exception), str(caught.exception)
+
+        def failing_enrich(blocks, **kwargs):
+            for b in blocks:
+                b.metadata.update({"vlm_status": "failed", "vlm_error": "boom"})
+            return blocks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.jpg"; bad.write_bytes(b"not an image")
+            strip = Path(tmp) / "divider.png"; Image.new("RGB", (3000, 20)).save(strip)
+            good = Path(tmp) / "fig.png"; Image.new("RGB", (64, 48)).save(good)
+            self.assertEqual(failure(bad)[0], False)
+            retry, message = failure(strip)
+            self.assertEqual((retry, message), (False, "VLM caption skipped for image file divider.png: degenerate_aspect"))
+            self.assertEqual(failure(good, api_key=""), (True, "VLM caption skipped for image file fig.png: missing_api_key"))
+            with patch.object(image_file, "enrich_blocks_with_vlm", failing_enrich):
+                self.assertEqual(failure(good)[0], True)
+            # A file that cannot be opened is an environment problem (permissions, disk), not a broken image: retried as usual
+            with patch.object(Path, "open", side_effect=PermissionError("permission denied")), self.assertRaises(PermissionError) as caught:
+                image_file.parse_image_file(path=good, cache_dir=Path(tmp) / "cache", vlm_base_url="u",
+                                            vlm_api_key="k", vlm_model_id="m", vlm_concurrency=1)
+            self.assertTrue(_should_retry(job, settings, caught.exception))
+
 
 class VisualChunkSelectionTests(unittest.TestCase):
     def test_first_chunk_of_each_vlm_seen_picture_is_selected(self) -> None:
@@ -485,6 +576,17 @@ class VisualChunkSelectionTests(unittest.TestCase):
             visual_blocks.enrich_blocks_with_vlm([c], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp), filter_decorative=False)
             self.assertEqual(c.metadata["vlm_status"], "skipped")
             self.assertNotIn("decorative", c.metadata)                              # standalone image file: caption skipped only, not folded away
+
+    def test_decorative_filter_before_the_vlm(self) -> None:
+        """Before the model is called only size and file name decide; logos / watermarks have no reliable feature
+        up front (cropped images are named by content hash), so the model judges them."""
+        from kb_pipeline.vision.filter import conservative_decorative_filter as decide
+
+        self.assertEqual(decide(width=79, height=79, object_name="ab12.jpg").decorative_reason, "tiny_icon")
+        self.assertFalse(decide(width=79, height=80, object_name="ab12.jpg").decorative_skip)
+        self.assertEqual(decide(width=800, height=600, object_name="page-background.png").decorative_reason, "decorative_name")
+        self.assertFalse(decide(width=800, height=600, object_name="company-logo.png").decorative_skip)
+        self.assertFalse(decide(width=None, height=None).decorative_skip)
 
     def test_vlm_title_appears_once_as_caption(self) -> None:
         from kb_pipeline.chunking.chunker import text_for_block
@@ -665,6 +767,49 @@ class ShortBufferFoldTests(unittest.TestCase):
         self.assertEqual([b.block_id for b in merged[:2]],
                          ["mineru-merged-text-00001", "mineru-merged-text-00002"])
 
+    def test_a_title_at_the_break_goes_with_the_text_below_it(self) -> None:
+        """When the buffer is cut because it is full, the titles at its tail are left to the next buffer. They used
+        to go out with the previous block: the title landed at the end of the previous section's block and then
+        vanished from every chunk during chunking (in production 42 of 116 PDFs, 326 lines)."""
+        from kb_pipeline.chunking.chunker import blocks_to_chunks
+
+        def section(name):
+            return {"section_path": [name]}
+
+        merged = self._run([
+            _mb("a", _text_of_tokens(700), metadata=section("第1章 概述")),
+            _mb("h", "第2章 部署说明", block_type="title", metadata=section("第2章 部署说明")),
+            _mb("b", _text_of_tokens(300), metadata=section("第2章 部署说明")),     # 700 + title + 300 overflows: cut before the title
+            _mb("h2", "2.1 环境", block_type="title", metadata=section("2.1 环境")),
+        ])
+        self.assertEqual([b.metadata["source_block_ids"] for b in merged], [["a"], ["h", "b", "h2"]])
+        self.assertEqual(merged[0].metadata["heading_lines"], [])
+        self.assertTrue(merged[1].text.startswith("第2章 部署说明\n\n书"))
+        self.assertEqual(merged[1].metadata["section_path"], ["第2章 部署说明"])
+        chunks = blocks_to_chunks(kb_id="k", file_key=1, content_version="v", parser_profile="p", blocks=merged,
+                                  max_tokens=400, overlap_tokens=0)
+        texts = [c.text for c in chunks]
+        self.assertTrue(any(t.startswith("第2章 部署说明\n书") for t in texts), [t[:20] for t in texts])
+        self.assertEqual(sum(t.count("2.1 环境") for t in texts), 1)               # the title at the end has no next block to go to, and is not lost either
+        # The title exactly fills the buffer: it is left to the next block as well
+        from kb_pipeline.utils import count_tokens
+
+        merged = self._run([_mb("a", _text_of_tokens(800 - count_tokens("第2章 部署说明"))),
+                            _mb("h", "第2章 部署说明", block_type="title"), _mb("b", _text_of_tokens(300))])
+        self.assertEqual([b.metadata["source_block_ids"] for b in merged], [["a"], ["h", "b"]])
+        # A table follows the title: the title still becomes the table's TITLE and is not carried forward
+        merged = self._run([_mb("a", _text_of_tokens(798)), _mb("h", "第2章 部署说明", block_type="title"),
+                            _mb("tbl", "| a | b |", block_type="table")])
+        self.assertEqual([(b.block_id, b.title) for b in merged], [("mineru-merged-text-00001", None), ("tbl", "第2章 部署说明")])
+        # A long run of titles (an outline, an index page marked as titles throughout): at most 3 are left to the
+        # next block, and the buffer is still emitted by size
+        outline = [_mb(f"h{i}", f"{i} 条目{i}", block_type="title") for i in range(1000)] + [_mb("p", _text_of_tokens(300))]
+        merged = self._run(outline)
+        self.assertGreater(len(merged), 5)
+        self.assertLess(max(count_tokens(b.text) for b in merged), 1200)        # the blank lines between blocks cost tokens too, so a little over 800
+        self.assertEqual([i for b in merged for i in b.metadata["source_block_ids"]], [b.block_id for b in outline])
+        self.assertEqual(merged[-1].metadata["source_block_ids"][-2:], ["h999", "p"])
+
 
 class DocxMergeTests(unittest.TestCase):
     """docx used to have no merge step at all.
@@ -734,6 +879,184 @@ class DocxMergeTests(unittest.TestCase):
         call = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
         docx_call = call.split("return parse_docx_enhanced(", 1)[1].split(")", 1)[0]
         self.assertIn("merge_target_tokens=source.block_merge_tokens", docx_call)
+
+
+class OfficeRepeatedContentTests(unittest.TestCase):
+    """docx / pptx used to de-duplicate by "type + first 160 characters". In most docx files the page number is
+    the same value throughout, so the de-duplication covered the whole document, and paragraphs, tables and
+    pictures in later sections identical to earlier ones were silently dropped (three FAQ questions each had a
+    "Solution" line, and after indexing only the first question kept it); pptx kept only one of the short
+    labels repeated on a slide. What the original repeats is content, and is not de-duplicated."""
+
+    def test_docx_keeps_paragraphs_tables_and_pictures_that_repeat(self) -> None:
+        import base64
+        from unittest import mock
+
+        from kb_pipeline.parsers import mineru_docx
+
+        table = "<table><tr><td>参数</td><td>取值</td></tr><tr><td>仓库</td><td>GitHub</td></tr></table>"
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+        content = []
+        for n in (1, 2, 3):
+            content += [
+                {"type": "text", "text": f"问题 {n}", "text_level": 1, "page_idx": 0},
+                {"type": "text", "text": f"问题描述:第 {n} 种现象。", "page_idx": 0},
+                {"type": "text", "text": "解决方案:重启服务后重新登录。", "page_idx": 0},
+                {"type": "table", "table_body": table, "page_idx": 0},
+                {"type": "image", "img_path": "images/flow.png", "page_idx": 0},
+            ]
+        payload = {"content_list": content, "images": {"images/flow.png": png}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(mineru_docx, "call_mineru_sync", return_value=payload):
+            blocks = mineru_docx.mineru_docx_blocks(mineru_url="http://x", path=Path(tmp) / "faq.docx", cache_dir=Path(tmp))
+        self.assertEqual(len(blocks), 15)
+        self.assertEqual(len({b.block_id for b in blocks}), 15)
+        for kind, section in (("text", "问题 2"), ("table", "问题 3"), ("image", "问题 3")):
+            self.assertTrue([b for b in blocks if b.block_type == kind and b.metadata["section_path"] == [section]
+                             and (kind != "text" or b.text == "解决方案:重启服务后重新登录。")], (kind, section))
+        self.assertEqual(sum(b.text == "解决方案:重启服务后重新登录。" for b in blocks), 3)
+        self.assertEqual(len({b.visual_ref for b in blocks if b.block_type == "image"}), 1)      # the same picture, referenced in three places
+
+    def test_pptx_keeps_short_labels_that_repeat_on_a_slide(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.parsers import mineru_pptx
+
+        content = [{"type": "text", "text": "功能对比", "page_idx": 0}]
+        for name in ("单点登录", "审计日志", "离线包", "国密算法"):
+            content += [{"type": "text", "text": name, "page_idx": 0}, {"type": "text", "text": "支持", "page_idx": 0}]
+        content += [{"type": "text", "text": "功能对比", "page_idx": 1}, {"type": "text", "text": "支持", "page_idx": 1}]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(mineru_pptx, "call_mineru_sync", return_value={"content_list": content}):
+            blocks = mineru_pptx.mineru_pptx_blocks(mineru_url="http://x", path=Path(tmp) / "deck.pptx", cache_dir=Path(tmp))
+            slides = mineru_pptx.aggregate_mineru_slide_blocks(blocks, Path(tmp) / "deck.pptx")
+        self.assertEqual([b.text for b in blocks if b.slide_idx == 1],
+                         ["功能对比", "单点登录", "支持", "审计日志", "支持", "离线包", "支持", "国密算法", "支持"])
+        self.assertEqual(slides[0].text.count("支持"), 4)                                        # the label under every card is kept
+        self.assertEqual(len({b.block_id for b in blocks}), len(blocks))
+        self.assertEqual(parser_profile_for_path(Path("a.pptx")), "pptx-mineru-slide-vlm-v4")
+
+
+class DocxChartTests(unittest.TestCase):
+    """The text of a native docx chart used to be every value in the XML collected together and de-duplicated by
+    value: repeated data points were deleted, every later value shifted, and formula references were written
+    into the body as well; chart blocks were always appended at the end of the document, without a section."""
+
+    NS = ('xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+          'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"')
+
+    @staticmethod
+    def _cache(kind: str, values, number_format: str = "General") -> str:
+        pts = "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in enumerate(values) if v is not None)
+        code = f"<c:formatCode>{number_format}</c:formatCode>" if kind == "num" else ""
+        return (f"<c:{kind}Ref><c:f>Sheet1!$B$2:$B$5</c:f><c:{kind}Cache>{code}"
+                f'<c:ptCount val="{len(values)}"/>{pts}</c:{kind}Cache></c:{kind}Ref>')
+
+    def _series(self, name: str, cats, vals, number_format: str = "General") -> str:
+        return (f"<c:ser><c:tx>{self._cache('str', [name])}</c:tx><c:cat>{self._cache('str', cats)}</c:cat>"
+                f"<c:val>{self._cache('num', vals, number_format)}</c:val></c:ser>")
+
+    def _chart(self, title: str, *series: str) -> bytes:
+        return (f"<c:chartSpace {self.NS}><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title>"
+                f"<c:plotArea><c:barChart>{''.join(series)}</c:barChart>"
+                "<c:catAx><c:title><c:tx><c:rich><a:p><a:r><a:t>季度</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>"
+                "</c:plotArea></c:chart></c:chartSpace>").encode("utf-8")
+
+    def test_every_point_keeps_its_series_and_category(self) -> None:
+        from kb_pipeline.parsers.docx_enhanced import chart_xml_table
+
+        quarters = ["Q1", "Q2", "Q3", "Q4"]
+        title, axes, table = chart_xml_table(self._chart(
+            "销售额", self._series("2023", quarters, [10, 20, 10, 30]), self._series("2024", quarters, [10, None, 0.1 + 0.2, 30]),
+            self._series("完成率", quarters, [0.06, 0.916666666666667, 1, 0.5], "0%")))
+        self.assertEqual((title, axes), ("销售额", ["季度"]))
+        self.assertEqual(table.splitlines(), [
+            "| Series | Category | Value |", "| --- | --- | --- |",
+            "| 2023 | Q1 | 10 |", "| 2023 | Q2 | 20 |", "| 2023 | Q3 | 10 |", "| 2023 | Q4 | 30 |",     # the 10 of Q3 is still there
+            "| 2024 | Q1 | 10 |", "| 2024 | Q2 |  |", "| 2024 | Q3 | 0.3 |", "| 2024 | Q4 | 30 |",       # values equal to the previous series are kept; an empty point keeps its place
+            "| 完成率 | Q1 | 6% |", "| 完成率 | Q2 | 92% |", "| 完成率 | Q3 | 100% |", "| 完成率 | Q4 | 50% |",
+        ])
+        self.assertNotIn("Sheet1!", table)                                                       # formula references are not content
+        # Multi-level categories (the inner level first in the file) are joined from the outer to the inner level,
+        # an outer label written only on the first point of its group and carried forward; a date axis caches
+        # serial numbers. However large the indexes, only the points that exist count
+        far = 3_000_000_000
+        levels = ("<c:multiLvlStrRef><c:f>Sheet1!$A$2:$B$5</c:f><c:multiLvlStrCache>"
+                  + "<c:lvl>" + "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in ((0, "Q1"), (1, "Q2"), (2, "Q1"), (far, "Q2"))) + "</c:lvl>"
+                  + '<c:lvl><c:pt idx="0"><c:v>2023</c:v></c:pt><c:pt idx="2"><c:v>2024</c:v></c:pt></c:lvl>'
+                  + "</c:multiLvlStrCache></c:multiLvlStrRef>")
+        values = "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in ((0, 1), (1, 2), (2, 3), (far, 4)))
+        nested = (f"<c:ser><c:tx>{self._cache('str', ['销量'])}</c:tx><c:cat>{levels}</c:cat>"
+                  f"<c:val><c:numRef><c:numCache><c:formatCode>General</c:formatCode>{values}</c:numCache></c:numRef></c:val></c:ser>")
+        dated = (f"<c:ser><c:tx>{self._cache('str', ['日活'])}</c:tx><c:cat>{self._cache('num', [45292, 45323], 'yyyy/m/d')}</c:cat>"
+                 f"<c:val>{self._cache('num', [120, 135])}</c:val></c:ser>")
+        self.assertEqual(chart_xml_table(self._chart("走势", nested, dated))[2].splitlines()[2:], [
+            "| 销量 | 2023/Q1 | 1 |", "| 销量 | 2023/Q2 | 2 |", "| 销量 | 2024/Q1 | 3 |", "| 销量 | 2024/Q2 | 4 |",
+            "| 日活 | 2024-01-01 | 120 |", "| 日活 | 2024-02-01 | 135 |",
+        ])
+        # A chart with formula references only and no cached values: there is no data to write
+        bare = f"<c:chartSpace {self.NS}><c:chart><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>S!B2:B5</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
+        self.assertEqual(chart_xml_table(bare.encode("utf-8")), ("", [], ""))
+        # A chart with the other structure (chartEx): no pairing, the cached values are listed in their original
+        # order, and repeated values are kept
+        other = ('<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0">'
+                 '<cx:strDim type="cat"><cx:f>Sheet1!$A$2:$A$4</cx:f><cx:lvl ptCount="3"><cx:pt idx="0">期初</cx:pt><cx:pt idx="1">增加</cx:pt><cx:pt idx="2">期末</cx:pt></cx:lvl></cx:strDim>'
+                 '<cx:numDim type="val"><cx:f>Sheet1!$B$2:$B$4</cx:f><cx:lvl ptCount="3"><cx:pt idx="0">10</cx:pt><cx:pt idx="1">10</cx:pt><cx:pt idx="2">20</cx:pt></cx:lvl></cx:numDim>'
+                 "</cx:data></cx:chartData></cx:chartSpace>")
+        self.assertEqual(chart_xml_table(other.encode("utf-8"))[2].splitlines(), ["期初", "增加", "期末", "10", "10", "20"])
+
+    def test_charts_go_back_to_where_they_sit_in_the_document(self) -> None:
+        import zipfile
+        from unittest import mock
+
+        from kb_pipeline.chunking.chunker import blocks_to_chunks
+        from kb_pipeline.parsers import docx_enhanced
+
+        w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        r = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        c = 'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
+
+        def para(text: str = "", chart: str = "") -> str:
+            run = f"<w:r><w:t>{text}</w:t></w:r>" if text else ""
+            ref = f'<w:r><w:drawing><c:chart {c} r:id="{chart}"/></w:drawing></w:r>' if chart else ""
+            return f"<w:p>{run}{ref}</w:p>"
+
+        document = (f"<w:document {w} {r}><w:body>" + para("一、华东区") + para("华东区各季度销售额如下:") + para(chart="rId7")
+                    + para("二、华南区") + para("华南区各季度销售额如下:") + para(chart="rId5") + para("三、结论") + "</w:body></w:document>")
+        rels = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>'
+                '<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="/word/charts/chart2.xml"/>'
+                "</Relationships>")
+        quarters = ["Q1", "Q2", "Q3", "Q4"]
+        blocks = [
+            _mb("t1", "**一、华东区**", block_type="title", metadata={"section_path": ["一、华东区"]}),
+            _mb("p1", "华东区各季度销售额如下:", metadata={"section_path": ["一、华东区"]}),
+            _mb("t2", "**二、华南区**", block_type="title", metadata={"section_path": ["二、华南区"]}),
+            _mb("p2", "华南区各季度销售额如下:", metadata={"section_path": ["二、华南区"]}),
+            _mb("t3", "**三、结论**", block_type="title", metadata={"section_path": ["三、结论"]}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "报告.docx"
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("word/document.xml", document)
+                zf.writestr("word/_rels/document.xml.rels", rels)
+                zf.writestr("word/charts/chart1.xml", self._chart("华南区销售额", self._series("2024", quarters, [7, 7, 8, 9])))
+                zf.writestr("word/charts/chart2.xml", self._chart("华东区销售额", self._series("2024", quarters, [10, 20, 10, 30])))
+            with mock.patch.object(docx_enhanced, "mineru_docx_blocks", lambda **kw: list(blocks)), \
+                    mock.patch.object(docx_enhanced, "merge_mineru_text_blocks", lambda found, **kw: found):
+                out = docx_enhanced.parse_docx_enhanced(mineru_url="", vlm_base_url="", vlm_api_key="", vlm_model_id="",
+                                                        vlm_concurrency=1, path=path, cache_dir=Path(tmp))
+        self.assertEqual([b.block_id for b in out], ["t1", "p1", "docx-chart-0001", "t2", "p2", "docx-chart-0002", "t3"])
+        east, south = out[2], out[5]
+        self.assertEqual((east.title, east.metadata["section_path"]), ("华东区销售额", ["一、华东区"]))
+        self.assertEqual((south.title, south.metadata["section_path"]), ("华南区销售额", ["二、华南区"]))
+        self.assertEqual((east.block_type, east.caption), ("table", "Chart data; axes: 季度"))
+        chunks = blocks_to_chunks(kb_id="kb", file_key=1, content_version="v", parser_profile="p", blocks=out,
+                                  max_tokens=400, overlap_tokens=0)
+        text = next(c.text for c in chunks if c.block.block_id == "docx-chart-0001")
+        self.assertIn("TITLE: 华东区销售额\nCAPTION: Chart data; axes: 季度\n| Series | Category | Value |", text)
+        self.assertIn("| 2024 | Q3 | 10 |", text)
+        self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v10")
 
 
 class LeadInAdoptionTests(unittest.TestCase):
@@ -1029,6 +1352,19 @@ class CodeAndFrontmatterParsingTests(unittest.TestCase):
         self.assertEqual(mod["calls"], ["run"])
         self.assertTrue(all(b.block_id.startswith("py-") for b in blocks))
 
+    def test_python_blocks_split_lines_the_way_the_parser_counts_them(self) -> None:
+        """Form feeds (Emacs-style page breaks) and a U+2028 inside a string are not line breaks. Lines used to be
+        split with str.splitlines, so a single one in the file shifted the text of every later function block by
+        a line, and function bodies landed in the module block."""
+        from kb_pipeline.parsers.code_python import python_symbol_blocks
+
+        src = "import os\n\x0c\ndef a():\n    s = 'x y'\n    return 1\n\n\ndef b():\n    return 2\n"
+        for text in (src, src.replace("\n", "\r\n")):
+            blocks = {b.title: b.text for b in python_symbol_blocks(text)}
+            self.assertEqual(blocks["a"], "def a():\n    s = 'x y'\n    return 1")
+            self.assertEqual(blocks["b"], "def b():\n    return 2")
+            self.assertEqual(blocks["(module)"], "import os\n\x0c")
+
 
 class MultiLanguageSymbolTests(unittest.TestCase):
     """tree-sitter multi-language symbol chunking: a small sample per language, checking that functions /
@@ -1052,6 +1388,81 @@ class MultiLanguageSymbolTests(unittest.TestCase):
         got = sorted(l for b in blocks for l in b.text.splitlines() if l.strip())
         self.assertEqual(got, sorted(l for l in src.splitlines() if l.strip()), language)
         return syms, module
+
+    def test_blocks_split_lines_the_way_the_syntax_tree_counts_them(self) -> None:
+        """A U+2028 inside a string, old Mac \\r line endings: when lines are split differently from the way the syntax
+        tree numbers them, every function block takes its text from somewhere else."""
+        from kb_pipeline.parsers.code_symbols import symbol_blocks
+
+        src = 'const s = "a\u2028b";\nfunction a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n'
+        for text in (src, src.replace("\n", "\r\n"), src.replace("\n", "\r")):
+            blocks = {b.title: b.text for b in symbol_blocks(text, "javascript")}
+            self.assertEqual(blocks["a"], "function a() {\n  return 1;\n}")
+            self.assertEqual(blocks["b"], "function b() {\n  return 2;\n}")
+            self.assertEqual(blocks["(module)"], 'const s = "a\u2028b";')
+
+    def test_decorators_belong_to_the_definition_below_them(self) -> None:
+        """Decorators on TypeScript class members and Rust attributes are siblings in front of the definition in the
+        syntax tree: they used to end up in the previous method's block (the first method's in the class head), so
+        route / test markers were separated from the methods they decorate."""
+        from kb_pipeline.parsers.code_symbols import symbol_blocks
+
+        syms, _ = self._syms("typescript", '''class Svc {
+  @Get('/a')
+  first() { return 1; }
+
+  /** second route */
+  @Post('/b')
+  @Auth()
+  second() { return 2; }
+}
+''')
+        self.assertEqual((syms["Svc.first"]["lineno"], syms["Svc.second"]["lineno"]), (2, 6))
+        self.assertEqual(syms["Svc.second"]["docstring"], "second route")
+        blocks = {b.title: b.text for b in symbol_blocks("class Svc {\n  @Get('/a')\n  first() {}\n  @Post('/b')\n  second() {}\n}\n", "typescript")}
+        self.assertEqual(blocks, {"Svc": "class Svc {", "Svc.first": "  @Get('/a')\n  first() {}",
+                                  "Svc.second": "  @Post('/b')\n  second() {}\n}"})
+        rust = "/// A thing\n#[derive(Debug)]\nstruct Foo { a: i32 }\n\nimpl Foo {\n    #[inline]\n    fn first(&self) -> i32 { 1 }\n\n    #[cfg(test)]\n    fn second(&self) -> i32 { 2 }\n}\n\n#[test]\nfn top() {}\n"
+        blocks = [(b.title, b.text) for b in symbol_blocks(rust, "rust")]
+        self.assertEqual(blocks, [("(module)", "/// A thing"), ("Foo", "#[derive(Debug)]\nstruct Foo { a: i32 }"), ("Foo", "impl Foo {"),
+                                  ("Foo.first", "    #[inline]\n    fn first(&self) -> i32 { 1 }\n"),
+                                  ("Foo.second", "    #[cfg(test)]\n    fn second(&self) -> i32 { 2 }\n}"),
+                                  ("top", "#[test]\nfn top() {}")])
+
+    def test_go_grouped_types_take_their_own_lines(self) -> None:
+        """type ( A struct...; B struct... ): each type used to take the first and last line of the whole group, so the
+        same text went into the blocks of both A and B."""
+        from kb_pipeline.parsers.code_symbols import symbol_blocks
+
+        src = "package x\n\ntype (\n\t// A doc\n\tA struct {\n\t\tX int\n\t}\n\tB interface {\n\t\tRun()\n\t}\n)\n\n// C doc\ntype C struct { Z int }\n"
+        syms, _ = self._syms("go", src)                                          # lossless: every line lands in exactly one block
+        blocks = {b.title: b.text for b in symbol_blocks(src, "go")}
+        self.assertEqual(blocks["A"], "\tA struct {\n\t\tX int\n\t}")
+        self.assertEqual(blocks["B"], "\tB interface {\n\t\tRun()\n\t}")
+        self.assertEqual(blocks["C"], "type C struct { Z int }")
+        self.assertEqual([(syms[n]["lineno"], syms[n]["end_lineno"], syms[n]["signature"], syms[n]["docstring"]) for n in "ABC"],
+                         [(5, 7, "A struct", "A doc"), (8, 10, "B interface", ""), (14, 14, "type C struct", "C doc")])
+        syms, _ = self._syms("go", "package x\n\n// Shapes used by the renderer\ntype (\n\tA struct {\n\t\tX int\n\t}\n\tB struct {\n\t\tY int\n\t}\n)\n")
+        self.assertEqual([syms[n]["docstring"] for n in "AB"], ["Shapes used by the renderer"] * 2)   # a type without a comment of its own takes the group's
+
+    def test_two_methods_on_one_line_do_not_break_the_file(self) -> None:
+        syms, _ = self._syms("javascript", "class A {\n  a() { return 1; } b() { return 2; }\n  c() { return 3; }\n}\n")
+        self.assertEqual(syms["A"]["methods"], ["a", "b", "c"])
+        self.assertIn("A.c", syms)
+
+    def test_wide_literals_do_not_take_quadratic_time(self) -> None:
+        """In a bundled / generated file one statement is an array of tens of thousands of items: callee names used
+        to be dequeued one at a time from a list used as a queue and checked for duplicates against an unbounded
+        list, over twenty seconds for 1 MB. Collection now stops at the cap; the result is unchanged."""
+        import time as time_module
+
+        from kb_pipeline.parsers.code_symbols import MAX_CALLS, symbol_blocks
+
+        big = "const data = [" + ",".join(f"f{i}({i})" for i in range(60000)) + "];\n"
+        started = time_module.time()
+        blocks = symbol_blocks(big, "javascript")
+        self.assertLess(time_module.time() - started, 5.0)
+        self.assertEqual(blocks[0].metadata["symbol"]["calls"], [f"f{i}" for i in range(MAX_CALLS)])
 
     def test_javascript_and_typescript(self) -> None:
         syms, mod = self._syms("javascript", '''import fs from "fs";
@@ -1394,6 +1805,100 @@ class TableHeaderCandidateTests(unittest.TestCase):
         self.assertEqual(normalize_cell('=DISPIMG("ID_3F2A",1)'), "(image)")
         self.assertEqual(normalize_cell("普通"), "普通")
 
+    def test_notes_above_the_header_are_kept_whole_and_only_once(self) -> None:
+        """Note rows above the header go only into the summary, and they used to be cut at 200 characters, so the
+        second half was in no chunk at all; a merged note block spanning 6 rows was spread into 6 identical lines,
+        the summary repeated the same passage 6 times, and chunking produced word-for-word identical chunks."""
+        from openpyxl import Workbook
+
+        from kb_pipeline.chunking.chunker import blocks_to_chunks
+        from kb_pipeline.parsers.native_table import parse_native_table
+
+        note = "填写说明:" + "".join(f"第{i}条,按实际情况如实填写,不确定的留空。" for i in range(1, 25))
+        self.assertGreater(len(note), 400)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "中间件.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "中间件"
+            ws["A1"] = "说明"
+            ws["B1"] = note
+            ws.merge_cells("A1:A6")
+            ws.merge_cells("B1:H6")
+            for row_no, row in enumerate((["名称", "版本", "用途", "备注"], ["nginx", "1.25", "反向代理", ""], ["redis", "7.2", "缓存", "单机"]), start=8):
+                for col, value in enumerate(row, start=1):
+                    ws.cell(row=row_no, column=col, value=value)
+            wb.save(path)
+            blocks = parse_native_table(path, max_tokens=200, overlap_tokens=0)
+        summary = blocks[0]
+        self.assertEqual(summary.text.count("Title: "), 1)
+        self.assertIn(f"Title: 说明 {note}", summary.text)
+        self.assertIn("Columns: 名称 | 版本 | 用途 | 备注", summary.text)
+        self.assertNotIn("填写说明", "\n".join(b.text for b in blocks[1:]))
+        chunks = blocks_to_chunks(kb_id="kb", file_key=1, content_version="v", parser_profile="p",
+                                  blocks=blocks, max_tokens=200, overlap_tokens=0)
+        texts = [c.text for c in chunks if c.block.block_id == summary.block_id]
+        self.assertGreater(len(texts), 1)                                       # the note is longer than the budget: split, every piece within it
+        self.assertTrue(all(c.token_count <= 200 for c in chunks), [c.token_count for c in chunks])
+        self.assertEqual(len(set(texts)), len(texts))                           # no word-for-word identical chunks
+        body = [l for t in texts for l in t.splitlines() if not l.startswith(("TITLE:", "Sheet:", "Rows:", "Columns:"))]
+        self.assertEqual("".join(body), f"Title: 说明 {note}")                   # split by sentence without losing a character, and not labelled like a table row
+
+    def test_xlsx_cells_read_the_way_the_sheet_shows_them(self) -> None:
+        """The number format used to be ignored: a cell showing 6% was indexed as 0.06, one showing 92% as
+        0.916666666666667, and a whole date carried 00:00:00."""
+        import datetime
+
+        from openpyxl import Workbook
+
+        from kb_pipeline.parsers.native_table import normalize_cell, read_xlsx_rows
+
+        cells = [
+            ("覆盖率", 0.916666666666667, "0%", "92%"),
+            ("税率", 0.06, "0%", "6%"),
+            ("增长率", 0.546, "0.00%", "54.60%"),
+            ("降幅", -0.0525, "0.0%;[Red]-0.0%", "-5.3%"),
+            ("进位", 0.545, "0%", "55%"),                       # 0.54500000000000004 in the machine, the sheet shows 55%
+            ("字面百分号", 0.06, '0.00"%"', "0.06"),             # a quoted % is just a character, no multiplication by 100
+            ("勾选", 1, '[=1]"☑";[=0]"☐"', "1"),
+            ("公式结果", 0.1 + 0.2, "General", "0.3"),
+            ("整数", 3.0, "General", "3"),
+            ("金额", 1234.5, '"￥"#,##0.00', "1234.5"),          # currency symbol and thousands separators are not restored
+            ("日期", datetime.datetime(2024, 1, 1), "yyyy-mm-dd", "2024-01-01"),
+            ("时刻", datetime.datetime(2024, 1, 1, 9, 30), "yyyy-mm-dd h:mm", "2024-01-01 09:30:00"),
+            ("启用", True, "General", "TRUE"),
+            ("文本", "0.06", "0%", "0.06"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "格式.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.append([name for name, *_ in cells])
+            ws.append([value for _, value, *_ in cells])
+            for col, (_, _, number_format, _) in enumerate(cells, start=1):
+                ws.cell(row=2, column=col).number_format = number_format
+            ws.append(["合并的百分比", 0.25])
+            ws.cell(row=3, column=2).number_format = "0%"
+            ws.merge_cells("B3:B4")
+            ws.cell(row=4, column=1).value = "下一行"
+            wb.save(path)
+            rows = read_xlsx_rows(path)[0][1]
+        self.assertEqual(rows[1][1], [shown for *_, shown in cells])
+        self.assertEqual([values[:2] for _, values in rows[2:]], [["合并的百分比", "25%"], ["下一行", "25%"]])   # values spread over a merged range are written the same way
+        self.assertEqual(normalize_cell(0.06), "0.06")                          # csv / xls carry no format information: the number as it is
+        self.assertEqual(normalize_cell(45123.0), "45123")
+        # A very large number in a percentage cell: still written out, it must not fail the whole sheet; one that
+        # overflows when multiplied by 100 is written as if it had no format
+        self.assertEqual(normalize_cell(1e30, "0%"), "1" + "0" * 32 + "%")
+        self.assertEqual(normalize_cell(1e24, "0.00%"), "1" + "0" * 26 + ".00%")
+        self.assertEqual(normalize_cell(1.7e308, "0%"), normalize_cell(1.7e308))
+        import xlrd
+
+        from kb_pipeline.parsers.native_table import xls_cell_text
+
+        self.assertEqual(xls_cell_text(xlrd.XL_CELL_NUMBER, 0.1 + 0.2, 0), "0.3")   # numbers from xls are written the same way
+        self.assertEqual(parser_profile_for_path(Path("a.xlsx")), "table-native-v4")
+
 
 class VisualContractTests(unittest.TestCase):
     def test_contract_v5_has_decorative_and_kind_specific_guidance(self) -> None:
@@ -1558,6 +2063,37 @@ class ParserDetailTests(unittest.TestCase):
         self.assertIn("- 依赖 A", blocks[2].text)
         self.assertTrue(all(b.block_id.startswith("page-1-") for b in blocks))
         self.assertIn("前言文字", blocks[0].text)      # a UTF-8 page without a declared charset is no longer read as Latin-1
+
+    def test_html_tables_stay_in_their_section_and_spans_are_filled(self) -> None:
+        """The tables of a generic HTML page all used to come after every section, without a section path and titled
+        after the first heading of the page, so nothing told which table belonged to which section; header cells
+        spanning rows / columns were ignored, so the second header row was shifted as a whole."""
+        from kb_pipeline.parsers.html_dom import parse_html_dom
+
+        html_text = ("<html><head><title>手册</title></head><body><p>" + "前言文字," * 12 + "</p>"
+                     "<h1>型号 A 参数</h1><p>型号 A 的说明。</p>"
+                     "<table><tr><th rowspan='2'>项目</th><th colspan='2'>数值</th></tr><tr><th>最小</th><th>最大</th></tr>"
+                     "<tr><td>电压</td><td>3.0</td><td>3.6</td></tr></table><p>表后的补充说明。</p>"
+                     "<h2>订购信息</h2><table><tr><td>料号</td><td>封装</td></tr><tr><td>A-100</td><td>QFN</td></tr></table>"
+                     "<h1>型号 B 参数</h1><p>型号 B 的说明。</p>"
+                     "<table><tr><th>项目</th><th>数值</th></tr><tr><td>电压</td><td>5.0</td></tr></table></body></html>")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manual.html"
+            path.write_text(html_text, encoding="utf-8")
+            blocks = parse_html_dom(path)
+        self.assertEqual([(b.block_type, b.metadata.get("section_path")) for b in blocks], [
+            ("text", None), ("text", ["型号 A 参数"]), ("table", ["型号 A 参数"]),
+            ("table", ["型号 A 参数", "订购信息"]),                                   # this section has a table and no body
+            ("text", ["型号 B 参数"]), ("table", ["型号 B 参数"])])
+        tables = [b for b in blocks if b.block_type == "table"]
+        self.assertEqual([b.title for b in tables], ["型号 A 参数 / Table 1", "订购信息 / Table 2", "型号 B 参数 / Table 3"])
+        self.assertEqual(len({b.block_id for b in blocks}), len(blocks))
+        self.assertEqual(tables[0].text.splitlines(), ["| 项目 | 数值 | 数值 |", "| --- | --- | --- |",
+                                                       "| 项目 | 最小 | 最大 |", "| 电压 | 3.0 | 3.6 |"])
+        self.assertIn("| 电压 | 5.0 |", tables[2].text)
+        self.assertEqual(blocks[1].text.splitlines(), ["型号 A 的说明。", "表后的补充说明。"])   # the text of the tables does not go into the body
+        self.assertTrue(all(b.parser_profile == "html-dom-v2" for b in blocks))
+        self.assertEqual(parser_profile_for_path(Path("a.html")), "html-dom-v2")
 
     def test_hidden_sheets_and_rows_are_skipped(self) -> None:
         """R8: hidden sheets / hidden rows are not indexed."""
@@ -1738,6 +2274,13 @@ class PdfReportParseTests(unittest.TestCase):
         h = table("t8", head + "\n| a | b | 1 | 2 | c |", 1)
         i = table("t9", "| d | e | 3 | 4 | f |\n| --- | --- | --- | --- | --- |", 5)
         self.assertEqual(len(merge_split_tables([h, i])), 2)
+        # A table spanning three pages: the part on the third page continues the second page; it used to be compared
+        # with the first page, and two pages apart it was not merged
+        first = table("t10", head + "\n| a | b | 1 | 2 | c |", 1)
+        rest = [table(f"t1{n}", f"| r{n} | x | {n} | 4 | f |\n| --- | --- | --- | --- | --- |", n + 1) for n in (1, 2, 3)]
+        self.assertEqual([x.block_id for x in merge_split_tables([first, *rest])], ["t10"])
+        self.assertEqual((first.metadata["merged_tables"], first.metadata["page_end"]), (["t11", "t12", "t13"], 4))
+        self.assertEqual([l.split(" | ")[0] for l in first.table_markdown.splitlines()[2:]], ["| a", "| r1", "| r2", "| r3"])
         for name in ("pdf_enhanced.py", "docx_enhanced.py"):
             self.assertIn("blocks = merge_split_tables(blocks)", _repo_file(f"app/kb_pipeline/parsers/{name}"), name)
 
@@ -1775,12 +2318,17 @@ class PdfReportParseTests(unittest.TestCase):
         body = [l for p in pieces for l in p.splitlines()[5:]]
         self.assertEqual(body, rows.splitlines())
         # Lead-in line too long (over a third of the budget): carry only the prefix lines and the header; the
-        # long lead-in text goes into the body of the first piece and is not lost
-        long_lead = "CAPTION: 表\n" + "很长的引导说明," * 60 + "\n| a | b |\n| --- | --- |"
+        # long lead-in text goes first as body text and is not lost; when it alone exceeds the budget it is split
+        # to the budget as a passage of text, not as a table row, so it gets no column names
+        lead_in = "很长的引导说明," * 60
+        long_lead = "CAPTION: 表\n" + lead_in + "\n| a | b |\n| --- | --- |"
         pieces = split_table_text(long_lead + "\n" + "\n".join(f"| {i} | {i} |" for i in range(80)), 120)
         self.assertTrue(all(p.startswith("CAPTION: 表\n| a | b |\n| --- | --- |") for p in pieces))
-        self.assertIn("很长的引导说明,", pieces[0])
-        self.assertNotIn("很长的引导说明,", pieces[1])
+        self.assertTrue(all(count_tokens(p) <= 120 for p in pieces), [count_tokens(p) for p in pieces])
+        rest = [l for p in pieces for l in p.splitlines()[3:]]
+        self.assertEqual("".join(l for l in rest if not l.startswith("|")), lead_in)
+        self.assertEqual([l for l in rest if l.startswith("|")], [f"| {i} | {i} |" for i in range(80)])
+        self.assertNotIn("a: ", "\n".join(pieces))
 
 
 class VisualEvidenceTests(unittest.TestCase):
@@ -1982,6 +2530,7 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         identity; empty columns must not vanish silently."""
         from kb_pipeline.chunking.chunker import _split_table_row, split_table_text
         from kb_pipeline.parsers.native_table import split_long_row
+        from kb_pipeline.utils import count_tokens
 
         header = ["提交时间", "姓名", "岗位", "问题一", "问题二"]
         row = ["2026-05-01", "张三", "", "很长的回答" * 30, "另一段很长的回答" * 30]
@@ -1991,17 +2540,22 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         self.assertTrue(all(p.startswith("提交时间: 2026-05-01") for p in pieces))              # every piece starts with the row identity
         self.assertIn("问题二: 另一段很长的回答", pieces[-1])
         self.assertNotIn("岗位:", " ".join(pieces))
-        self.assertEqual(split_long_row(["A值", "", "C值"], 1, None), ["A: A值", "A: A值 | C: C值"])   # without a header, column letters keep the position
+        self.assertTrue(all(count_tokens(p) <= 60 for p in pieces), [count_tokens(p) for p in pieces])   # a long cell alone exceeds the budget: split, every piece within it
+        self.assertEqual("".join(p.split("问题一: ", 1)[1] for p in pieces if "问题一: " in p), row[3])
+        self.assertEqual(split_long_row(["A值", "", "C值"], 60, None), ["A: A值 | C: C值"])   # without a header, column letters keep the position
         self.assertEqual(split_long_row(["", ""], 8, ["a", "b"]), [""])
         # markdown tables / native table blocks follow the same rule
-        md = _split_table_row("| REQ-1 | | 描述文字 |", 4, ["编号", "状态", "描述"])
-        self.assertEqual(md[0], "| 编号: REQ-1 |")
-        self.assertTrue(md[1].startswith("| 编号: REQ-1 | 描述: 描述文字"))
-        text = "HEADER: 编号 | 状态 | 描述\nREQ-9 | | " + "很长的描述。" * 200
+        md = _split_table_row("| REQ-1 | | " + "描述文字" * 40 + " |", 40, ["编号", "状态", "描述"])
+        self.assertGreater(len(md), 1)
+        self.assertTrue(all(m.startswith("编号: REQ-1 | 描述: ") for m in md), md)               # no line holding nothing but the row identity
+        self.assertEqual("".join(m[len("编号: REQ-1 | 描述: "):] for m in md), "描述文字" * 40)
+        text = "SHEET: 需求\nROWS: 9-9\nHEADER: 编号 | 状态 | 描述\nREQ-9 |  | " + "很长的描述。" * 200
         out = split_table_text(text, 120)
-        self.assertTrue(all(l.startswith("HEADER:") for l in (o.splitlines()[0] for o in out)))
-        self.assertEqual(out[0].splitlines()[1], "编号: REQ-9")                                   # the first piece holds only the row identity: the long cell alone exceeds the budget
-        self.assertTrue(out[1].splitlines()[1].startswith("编号: REQ-9 | 描述: 很长的描述。"))   # the long cell's piece also carries the row identity and column name
+        self.assertGreater(len(out), 5)
+        self.assertTrue(all(o.splitlines()[:2] == ["SHEET: 需求", "ROWS: 9-9"] for o in out))
+        self.assertTrue(all(o.splitlines()[2].startswith("编号: REQ-9 | 描述: 很长的描述。") for o in out))   # every piece carries the row identity and the column name
+        self.assertNotIn("HEADER:", "\n".join(out))                                           # pieces that carry column names do not repeat the whole header
+        self.assertTrue(all(count_tokens(o) <= 120 for o in out))
 
     def test_xls_cell_text_dates_and_booleans(self) -> None:  # issue 9
         import xlrd
@@ -2401,6 +2955,28 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         _, summary, _ = reconcile_visual_facts([], "综合风险指数 34", "同龄平均 31;显示当前风险值为31")
         self.assertEqual(summary, "同龄平均 31;显示当前风险值为34")
 
+    def test_a_runaway_transcription_does_not_stall_the_parse(self) -> None:
+        """A few thousand characters repeated by the model carry neither punctuation nor digits, and backtracking of
+        the "label value" pattern on such a segment grows with the cube of its length: 1,600 characters take 27
+        seconds, so one picture could hold a whole document in the image description stage (2026-09-30, a manual
+        with 166 pictures). A segment longer than SEGMENT_MAX_CHARS is not a reading and is skipped; short segments
+        are compared as before."""
+        import time
+
+        from kb_pipeline.parsers.visual_blocks import SEGMENT_MAX_CHARS, _label_num_spans, reconcile_visual_facts
+
+        runaway = "用户管理 " * 4000
+        started = time.monotonic()
+        self.assertEqual(_label_num_spans(runaway, max_numbers=3), [])
+        self.assertEqual(_label_num_spans(runaway + "设备 12", single_only=True), [])
+        self.assertEqual(_label_num_spans(runaway), [])
+        out, _, conflicts = reconcile_visual_facts(["总分 95"], runaway + "\n总分 98", runaway)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual((out, conflicts[0]["text_value"]), (["总分 98"], "98"))      # the runaway segment is skipped, the real reading next to it still applies
+        long_label = "甲" * (SEGMENT_MAX_CHARS - 4) + " 12"
+        self.assertEqual(len(_label_num_spans(long_label)), 1)
+        self.assertEqual(_label_num_spans("甲" * SEGMENT_MAX_CHARS + " 12"), [])
+
     def test_same_label_with_several_values_is_left_alone(self) -> None:
         from kb_pipeline.parsers.visual_blocks import reconcile_visual_facts
 
@@ -2466,6 +3042,32 @@ class PdfTextLayerTests(unittest.TestCase):
         from kb_pipeline.models import ParsedBlock
         return ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type=block_type, text=text,
                            block_id=f"b-{page}-{abs(hash(text)) % 1000}", page_idx=page, bbox=bbox, metadata=dict(meta))
+
+    def test_text_layer_and_rendering_run_on_a_real_pdf(self) -> None:
+        """Text-layer counts, font checks and page rendering run on the real PyMuPDF: the other tests stub it, so a
+        broken import would be swallowed by "skip when not installed"."""
+        try:
+            import pymupdf
+        except ImportError:
+            self.skipTest("PyMuPDF not installed")
+        from kb_pipeline.parsers import pdf_textlayer as tl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "a.pdf"
+            with pymupdf.open() as doc:
+                doc.new_page(width=300, height=200).insert_text(          # china-s is a non-embedded Chinese font
+                    (20, 40), "窦性心律 未见明显异常 建议定期复查 心电图报告结论正常范围", fontname="china-s", fontsize=9)
+                doc.new_page(width=300, height=200).insert_text((20, 40), "plain page 12 34", fontname="helv", fontsize=9)
+                doc.save(str(source))
+            self.assertEqual(tl.text_layer_cjk_by_page(source), {1: 27, 2: 0})
+            self.assertEqual(tl.page_details(source, [1, 2, 9], {}), {1: (27, 27), 2: (0, 0)})      # out-of-range page numbers are ignored
+            self.assertEqual(tl.page_details(source, [1], {1: [[0, 0, 1000, 1000]]}), {1: (0, 0)})   # text inside figure regions does not count
+            rendered = tl.render_pages(source, [1], Path(tmp) / "rendered" / "a.pdf")
+            with pymupdf.open(str(rendered)) as doc:
+                self.assertEqual(doc.page_count, 1)
+                self.assertEqual((doc[0].rect.width, doc[0].rect.height), (300.0, 200.0))
+                self.assertEqual(len(doc[0].get_images()), 1)
+            self.assertIsNone(tl.text_layer_cjk_by_page(Path(tmp) / "missing.pdf"))
 
     def test_candidate_pages_compare_layer_with_blocks_and_skip_figures(self) -> None:
         from kb_pipeline.parsers.pdf_textlayer import blocks_cjk_by_page, candidate_pages, figure_boxes_by_page
@@ -2543,3 +3145,183 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(payload["degraded"], "text_layer_cjk_lost")
         self.assertIsNone(_payload_for_chunk(settings, row, UnifiedChunk("u2", 1, "t", single, 1), 2).get("degraded"))
         self.assertEqual(source_row(1, {"point_id": "p"}, {"text": "t", **payload})["degraded"], "text_layer_cjk_lost")
+
+    def test_second_pass_failures_are_told_apart(self) -> None:
+        """Resending the rendered pages to MinerU fails: every such failure used to be swallowed, the lost pages were
+        marked degraded and indexed as usual, the scan then judged the file unchanged and it was never retried.
+        Transient failures (unreachable, 5xx) must be able to propagate; an explicit rejection by MinerU (4xx) and
+        a rendering failure would fail the same way on retry, so they degrade in place."""
+        from kb_pipeline.parsers import pdf_textlayer as tl
+        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
+
+        original = [self._block(0, "封面"), self._block(1, "1 2 3")]
+
+        def repair(parse_rendered, **kw):
+            return tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"), layer={0: 2, 1: 40},
+                                             detail=lambda pages, boxes: {1: (40, 40)}, parse_rendered=parse_rendered, **kw)
+
+        def failing(exc):
+            def parse(_path):
+                raise exc
+            return parse
+
+        with patch.object(tl, "render_pages") as render:
+            for exc in (MinerUServiceError("500 Server Error", status_code=500), MinerUServiceError("connection reset"),
+                        RuntimeError("boom")):
+                with self.assertRaises(type(exc)):
+                    repair(failing(exc), raise_transient=True)
+                blocks, info = repair(failing(exc))                                  # last attempt: degrade in place
+                self.assertEqual((blocks, info["lost"]), (original, [1]))
+            blocks, info = repair(failing(MinerUServiceError("422 Unprocessable", status_code=422)), raise_transient=True)
+            self.assertEqual((blocks, info["lost"], info["rendered"]), (original, [1], False))
+            self.assertIn("422", info["error"])
+            render.side_effect = OSError("disk full")                                # rendering failed: a retry would fail the same way
+            blocks, info = repair(lambda p: [], raise_transient=True)
+            self.assertEqual((info["lost"], info["error"]), ([1], "OSError: disk full"))
+            render.reset_mock(side_effect=True)
+            blocks, info = repair(None, raise_transient=True)                        # check only, no repair
+            self.assertEqual((blocks, info["lost_before"], info["lost"]), (original, [1], [1]))
+            render.assert_not_called()
+
+    def _parse_pdf(self, tmp, fake_mineru, **kw):
+        """Run parse_pdf_enhanced once: the main parse yields two pages, and page 1 is confirmed to have lost its
+        text; fake_mineru stands in for MinerU, rendering is stubbed."""
+        from kb_pipeline.parsers import pdf_enhanced, pdf_textlayer as tl
+
+        with patch.object(pdf_enhanced, "mineru_pdf_blocks", fake_mineru), \
+                patch.object(tl, "text_layer_cjk_by_page", return_value={1: 40, 2: 7}), \
+                patch.object(tl, "page_details", return_value={1: (40, 40)}), \
+                patch.object(tl, "render_pages", side_effect=lambda src, pages, out, **_: out) as render:
+            blocks = pdf_enhanced.parse_pdf_enhanced(
+                mineru_url="http://x", vlm_base_url="u", vlm_api_key="", vlm_model_id="m", vlm_concurrency=1,
+                path=Path(tmp) / "a.pdf", cache_dir=Path(tmp) / "cache", **kw)
+        return blocks, render
+
+    def test_transient_second_pass_failure_retries_the_job_and_degrades_on_the_last_attempt(self) -> None:
+        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
+
+        def fake_mineru(*, path, **kw):
+            if path.name.endswith(".lost-pages.pdf"):
+                raise MinerUServiceError("500 Server Error", status_code=500)
+            return [self._block(1, "1 2 3"), self._block(2, "第二页正文照旧")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(MinerUServiceError):
+                self._parse_pdf(tmp, fake_mineru)                                    # retries left: the job fails and runs again
+            blocks, _ = self._parse_pdf(tmp, fake_mineru, text_layer_repair="final")
+        self.assertEqual([b.metadata.get("degraded") for b in blocks], ["text_layer_cjk_lost"])
+        self.assertIn("第二页正文照旧", blocks[0].text)
+
+    def test_preview_mode_never_sends_the_rendered_pages_to_mineru(self) -> None:
+        """The chunk preview runs in the web process: without a resend result in the parse cache the pages are only
+        marked; with one, only the cache is read."""
+        seen = []
+
+        def fake_mineru(*, path, cached_only=False, **kw):
+            seen.append((path.name, cached_only))
+            if path.name.endswith(".lost-pages.pdf"):
+                return [self._block(1, "第一页救回来了 窦性心律 未见明显异常 建议定期复查 心电图报告结论正常")]
+            return [self._block(1, "1 2 3"), self._block(2, "第二页正文照旧")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            blocks, render = self._parse_pdf(tmp, fake_mineru, text_layer_repair="cached")
+            self.assertEqual(seen, [("a.pdf", False)])
+            render.assert_not_called()
+            self.assertEqual([b.metadata.get("degraded") for b in blocks], ["text_layer_cjk_lost"])
+            cached = Path(tmp) / "cache" / "rendered" / "mineru" / "result.json"
+            cached.parent.mkdir(parents=True)
+            cached.write_text("{}", encoding="utf-8")
+            blocks, _ = self._parse_pdf(tmp, fake_mineru, text_layer_repair="cached")
+            self.assertEqual(seen[1:], [("a.pdf", False), ("a.lost-pages.pdf", True)])
+            self.assertIn("窦性心律", blocks[0].text)
+            self.assertNotIn("degraded", blocks[0].metadata)
+
+    @staticmethod
+    def _fake_mineru_service(payload, posts):
+        """Stand-in for the MinerU HTTP session: records the form of every request and returns a fixed result."""
+        class Session:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, url, files=None, data=None, timeout=None):
+                posts.append(dict(data))
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: json.loads(json.dumps(payload)))
+        return Session
+
+    def test_mineru_cache_is_reused_only_for_the_same_file_and_backend(self) -> None:
+        """The MinerU result cache used to check the file size only: after MINERU_BACKEND changed, a re-parse was
+        served the old backend's result as is, and the new backend was never called."""
+        import os
+
+        from kb_pipeline.parsers import service_clients
+
+        posts: list[dict] = []
+        session = self._fake_mineru_service({"backend": "vlm-engine", "version": "3.4.4", "content_list": []}, posts)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(service_clients, "_local_service_session", session), \
+                patch.dict(os.environ, {"MINERU_BACKEND": "vlm-engine", "MINERU_REUSE_CACHE": "1"}):
+            src = Path(tmp) / "a.pdf"
+            src.write_bytes(b"%PDF-1.4 demo")
+            out = Path(tmp) / "mineru" / "result.json"
+            call = lambda **kw: service_clients.call_mineru_sync("http://x", src, out, out.with_suffix(".md"), **kw)
+            with self.assertRaisesRegex(RuntimeError, "no cached MinerU result"):
+                call(cached_only=True)                                        # a cache-only caller: no cache means an error, no request
+            self.assertEqual(posts, [])
+            call()
+            call()                                                            # same file, same backend: reused
+            self.assertEqual(call(cached_only=True)["_kb_source"], {"name": "a.pdf", "size": 13, "backend": "vlm-engine"})
+            self.assertEqual([p["backend"] for p in posts], ["vlm-engine"])
+            with patch.dict(os.environ, {"MINERU_BACKEND": "pipeline"}):
+                call()                                                        # backend changed: requested again
+                self.assertEqual([p["backend"] for p in posts], ["vlm-engine", "pipeline"])
+                call()
+                self.assertEqual(len(posts), 2)
+            src.write_bytes(b"%PDF-1.4 another")
+            call()                                                            # file changed: requested again
+            self.assertEqual(len(posts), 3)
+            out.write_text(json.dumps({"content_list": [], "_kb_source": {"name": "a.pdf", "size": src.stat().st_size}}), encoding="utf-8")
+            call()                                                            # the stamp records no backend: nothing to compare, accepted as before
+            self.assertEqual(len(posts), 3)
+
+    def test_parse_job_picks_the_mode_from_the_attempts_left(self) -> None:
+        """With retries left a transient failure makes the job retry, and the last attempt degrades in place;
+        callers outside a job (the chunk preview) read only the cache by default."""
+        from kb_pipeline.pipeline import parse_job
+
+        seen = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_parse_blocks(*args, **kw):
+            seen.append(kw.get("text_layer_repair"))
+            raise Stop()
+
+        def fake_pdf(**kw):
+            seen.append(kw["text_layer_repair"])
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "a.pdf"
+            pdf.write_bytes(b"%PDF-1.4 demo")
+            settings = SimpleNamespace(max_file_bytes=0, job_max_retries=5, cache_dir=Path(tmp) / "cache", mineru_url="http://x",
+                                       vlm_base_url="u", vlm_api_key="", vlm_model_id="m", vlm_concurrency=1, vlm_temperature=0.1,
+                                       vlm_top_p=0.8, vlm_max_tokens=64, vlm_structured_output=True, image_max_pixels=1,
+                                       mineru_timeout_seconds=5)
+            source = SimpleNamespace(vlm_prompt=None, graph_language=None, block_merge_tokens=800, max_tokens=400, overlap_tokens=0)
+            row = {"physical_path": str(pdf), "size": 13, "kb_id": "kb_x", "file_key": 1, "content_version": "v", "source_path": "r/a.pdf"}
+            with patch.object(parse_job.db, "get_file_by_id", return_value=row), \
+                    patch.object(parse_job, "_source_for_file", return_value=source), \
+                    patch.object(parse_job, "verify_source_file"), \
+                    patch.object(parse_job, "_parse_blocks", fake_parse_blocks):
+                for retry_count in (0, 4, 5):
+                    job = {"job_id": "j", "file_id": "f", "parser_profile": "p", "retry_count": retry_count, "locked_by": None}
+                    with self.assertRaises(Stop):
+                        parse_job.process_parse_job(None, settings, job)
+            self.assertEqual(seen, ["retry", "retry", "final"])
+            with patch.object(parse_job, "parse_pdf_enhanced", fake_pdf):
+                parse_job._parse_blocks(settings, source, pdf, Path(tmp) / "cache", "p", row)
+                parse_job._parse_blocks(settings, source, pdf, Path(tmp) / "cache", "p", row, text_layer_repair="final")
+            self.assertEqual(seen[3:], ["cached", "final"])

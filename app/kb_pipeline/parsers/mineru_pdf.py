@@ -11,9 +11,11 @@ from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, clean_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx, walk_dicts
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
 
-# v2 (2026-09-06): merged-cell table flags + screenshot verification repair are now in the blocks; the
-# version bump makes scan re-parse via parser_changed
-PDF_PARSER_PROFILE = "mineru-3.4.4-pipeline-v2"
+# Block-level provenance tag, written into parser_profile in the chunk payload; whether a file is re-parsed is
+# decided by the route-level version (common.parser_profile_for_path). The tag does not name the MinerU
+# backend: the backend is chosen at run time (MINERU_BACKEND or the parser container, see mineru_backend), and
+# a name hard-coded here would not match the one actually used
+PDF_PARSER_PROFILE = "mineru-3.4.4-pdf-v3"
 
 
 class MinerUServiceError(RuntimeError):
@@ -38,6 +40,7 @@ def mineru_pdf_blocks(
     path: Path,
     cache_dir: Path,
     timeout: int = 43200,
+    cached_only: bool = False,
 ) -> list[ParsedBlock]:
     out_json = cache_dir / "mineru" / "result.json"
     out_md = cache_dir / "mineru" / "result.md"
@@ -50,6 +53,7 @@ def mineru_pdf_blocks(
             table_enable=True,
             return_middle_json=True,
             timeout=timeout,
+            cached_only=cached_only,
         )
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -67,8 +71,8 @@ def mineru_pdf_blocks(
     # list items are not headings, and unnumbered headings hang under the nearest numbered one.
     # Ordinary body lines MinerU did not mark are recognised by inference (see headings.HeadingResolver)
     toc_pages = detect_toc_pages((page_idx(i), item_text(i)) for i in items if label_of(i) in ("text", "title"))
-    if toc_pages:
-        print(f"[parser] pdf toc pages={sorted(p + 1 for p in toc_pages)} (headings there are not sections)", flush=True)
+    if toc_pages:       # page_idx() already returns 1-based page numbers
+        print(f"[parser] pdf toc pages={sorted(toc_pages)} (headings there are not sections)", flush=True)
     resolver = HeadingResolver(item_text(i) for i in items if heading_level(i) and label_of(i) in ("text", "title"))
     count = 0
     for item in items:

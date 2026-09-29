@@ -46,7 +46,12 @@ def parse_pdf_enhanced(
     caption_cache_root: Path | None = None,
     vlm_prompt: str | None = None,
     progress_cb=None,
+    text_layer_repair: str = "retry",
 ) -> list[ParsedBlock]:
+    """text_layer_repair: what to do when the second MinerU request of the text-layer repair fails. "retry": a
+    transient failure is raised and the job retries; "final" (the job's last attempt): degrade in place, so a
+    document is not kept out of the index for good; "cached" (chunk preview): use only a resend result already
+    in the parse cache, never call MinerU."""
     print(f"[parser] pdf mineru start file={path.name}", flush=True)
     try:
         blocks = mineru_pdf_blocks(mineru_url=mineru_url, path=path, cache_dir=cache_dir, timeout=timeout)
@@ -57,10 +62,19 @@ def parse_pdf_enhanced(
 
     # Text-layer cross-check: when MinerU cannot render non-embedded Chinese fonts whole pages lose their CJK text;
     # render those pages with PyMuPDF and send them through MinerU once more (pdf_textlayer)
+    rendered_dir = cache_dir / "rendered"
+    cached_only = text_layer_repair == "cached"
+
+    def parse_rendered(rendered: Path) -> list[ParsedBlock]:
+        return mineru_pdf_blocks(mineru_url=mineru_url, path=rendered, cache_dir=rendered_dir, timeout=timeout,
+                                 cached_only=cached_only)
+
+    # Cache only, and the cache holds no resend result: pages that lost their text are only marked, neither
+    # rendered nor parsed
+    skip_repair = cached_only and not (rendered_dir / "mineru" / "result.json").exists()
     blocks, layer_info = repair_lost_text_layer(
-        blocks, path=path, rendered_path=cache_dir / "rendered" / f"{path.stem}.lost-pages.pdf",
-        parse_rendered=lambda rendered: mineru_pdf_blocks(mineru_url=mineru_url, path=rendered, cache_dir=cache_dir / "rendered",
-                                                          timeout=timeout))
+        blocks, path=path, rendered_path=rendered_dir / f"{path.stem}.lost-pages.pdf",
+        parse_rendered=None if skip_repair else parse_rendered, raise_transient=text_layer_repair == "retry")
     if layer_info.get("lost_before"):
         print(f"[parser] pdf text-layer cjk lost pages={layer_info['lost_before']} rendered={layer_info['rendered']} "
               f"recovered={layer_info['recovered']} still_lost={layer_info['lost']}"
@@ -142,7 +156,8 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
                 or high_confidence(prev.metadata.get("table_flags")) or high_confidence(block.metadata.get("table_flags"))):
             out.append(block)
             continue
-        if block.page_idx is not None and prev.page_idx is not None and block.page_idx not in (prev.page_idx, prev.page_idx + 1):
+        prev_end = prev.metadata.get("page_end", prev.page_idx)      # a table that already absorbed continuations is compared from its last page
+        if block.page_idx is not None and prev_end is not None and block.page_idx not in (prev_end, prev_end + 1):
             out.append(block)
             continue
         pre_a, rows_a, post_a = _table_lines(prev.table_markdown)
@@ -216,6 +231,8 @@ def merge_mineru_text_blocks(
         with the min_merge_tokens description.
       - Short lines before a title (table-of-contents entries such as "Technical support....18",
         parameter lines) do not follow the title into the TITLE; inline icons are not boundaries.
+      - When the buffer is cut because it is full, the titles at its tail are left to the next buffer, so a
+        title stays in the same block as the body below it.
     """
     if not target_tokens or target_tokens <= 0:
         return blocks
@@ -285,7 +302,7 @@ def merge_mineru_text_blocks(
         merged.append(
             ParsedBlock(
                 parser=template.parser,
-                parser_profile=f"{template.parser_profile}+text-merge-v3",
+                parser_profile=f"{template.parser_profile}+text-merge-v4",
                 doc_type=template.doc_type,
                 block_type="text",
                 text=text,
@@ -306,11 +323,20 @@ def merge_mineru_text_blocks(
             )
         )
 
-    def flush() -> None:
+    def flush(*, carry_titles: bool = False) -> None:
         nonlocal buf, buf_tokens
+        keep: list[ParsedBlock] = []
+        if carry_titles:
+            # Cut for length: the titles at the tail of the buffer are left for the start of the next buffer.
+            # Emitted with this block, a title would end the previous section's block while the body below it
+            # sits in another block, and the chunks would not match their section either. At most 3 are kept
+            # (the same limit as for titles handed to a figure / table as TITLE): material whose whole page is
+            # marked as titles must not leave the buffer growing without ever emptying
+            while buf and len(keep) < 3 and buf[-1].block_type == "title":
+                keep.insert(0, buf.pop())
         emit(buf)
-        buf = []
-        buf_tokens = 0
+        buf = keep
+        buf_tokens = sum(count_tokens(rendered(block)) for block in keep)
 
     def attach_footnote(target: ParsedBlock, run: list[ParsedBlock], text: str) -> None:
         nonlocal footnoted
@@ -386,7 +412,7 @@ def merge_mineru_text_blocks(
             dropped_noise += 1
             continue
         if is_inline_icon(block):
-            # Inline icons (bbox smaller than ICON_MAX_PT square): nothing retrievable in them, and they
+            # Inline icons (under ICON_MAX_PERMILLE on both sides): nothing retrievable in them, and they
             # would cut a paragraph in half and steal the preceding heading as their TITLE. The VLM side
             # filters by size the same way, so here they simply are not boundaries
             dropped_icons += 1
@@ -420,11 +446,11 @@ def merge_mineru_text_blocks(
                     buf_tokens = 0
                     continue
         if buf and buf_tokens + tokens > target_tokens:
-            flush()
+            flush(carry_titles=True)
         buf.append(block)
         buf_tokens += tokens
         if buf_tokens >= target_tokens:
-            flush()
+            flush(carry_titles=True)
     # End of document: drop a note that is only a label, emit the rest
     if buf:
         text_all = "\n\n".join(part for part in (rendered(block) for block in buf) if part)
@@ -440,19 +466,21 @@ def merge_mineru_text_blocks(
     )
     return merged
 
-ICON_MAX_PT = 48
+ICON_MAX_PERMILLE = 48
 
 
 def is_inline_icon(block: ParsedBlock) -> bool:
-    """MinerU bboxes are page coordinates (pt); an image under ICON_MAX_PT on both sides is an inline
-    icon / bullet."""
+    """An image whose width and height are both under ICON_MAX_PERMILLE of the page is an inline icon / bullet.
+    MinerU normalizes bboxes to 0-1000 of the page (per mille), not pt, so the threshold is relative to the
+    page: on a large slide exported in pixels an icon measures many pt, yet its share of the page is still
+    small."""
     if block.block_type != "image" or not block.bbox or len(block.bbox) < 4:
         return False
     try:
         x0, y0, x1, y1 = (float(v) for v in block.bbox[:4])
     except (TypeError, ValueError):
         return False
-    return (x1 - x0) < ICON_MAX_PT and (y1 - y0) < ICON_MAX_PT
+    return (x1 - x0) < ICON_MAX_PERMILLE and (y1 - y0) < ICON_MAX_PERMILLE
 
 
 def source_type(block: ParsedBlock) -> str:

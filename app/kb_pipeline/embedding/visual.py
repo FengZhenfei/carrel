@@ -190,7 +190,13 @@ class VisualEmbeddingClient:
             vectors = [one(job) for job in jobs]
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                vectors = list(executor.map(one, jobs))
+                try:
+                    vectors = list(executor.map(one, jobs))
+                except Exception:
+                    # One image failed in transport, so the whole file has to be redone: the queued images
+                    # need not each be tried again
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
         rejected = sum(1 for vector in vectors if vector is None)
         print(
             f"[visual-embed] done images={len(jobs)} rejected={rejected} elapsed={time.time() - started:.1f}s",

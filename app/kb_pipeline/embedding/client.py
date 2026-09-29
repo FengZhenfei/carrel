@@ -28,12 +28,29 @@ class EmbeddingDimensionError(RuntimeError):
     retried."""
 
 
-def _is_deterministic_client_error(exc: Exception) -> bool:
+class EmbeddingInputRejected(RuntimeError):
+    """The service rejected one of the inputs because of its content (most likely it exceeds the length limit
+    of the model). Retrying the same input changes nothing, so it is not retried. index is the position of the
+    rejected input in embed(texts)."""
+
+    deterministic = True
+
+    def __init__(self, index: int, reason: str) -> None:
+        super().__init__(f"embedding input #{index + 1} rejected: {reason}")
+        self.index = index
+        self.reason = reason
+
+
+def _status_of(exc: Exception) -> int | None:
     status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
     try:
-        status = int(status) if status is not None else None
+        return int(status) if status is not None else None
     except (TypeError, ValueError):
-        status = None
+        return None
+
+
+def _is_deterministic_client_error(exc: Exception) -> bool:
+    status = _status_of(exc)
     # 408 timeout / 429 rate limit are transient; retrying any other 4xx is pointless
     return status is not None and 400 <= status < 500 and status not in (408, 409, 429)
 
@@ -87,6 +104,9 @@ class EmbeddingClient:
                     if _is_deterministic_client_error(exc):
                         # A 400 (input too long / invalid) retried 5 times just wastes 20 seconds, and then a
                         # job-level retry round follows anyway.
+                        rejected = self._rejected_input(batch, exc)
+                        if rejected is not None:
+                            raise EmbeddingInputRejected(i + rejected, str(exc)) from exc
                         raise
                     last_error = exc
                     print(
@@ -101,3 +121,25 @@ class EmbeddingClient:
             if self.sleep_seconds > 0:
                 time.sleep(self.sleep_seconds)
         return vectors
+
+    def _rejected_input(self, batch: list[str], exc: Exception) -> int | None:
+        """When a batch is rejected with 400 / 422, find the input responsible: send the inputs one at a time and
+        pick the one that is rejected on its own while a short prefix of it is accepted. When every input
+        passes on its own (the batch as a whole was rejected), or even the short prefix is rejected (the
+        service rejects any input, a configuration problem), return None: no single input is at fault, and
+        the original error goes on to the job-level retry."""
+        if _status_of(exc) not in (400, 422):
+            return None
+        for idx, text in enumerate(batch):
+            if not self._accepts(text):
+                return idx if self._accepts(text[:32]) else None
+        return None
+
+    def _accepts(self, text: str) -> bool:
+        try:
+            self.client.embeddings.create(model=self.model_id, input=[text], dimensions=self.dim)
+        except Exception as exc:
+            if _status_of(exc) in (400, 422):
+                return False
+            raise
+        return True

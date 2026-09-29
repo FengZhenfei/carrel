@@ -225,10 +225,10 @@ def normalize_predicate_name(value: Any) -> str:
     return _PREDICATE_NAME_RE.sub("", text).strip("_")
 
 
-def normalize_predicates(value: Any) -> tuple[dict[str, Any], ...]:
+def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX) -> tuple[dict[str, Any], ...]:
     """Predicate table: [{name, description, source_parents, target_parents}]; names are lower_snake,
-    de-duplicated, with the fallback related_to removed. A string form (names separated by commas /
-    newlines) is accepted too."""
+    de-duplicated, with the fallback related_to removed, keeping at most limit entries (None = no cut, used
+    when validating the count). A string form (names separated by commas / newlines) is accepted too."""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -254,7 +254,7 @@ def normalize_predicates(value: Any) -> tuple[dict[str, Any], ...]:
             "source_parents": [str(p).strip().lower() for p in (item.get("source_parents") or []) if str(p).strip()][:8],
             "target_parents": [str(p).strip().lower() for p in (item.get("target_parents") or []) if str(p).strip()][:8],
         })
-        if len(out) >= GRAPH_PREDICATES_MAX:
+        if limit is not None and len(out) >= limit:
             break
     return tuple(out)
 
@@ -427,7 +427,7 @@ def validate_graph_schema_config(predicates: Any, parent_types: Any) -> list[str
     if predicates not in (None, "", (), []):
         if not isinstance(predicates, (list, tuple, str)):
             errors.append("graph_predicates must be a list")
-        elif len(normalize_predicates(predicates)) > GRAPH_PREDICATES_MAX:
+        elif len(normalize_predicates(predicates, limit=None)) > GRAPH_PREDICATES_MAX:
             errors.append(f"At most {GRAPH_PREDICATES_MAX} predicates")
     if parent_types not in (None, "", {}):
         if not isinstance(parent_types, dict):

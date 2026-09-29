@@ -240,6 +240,11 @@ def _unit_norm(unit: str) -> str:
 
 _ID_NUM_RE = re.compile(r"^[-+]?0\d")       # 0001 / 007: leading zeros mean an id / code, not a reading
 TRUSTED_SEGMENT_MAX_NUMBERS = 3            # more numbers than this in one in-image text segment means a table row / a whole flattened table; which number belongs to which label cannot be told
+# No "label value" segment is this long: anything longer is running prose, or a few thousand characters the model
+# repeated. Backtracking of _LABEL_NUM_RE on one segment grows with the cube of its length (1,600 characters take
+# 27 seconds, 8,000 about an hour), so a single runaway picture could hold a whole document in the image
+# description stage (2026-09-30)
+SEGMENT_MAX_CHARS = 200
 
 
 def _is_flat_header(label: str) -> bool:
@@ -284,9 +289,12 @@ def _fully_paired(seg: str) -> bool:
 def _collect_pair(body: str, start: int, end: int, single_only: bool, out: list[dict[str, Any]],
                   max_numbers: int | None = None) -> None:
     seg = body[start:end]
-    if single_only and len(_NUM_ONLY_RE.findall(seg)) != 1:
+    if len(seg) > SEGMENT_MAX_CHARS:
         return
-    if max_numbers is not None and (len(_NUM_ONLY_RE.findall(seg)) > max_numbers or not _fully_paired(seg)):
+    numbers = len(_NUM_ONLY_RE.findall(seg))
+    if not numbers or (single_only and numbers != 1):
+        return
+    if max_numbers is not None and (numbers > max_numbers or not _fully_paired(seg)):
         return          # too many numbers in this in-image text segment, or no one-to-one "label -> number" split: cannot tell which number belongs to which label, so not a trusted reading
     m = _LABEL_NUM_RE.search(seg)
     if not m:

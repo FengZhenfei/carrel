@@ -18,10 +18,13 @@ def _local_service_session() -> requests.Session:
     return session
 
 
-def _load_cached_mineru(output_json: Path, input_path: Path) -> dict[str, Any] | None:
-    """Reuse the previous MinerU result. Accepted only when the source-file size recorded in the cache
-    matches the current one (the cache directory is already isolated by content_version; this is a
-    second safeguard)."""
+def _load_cached_mineru(output_json: Path, input_path: Path, backend: str) -> dict[str, Any] | None:
+    """Reuse the previous MinerU result. Accepted only when the source-file size and the backend of the
+    request, both recorded in the cache, match the current ones (the cache directory is already isolated
+    by content_version; this is a second safeguard): once the backend has changed (MINERU_BACKEND, or the
+    parser container's own choice), a re-parse must not be served the old backend's result as is. A cache
+    whose stamp does not record the backend cannot be compared and is accepted as before, like one
+    without a stamp."""
     if not output_json.exists():
         return None
     try:
@@ -37,6 +40,8 @@ def _load_cached_mineru(output_json: Path, input_path: Path) -> dict[str, Any] |
                 return None
         except (OSError, TypeError, ValueError):
             return None
+        if stamp.get("backend") not in (None, backend):
+            return None
     return payload
 
 
@@ -49,18 +54,22 @@ def call_mineru_sync(
     table_enable: bool = False,
     return_middle_json: bool = True,
     timeout: int = 43200,
+    cached_only: bool = False,
 ) -> dict[str, Any]:
     output_json.parent.mkdir(parents=True, exist_ok=True)
     # Result cache: cache_dir is already split by kb/file/content_version, so MinerU output for the
     # same version can be reused directly. It used to be written but never read, so any later-stage
     # failure (embedding hiccup, Qdrant timeout, OpenSearch outage) sent the whole document back to
     # the GPU on retry -- minutes to tens of minutes for a large PDF, up to 5 times.
+    # The backend is resolved first: it is part of the cache identity
+    backend, _backend_source = resolve_backend()
     if os.getenv("MINERU_REUSE_CACHE", "1").strip().lower() in {"1", "true", "yes", "on"}:
-        cached = _load_cached_mineru(output_json, input_path)
+        cached = _load_cached_mineru(output_json, input_path, backend)
         if cached is not None:
             print(f"[mineru] reusing cached result for {input_path.name}", flush=True)
             return cached
-    backend, _backend_source = resolve_backend()
+    if cached_only:       # the caller must not send the file off for parsing (the console's chunk preview runs in the web process)
+        raise RuntimeError(f"no cached MinerU result for {input_path.name}")
     request_data = [
         ("lang_list", os.getenv("MINERU_LANG", "ch")),
         ("backend", backend),
@@ -97,8 +106,8 @@ def call_mineru_sync(
     assert response is not None
     response.raise_for_status()
     payload = response.json()
-    try:   # source stamp: used to confirm the file has not changed before reusing the cache
-        payload["_kb_source"] = {"name": input_path.name, "size": int(input_path.stat().st_size)}
+    try:   # source stamp: used to confirm that neither the file nor the backend has changed before reusing the cache
+        payload["_kb_source"] = {"name": input_path.name, "size": int(input_path.stat().st_size), "backend": backend}
     except (OSError, TypeError):
         pass
     output_json.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")

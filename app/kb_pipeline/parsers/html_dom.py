@@ -9,10 +9,10 @@ from pathlib import Path
 from lxml import etree, html
 
 from ..models import ParsedBlock
-from .common import SectionTracker, clean_text, decode_text_bytes
+from .common import SectionTracker, _span_of, clean_text, decode_text_bytes
 
 
-PARSER_PROFILE = "html-dom-v1"
+PARSER_PROFILE = "html-dom-v2"
 NOISE_XPATHS = (
     ".//script",
     ".//style",
@@ -110,27 +110,43 @@ def _blocks_for_page(page: etree._Element, *, page_id: str, page_title: str) -> 
     seen: set[str] = set()
 
     overview = copy.deepcopy(page)
-    _remove_nodes(overview, SPECIAL_BLOCK_XPATHS)
     tailored = any(page.xpath(xp) for xp in _TAILORED_XPATHS)
     sectioned = None if tailored else _sectioned_overview(overview)
     if sectioned is not None:
         # Generic HTML (health check R9): sectioned by h1-h6, one block per section with a
         # section_path, so chunks get a section prefix; previously the whole page was one block and
         # long documents carried no section information
-        preface, sections = sectioned
+        preface, sections, tables = sectioned
         tracker = SectionTracker()
+
+        def section_tables(section: int, title: str) -> list[ParsedBlock]:
+            # A table follows the section it is in: placed after that section's body, with the same section
+            # path and titled with that section's heading. Put at the end of the page with every title hung
+            # on the page's first heading, the table of the second section was attributed to the first
+            found = []
+            for number, (at, table) in enumerate(tables, start=1):
+                table_md = _table_markdown(table) if at == section else ""
+                if table_md:
+                    found.append(_block(block_type="table", text=table_md, title=f"{title} / Table {number}",
+                                        block_id=f"{_safe_id(page_id)}-table-{number:04d}", page_id=page_id,
+                                        page_title=page_title, html_block_type="table", table_markdown=table_md,
+                                        section_path=tracker.path))
+            return found
+
         if preface:
             blocks.append(_block(block_type="text", text=preface, title=page_title,
                                  block_id=f"{_safe_id(page_id)}-overview", page_id=page_id,
                                  page_title=page_title, html_block_type="overview"))
+        blocks.extend(section_tables(0, page_title))
         for idx, (title, level, text) in enumerate(sections, start=1):
             tracker.observe(level, title)
-            if not text:
-                continue        # the next heading follows directly: no body to store, the path is already in the tracker
-            blocks.append(_block(block_type="text", text=text, title=title or page_title,
-                                 block_id=f"{_safe_id(page_id)}-s{idx:03d}", page_id=page_id,
-                                 page_title=page_title, html_block_type="section", section_path=tracker.path))
+            if text:            # otherwise the next heading follows directly: no body to store, the path is already in the tracker
+                blocks.append(_block(block_type="text", text=text, title=title or page_title,
+                                     block_id=f"{_safe_id(page_id)}-s{idx:03d}", page_id=page_id,
+                                     page_title=page_title, html_block_type="section", section_path=tracker.path))
+            blocks.extend(section_tables(idx, title or page_title))
     else:
+        _remove_nodes(overview, SPECIAL_BLOCK_XPATHS)
         overview_text = _element_text(overview)
         if overview_text:
             blocks.append(
@@ -249,7 +265,7 @@ def _blocks_for_page(page: etree._Element, *, page_id: str, page_title: str) -> 
             )
         )
 
-    for idx, table in enumerate(page.xpath(".//table"), start=1):
+    for idx, table in enumerate(() if sectioned is not None else page.xpath(".//table"), start=1):
         if _skip_nested_or_seen(seen, table):
             continue
         table_md = _table_markdown(table)
@@ -303,19 +319,24 @@ def _block(
     )
 
 
-def _sectioned_overview(overview: etree._Element) -> tuple[str, list[tuple[str, int, str]]] | None:
+def _sectioned_overview(
+    overview: etree._Element,
+) -> tuple[str, list[tuple[str, int, str]], list[tuple[int, etree._Element]]] | None:
     """Section a generic page by h1-h6: returns (text before the first heading, [(heading, level,
-    body) ...]); with fewer than 2 headings it returns None and the whole page stays one block. The
-    heading text does not go into the body (title + section_path already carry it)."""
-    count = sum(1 for el in overview.iter() if isinstance(el.tag, str) and _tag(el) in HEADING_TAGS)
-    if count < 2:
-        return None
+    body) ...], [(section it is in, table) ...]); with fewer than 2 headings it returns None and the
+    whole page stays one block. The heading text does not go into the body (title + section_path
+    already carry it); nor do tables: the section each one is in is recorded (0 = before the first
+    heading) and it becomes a block of its own. Headings inside a table do not start a section."""
     parts: list[list[str]] = [[]]
     titles: list[tuple[str, int]] = []
+    tables: list[tuple[int, etree._Element]] = []
 
     def visit(node: etree._Element) -> None:
         tag = _tag(node)
         if tag in {"script", "style", "noscript", "template"}:
+            return
+        if tag == "table":
+            tables.append((len(titles), node))
             return
         if tag in HEADING_TAGS:
             titles.append((_normalize_text("".join(node.itertext())).replace("\n", " "), int(tag[1])))
@@ -335,9 +356,11 @@ def _sectioned_overview(overview: etree._Element) -> tuple[str, list[tuple[str, 
             parts[-1].append("\n")
 
     visit(overview)
+    if len(titles) < 2:
+        return None
     preface = _normalize_text("".join(parts[0]))
     sections = [(title, level, _normalize_text("".join(body))) for (title, level), body in zip(titles, parts[1:])]
-    return preface, sections
+    return preface, sections, tables
 
 
 _CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.IGNORECASE)
@@ -447,6 +470,7 @@ def _normalize_text(text: str) -> str:
 
 def _table_markdown(table: etree._Element) -> str:
     rows: list[list[str]] = []
+    carry: dict[int, list] = {}      # column -> [rows still to fill below, value]: placeholders left by a rowspan above
     for tr in table.xpath(".//tr"):
         # Rows of a nested table belong to that table; pulling them up here
         # duplicated the inner content (the outer cell's text already inlines
@@ -454,8 +478,25 @@ def _table_markdown(table: etree._Element) -> str:
         nearest_table = tr.xpath("ancestor::table[1]")
         if nearest_table and nearest_table[0] is not table:
             continue
-        cells = [_element_text(cell).replace("\n", " ") for cell in tr.xpath("./th|./td")]
-        cells = [_escape_table_cell(cell) for cell in cells]
+        cells: list[str] = []
+
+        def fill_from_above() -> None:
+            while carry.get(len(cells), [0])[0] > 0:
+                carry[len(cells)][0] -= 1
+                cells.append(carry[len(cells)][1])
+
+        for cell in tr.xpath("./th|./td"):
+            fill_from_above()
+            value = _escape_table_cell(_element_text(cell).replace("\n", " "))
+            down = _span_of(cell.get("rowspan")) - 1
+            # A cell spanning rows / columns fills its value into every position it covers (the same rule as
+            # common._TableReader): a markdown table has no merged cells, and leaving them empty would shift
+            # the columns after them
+            for _ in range(_span_of(cell.get("colspan"))):
+                if down:
+                    carry[len(cells)] = [down, value]
+                cells.append(value)
+        fill_from_above()
         if any(cells):
             rows.append(cells)
     if not rows:

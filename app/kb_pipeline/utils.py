@@ -96,6 +96,15 @@ def detect_lang(text: str) -> str:
 _ENCODER = None
 
 
+def pin_tokenizer_cache(runtime_dir: str | Path) -> None:
+    """By default tiktoken caches its encoding files in the system temp directory, which is cleared at boot; the
+    next count then has to download them again, and when that fails the whole process falls back to the
+    estimate. Point the cache at tiktoken/ under the runtime directory; a cache directory already set in the
+    environment is left alone."""
+    if "TIKTOKEN_CACHE_DIR" not in os.environ and "DATA_GYM_CACHE_DIR" not in os.environ:
+        os.environ["TIKTOKEN_CACHE_DIR"] = str(Path(runtime_dir) / "tiktoken")
+
+
 def count_tokens(text: str, encoding_model: str = "o200k_base") -> int:
     """Real token count for context budgeting. Falls back to the heuristic."""
     global _ENCODER
@@ -104,8 +113,13 @@ def count_tokens(text: str, encoding_model: str = "o200k_base") -> int:
             import tiktoken
 
             _ENCODER = tiktoken.get_encoding(encoding_model)
-        except Exception:
+        except Exception as exc:
             _ENCODER = False
+            # The estimate can be 20-30% off the real tokenizer: chunk boundaries and the evidence budget of
+            # search change their measure along with it, so this must not happen silently
+            cache_dir = os.getenv("TIKTOKEN_CACHE_DIR") or os.getenv("DATA_GYM_CACHE_DIR") or "the system temp directory"
+            print(f"[tokenizer] {encoding_model} is unavailable ({exc!r}); this process counts tokens with the heuristic "
+                  f"until it restarts. The encoding file is cached in {cache_dir}", flush=True)
     if _ENCODER is False:
         return approx_tokens(text)
     return len(_ENCODER.encode(text, disallowed_special=()))

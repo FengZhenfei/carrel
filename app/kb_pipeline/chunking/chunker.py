@@ -3,10 +3,13 @@
 Overhaul after the 2026-09-05 sampling audit (plan: the chunking-logic optimization document in the
 2026-09-05 chunk-sampling folder on the Desktop):
   · Tables are split by row and every chunk carries the header (TITLE/CAPTION, SHEET/ROWS/HEADER lines,
-    and for markdown tables the header row + separator row); cells are never split, and a row is only
-    split by cell when it alone exceeds the budget;
+    and for markdown tables the header row + separator row); a row over the budget is split by cell, each
+    cell carrying its column name (such chunks no longer carry the header lines that spell out the column
+    names), and a cell that alone exceeds the budget is split further by sentence, then by token; in a
+    table whose header takes up most of the budget, every row is written this way;
   · Code fences and pipe tables inside prose are atomic segments: they travel with the prose whole when
-    they fit, and are split by line on their own only when they do not;
+    they fit, and are split by line on their own only when they do not (a single line over the budget is
+    split by token);
   · A fallback pass after chunking: fragments (below diagnose.tiny_threshold) are merged into an adjacent
     chunk of the same section (preferring the following one), never across tables / images; a
     heading-only fragment right before a figure or table becomes that block's TITLE;
@@ -31,6 +34,7 @@ GLUE_SLACK = 1.25
 _FENCE_OPEN_RE = re.compile(r"^\s*(```|~~~)")
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}")
+_CELL_BAR_RE = re.compile(r"(?<!\\)\|")          # the bars separating the cells of a pipe table; a bar inside a cell is written \|
 _NATIVE_TABLE_PREFIXES = ("SHEET:", "ROWS:", "HEADER:")
 _HEAD_PREFIXES = ("TITLE:", "CAPTION:") + _NATIVE_TABLE_PREFIXES
 
@@ -111,59 +115,133 @@ def _segments(text: str) -> list[tuple[str, str]]:
 _ROW_IDENT_MAX_CHARS = 40
 
 
+def _native_cells(line: str) -> list[str]:
+    """Split a row of a native table block (or the part of a HEADER line after the colon) into cells by
+    position: separated by " | ", without an outer frame. When the first cell is empty the whole line starts
+    with "| " (native_table._joined_cells strips the leading whitespace); the empty cell is restored first,
+    otherwise every later cell would shift one column to the left."""
+    s = line.strip()
+    s = (" " + s if s.startswith("|") else s) + (" " if s.endswith("|") else "")
+    return [c.strip() for c in s.split(" | ")]
+
+
+def _framed_cells(line: str) -> list[str]:
+    """Strip the outer frame of a pipe-table row and split it into cells by position."""
+    return [c.strip() for c in _CELL_BAR_RE.split(line.strip().strip("|"))]
+
+
 def _table_header_cells(lines: list[str]) -> list[str]:
     """Column names of the header: the markdown header row (| a | b |) or the "HEADER: a | b" line of a native
     table block; an empty list when there is none."""
     for line in lines:
         s = line.strip()
         if s.startswith("HEADER:"):
-            return [c.strip() for c in s[len("HEADER:"):].split("|")]
+            return _native_cells(s[len("HEADER:"):])
         if _TABLE_LINE_RE.match(s) and not _TABLE_SEP_RE.match(s):
-            return [c.strip() for c in s.strip("|").split("|")]
+            return _framed_cells(s)
     return []
 
 
-def _split_table_row(line: str, budget: int, header_cells: list[str] | None = None) -> list[str]:
-    """A row over budget: split it into several lines by cell, each cell carrying its column name ("column N"
-    when there is no header), and the following lines start with the row identifier (the first non-empty
-    cell) repeated. Empty cells are skipped but the column names keep the positions clear -- empty cells
-    used to be squeezed out, so continuation lines no longer lined up with the header (2026-09-13 Codex
-    F01, the same rule as for native tables). The outer frame of a pipe table is preserved."""
-    wrapped = line.strip().startswith("|")
-    raw = [c.strip() for c in line.strip().strip("|").split("|")]
-    cells = []
+def _split_long_line(text: str, max_tokens: int) -> list[str]:
+    """Split one long line of text (a long table cell, a table note) into pieces of at most max_tokens: pack by
+    sentence first, and split a sentence that alone exceeds the budget by token. No newline is added inside a
+    piece, so one record stays one line."""
+    parts: list[str] = []
+    cur = ""
+    for sentence in split_sentences(text):
+        gap = "" if not cur or cur[-1] in "。！？；" else " "       # no space follows Chinese sentence-final punctuation
+        joined = cur + gap + sentence
+        if count_tokens(joined) <= max_tokens:
+            cur = joined
+            continue
+        if cur:
+            parts.append(cur)
+        cur = sentence
+        if count_tokens(cur) > max_tokens:
+            *done, cur = _split_long_sentence(cur, max_tokens)
+            parts.extend(done)
+    return parts + [cur] if cur else parts
+
+
+def pack_labelled_cells(items: list[str], budget: int) -> list[str]:
+    """Pack labelled cells ("name: value") into lines "name: value | name: value" within the budget; shared by
+    native tables (native_table.split_long_row) and pipe tables. From the second line on, each line starts
+    with the row identifier repeated (the first cell, only when its value is short); a line holding nothing
+    but the row identifier is not emitted, since the identifier opens every following line anyway. A cell
+    that does not fit by itself has its value split into pieces, each carrying the row identifier and the
+    column name -- a whole cell kept as one line would leave the chunk length unbounded, and once it exceeds
+    the limit of the embedding service the whole file cannot be indexed."""
+    ident = items[0] if items and len(items[0].partition(": ")[2]) <= _ROW_IDENT_MAX_CHARS else ""
+    lines: list[str] = []
+    cur: list[str] = []
+    for item in items:
+        if cur and count_tokens(" | ".join(cur + [item])) <= budget:
+            cur.append(item)
+            continue
+        bare_ident = cur == [ident]
+        if cur and not bare_ident:
+            lines.append(" | ".join(cur))
+        start = [ident] if ident and item != ident else []
+        cur = start + [item]
+        if count_tokens(" | ".join(cur)) <= budget:
+            continue
+        name, sep, text = item.partition(": ")
+        lead = " | ".join(start + [name + sep])
+        room = budget - count_tokens(lead)
+        if sep and room >= budget // 2:
+            parts = [lead + part for part in _split_long_line(text, room)]
+        else:
+            # The row identifier and the column name alone take more than half the budget: this cell goes
+            # without the row identifier and, when it still does not fit, is split as one line of text
+            if bare_ident and start:
+                lines.append(ident)
+            parts = _split_long_line(item, budget)
+        lines.extend(parts[:-1])
+        cur = parts[-1:]          # the last piece is usually not full; the following cells continue on it
+    if cur and (cur != [ident] or not lines):
+        lines.append(" | ".join(cur))
+    return lines
+
+
+def _labelled_cells(line: str, header_cells: list[str] | None, native: bool) -> list[str]:
+    """Split a row by position and write each cell as "name: value": a column without a name in the header is
+    called "column N", and empty cells are skipped. In a native table block without a HEADER line the rows
+    were already expanded with column names by native_table (empty cells skipped, positions unrelated to
+    the header): those cells are used as they are, without pairing column names a second time."""
+    raw = _native_cells(line) if native else _framed_cells(line)
+    if native and not header_cells:
+        return [c for c in raw if c]
+    items = []
     for idx, text in enumerate(raw):
         if not text:
             continue
         name = (header_cells[idx] if header_cells and idx < len(header_cells) and header_cells[idx].strip() else f"column {idx + 1}")
-        cells.append((name, text))
-    if not cells:
-        return [line]
-    ident = f"{cells[0][0]}: {cells[0][1]}" if len(cells[0][1]) <= _ROW_IDENT_MAX_CHARS else ""
-    pieces: list[list[str]] = []
-    cur: list[str] = []
-    cur_tokens = 0
-    for name, text in cells:
-        item = f"{name}: {text}"
-        t = count_tokens(item)
-        if cur and cur_tokens + t > budget:
-            pieces.append(cur)
-            cur, cur_tokens = [], 0
-        if not cur and ident and item != ident:
-            cur.append(ident)
-            cur_tokens = count_tokens(ident)
-        cur.append(item)
-        cur_tokens += t
-    if cur:
-        pieces.append(cur)
-    joined = [" | ".join(p) for p in pieces]
-    return [f"| {p} |" if wrapped else p for p in joined]
+        items.append(f"{name}: {text}")
+    return items
+
+
+def _split_table_row(line: str, budget: int, header_cells: list[str] | None = None, *, native: bool = False) -> list[str]:
+    """A row over budget: split it into several lines by cell, each cell carrying its column name ("column N"
+    when there is no header), and the following lines start with the row identifier (the first non-empty
+    cell) repeated. Empty cells are skipped but the column names keep the positions clear -- empty cells
+    used to be squeezed out, so continuation lines no longer lined up with the header (2026-09-13 Codex
+    F01, the same rule as for native tables). The split lines do not keep the outer frame of a pipe table:
+    the chunk they land in carries no header row, so it is no longer a pipe table."""
+    items = _labelled_cells(line, header_cells, native)
+    return pack_labelled_cells(items, budget) if items else [line]
 
 
 def split_table_text(text: str, max_tokens: int) -> list[str]:
     """Split a table by row, every chunk carrying the header. Header = the leading TITLE/CAPTION lines, the
     SHEET/ROWS/HEADER lines, and for markdown tables the header row + separator row. The whole table is
-    one chunk when it fits."""
+    one chunk when it fits.
+    A row over the budget is split by cell with each cell preceded by its own column name, and such chunks
+    leave out the header lines that spell out the column names (the HEADER line, the markdown header row +
+    separator row): for them the whole header is mere repetition that eats into the budget for the body.
+    When the header takes up more than three quarters of the budget, carrying it in every chunk leaves no
+    room for data (a 40-column questionnaire table had 700-odd tokens of header per chunk next to a few
+    dozen tokens of data, so the vector was decided almost entirely by the header): then every row is
+    written this way."""
     if count_tokens(text) <= max_tokens:
         return [text]
     lines = text.splitlines()
@@ -179,45 +257,69 @@ def split_table_text(text: str, max_tokens: int) -> list[str]:
     if count_tokens("\n".join(lead)) > max_tokens // 3:
         extra_body = [l for l in lead if not l.lstrip().startswith(_HEAD_PREFIXES)]
         lead = [l for l in lead if l.lstrip().startswith(_HEAD_PREFIXES)]
-    head: list[str] = list(lead)
+    columns = [l for l in lead if l.lstrip().startswith("HEADER:")]         # the header lines that name the columns
+    context = [l for l in lead if l not in columns]                         # the rest: title, caption, SHEET / ROWS
     body = extra_body + lines[first_table:]
     if len(body) >= len(extra_body) + 2 and _TABLE_LINE_RE.match(body[len(extra_body)]) and _TABLE_SEP_RE.match(body[len(extra_body) + 1]):
-        head.extend(body[len(extra_body):len(extra_body) + 2])
+        columns = body[len(extra_body):len(extra_body) + 2]
         body = extra_body + body[len(extra_body) + 2:]
-    head = [l for l in head if l.strip()]
-    head_text = "\n".join(head)
-    head_tokens = count_tokens(head_text) + 1 if head else 0
-    budget = max(max_tokens // 4, max_tokens - head_tokens)
-    header_cells = _table_header_cells(head)
-    groups: list[list[str]] = []
+    header_cells = _table_header_cells(columns)
+    native = any(l.lstrip().startswith(_NATIVE_TABLE_PREFIXES) for l in lead)
+    # Every line of a native table block is a data row; in other tables a line without a bar is a table note, a
+    # footnote or original text that was not turned into a table: not split by cell, no column names
+    entries = [(l, native or "|" in l) for l in body if l.strip()]
+
+    def room(head_lines: list[str]) -> int:
+        return max_tokens - (count_tokens("\n".join(head_lines)) + 1 if head_lines else 0)
+
+    floor = max_tokens // 4
+    while context and room(context) < floor:
+        # Title / caption take up most of the budget: the longest line is no longer carried by every chunk; it
+        # appears once at the start, ahead of the table, and is split like body text
+        context.remove(max(context, key=count_tokens))
+    opening = [l for l in lead if l not in columns and l not in context]
+    has_rows = any(is_row for _, is_row in entries)
+    entries = [(l, False) for l in opening] + entries
+    expand_all = bool(columns) and has_rows and room(context + columns) < floor
+    if columns and not has_rows:
+        # A header and no data rows (a "table" whose single cell holds a whole passage): the header is the
+        # content, split it as body text
+        at = len(opening) + len(extra_body)
+        entries[at:at] = [(l, False) for l in columns if not _TABLE_SEP_RE.match(l)]
+    if expand_all or not has_rows:
+        columns = []
+    budgets = {False: room(context + columns), True: room(context)}          # key: the chunk leaves out the column header lines (True) or not
+    groups: list[tuple[bool, list[str]]] = []
     cur: list[str] = []
     cur_tokens = 0
-    for line in body:
-        if not line.strip():
-            continue
-        t = count_tokens(line) + 1              # +1: the newline when joining back
-        if t > budget:
-            if cur:
-                groups.append(cur)
+    cur_named = expand_all
+    for k, (line, is_row) in enumerate(entries):
+        fits = count_tokens(line) + 1 <= budgets[False]
+        if is_row:
+            named = expand_all or not fits
+            parts = _split_table_row(line, budgets[True] - 1, header_cells, native=native) if named else [line]
+        else:
+            named = k < len(opening) or (cur_named if cur else expand_all)   # table notes and footnotes follow the chunk before them
+            parts = [line] if count_tokens(line) + 1 <= budgets[named] else _split_long_line(line, budgets[named] - 1)
+        for part in parts:
+            t = count_tokens(part) + 1              # +1: the newline when joining back
+            if cur and (named != cur_named or cur_tokens + t > budgets[named]):
+                groups.append((cur_named, cur))
                 cur, cur_tokens = [], 0
-            for part in _split_table_row(line, budget, header_cells):
-                groups.append([part])
-            continue
-        if cur and cur_tokens + t > budget:
-            groups.append(cur)
-            cur, cur_tokens = [], 0
-        cur.append(line)
-        cur_tokens += t
+            cur.append(part)
+            cur_tokens += t
+            cur_named = named
     if cur:
-        groups.append(cur)
+        groups.append((cur_named, cur))
     if not groups:
         return [text]
-    return ["\n".join(([head_text] if head_text else []) + rows) for rows in groups]
+    return ["\n".join(context + ([] if named else columns) + rows) for named, rows in groups]
 
 
 def _split_fence(text: str, max_tokens: int) -> list[str]:
     """A code fence that does not fit: split by line, each piece re-wrapped with the opening fence line and the
-    closing fence."""
+    closing fence. A single line over the budget (JSON squashed into one line, base64) is split by token into
+    several lines."""
     lines = text.splitlines()
     if not lines:
         return []
@@ -230,12 +332,13 @@ def _split_fence(text: str, max_tokens: int) -> list[str]:
     cur: list[str] = []
     cur_tokens = 0
     for line in body:
-        t = count_tokens(line) + 1
-        if cur and cur_tokens + t > budget:
-            pieces.append("\n".join([opener, *cur, closer]))
-            cur, cur_tokens = [], 0
-        cur.append(line)
-        cur_tokens += t
+        for part in ([line] if count_tokens(line) + 1 <= budget else _split_long_sentence(line, budget)):
+            t = count_tokens(part) + 1
+            if cur and cur_tokens + t > budget:
+                pieces.append("\n".join([opener, *cur, closer]))
+                cur, cur_tokens = [], 0
+            cur.append(part)
+            cur_tokens += t
     if cur:
         pieces.append("\n".join([opener, *cur, closer]))
     return pieces or [text]
@@ -260,7 +363,8 @@ def _chunk_prose(
         **without overlap** (the new chunk starts at the heading; the tail of the previous section must
         not bleed in); below half, keep packing so small sections stay together
       · When cutting for length and the chunk ends with a heading line, move it to the start of the next
-        chunk -- the heading is the nameplate of the next passage
+        chunk -- the heading is the nameplate of the next passage; when there is no next chunk to attach
+        it to (the text ends there, or the following unit is split on its own), it becomes a chunk of its own
     An atomic unit (fence / table) is packed like a sentence when it fits; only when it does not is it
     split by line on its own.
     """
@@ -300,7 +404,9 @@ def _chunk_prose(
     for sentence, atomic in units:
         t = cost(sentence)
         if t > max_tokens:
-            flush()
+            # A heading moved off the end of the chunk cannot attach to a unit that is split on its own: it becomes
+            # a chunk of its own, and the fragment fallback (_glue_pieces) merges it into a neighbouring chunk
+            chunks.extend(flush())
             if atomic:
                 kind = "fence" if _FENCE_OPEN_RE.match(sentence) else "table"
                 chunks.extend(_split_fence(sentence, max_tokens) if kind == "fence" else split_table_text(sentence, max_tokens))
@@ -322,7 +428,7 @@ def _chunk_prose(
                 current_tokens = sum(cost(s) for s in carry)
         current.append(sentence)
         current_tokens += t
-    flush()
+    chunks.extend(flush())      # the text ends with a heading: no sentence follows to attach it to, so it stands alone too
     return [c for c in chunks if c]
 
 

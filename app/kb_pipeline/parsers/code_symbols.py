@@ -11,11 +11,13 @@ installed or the syntax tree errors out, the caller falls back to one block for 
 from __future__ import annotations
 
 import re
+from collections import deque
 from typing import Any, Callable
 
 from ..models import ParsedBlock
 
-PROFILE = "code-symbols-v1"
+PROFILE = "code-symbols-v2"
+MAX_CALLS = 40          # how many callee names are recorded per symbol
 
 # Extension -> tree-sitter language name
 LANGUAGE_BY_SUFFIX = {
@@ -43,6 +45,9 @@ _NAMESPACE = {"namespace_definition", "namespace_declaration", "module", "file_s
 _WRAPPERS = {"export_statement", "template_declaration", "decorated_definition", "declaration"}
 _TRANSPARENT = {"statement_list"}          # powershell: program -> statement_list -> statements
 _COMMENTS = {"comment", "line_comment", "block_comment", "multiline_comment", "doc_comment"}
+# Decorators that sit in the syntax tree as siblings in front of the definition: @Get() on TypeScript class
+# members, Rust's #[test]. Other languages keep them inside the definition node
+_DECORATORS = {"decorator", "attribute_item"}
 _CALL_TYPES = {"call_expression", "method_invocation", "invocation_expression", "function_call_expression",
                "member_call_expression", "scoped_call_expression", "new_expression", "object_creation_expression",
                "call", "command", "nullsafe_member_call_expression"}
@@ -123,13 +128,37 @@ def _clean_comment(text: str) -> str:
     return " ".join(lines).split(". ")[0][:300]
 
 
-def _doc_before(node, siblings: list) -> str:
-    """The comment directly before a definition (may be several consecutive lines)."""
-    idx = next((i for i, s in enumerate(siblings) if s.id == node.id), None)
-    if idx is None:
+class _Siblings(list):
+    """The sibling nodes of one container, with a node -> position index. Looking up its own position linearly
+    for every symbol takes quadratic time on a file with many top-level symbols."""
+
+    def __init__(self, nodes) -> None:
+        super().__init__(nodes)
+        self.position = {n.id: i for i, n in enumerate(self)}
+
+
+def _leading(node, siblings: _Siblings) -> int:
+    """Where a definition starts among its siblings: decorators directly before it count as part of it (the
+    same rule as code_python._start_line). Returns -1 when the node is not among these siblings."""
+    idx = siblings.position.get(node.id, -1)
+    while idx > 0 and siblings[idx - 1].type in _DECORATORS:
+        idx -= 1
+    return idx
+
+
+def _start_row(node, siblings: _Siblings) -> int:
+    idx = _leading(node, siblings)
+    return siblings[idx].start_point[0] if idx >= 0 else node.start_point[0]
+
+
+def _doc_before(node, siblings: _Siblings) -> str:
+    """The comment directly before a definition (together with its decorators); may be several consecutive
+    lines."""
+    idx = _leading(node, siblings)
+    if idx < 0:
         return ""
     parts: list[str] = []
-    line = node.start_point[0]
+    line = siblings[idx].start_point[0]
     for s in reversed(siblings[:idx]):
         if s.type in _COMMENTS and s.end_point[0] >= line - 1:
             parts.insert(0, _text(s))
@@ -173,26 +202,30 @@ def _callee(node) -> str | None:
 
 
 def _calls_in(node) -> list[str]:
+    """The names called inside the node, the first MAX_CALLS in breadth-first order. Stops once full: in a
+    bundled file a single statement is the whole file."""
     out: list[str] = []
-    stack = [node] if node.type in _CALL_TYPES else list(node.named_children)
-    while stack:
-        n = stack.pop(0)
+    seen: set[str] = set()
+    queue = deque([node] if node.type in _CALL_TYPES else node.named_children)
+    while queue and len(out) < MAX_CALLS:
+        n = queue.popleft()
         if n.type in _CALL_TYPES:
             c = _callee(n)
             if c:
                 c = re.sub(r"^\$?this(\.|->)", "self.", c)
                 c = c.replace("self::", "self.").replace("static.", "self.")
-                if c not in out and len(c) <= 80:
+                if c not in seen and len(c) <= 80:
+                    seen.add(c)
                     out.append(c)
-        stack.extend(n.named_children)
-    return out[:40]
+        queue.extend(n.named_children)
+    return out
 
 
 def _string_in(node) -> str:
     """Content of the first string literal inside the node (an import path)."""
-    stack = [node]
+    stack = deque([node])
     while stack:
-        n = stack.pop(0)
+        n = stack.popleft()
         if n.type in _STRING_TYPES:
             s = _text(n).strip().strip("\"'`<>")
             if n.type == "system_lib_string":
@@ -339,10 +372,14 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
     parser = _get_parser(language)
     if parser is None:
         return None
+    # Lines must be split the same way the syntax tree numbers them: tree-sitter only knows \n, so \r\n and \r
+    # are normalized first and the text is split on \n alone. str.splitlines also breaks at form feeds, \x85
+    # and U+2028, and a single one in the file shifts the text taken for every symbol after it
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
     data = source.encode("utf-8", errors="ignore")
     tree = parser.parse(data)
     root = tree.root_node
-    lines = source.splitlines()
+    lines = source.split("\n")
     covered = [False] * (len(lines) + 2)
     symbols: list[tuple[int, int, dict[str, Any], list[str]]] = []
     imports: list[dict[str, Any]] = []
@@ -358,13 +395,14 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
             covered[i] = True
         return "\n".join(lines[start - 1:end])
 
-    def handle_class(node, prefix: str, siblings: list, doc_node=None) -> None:
+    def handle_class(node, prefix: str, siblings: _Siblings, doc_node=None) -> None:
         name, methods, bases, body = _class_name_and_methods(node, language)
         doc_node = doc_node or node
         if not name:
             return
         qual = f"{prefix}{name}"
-        cstart, cend = doc_node.start_point[0] + 1, doc_node.end_point[0] + 1
+        cstart, cend = _start_row(doc_node, siblings) + 1, doc_node.end_point[0] + 1
+        body_children = _Siblings(body.named_children if body is not None else [])
         flavor = node.type.replace("_declaration", "").replace("_item", "").replace("_specifier", "").replace("_definition", "").replace("_statement", "")
         method_names = []
         ranges = []
@@ -373,12 +411,12 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
             mname = _qual(_text(mn)) if mn is not None else None
             if not mname:
                 continue
-            mstart = m.start_point[0] + 1
+            mstart = _start_row(m, body_children) + 1
             if mstart <= node.start_point[0] + 1:
                 method_names.append(mname)          # on the same line as the class head (one-line class): record the name only, no separate block
                 continue
             ranges.append((mstart, m.end_point[0] + 1, m, mname))
-        ranges.sort()
+        ranges.sort(key=lambda r: r[:2])
         head_end = (ranges[0][0] - 1) if ranges else cend
         if node.type != "impl_item":
             add_symbol(cstart, max(cstart, head_end), {
@@ -394,7 +432,6 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
                 "signature": _signature(node), "docstring": _doc_before(doc_node, siblings), "bases": bases,
                 "methods": method_names + [r[3] for r in ranges], "fields": [], "calls": [], "decorators": [],
             }, list(filter(None, prefix.rstrip(".").split("."))))
-        body_children = list(body.named_children) if body is not None else []
         for i, (mstart, mend, m, mname) in enumerate(ranges):
             mend2 = (ranges[i + 1][0] - 1) if i + 1 < len(ranges) else cend
             add_symbol(mstart, mend2, {
@@ -403,17 +440,21 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
                 "class": qual, "decorators": [],
             }, list(filter(None, qual.split("."))))
 
-    def handle_function(node, name: str, prefix: str, siblings: list, kind: str = "function", cls: str | None = None, doc_node=None) -> None:
+    def handle_function(node, name: str, prefix: str, siblings: _Siblings, kind: str = "function", cls: str | None = None, doc_node=None) -> None:
         doc_node = doc_node or node
-        start, end = doc_node.start_point[0] + 1, doc_node.end_point[0] + 1
+        start, end = _start_row(doc_node, siblings) + 1, doc_node.end_point[0] + 1
         meta = {"kind": kind, "name": name.rsplit(".", 1)[-1], "qualname": f"{prefix}{name}", "lineno": start, "end_lineno": end,
                 "signature": _signature(node), "docstring": _doc_before(doc_node, siblings), "calls": _calls_in(node), "decorators": []}
         if cls:
             meta["class"] = cls
         add_symbol(start, end, meta, list(filter(None, (cls or prefix.rstrip(".")).split("."))))
 
+    def note_calls(node) -> None:
+        if len(top_calls) < MAX_CALLS:
+            top_calls.extend(c for c in _calls_in(node) if c not in top_calls)
+
     def visit(container, prefix: str) -> None:
-        children = list(container.named_children)
+        children = _Siblings(container.named_children)
         for raw in children:
             node = _unwrap(raw)
             t = node.type
@@ -457,15 +498,20 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
                     visit(body, f"{prefix}{ns}." if ns else prefix)
                 continue
             if t == "type_declaration" and language == "go":
-                for spec in node.named_children:
-                    if spec.type == "type_spec":
-                        nn = spec.child_by_field_name("name")
-                        typ = spec.child_by_field_name("type")
-                        if nn is not None and typ is not None and typ.type in ("struct_type", "interface_type"):
-                            start, end = node.start_point[0] + 1, node.end_point[0] + 1
-                            add_symbol(start, end, {"kind": "class", "flavor": typ.type.replace("_type", ""), "name": _text(nn), "qualname": f"{prefix}{_text(nn)}",
-                                                    "lineno": start, "end_lineno": end, "signature": _signature(node), "docstring": _doc_before(raw, children),
-                                                    "bases": [], "methods": [], "fields": [], "calls": [], "decorators": []}, [])
+                group = _Siblings(node.named_children)
+                specs = [spec for spec in group if spec.type == "type_spec"]
+                for spec in specs:
+                    nn = spec.child_by_field_name("name")
+                    typ = spec.child_by_field_name("type")
+                    if nn is not None and typ is not None and typ.type in ("struct_type", "interface_type"):
+                        # In a grouped declaration type ( A ...; B ... ) each type takes only its own lines: taking
+                        # the whole group put the same text into the block of every type
+                        own, doc = (spec, _doc_before(spec, group)) if len(specs) > 1 else (node, "")
+                        doc = doc or _doc_before(raw, children)
+                        start, end = own.start_point[0] + 1, own.end_point[0] + 1
+                        add_symbol(start, end, {"kind": "class", "flavor": typ.type.replace("_type", ""), "name": _text(nn), "qualname": f"{prefix}{_text(nn)}",
+                                                "lineno": start, "end_lineno": end, "signature": _signature(own), "docstring": doc,
+                                                "bases": [], "methods": [], "fields": [], "calls": [], "decorators": []}, [])
                 continue
             if t == "method_declaration" and language == "go":
                 recv = node.child_by_field_name("receiver")
@@ -514,9 +560,9 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
                 for nm in names:
                     if nm and _is_upper(nm.split(".")[-1]) and nm not in constants:
                         constants.append(nm.split("$")[-1])
-                top_calls.extend(c for c in _calls_in(node) if c not in top_calls)
+                note_calls(node)
                 continue
-            top_calls.extend(c for c in _calls_in(node) if c not in top_calls)
+            note_calls(node)
 
     top = list(root.named_children)
     if top and top[0].type in _COMMENTS:
@@ -536,7 +582,7 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
     rest = [lines[i - 1] for i in range(1, len(lines) + 1) if not covered[i]]
     rest_text = "\n".join(rest).strip("\n")
     module_meta = {"kind": "module", "name": "", "qualname": "", "docstring": file_doc, "imports": imports,
-                   "constants": constants[:60], "calls": top_calls[:40], "language": language, "has_error": bool(root.has_error)}
+                   "constants": constants[:60], "calls": top_calls[:MAX_CALLS], "language": language, "has_error": bool(root.has_error)}
     if rest_text.strip():
         blocks.insert(0, ParsedBlock(parser="tree-sitter", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
                                      text=rest_text, title="(module)", block_id="sym-0000-module",

@@ -6,7 +6,6 @@ from ..models import ParsedBlock
 from ..utils import infer_doc_type
 from .common import markdown_to_blocks, parser_profile_for_path, read_text_smart
 from .errors import NonRetryableParseError
-from .html_dom import parse_html_dom
 from .native import parse_text
 
 TEXT_SUFFIXES = {
@@ -22,8 +21,6 @@ TEXT_FILENAMES = {"Dockerfile", "Makefile", "Gemfile", "Rakefile", "Jenkinsfile"
 def parse_native(path: Path, mime_type: str = "") -> list[ParsedBlock]:
     doc_type = infer_doc_type(path.name, mime_type)
     suffix = path.suffix.lower()
-    if suffix == ".html":
-        return parse_html_dom(path)
     if suffix in {".md", ".markdown"}:
         # Split on headings so chunks align with sections and carry
         # section_path; the chunker still subdivides long sections. Falls back
@@ -54,8 +51,8 @@ def parse_native(path: Path, mime_type: str = "") -> list[ParsedBlock]:
         # text; parsing is no longer refused because the fallback whitelist lacks an entry (final
         # review S02)
         return parse_text(path, doc_type, parser_profile_for_path(path))
-    # csv/xlsx/xls never reach here: parse_job routes TABLE_SUFFIXES to
-    # parse_native_table before falling back to this router.
+    # csv/xlsx/xls and html never reach here: parse_job routes them to
+    # parse_native_table / parse_html_dom before falling back to this router.
     # Deterministic failure: a format with no parse route gives the same result however often it is
     # retried, so do not go through 5 rounds of backoff (2026-09-06 health check B6)
     raise NonRetryableParseError(f"parser route for {suffix or doc_type} is not enabled in this phase")

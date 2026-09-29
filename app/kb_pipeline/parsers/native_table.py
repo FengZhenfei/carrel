@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import csv
+import datetime
+import math
 import re
 import string
 import zipfile
 import xml.etree.ElementTree as ET
+from decimal import ROUND_HALF_UP, Context, Decimal
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..chunking.chunker import pack_labelled_cells
 from ..models import ParsedBlock
 from ..utils import count_tokens
 from .common import clean_text
@@ -50,10 +54,6 @@ def read_csv_rows_numbered(path: Path) -> list[tuple[int, list[str]]]:
         return _read_csv_rows_with_encoding(path, encoding="utf-8", errors="ignore")
     except Exception as exc:
         raise RuntimeError(f"cannot read csv {path}: {last_error or exc!r}") from exc
-
-
-def read_csv_rows(path: Path) -> list[list[str]]:
-    return [cells for _, cells in read_csv_rows_numbered(path)]
 
 
 def _read_csv_rows_with_encoding(path: Path, *, encoding: str, errors: str) -> list[tuple[int, list[str]]]:
@@ -127,7 +127,8 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
             content_rows, content_cols = _xlsx_content_extent(ws)
             for merged in ws.merged_cells.ranges:
                 min_col, min_row, max_col, max_row = merged.bounds
-                value = normalize_cell(ws.cell(min_row, min_col).value)
+                anchor = ws.cell(min_row, min_col)
+                value = normalize_cell(anchor.value, getattr(anchor, "number_format", None))
                 if not value:
                     continue
                 # Fill vertically, not horizontally. Every **row** covered by the merged range gets
@@ -153,7 +154,7 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                     continue
                 values: list[str] = []
                 for cell in row:
-                    values.append(normalize_cell(cell.value) or merged_values.get((cell.row, cell.column), ""))
+                    values.append(normalize_cell(cell.value, cell.number_format) or merged_values.get((cell.row, cell.column), ""))
                 if any(values):
                     empty_run = 0
                     rows.append((row[0].row if row else len(rows) + 1, values))
@@ -387,22 +388,38 @@ def chunk_rows_to_blocks(
     first_header_no = min(header_row_nos) if header_row_nos else None
     lead_rows = [(row_no, row) for row_no, row in rows if first_header_no is not None and row_no < first_header_no and any((c or "").strip() for c in row)]
     lead_row_nos = {row_no for row_no, _ in lead_rows}
-    blocks = [summary_block(doc_type, sheet_name, rows, header_line,
-                            lead_lines=[row_to_text(row) for _, row in lead_rows])]
+    # A vertically merged note block is spread over every row it covers (read_xlsx_rows), so by now it is
+    # several identical lines of text: of adjacent identical lines only one is kept.
+    # A note line is a passage of text, not a table row: its cells are joined with spaces, not " | ", so that
+    # when it is over budget the chunker splits it by sentence instead of by cell
+    lead_lines: list[str] = []
+    for _, row in lead_rows:
+        line = " ".join(cell for cell in map(flat_cell, row) if cell)
+        if not lead_lines or line != lead_lines[-1]:
+            lead_lines.append(line)
+    blocks = [summary_block(doc_type, sheet_name, rows, header_line, lead_lines=lead_lines)]
 
     # Every emitted block carries the SHEET/ROWS/HEADER prefix in front of the
     # packed rows, so the row budget is what is left after that prefix;
     # otherwise a wide header silently pushes every block past max_tokens
     # (measured: 55 of 60 blocks at 450-507 against a 400 limit).
-    prefix_tokens = count_tokens(
-        "\n".join(x for x in (f"SHEET: {sheet_name}" if sheet_name else "", "ROWS: 00000-00000", f"HEADER: {header_line}" if header_line else "") if x)
-    )
-    row_budget = max(64, max_tokens - prefix_tokens)
+    # The budget is counted the same way as in the chunker (the prefix and the newline after every row count),
+    # so the chunker does not split the block a second time.
+    # Rows expanded with column names ("name: value | ...") go without the HEADER line: the column name already
+    # stands before every cell, so the whole header would only repeat it.
+    bare_prefix = "\n".join(x for x in (f"SHEET: {sheet_name}" if sheet_name else "", "ROWS: 00000-00000") if x)
+    labelled_budget = max_tokens - count_tokens(bare_prefix) - 1
+    row_budget = labelled_budget - (count_tokens(f"HEADER: {header_line}") + 1 if header_line else 0)
+    # When the header takes more than three quarters of the budget, "whole header + positional rows" leaves no
+    # room for data and every block is mostly header (a 40-column questionnaire sheet produced 330 chunks, each
+    # 700-odd tokens of header next to a few dozen tokens of data): then every row of the table is expanded with
+    # column names
+    labelled_only = bool(header_line) and row_budget < max_tokens // 4
 
     current: list[tuple[int, str]] = []
     current_tokens = 0
 
-    def flush(piece: int | None = None) -> None:
+    def flush(piece: int | None = None, *, labelled: bool = labelled_only) -> None:
         nonlocal current, current_tokens
         if not current:
             return
@@ -411,7 +428,7 @@ def chunk_rows_to_blocks(
         if sheet_name:
             prefix.append(f"SHEET: {sheet_name}")
         prefix.append(f"ROWS: {current[0][0]}-{current[-1][0]}")
-        if header_line:
+        if header_line and not labelled:
             prefix.append(f"HEADER: {header_line}")
         text = "\n".join(prefix) + "\n" + body
         blocks.append(
@@ -444,39 +461,42 @@ def chunk_rows_to_blocks(
         tail: list[tuple[int, str]] = []
         tail_tokens = 0
         for item in reversed(current):
-            tokens = count_tokens(item[1])
+            tokens = count_tokens(item[1]) + 1
             if tail and tail_tokens + tokens > overlap_tokens:
                 break
             tail.append(item)
             tail_tokens += tokens
         current = list(reversed(tail))
-        current_tokens = sum(count_tokens(line) for _, line in current)
+        current_tokens = tail_tokens
 
+    budget = labelled_budget if labelled_only else row_budget
     for row_no, row in rows:
         if row_no in header_row_nos or row_no in lead_row_nos:
             continue
         line = row_to_text(row)
         if not line:
             continue
-        tokens = count_tokens(line)
-        if tokens > row_budget:
+        over = not labelled_only and count_tokens(line) + 1 > row_budget
+        pieces = split_long_row(row, labelled_budget - 1, header) if over or labelled_only else [line]
+        if over or len(pieces) > 1:
             # A single row that alone exceeds the budget (a long free-text cell)
             # is split at cell boundaries into several lines, each emitted as
-            # its own block so every piece keeps the header prefix.
+            # its own block.
             flush()
-            for piece_no, piece_line in enumerate(split_long_row(row, row_budget, header), start=1):
+            for piece_no, piece_line in enumerate(pieces, start=1):
                 current = [(row_no, piece_line)]
-                current_tokens = count_tokens(piece_line)
-                flush(piece=piece_no)
+                flush(piece=piece_no, labelled=True)
             current = []
             current_tokens = 0
             continue
-        if current and current_tokens + tokens > row_budget:
+        line = pieces[0]
+        tokens = count_tokens(line) + 1              # +1: the newline when joining back
+        if current and current_tokens + tokens > budget:
             flush()
             # flush() keeps an overlap tail that always retains at least one
             # row however large; without this recheck the tail plus the new
             # row accumulates past the budget (same fix as chunker.chunk_text).
-            if current and current_tokens + tokens > row_budget:
+            if current and current_tokens + tokens > budget:
                 current = []
                 current_tokens = 0
         current.append((row_no, line))
@@ -496,7 +516,7 @@ def summary_block(
     text = f"{target}\nRows: {len(rows)}"
     for line in (lead_lines or []):
         if line.strip():
-            text += f"\nTitle: {line[:200]}"
+            text += f"\nTitle: {line}"          # not truncated: note lines are indexed only here; the chunker splits a long one to the budget
     if header_line:
         text += f"\nColumns: {header_line}"
     return ParsedBlock(
@@ -518,13 +538,49 @@ def summary_block(
 _DISPIMG_RE = re.compile(r"^=\s*DISPIMG\(", re.IGNORECASE)
 
 
-def normalize_cell(value: Any) -> str:
+# The parts of a number format that are not format symbols: quoted literals, escaped characters,
+# [conditions / colours], padding (_x) and fill (*x)
+_FORMAT_LITERAL_RE = re.compile(r'"[^"]*"|\\.|\[[^\]]*\]|[_*].')
+_FORMAT_DECIMALS_RE = re.compile(r"\.([0#?]+)")
+_PERCENT_CONTEXT = Context(prec=400)      # the default 28 significant digits cannot hold a very large number, and rounding would raise
+
+
+def percent_decimals(number_format: str | None) -> int | None:
+    """For a percentage number format, how many decimals it displays (0% -> 0, 0.00% -> 2); None when it is
+    not a percentage. Only the first section (the positive-number format) is considered."""
+    section = _FORMAT_LITERAL_RE.sub("", str(number_format or "")).split(";")[0]
+    if "%" not in section:
+        return None
+    decimals = _FORMAT_DECIMALS_RE.search(section)
+    return len(decimals.group(1)) if decimals else 0
+
+
+def normalize_cell(value: Any, number_format: str | None = None) -> str:
+    """Cell value -> the form that is indexed, as close as possible to what the sheet shows (ignoring the number
+    format, a cell showing 6% was indexed as 0.06, a formula result of 92% as 0.916666666666667, and a whole
+    date carried 00:00:00). number_format is the cell's number format, used only for percentages; dates are
+    always written in ISO form, while currency symbols and thousands separators are not restored."""
     if value is None:
         return ""
     if isinstance(value, str) and _DISPIMG_RE.match(value.strip()):
         return "(image)"                       # WPS embedded-image formula; storing it verbatim is only noise
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"   # the same form as the xls path
+    if isinstance(value, datetime.datetime):
+        if value.hour == value.minute == value.second == 0:
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, (int, float)):
+        decimals = percent_decimals(number_format)
+        if decimals is not None and math.isfinite(value * 100):
+            # Reduce to 15 significant digits before rounding: 0.545 is 0.54500000000000004 in the machine,
+            # and the sheet shows 55%
+            shown = Decimal(format(value * 100, ".15g")).quantize(
+                Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP, context=_PERCENT_CONTEXT)
+            return f"{shown:f}%"
+        if isinstance(value, float):
+            # Integral values lose the ".0"; the rest lose the binary floating-point tail (0.30000000000000004 -> 0.3)
+            value = int(value) if value.is_integer() else format(value, ".15g")
     return clean_text(str(value))
 
 
@@ -544,13 +600,6 @@ def _looks_like_header_cell(cell: str) -> bool:
     if _NUMERIC_RE.match(cell) or _DATAISH_RE.search(cell):
         return False
     return True
-
-
-def _looks_like_header_row(row: list[str]) -> bool:
-    cells = [c for c in row if (c or "").strip()]
-    if not cells:
-        return False
-    return all(_looks_like_header_cell(c) for c in cells)
 
 
 def detect_header_rows(rows: list[tuple[int, list[str]]], max_header_rows: int = 3,
@@ -616,13 +665,6 @@ def _extends_header(prev: list[str], row: list[str]) -> bool:
     return repeat >= 1 and fresh >= 1
 
 
-def _looks_like_header_row_of_data(row: list[str], prev: list[str]) -> bool:
-    """A row that merely repeats the previous header verbatim is a second
-    header tier only if it differs somewhere; an identical row is data-like
-    (e.g. a repeated title line) and should not extend the header."""
-    return [c.strip() for c in row] == [c.strip() for c in prev]
-
-
 def merge_header_rows(rows: list[list[str]]) -> list[str]:
     """Combine tiered header rows column-wise into 'upper/lower' names,
     dropping a repeated upper value and carrying merged spans forward."""
@@ -645,9 +687,6 @@ def merge_header_rows(rows: list[list[str]]) -> list[str]:
     return merged
 
 
-ROW_IDENT_MAX_CHARS = 40     # a row identifier (the first non-empty cell) is at most this long; anything longer is free text and not used as an identifier
-
-
 def split_long_row(row: list[str], budget: int, header: list[str] | None = None) -> list[str]:
     """A row over budget: split it into several pieces by cell, each cell carrying its column name
     (the column letter when the header has none), and later pieces start by repeating the row
@@ -655,35 +694,18 @@ def split_long_row(row: list[str], budget: int, header: list[str] | None = None)
     positions clear. Previously the non-empty cells were simply packed by budget and empty columns
     vanished, so a continuation piece no longer lined up with the full-row header (2026-09-13 Codex
     F01: a 40-column questionnaire sheet whose continuation held only the W-AE stretch under the
-    complete header). A single cell still over budget is left to the generic chunker downstream to
-    split by sentence."""
-    cells = []
+    complete header). No piece exceeds budget: a single cell that is still over budget has its value
+    split by token (for the packing see chunker.pack_labelled_cells)."""
+    items = []
     for idx, cell in enumerate(row):
         text = flat_cell(cell)
         if not text:
             continue
         name = (header[idx] if header and idx < len(header) and str(header[idx] or "").strip() else col_name(idx))
-        cells.append((flat_cell(str(name)), text))
-    if not cells:
+        items.append(f"{flat_cell(str(name))}: {text}")
+    if not items:
         return [row_to_text(row)]
-    ident = f"{cells[0][0]}: {cells[0][1]}" if len(cells[0][1]) <= ROW_IDENT_MAX_CHARS else ""
-    pieces: list[str] = []
-    cur: list[str] = []
-    cur_tok = 0
-    for name, text in cells:
-        item = f"{name}: {text}"
-        t = count_tokens(item)
-        if cur and cur_tok + t > budget:
-            pieces.append(" | ".join(cur))
-            cur, cur_tok = [], 0
-        if not cur and ident and item != ident:
-            cur.append(ident)
-            cur_tok = count_tokens(ident)
-        cur.append(item)
-        cur_tok += t
-    if cur:
-        pieces.append(" | ".join(cur))
-    return pieces
+    return pack_labelled_cells(items, budget)
 
 
 def _is_note_row(cells: list[str]) -> bool:
