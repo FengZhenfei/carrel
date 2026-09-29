@@ -695,6 +695,30 @@ class SchemaFeedbackTests(unittest.TestCase):
                 discovery.set_config(con, "kb_x", {"graph_rebuild_resuggest": False}); con.commit()
             src3, info3 = schema_flow.resuggest_for_rebuild(settings, source)
             self.assertEqual((src3 is source, info3), (True, {"skipped": "disabled"}))
+            # 2026-09-29 audit: one baseline is re-suggested only once. After a failed full build the baseline is
+            # unchanged; re-suggesting every round changes the fingerprint every round, invalidates the whole
+            # extraction cache and soon pushes the versions saved by hand out of the ring
+            with db.connect(settings.state_db) as con:
+                discovery.set_config(con, "kb_x", {"graph_rebuild_resuggest": None}); con.commit()
+            calls: list[str] = []
+
+            def fake_suggest(settings_, source_, **kw):
+                calls.append(kw["origin"])
+                return {"version_id": f"r{len(calls)}", "origin": kw["origin"]}
+
+            from unittest import mock
+            with mock.patch.object(schema_flow, "suggest_schema_version", side_effect=fake_suggest), \
+                    mock.patch.object(schema_flow, "reload_source", side_effect=lambda s, src: src):
+                _, once = schema_flow.resuggest_for_rebuild(settings, source, baseline_version="g-full-1")
+                _, again = schema_flow.resuggest_for_rebuild(settings, source, baseline_version="g-full-1")
+                _, later = schema_flow.resuggest_for_rebuild(settings, source, baseline_version="g-full-2")
+                _, forced = schema_flow.resuggest_for_rebuild(settings, source)
+            self.assertEqual(once["version_id"], "r1")
+            self.assertEqual(again, {"skipped": "already_resuggested_for_baseline", "baseline": "g-full-1", "version_id": "r1"})
+            self.assertEqual((later["version_id"], forced["version_id"]), ("r2", "r3"))      # a new baseline, or none (forced by the operator), re-suggests as usual
+            self.assertEqual(len(calls), 3)
+            cli_src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "cli.py").read_text(encoding="utf-8")
+            self.assertIn('baseline_version=decision.get("baseline_graph_version")', cli_src)
             # A manual extraction (console) enters the ring but does not take effect
             manual = schema_flow.suggest_schema_version(settings, source, origin=schema_flow.ORIGIN_MANUAL, adopt=False,
                                                         client=_client(list(self.ANSWERS)), docs=["sample"])
@@ -870,7 +894,7 @@ class SchemaFeedbackTests(unittest.TestCase):
             order: list[str] = []
             base = dict(env_file=None, source=None, collection=None, all=False)
 
-            def resuggest(settings, source):
+            def resuggest(settings, source, **kwargs):
                 order.append("resuggest"); return src2, {"version_id": "v2"}
 
             def build(settings, **kw):

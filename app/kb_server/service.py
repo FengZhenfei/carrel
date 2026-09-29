@@ -1330,6 +1330,14 @@ def strip_retired_config(updates: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _graph_llm_choice(value: Any) -> dict[str, str]:
+    """The model chosen for each build step, without the empty slots: used to tell whether a save really
+    changes a model."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(step): str(name).strip() for step, name in value.items() if str(name or "").strip()}
+
+
 def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     cfg = settings()
     limits = chunk_limits(cfg.embedding_base_url)
@@ -1359,9 +1367,18 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         # usual and leaves artifacts, but graph_status has already become disabled, "Delete knowledge graph"
         # greys out with it, and the artifacts have no entry point left for cleanup. Parse-related fields are
         # unaffected and can be changed as usual.
-        graph_keys = {"graph_enabled", "graph_llm"}
+        # The form sends graph_enabled and graph_llm with every save: what counts is whether the values changed,
+        # not whether the keys are present. Judged by the keys, any change of a graph policy was refused while
+        # a build ran (an automatic append every 2 hours, a full build for many hours), and saving any setting
+        # after a pause cleared the pause (2026-09-29 audit).
+        before = dict(discovery.DEFAULTS)
+        before.update(_dir_defaults(con, kb_id))
+        before.update(current)
+        was_enabled = bool(before.get("graph_enabled"))
+        closing = updates.get("graph_enabled") is False and was_enabled
+        changing_llm = "graph_llm" in updates and _graph_llm_choice(updates.get("graph_llm")) != _graph_llm_choice(current.get("graph_llm"))
         stop_build = False
-        if graph_keys & set(updates):
+        if closing or changing_llm:
             db.reconcile_stale_graph_builds(con)
             latest = con.execute(
                 "SELECT status FROM graph_builds WHERE kb_id=? ORDER BY started_at DESC LIMIT 1", (kb_id,)
@@ -1370,13 +1387,14 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
                 # Turning the switch off = an explicit request to stop work, so allow it and terminate the
                 # build along the way; changing a model is merely a config change, and switching mid-way would
                 # build the two halves with different models, so that is still refused.
-                if updates.get("graph_enabled") is False:
+                if closing:
                     stop_build = True
                 else:
                     raise ValueError("A graph build is running; step models cannot be changed now. Wait for it to finish or turn the knowledge graph off first")
-        # "Turn on knowledge graph" is an explicit intent that overrides the earlier pause. Turning it off
-        # needs no clearing: while off, evaluate_rebuild already returns at the graph_enabled gate.
-        if updates.get("graph_enabled") is True and current.get("graph_paused"):
+        # "Turn on knowledge graph" is an explicit intent that overrides the earlier pause -- only when the
+        # switch really goes from off to on. Turning it off needs no clearing: while off, evaluate_rebuild
+        # already returns at the graph_enabled gate.
+        if updates.get("graph_enabled") is True and not was_enabled and current.get("graph_paused"):
             updates = dict(updates)
             updates["graph_paused"] = None
         saved = discovery.set_config(con, kb_id, updates)
@@ -1426,7 +1444,7 @@ def delete_graph(kb_id: str) -> dict[str, Any]:
 
 
 def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None = None,
-                       append: bool = False) -> dict[str, Any]:
+                       append: bool = False, force: bool = False) -> dict[str, Any]:
     base_dir = cfg.state_db.parent.parent.parent
     py = base_dir / "app" / ".venv" / "bin" / "python"
     env_file = os.environ.get("KB_ENV_FILE") or str(base_dir / "config" / "knowledge-base.env")
@@ -1437,6 +1455,8 @@ def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None =
     if graph_version and not append:
         # Resume last time's version: phases already completed are skipped per graph_build_phases
         build_cmd += ["--graph-version", graph_version, "--allow-existing-graph-version"]
+    if append and force:
+        build_cmd += ["--force"]          # carrying on an append that stopped midway: append even without new changes
     # A graph build easily runs for hours. A child spawned by a plain Popen stays in carrel-web's cgroup,
     # and with systemd's default KillMode=control-group every web restart (deploy, config change) would
     # take the running build down with it. So first try systemd-run to start it in a separate transient
@@ -1499,6 +1519,11 @@ def pause_graph_build(kb_id: str) -> dict[str, Any]:
     result = stop_graph_build_now(cfg, kb_id=kb_id, reason="Build stopped by “Pause build”")
     if not result.get("stopped"):
         raise ValueError("The graph build process could not be terminated; try again later")
+    if not result.get("running") or result.get("status") == "done":
+        # The request met the end of the build: this version is built and there is nothing to pause. Writing
+        # the pause mark anyway would stop automatic appends and rebuilds of a finished base for good, with
+        # nothing to see in the console (2026-09-29 audit)
+        raise ValueError("The build has already finished; there is nothing to pause")
     # Stopping the process is not enough: a pause leaves cancelled rather than a successful build, and
     # evaluate_rebuild only accepts successful builds as the baseline -- so for a KB that never built
     # successfully, due stays true after a pause and the 00:00 run that night resumes it. Persist the intent
@@ -1605,14 +1630,24 @@ def trigger_graph_build(kb_id: str) -> dict[str, Any]:
         # completed: resume the same version and skip the completed phases. Otherwise start a new version
         # from scratch.
         resume_version = None
+        resume_append = False
         if latest is not None and str(latest["status"]) in ("cancelled", "failed"):
-            if (_paused_cache_reuse(con, kb_id, latest)["cache_reusable"]
+            kind = str(latest["build_kind"] or "full") if "build_kind" in latest.keys() else "full"
+            if kind == "append" and db.latest_successful_graph_build(con, kb_id) is not None:
+                # What stopped midway was an append: carrying on means appending once more. Resuming the same
+                # version would run a full build, without replaying merge decisions or reusing vectors; an
+                # append of a few minutes turned into a full rebuild and became the new rebuild baseline
+                # (2026-09-29 audit)
+                resume_append = True
+            elif (_paused_cache_reuse(con, kb_id, latest)["cache_reusable"]
                     and db.graph_phases_done(con, str(latest["graph_build_id"]))):
                 resume_version = str(latest["graph_version"])
         # "Resume build / Rebuild now" is an explicit intent to resume, so clear the pause mark along the way
         # -- otherwise once this run finishes, the auto-rebuild side still treats the KB as paused.
         if discovery.get_config(con, kb_id).get("graph_paused"):
             discovery.set_config(con, kb_id, {"graph_paused": None})
+    if resume_append:
+        return _spawn_graph_build(cfg, kb_id, append=True, force=True)
     return _spawn_graph_build(cfg, kb_id, graph_version=resume_version)
 
 

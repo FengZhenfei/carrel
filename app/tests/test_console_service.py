@@ -576,6 +576,167 @@ class GraphPauseTests(unittest.TestCase):
             self.assertEqual(graph_cache_entries(cfg, "kb_404"), 0)   # file does not exist
 
 
+class GraphSaveAndPauseSemanticsTests(unittest.TestCase):
+    """2026-09-29 audit: the graph form sends graph_enabled and graph_llm with every save. Judged by the presence
+    of the keys, saving any setting after a pause cleared the pause, and saving any policy while a build ran was
+    refused. What counts now is whether the values changed."""
+
+    def _env(self, tmp: str, config: dict):
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_pipeline import discovery
+
+        root = Path(tmp)
+        state_db = root / "state.sqlite3"
+        dbm.init_db(state_db)
+        mirror = root / "mirror"
+        (mirror / "docs").mkdir(parents=True)
+        with dbm.connect(state_db) as con:
+            source, _ = discovery.enroll(con, mirror, "docs")
+            dbm.upsert_llm(con, name="m1", base_url="http://llm.invalid/v1", api_key="", model_id="m1")
+            dbm.upsert_llm(con, name="m2", base_url="http://llm.invalid/v1", api_key="", model_id="m2")
+            discovery.set_config(con, source.kb_id, config)
+            con.commit()
+        stub = mock.Mock()
+        stub.state_db = state_db
+        stub.embedding_base_url = "http://embedding.invalid/v1"
+        limits = {"embedding_max_model_len": 4096, "effective_max_model_len": 4096, "max_tokens_cap": 3276,
+                  "max_tokens_min": 128, "cap_ratio": 0.8, "overlap_rule": "", "live": False}
+        return source, stub, limits
+
+    def test_saving_a_setting_keeps_the_pause_and_turning_the_graph_on_clears_it(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            llm = {"extract": "m1", "summarize": "m1", "tune": "m1"}
+            source, stub, limits = self._env(tmp, {"graph_enabled": True, "graph_paused": True, "graph_llm": llm})
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "chunk_limits", return_value=limits):
+                # the form carries the switch and the models as they are, only the rebuild interval changed: still paused
+                service.update_kb_config(source.kb_id, {"graph_enabled": True, "graph_llm": dict(llm),
+                                                        "graph_rebuild_interval": "2w"})
+                with dbm.connect(stub.state_db) as con:
+                    cfg = discovery.get_config(con, source.kb_id)
+                self.assertEqual((cfg.get("graph_paused"), cfg.get("graph_rebuild_interval")), (True, "2w"))
+                # off and on again: only a switch that really goes from off to on overrides the earlier pause
+                service.update_kb_config(source.kb_id, {"graph_enabled": False})
+                service.update_kb_config(source.kb_id, {"graph_enabled": True, "graph_llm": dict(llm)})
+                with dbm.connect(stub.state_db) as con:
+                    cfg = discovery.get_config(con, source.kb_id)
+                self.assertTrue(cfg.get("graph_enabled"))
+                self.assertFalse(cfg.get("graph_paused"))
+
+    def test_a_running_build_only_blocks_a_real_change_of_models(self) -> None:
+        import socket
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            llm = {"extract": "m1", "summarize": "m1", "tune": ""}
+            source, stub, limits = self._env(tmp, {"graph_enabled": True, "graph_llm": llm})
+            with dbm.connect(stub.state_db) as con:
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                    "started_at, worker_host, worker_pid, heartbeat_at) VALUES('g1', ?, ?, ?, 'v1', 'running', ?, ?, ?, ?)",
+                    (source.kb_id, source.kb_id, source.collection, int(time.time()), socket.gethostname(), os.getpid(),
+                     int(time.time())))
+                con.commit()
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "chunk_limits", return_value=limits):
+                # a build is running, the form carries the same switch and models, automatic append changes: saved as usual
+                saved = service.update_kb_config(source.kb_id, {"graph_enabled": True, "graph_llm": dict(llm),
+                                                                "graph_auto_append": False})
+                self.assertIs(saved["config"].get("graph_auto_append"), False)
+                with self.assertRaisesRegex(ValueError, "step models cannot be changed now"):
+                    service.update_kb_config(source.kb_id, {"graph_enabled": True, "graph_llm": {**llm, "extract": "m2"}})
+                with dbm.connect(stub.state_db) as con:
+                    self.assertEqual(discovery.get_config(con, source.kb_id)["graph_llm"]["extract"], "m1")
+
+    def test_pause_that_meets_a_finished_build_records_nothing(self) -> None:
+        """A pause request that meets the end of the build: the version is built. Writing the pause mark anyway
+        would stop automatic appends and rebuilds of a finished base for good."""
+        import socket
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, stub, _limits = self._env(tmp, {"graph_enabled": True})
+            with dbm.connect(stub.state_db) as con:
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                    "started_at, worker_host, worker_pid, heartbeat_at) VALUES('g1', ?, ?, ?, 'v1', 'running', ?, ?, ?, ?)",
+                    (source.kb_id, source.kb_id, source.collection, int(time.time()), socket.gethostname(), os.getpid(),
+                     int(time.time())))
+                con.commit()
+            for outcome in ({"running": False, "stopped": True}, {"running": True, "stopped": True, "status": "done"}):
+                with mock.patch.object(service, "settings", return_value=stub), \
+                        mock.patch("kb_pipeline.maintenance.stop_graph_build_now", return_value=dict(outcome)):
+                    with self.assertRaisesRegex(ValueError, "already finished"):
+                        service.pause_graph_build(source.kb_id)
+                with dbm.connect(stub.state_db) as con:
+                    self.assertFalse(discovery.get_config(con, source.kb_id).get("graph_paused"))
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "graph_cache_entries", return_value=0), \
+                    mock.patch("kb_pipeline.maintenance.stop_graph_build_now",
+                               return_value={"running": True, "stopped": True, "status": "cancelled"}):
+                service.pause_graph_build(source.kb_id)                       # a running build was really stopped: the pause is recorded
+            with dbm.connect(stub.state_db) as con:
+                self.assertIs(discovery.get_config(con, source.kb_id).get("graph_paused"), True)
+
+    def test_an_interrupted_append_continues_as_an_append(self) -> None:
+        """What stopped midway was an append and a built version is still live: "continue" appends once more.
+        Resuming the same version would run a full build."""
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, stub, _limits = self._env(tmp, {"graph_enabled": True, "graph_paused": True,
+                                                   "graph_llm": {"extract": "m1", "summarize": "m1", "tune": "m1"}})
+            with dbm.connect(stub.state_db) as con:
+                for bid, version, status, kind, started in (("g1", "v1", "done", "full", 100), ("g2", "v2", "cancelled", "append", 200)):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                        "started_at, finished_at, build_kind) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (bid, source.kb_id, source.kb_id, source.collection, version, status, started, started + 10, kind))
+                con.commit()
+            spawned: list[dict] = []
+
+            def spawn(cfg, kb_id, **kwargs):
+                spawned.append(kwargs)
+                return {"started": True}
+
+            gate = lambda con, cfg, kb_id: (None, {}, con.execute(
+                "SELECT * FROM graph_builds WHERE kb_id=? ORDER BY started_at DESC LIMIT 1", (kb_id,)).fetchone())
+            with mock.patch.object(service, "settings", return_value=stub), \
+                    mock.patch.object(service, "_graph_action_gate", side_effect=gate), \
+                    mock.patch.object(service, "_spawn_graph_build", side_effect=spawn):
+                service.trigger_graph_build(source.kb_id)
+                self.assertEqual(spawned, [{"append": True, "force": True}])
+                with dbm.connect(stub.state_db) as con:
+                    con.execute("UPDATE graph_builds SET build_kind = 'full' WHERE graph_build_id = 'g2'")
+                    con.commit()
+                with mock.patch.object(service, "_paused_cache_reuse", return_value={"cache_reusable": True, "cache_stale": ""}), \
+                        mock.patch.object(dbm, "graph_phases_done", return_value=["extract"]):
+                    service.trigger_graph_build(source.kb_id)
+                self.assertEqual(spawned[-1], {"graph_version": "v2"})            # a full build that stopped midway still resumes its version
+        js = _repo_file("app/kb_server/static/app.js")
+        self.assertIn("resumeAppend ?", js)
+        self.assertIn("const liveGraph = kb.graph_status === \"ok\" || (halted && !!(kb.graph_build || {}).active_graph_version);", js)
+
+
 class SchemaVersionDeleteTests(unittest.TestCase):
     """Label versions must be deletable -- the ring has only 3 slots, and one badly extracted version would
     occupy a slot for good.
@@ -1394,6 +1555,59 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 self.assertEqual(int(left), 0)                          # build records cleared
                 cfgd = discovery.get_config(con, s.kb_id)
             self.assertNotIn("graph_enabled", cfgd)                     # the switch is greyed out again
+            self.assertFalse(cfgd.get("graph_paused"))
+
+    def test_partly_failed_graph_delete_is_not_rebuilt_by_the_scheduler(self) -> None:
+        """2026-09-29 audit: when an external store fails to delete, the build records are cleared all the same and
+        the switch stays on; the base is then "switch on, never built" and the next maintenance round rebuilds
+        in full the graph the user asked to delete. The pause is recorded as well now, so automatic maintenance
+        yields; a retried delete that succeeds clears it."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from kb_pipeline import db as dbm
+        from kb_pipeline import discovery, maintenance
+        from kb_pipeline.graph.build import evaluate_rebuild
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_db = root / "state.sqlite3"
+            dbm.init_db(state_db)
+            mirror = root / "mirror"
+            (mirror / "docs").mkdir(parents=True)
+            with dbm.connect(state_db) as con:
+                s, _ = discovery.enroll(con, mirror, "docs")
+                discovery.set_config(con, s.kb_id, {"graph_enabled": True})
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                    "started_at, finished_at) VALUES('g1', ?, ?, ?, 'v1', 'done', 100, 110)", (s.kb_id, s.kb_id, s.collection))
+                con.commit()
+            stub = mock.Mock()
+            stub.state_db = state_db
+            stub.graph_work_dir = root / "gw"
+            stub.runtime_dir = root
+            with mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()), \
+                    mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}), \
+                    mock.patch.object(maintenance, "_drop_neo4j_projection", side_effect=RuntimeError("neo4j restarting")):
+                entry = maintenance.delete_graph_now(stub, kb_id=s.kb_id)
+            self.assertFalse(entry["graph_enabled_cleared"])
+            self.assertEqual(len(entry["errors"]), 1)
+            with dbm.connect(state_db) as con:
+                cfgd = discovery.get_config(con, s.kb_id)
+                row = con.execute("SELECT * FROM kb_sources WHERE kb_id = ?", (s.kb_id,)).fetchone()
+            self.assertEqual((cfgd.get("graph_enabled"), cfgd.get("graph_paused")), (True, True))
+            source = discovery.source_from_row(mirror, row)
+            decision = evaluate_rebuild(SimpleNamespace(state_db=state_db, sources={s.kb_id: source}), source_key=s.kb_id, source=source)
+            self.assertEqual((decision["due"], decision["reason"]), (False, "paused_by_operator"))   # not rebuilt behind the user's back
+            with mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()), \
+                    mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}), \
+                    mock.patch.object(maintenance, "_drop_neo4j_projection", return_value={}):
+                entry = maintenance.delete_graph_now(stub, kb_id=s.kb_id)                          # the retry succeeds
+            self.assertTrue(entry["graph_enabled_cleared"])
+            with dbm.connect(state_db) as con:
+                cfgd = discovery.get_config(con, s.kb_id)
+            self.assertNotIn("graph_enabled", cfgd)
+            self.assertFalse(cfgd.get("graph_paused"))
 
     def test_saved_key_is_not_reused_for_a_different_endpoint(self) -> None:
         """Security review 2026-09-28 F01 / F07: when editing a model, an empty key is reused only for the same

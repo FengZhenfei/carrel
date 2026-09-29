@@ -560,8 +560,10 @@ async function renderConfig() {
   const paused = kb.graph_status === "stopped";
   const halted = paused || kb.graph_status === "failed";
   $("#cfg-gbuild").disabled = !(active && $("#cfg-graph").checked) || building;   // no build without the graph turned on
-  // Appending needs a completed graph; a KB never built / stopped midway can only do a full build
-  $("#cfg-gappend").disabled = !(active && $("#cfg-graph").checked && kb.graph_status === "ok") || building;
+  // Appending needs a completed graph; a KB whose last append stopped midway (paused or failed) while a built
+  // version is still live can append as well, a KB that was never built can only do a full build
+  const liveGraph = kb.graph_status === "ok" || (halted && !!(kb.graph_build || {}).active_graph_version);
+  $("#cfg-gappend").disabled = !(active && $("#cfg-graph").checked && liveGraph) || building;
   // For a KB stopped midway (paused or failed), "build" may mean "carry on" -- but only when the cache can
   // really be resumed. The cache key includes model and messages: labels re-extracted, build model
   // switched or chunking parameters changed and the old cache is entirely missed; clicking then means a
@@ -569,8 +571,11 @@ async function renderConfig() {
   // taken at build start with the current config in _paused_cache_reuse; completed phases
   // (graph_build_phases) are skipped wholesale when resuming.
   const gb = kb.graph_build || {};
-  const canResume = halted && gb.cache_reusable === true;
-  $("#cfg-gbuild").textContent = t(canResume ? "继续建图" : "立即/重新建图");
+  // What stopped midway was an append and a built version is still live: carrying on means appending once
+  // more (the same rule as trigger_graph_build on the server)
+  const resumeAppend = halted && gb.build_kind === "append" && !!gb.active_graph_version;
+  const canResume = halted && (resumeAppend || gb.cache_reusable === true);
+  $("#cfg-gbuild").textContent = t(resumeAppend ? "继续并入" : canResume ? "继续建图" : "立即/重新建图");
   const parts = savedGraphOn ? rebuildProgressParts(kb.rebuild_check) : { time: "", fresh: "" };
   for (const [id, text] of [["#cfg-ri-progress", parts.time], ["#cfg-rp-progress", parts.fresh]]) {
     const el = $(id);

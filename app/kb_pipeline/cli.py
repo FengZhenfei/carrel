@@ -909,7 +909,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
                         from .graph.schema_flow import resuggest_for_rebuild
 
                         try:
-                            source, info = resuggest_for_rebuild(settings, source)
+                            source, info = resuggest_for_rebuild(
+                                settings, source, baseline_version=decision.get("baseline_graph_version"))
                         except Exception as exc:
                             info = {"error": repr(exc)}
                             print(f"[graph] {key}: schema resuggest failed, building with the current version: {exc!r}",

@@ -613,12 +613,18 @@ def delete_graph_now(settings: Settings, *, kb_id: str) -> dict[str, Any]:
             if row is None:
                 raise KeyError(kb_id)
             entry = _drop_graph_data(settings, con, kb_id=kb_id, collection=str(row["collection"]), errors=errors)
-            # If any external delete failed, keep the toggle and the build records: otherwise the alias would
-            # still point at the old collection and the Neo4j nodes would remain, while the UI believes the
-            # graph no longer exists and there is no entry point left to clean them up.
+            # If any external delete failed, keep the toggle: otherwise the alias would still point at the old
+            # collection and the Neo4j nodes would remain, while the UI believes the graph no longer exists
+            # and there is no entry point left to clean them up. The build records are gone by now, and a base
+            # with the toggle on and no successful build is taken for never built by the next maintenance
+            # round and rebuilt in full -- the very graph the user asked to delete (2026-09-29 audit). So the
+            # pause is recorded as well and automatic maintenance yields; it is cleared when a retried delete
+            # succeeds or the user starts a build.
             cleared = not errors
             if cleared:
-                discovery.set_config(con, kb_id, {"graph_enabled": None})
+                discovery.set_config(con, kb_id, {"graph_enabled": None, "graph_paused": None})
+            else:
+                discovery.set_config(con, kb_id, {"graph_paused": True})
             con.commit()
     finally:
         guard.release()

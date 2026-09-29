@@ -435,10 +435,18 @@ def ensure_schema_before_build(settings: Any, source: KBSource) -> tuple[KBSourc
     return reload_source(settings, source), info
 
 
-def resuggest_for_rebuild(settings: Any, source: KBSource) -> tuple[KBSource, dict[str, Any]]:
+RESUGGEST_MARK_PREFIX = "graph_resuggest_baseline:"
+
+
+def resuggest_for_rebuild(settings: Any, source: KBSource, *, baseline_version: str | None = None) -> tuple[KBSource, dict[str, Any]]:
     """Before a threshold-triggered full rebuild: re-extract a version on the basis of the active version and its
     ledger, and adopt it. Skipped when graph_rebuild_resuggest is off; a KB without any version is left to the
-    build itself (ensure_schema_before_build)."""
+    build itself (ensure_schema_before_build).
+    ``baseline_version``: the full build this rebuild is going to replace. One baseline is re-suggested only
+    once: after a failed full build the baseline is unchanged and the rebuild is due again in the next round
+    (2 hours later); re-suggesting every round changes the fingerprint every round, invalidates the whole
+    extraction cache so the entire corpus goes to the model again, and soon pushes the versions saved by hand
+    out of the version ring (2026-09-29 audit)."""
     try:
         config = load_config(settings, source.kb_id)
     except KeyError:
@@ -447,6 +455,23 @@ def resuggest_for_rebuild(settings: Any, source: KBSource) -> tuple[KBSource, di
         return source, {"skipped": "disabled"}
     if schema_missing(config):
         return source, {"skipped": "no_schema"}
+    mark_key = RESUGGEST_MARK_PREFIX + source.kb_id
+    if baseline_version:
+        try:
+            with db.connect(settings.state_db) as con:
+                mark = db.get_app_config(con, mark_key) or {}
+        except Exception:
+            mark = {}
+        if str(mark.get("baseline") or "") == str(baseline_version):
+            return source, {"skipped": "already_resuggested_for_baseline", "baseline": str(baseline_version),
+                            "version_id": mark.get("version_id")}
     info = suggest_schema_version(settings, source, origin=ORIGIN_REBUILD, adopt=True, use_prior=True)
+    if baseline_version:
+        try:
+            with db.connect(settings.state_db) as con:
+                db.set_app_config(con, mark_key, {"baseline": str(baseline_version), "version_id": info.get("version_id"),
+                                                  "at": int(time.time())})
+        except Exception as exc:
+            print(f"[schema] could not record the re-suggestion mark for {source.kb_id}: {exc!r}", flush=True)
     return reload_source(settings, source), {k: info.get(k) for k in ("version_id", "prior_id", "origin", "guard", "seconds",
                                                                        "entity_types", "predicates")}
