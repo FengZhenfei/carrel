@@ -15,6 +15,15 @@ from kb_pipeline.parsers.common import page_idx
 from _support import _CodexAudit20260906TestsSupport, _block, _local_file, _repo_file
 
 
+
+def _scratch_dir(case: unittest.TestCase) -> Path:
+    """A temporary directory removed when the test case ends. The tests used to call mkdtemp() directly and
+    left their directories in the system temp dir on every run (2026-09-29 audit)."""
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    return Path(tmp.name)
+
+
 class ApiLayerTests(unittest.TestCase):
     """The API layer previously had zero coverage: error-code mapping, the same-origin guard and payload type
     validation had only ever been clicked through by hand on the real box. They are the first gate of every
@@ -677,7 +686,7 @@ class ServiceDrawerBulkTests(unittest.TestCase):
             return mock.Mock()
 
         with mock.patch.object(service.subprocess, "Popen", side_effect=fake_popen), \
-                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=Path(tempfile.mkdtemp()))):
+                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=_scratch_dir(self))):
             out = service.stop_all_services(force=True)
             self.assertEqual(out["stopping"], service._all_service_containers())
             self.assertTrue(all(c[:2] == ["docker", "stop"] for c in calls))
@@ -688,7 +697,7 @@ class ServiceDrawerBulkTests(unittest.TestCase):
             self.assertTrue(all(c[:2] == ["docker", "restart"] for c in calls))
         # Without force while the system is busy: refused, with the reasons returned so the front end can ask for confirmation
         with mock.patch("kb_pipeline.maintenance.service_busy", return_value=(True, ["解析任务 3 个"])), \
-                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=Path(tempfile.mkdtemp()))):
+                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=_scratch_dir(self))):
             with self.assertRaisesRegex(ValueError, "a shutdown would interrupt"):
                 service.stop_all_services(force=False)
             with self.assertRaisesRegex(ValueError, "a restart would interrupt"):
@@ -780,7 +789,7 @@ class ServiceDrawerBulkTests(unittest.TestCase):
 
         with mock.patch.object(service.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch("kb_pipeline.maintenance.service_busy", return_value=(True, ["解析任务 3 个"])), \
-                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=Path(tempfile.mkdtemp()), console_services=all_rows)):
+                mock.patch.object(service, "settings", return_value=SimpleNamespace(log_dir=_scratch_dir(self), console_services=all_rows)):
             out = service.restart_service("reranker", force=False)          # restarts even while the system is busy
             self.assertEqual(out["restarting"], service.SERVICE_CONTAINERS["reranker"])
             self.assertEqual([c[2] for c in calls], service.SERVICE_CONTAINERS["reranker"])
@@ -790,9 +799,9 @@ class ServiceDrawerBulkTests(unittest.TestCase):
         def cfg(**over):
             base = dict(qdrant_url="http://q", opensearch_url="http://o", neo4j_uri="", mineru_url="http://m",
                         embedding_base_url="http://e/v1", vlm_base_url="http://v/v1", visual_embedding_enabled=False,
-                        visual_embedding_base_url="", parse_enabled=True, state_db=Path(tempfile.mkdtemp()) / "s.db",
+                        visual_embedding_base_url="", parse_enabled=True, state_db=_scratch_dir(self) / "s.db",
                         reranker_base_url="http://127.0.0.1:8102/v1", visual_reranker_base_url="http://127.0.0.1:8104/v1",
-                        console_services=all_rows, runtime_dir=Path(tempfile.mkdtemp()))
+                        console_services=all_rows, runtime_dir=_scratch_dir(self))
             base.update(over)
             return SimpleNamespace(**base)
 

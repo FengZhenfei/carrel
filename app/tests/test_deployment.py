@@ -39,6 +39,14 @@ def _read(rel: str) -> str:
     return (REPO / rel).read_text(encoding="utf-8")
 
 
+
+def _scratch_dir(case: unittest.TestCase) -> Path:
+    """A temporary directory removed when the test case ends."""
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    return Path(tmp.name)
+
+
 class ConsoleServicesConfigTests(unittest.TestCase):
     def test_parse_console_services(self) -> None:
         from kb_pipeline.config import CONSOLE_SERVICES_DEFAULT, parse_console_services
@@ -57,9 +65,9 @@ class ConsoleServicesConfigTests(unittest.TestCase):
             base = dict(qdrant_url="http://q", opensearch_url="http://o", neo4j_uri="", mineru_url="http://m",
                         embedding_base_url="http://e/v1", vlm_base_url="http://v/v1", visual_embedding_enabled=True,
                         visual_embedding_base_url="http://ve/v1", parse_enabled=True,
-                        state_db=Path(tempfile.mkdtemp()) / "s.db", reranker_base_url="http://r/v1",
+                        state_db=_scratch_dir(self) / "s.db", reranker_base_url="http://r/v1",
                         visual_reranker_base_url="http://vr/v1", console_services=("database", "mineru"),
-                        runtime_dir=Path(tempfile.mkdtemp()), log_dir=Path(tempfile.mkdtemp()))
+                        runtime_dir=_scratch_dir(self), log_dir=_scratch_dir(self))
             base.update(over)
             return SimpleNamespace(**base)
 
@@ -124,7 +132,7 @@ class MineruBackendResolverTests(unittest.TestCase):
         from kb_pipeline.parsers import mineru_backend
 
         mineru_backend._cache.update(path=None, mtime=None, value=None)
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = _scratch_dir(self)
         self.info = self.tmp / "mineru-output" / "carrel-mineru.json"
         self.info.parent.mkdir(parents=True)
 
