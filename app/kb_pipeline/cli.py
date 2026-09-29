@@ -14,7 +14,9 @@ from pathlib import Path
 from . import db
 from . import discovery, search_fts
 from .config import load_settings
-from .graph.build import adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild, llm_ready, rollback_graph_version
+from .graph.build import (GraphBuildInterrupted, adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild,
+                          llm_ready, rollback_graph_version)
+from .graph.llm import LLMInterrupted
 from .graph.lock import build_lock_held, build_lock_path, clear_lock_leftovers
 from .graph.neo4j_import import delete_neo4j_graph_version, import_graph_to_neo4j, neo4j_status
 from .localfs.scanner import list_recent_source_files, list_source_files
@@ -722,6 +724,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # undeletable collection / projection gave no signal at all.
         print(f"[cleanup] finished with {len(result['errors'])} failed step(s)", file=sys.stderr, flush=True)
         return 1
+    if isinstance(result, dict) and result.get("skipped") and result.get("yielded_to") == "graph_build":
+        # The graph-version safety net yields to a running build: that build's own clean-up covers this round
+        print("[cleanup] skipped: a graph build is running (its own clean-up covers this round); exiting 75",
+              file=sys.stderr, flush=True)
+        return 75
     if isinstance(result, dict) and result.get("skipped"):
         # Being blocked by service_busy is not success. Exit 75 so the systemd unit's Restart=on-failure
         # retries after 15 minutes -- otherwise one collision would mean the whole maintenance round of
@@ -856,6 +863,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
         # parsing / the graph build lock is held.
         results = []
         had_errors = False
+        stop_requested = False
         force_full = bool(getattr(args, "force_full", False))
         if force_full and (not args.execute or len(selected) != 1):
             raise ValueError("--force-full requires --execute and exactly one --source")
@@ -927,6 +935,9 @@ def cmd_graph(args: argparse.Namespace) -> int:
                     "collection": source.collection,
                     "error": repr(exc),
                 }
+                # The process was asked to stop (pause, base closed, service stopped): record this base and
+                # finish, do not go on to build the next one
+                stop_requested = isinstance(exc, (GraphBuildInterrupted, LLMInterrupted))
             results.append(decision)
             if args.execute and not args.dry_run:
                 # Record one row with this round's decision for this KB; the console status card uses it to say
@@ -944,6 +955,9 @@ def cmd_graph(args: argparse.Namespace) -> int:
                         })
                 except Exception as record_exc:
                     print(f"[graph] record check failed for {key}: {record_exc!r}", file=sys.stderr, flush=True)
+            if stop_requested:
+                print(f"[graph] stop requested while building {key}; skipping the remaining sources", file=sys.stderr, flush=True)
+                break
         print(json.dumps(results, ensure_ascii=False, indent=2))
         if had_errors:
             return 1
@@ -977,7 +991,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
         if len(selected) != 1:
             raise ValueError("rollback requires exactly one selected source (--source / --collection)")
         (key, source), = selected
-        result = rollback_graph_version(settings, source_key=key, source=source, graph_version=args.graph_version)
+        result = rollback_graph_version(settings, source_key=key, source=source, graph_version=args.graph_version,
+                                        force=bool(getattr(args, "force", False)))
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return 0
 
@@ -1327,6 +1342,9 @@ def build_parser() -> argparse.ArgumentParser:
     graph_rollback = graph_sub.add_parser("rollback", help="Roll the live graph back to a kept earlier version (switch aliases, activate the Neo4j version, record it); the rejected version is deleted afterwards")
     add_graph_source_args(graph_rollback)
     graph_rollback.add_argument("--graph-version", required=True, help="Version to switch back to (must still be inside the kept N versions)")
+    graph_rollback.add_argument("--force", action="store_true",
+                                help="Switch even when the target's record is not a finished build (paused / failed) or is "
+                                     "missing; collections with a wrong point count are refused all the same")
     graph_rollback.set_defaults(func=cmd_graph)
 
     graph_neo4j_import = graph_sub.add_parser("neo4j-import", help="Import a completed graph version into Neo4j")

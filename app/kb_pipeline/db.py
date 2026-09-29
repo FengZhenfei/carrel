@@ -502,6 +502,13 @@ def finish_graph_build(
     )
 
 
+def update_graph_build_manifest(con: sqlite3.Connection, graph_build_id: str, manifest: dict[str, Any] | None) -> None:
+    """Manifest only: results that exist only after the build was recorded as done (version GC, cache pruning)
+    are added to it; the status and the finish time stay as they are."""
+    con.execute("UPDATE graph_builds SET manifest_json = ? WHERE graph_build_id = ?",
+                (json.dumps(manifest or {}, ensure_ascii=False, sort_keys=True), graph_build_id))
+
+
 def replace_graph_build_chunks(
     con: sqlite3.Connection,
     graph_build_id: str,
@@ -873,6 +880,22 @@ def unsuccessful_graph_versions(con: sqlite3.Connection, kb_id: str, *, supersed
             continue
         out.add(version)
     return out
+
+
+def resumable_graph_versions(con: sqlite3.Connection, kb_id: str) -> set[str]:
+    """The version kept for a resume: when the newest build record of the base (by start time) is cancelled or
+    failed, or still marked running after its process died, its version id. "Continue build" only resumes that
+    newest record (kb_server.service.trigger_graph_build); no entry point resumes an older half-finished
+    version. The scheduled GC neither deletes it nor lets it take a slot among the "latest N versions": once it
+    took a slot, KEEP=1 deleted the resume artifacts the same night and KEEP=2 pushed out the previous good
+    graph (2026-09-29 audit). A rolled-back version does not count."""
+    row = con.execute(
+        "SELECT graph_version, status FROM graph_builds WHERE kb_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        (kb_id,)).fetchone()
+    if row is None or str(row["status"]) not in ("cancelled", "failed", "running"):
+        return set()
+    version = str(row["graph_version"] or "")
+    return {version} if version else set()
 
 
 def graph_extraction_flag_counts(con: sqlite3.Connection, kb_id: str, fingerprint: str, *, flags: Iterable[str] = ("truncated", "partial"),

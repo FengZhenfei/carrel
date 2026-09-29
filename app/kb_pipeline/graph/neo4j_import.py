@@ -204,24 +204,28 @@ def delete_old_neo4j_graph_versions(
     delete_unparseable: bool = False,
     keep_latest: int | None = None,
     discard_versions: Iterable[str] = (),
+    protect_versions: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Delete superseded Neo4j graph versions with the same rule as vector.qdrant.delete_old_graph_collections:
     with ``keep_latest`` the active version plus the ``keep_latest - 1`` newest other versions are kept
     unconditionally and everything older is deleted, age plays no part; without ``keep_latest`` days only.
     The active version is never deleted.
     ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright;
-    nodes left behind by an import killed midway are removed by version id as well."""
+    nodes left behind by an import killed midway are removed by version id as well.
+    ``protect_versions``: the version kept for a resume is neither deleted nor counted against the keep window."""
     if retention_days < 1:
         raise ValueError("retention_days must be >= 1")
     if keep_latest is not None and int(keep_latest) < 1:
         raise ValueError("keep_latest must be >= 1")
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
-    discard = {str(v) for v in discard_versions if str(v)}
+    protect = {str(v) for v in protect_versions if str(v)}
+    discard = {str(v) for v in discard_versions if str(v)} - protect
     driver = neo4j_driver(settings)
     try:
         result: dict[str, Any] = {
             "dry_run": dry_run, "retention_days": retention_days, "cutoff_ts": cutoff_ts, "keep_latest": keep_latest,
-            "delete_unparseable": delete_unparseable, "discard_versions": sorted(discard), "sources": {},
+            "delete_unparseable": delete_unparseable, "discard_versions": sorted(discard),
+            "protect_versions": sorted(protect), "sources": {},
             "total_deleted_nodes": 0,
         }
         for source in sources:
@@ -234,7 +238,8 @@ def delete_old_neo4j_graph_versions(
             stamps = {str(r.get("graph_version") or ""): (graph_version_timestamp(str(r.get("graph_version") or ""))
                                                           or _int_or_none(r.get("imported_at"))) for r in rows}
             # The active version takes a slot of its own; the others compete for the remaining slots, newest first
-            ranked = sorted((v for v, ts in stamps.items() if v and ts is not None and v not in discard and v != active_version),
+            ranked = sorted((v for v, ts in stamps.items() if v and ts is not None and v not in discard
+                             and v not in protect and v != active_version),
                             key=lambda v: -stamps[v])
             rank_of = {v: i for i, v in enumerate(ranked)}
             slots = max(0, int(keep_latest) - (1 if active_version else 0)) if keep_latest is not None else None
@@ -257,6 +262,9 @@ def delete_old_neo4j_graph_versions(
                     continue
                 if version == active_version:
                     source_result["skipped"].append({"graph_version": version, "reason": "active"})
+                    continue
+                if version in protect:
+                    source_result["skipped"].append({"graph_version": version, "reason": "resumable"})
                     continue
                 if version in discard:
                     nodes = count_version_nodes(driver, source.kb_id, version)

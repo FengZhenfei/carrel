@@ -299,6 +299,7 @@ def delete_old_graph_collections(
     delete_unparseable: bool = False,
     keep_latest: int | None = None,
     discard_versions: Iterable[str] = (),
+    protect_versions: Iterable[str] = (),
 ) -> dict[str, object]:
     """Delete superseded graph-version collections. Two modes:
     with ``keep_latest`` (the end-of-build GC and the nightly graph-gc): the aliased (active) version plus the
@@ -310,14 +311,17 @@ def delete_old_graph_collections(
     ``retention_days`` are deleted.
     ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright.
     Aliased collections are never deleted; the active version's unaliased optional collections (spec / page)
-    stay with it."""
+    stay with it.
+    ``protect_versions``: the version kept for a resume (the newest paused / failed one) is neither deleted nor
+    counted against the keep window; a version listed in both sets is kept."""
     if retention_days < 1:
         raise ValueError("retention_days must be >= 1")
     if keep_latest is not None and int(keep_latest) < 1:
         raise ValueError("keep_latest must be >= 1")
 
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
-    discard = {str(v) for v in discard_versions if str(v)}
+    protect = {str(v) for v in protect_versions if str(v)}
+    discard = {str(v) for v in discard_versions if str(v)} - protect
     selected_sources = {graph_collection_short_name(collection) for collection in source_collections}
     alias_targets = {item.collection_name for item in q.get_aliases().aliases}
     deleted: list[dict[str, object]] = []
@@ -342,7 +346,8 @@ def delete_old_graph_collections(
         for _, parsed in candidates:
             short, version = str(parsed["source_short"]), str(parsed["graph_version"])
             ts = graph_version_timestamp(version)
-            if ts is not None and version not in discard and version not in active_of.get(short, ()):
+            if ts is not None and version not in discard and version not in protect \
+                    and version not in active_of.get(short, ()):
                 by_source.setdefault(short, {})[version] = ts
         for short in selected_sources:
             slots_of[short] = max(0, int(keep_latest) - len(active_of.get(short, ())))
@@ -358,6 +363,9 @@ def delete_old_graph_collections(
             continue
         if version in active_of.get(short, ()):
             skipped_collections.append({**record, "reason": "active_version"})
+            continue
+        if version in protect:
+            skipped_collections.append({**record, "reason": "resumable"})
             continue
         if version in discard:
             delete_status = delete_collection(q, collection, dry_run=dry_run)
@@ -394,6 +402,7 @@ def delete_old_graph_collections(
         "cutoff_ts": cutoff_ts,
         "keep_latest": keep_latest,
         "discard_versions": sorted(discard),
+        "protect_versions": sorted(protect),
         "selected_sources": sorted(selected_sources),
         "deleted": deleted,
         "skipped_collections": skipped_collections,

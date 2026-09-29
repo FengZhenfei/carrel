@@ -41,8 +41,16 @@ mineru_output_gc() {
 # whose GC failed rely on this one. Same "active plus N-1" rule (GRAPH_GC_KEEP_VERSIONS); the whole round
 # is skipped while a build runs.
 graph_versions_gc() {
-  "$PY" -m kb_pipeline --env-file "$ENV_FILE" cleanup graph-gc \
-    || { echo "=== $(date '+%F %T') graph-gc: cleanup failed ==="; return 1; }
+  local code=0
+  "$PY" -m kb_pipeline --env-file "$ENV_FILE" cleanup graph-gc || code=$?
+  if [[ "$code" -eq 75 ]]; then
+    echo "=== $(date '+%F %T') graph-gc: a graph build is running, yielding this round (its own clean-up covers it) ==="
+    return 0
+  fi
+  if [[ "$code" -ne 0 ]]; then
+    echo "=== $(date '+%F %T') graph-gc: cleanup failed (exit ${code}) ==="
+    return 1
+  fi
 }
 
 # Weekly host clutter (2026-09-08, the user asked for all of it to rotate automatically):
@@ -116,9 +124,15 @@ while :; do
     exit 0
   fi
   if [[ "$code" -ne 75 ]]; then
+    if [[ "$COMMAND" == "parse-assets-gc" ]]; then
+      graph_versions_gc || true   # the graph-version safety net does not depend on the previous step succeeding
+    fi
     exit "$code"
   fi
   if [[ "$attempt" -ge "$ATTEMPTS" ]]; then
+    if [[ "$COMMAND" == "parse-assets-gc" ]]; then
+      graph_versions_gc || true   # graph versions are still cleaned on a night the previous step yielded
+    fi
     maint_defer_give_up "cleanup-$COMMAND" \
       "cleanup $COMMAND hit service_busy ${attempt} times in a row"
   fi

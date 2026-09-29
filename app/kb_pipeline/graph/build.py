@@ -1266,16 +1266,12 @@ def build_graph(
                     raise
                 result["steps"].append("activate_neo4j")
 
-        if run_gc and should_activate:
-            stage("Cleaning up old versions")
-            gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version,
-                                   grace_seconds=int(getattr(settings, "graph_gc_grace_seconds", 0) or 0))
-            result.update(gc["result"])
-            result["steps"].extend(gc["steps"])
-            if gc["errors"]:
-                result["graph_gc_errors"] = gc["errors"]
-                result["graph_gc_error"] = "; ".join(f"{k}: {v}" for k, v in gc["errors"].items())
-
+        # -- 7. Record the success --
+        # Once the aliases and Neo4j point at this version it is the live one: record done and commit first, clean
+        # up afterwards. The GC (including the grace period for searches in flight) used to run before done was
+        # written; a stop during that window recorded the live version as cancelled, the next round redid the
+        # work from the old baseline, and with KEEP=1 the old artifacts were already gone, so that append cost
+        # about as much as a full rebuild (2026-09-29 audit).
         stage("Done")
         with db.connect(settings.state_db) as con:
             db.finish_graph_build(
@@ -1283,6 +1279,7 @@ def build_graph(
                 active_doc_count=active_doc_count, source_content_hash=source_snapshot_hash(chunks),
                 output_dir=str(paths.output_dir), manifest=result,
             )
+        with db.connect(settings.state_db) as con:
             # Write the endpoint account back to the active schema version: the next merge passes them directly
             # and re-extracting labels keeps the rules (schema_flow)
             if not dry_run and doc_ids is None and schema_entry is not None:
@@ -1303,11 +1300,27 @@ def build_graph(
                     }
                     print(f"[graph] schema account: version={schema_entry.get('id')} written={written} "
                           f"confirmed_pairs={len(observed.get('confirmed') or [])}", flush=True)
+        print(f"[graph] build published kb={source.kb_id}({source.source_root}) version={graph_version}", flush=True)
+
+        # -- 8. Clean up -- the version is recorded as done: a failing clean-up step only goes into the manifest,
+        # a stop signal ends the remaining clean-up, and neither changes the terminal state
+        stopped: BaseException | None = None
+        try:
+            if run_gc and should_activate:
+                stage("Cleaning up old versions")
+                gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version,
+                                       grace_seconds=int(getattr(settings, "graph_gc_grace_seconds", 0) or 0))
+                result.update(gc["result"])
+                result["steps"].extend(gc["steps"])
+                if gc["errors"]:
+                    result["graph_gc_errors"] = gc["errors"]
+                    result["graph_gc_error"] = "; ".join(f"{k}: {v}" for k, v in gc["errors"].items())
             # The extraction cache is content-addressed, so rows left by deleted documents or changed text will
             # never hit again; clean them up after a full-corpus build
             if not dry_run and doc_ids is None and paths.units_file.exists():
                 keep_ids = {u.unit_id for u in read_units(paths.units_file)}
-                pruned = db.prune_graph_extractions(con, source.kb_id, keep_ids)
+                with db.connect(settings.state_db) as con:
+                    pruned = db.prune_graph_extractions(con, source.kb_id, keep_ids)
                 result["extraction_cache_pruned"] = pruned
                 if pruned:
                     print(f"[graph] extraction cache pruned rows={pruned} kb={source.kb_id}", flush=True)
@@ -1315,18 +1328,32 @@ def build_graph(
             # by a resume never tags entries; phases_done holds every phase once the run ends, so use resumed_phases
             # as recorded at the start), delete the responses this version did not use; incremental appends never prune
             if not dry_run and doc_ids is None and not incremental and not result.get("resumed_phases"):
+                llm_cache = LLMCache(paths.cache_file)
                 try:
-                    llm_cache = LLMCache(paths.cache_file)
-                    try:
-                        result["llm_cache_pruned"] = llm_cache.prune_unused(build_id)
-                        result["llm_cache_rows"] = llm_cache.count()
-                    finally:
-                        llm_cache.close()
-                    print(f"[graph] llm cache pruned rows={result['llm_cache_pruned']} kept={result['llm_cache_rows']} kb={source.kb_id}", flush=True)
-                except Exception as prune_exc:
-                    print(f"[graph] llm cache prune failed: {prune_exc!r}", flush=True)
+                    result["llm_cache_pruned"] = llm_cache.prune_unused(build_id)
+                    result["llm_cache_rows"] = llm_cache.count()
+                finally:
+                    llm_cache.close()
+                print(f"[graph] llm cache pruned rows={result['llm_cache_pruned']} kept={result['llm_cache_rows']} kb={source.kb_id}", flush=True)
+        except (GraphBuildInterrupted, LLMInterrupted) as stop_exc:
+            stopped = stop_exc
+            result["interrupted_during_gc"] = repr(stop_exc)
+            print(f"[graph] stopped during clean-up; version {graph_version} is already live and recorded as done: {stop_exc!r}",
+                  flush=True)
+        except Exception as post_exc:
+            result["post_publish_error"] = repr(post_exc)
+            print(f"[graph] clean-up after publishing failed (the build stays done): {post_exc!r}", flush=True)
+        if not dry_run and build_id != "dry-run":
+            try:
+                with db.connect(settings.state_db) as con:
+                    db.update_graph_build_manifest(con, build_id, result)
+                stage("Done")                     # the stage read "Cleaning up old versions" during the GC
+            except Exception as manifest_exc:
+                print(f"[graph] manifest update failed: {manifest_exc!r}", flush=True)
         print(f"[graph] build done kb={source.kb_id}({source.source_root}) version={graph_version} "
               f"steps={','.join(result.get('steps') or [])}", flush=True)
+        if stopped is not None:
+            raise stopped        # tells the caller (the check-rebuild loop) to stop instead of building the next base
         return result
     except Exception as exc:
         if result:
@@ -1336,7 +1363,7 @@ def build_graph(
         terminal_status = "cancelled" if isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) else "failed"
         if not dry_run and build_id != "dry-run":
             with db.connect(settings.state_db) as con:
-                db.finish_graph_build(
+                record_build_outcome(
                     con, build_id, status=terminal_status,
                     input_rows=int((input_manifest or {}).get("documents") or 0),
                     active_chunk_count=len(build_chunks),
@@ -1351,6 +1378,20 @@ def build_graph(
         restore_signals()
         if lock is not None:
             lock.release()
+
+
+def record_build_outcome(con, build_id: str, *, status: str, manifest: dict[str, Any] | None, error: str | None,
+                         **counts: Any) -> str:
+    """Write the terminal state (failed / cancelled) of a build that raised or was interrupted. When the version
+    is already live and recorded as done -- it was the clean-up afterwards that went wrong -- only the manifest
+    is updated and the terminal state stays: the aliases and Neo4j point at it, and recording it as cancelled
+    would make the next round redo the work from the old baseline. Returns the resulting status."""
+    row = con.execute("SELECT status FROM graph_builds WHERE graph_build_id = ?", (build_id,)).fetchone()
+    if row is not None and str(row["status"]) == "done":
+        db.update_graph_build_manifest(con, build_id, manifest)
+        return "done"
+    db.finish_graph_build(con, build_id, status=status, manifest=manifest, error=error, **counts)
+    return status
 
 
 def _cached_extract_summary(settings: Settings, source: KBSource, schema: ExtractionSchema, specs: dict[str, LLMSpec],
@@ -1380,17 +1421,19 @@ def _cached_extract_summary(settings: Settings, source: KBSource, schema: Extrac
 
 def _prune_graph_workspaces(settings: Settings, source: KBSource, *, keep_version: str, retention_days: int,
                             keep_latest: int | None = None, discard_versions: Iterable[str] = (),
-                            dry_run: bool = False) -> dict[str, Any]:
+                            protect_versions: Iterable[str] = (), dry_run: bool = False) -> dict[str, Any]:
     """Delete this base's superseded per-version workspace directories with the same rule as the Qdrant /
     Neo4j GC: with ``keep_latest`` the ``keep_version`` (active) directory plus the ``keep_latest - 1`` newest
     other directories are kept unconditionally and everything older is deleted, age plays no part; without
     ``keep_latest`` directories whose mtime is past the retention are deleted. ``keep_version`` is always kept;
     the LLM cache is shared across versions and untouched. Directories are ranked by the timestamp in the
     version id (mtime when the name is not a version id).
-    ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright."""
+    ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright.
+    ``protect_versions``: the version kept for a resume is neither deleted nor counted against the keep window."""
     short = graph_collection_short_name(source.collection)
     cutoff = time.time() - max(1, retention_days) * 86400
-    discard = {str(v) for v in discard_versions if str(v)} - {keep_version}
+    protect = {str(v) for v in protect_versions if str(v)}
+    discard = {str(v) for v in discard_versions if str(v)} - {keep_version} - protect
     removed: list[str] = []
     parent = settings.graph_work_dir / "work" / short
     if parent.is_dir():
@@ -1410,7 +1453,7 @@ def _prune_graph_workspaces(settings: Settings, source: KBSource, *, keep_versio
             slots = max(0, int(keep_latest) - (1 if keep_version and (parent / keep_version).is_dir() else 0))
         rank = 0
         for _stamp, mtime, version_dir in dirs:
-            if version_dir.name == keep_version:
+            if version_dir.name == keep_version or version_dir.name in protect:
                 continue
             if version_dir.name in discard:
                 if not dry_run:
@@ -1428,11 +1471,12 @@ def _prune_graph_workspaces(settings: Settings, source: KBSource, *, keep_versio
                 shutil.rmtree(version_dir, ignore_errors=True)
             removed.append(str(version_dir))
     return {"removed_dirs": removed, "retention_days": retention_days, "keep_latest": keep_latest,
-            "discard_versions": sorted(discard), "dry_run": dry_run}
+            "discard_versions": sorted(discard), "protect_versions": sorted(protect), "dry_run": dry_run}
 
 
 def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_version: str,
                       keep_latest: int | None = None, discard: set[str] | None = None,
+                      protect: set[str] | None = None,
                       grace_seconds: int = 0, dry_run: bool = False) -> dict[str, Any]:
     """One base's version GC, shared by the end of a build, a rollback and the nightly graph-gc: Qdrant
     collections, workspace directories and Neo4j versions are cleaned with the same "graph_version (active)
@@ -1440,8 +1484,13 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     independent: one failing does not drag the others down (2026-09-13: deleting old Neo4j versions hit the
     transaction memory limit). When ``discard`` is not given it is read from the records (cancelled / failed /
     rolled-back versions).
+    ``protect``: the version kept for a resume, neither deleted nor counted against the keep window (given by
+    the nightly GC; the end of a build and a rollback do not give it, the newest record is then the successful
+    version itself).
     ``grace_seconds``: wait after switching versions so searches still running at the switch finish with the
     old collections before they are deleted.
+    A stop signal (GraphBuildInterrupted / LLMInterrupted) is not swallowed as a failed step; it is passed on
+    to the caller.
     Returns {"result": per-step results, "steps": step names to record, "errors": failed steps}."""
     keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 2) or 2))
     result: dict[str, Any] = {}
@@ -1453,6 +1502,8 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
             result[name] = fn()
             if step:
                 steps.append(name)
+        except (GraphBuildInterrupted, LLMInterrupted):
+            raise
         except Exception as gc_exc:
             errors[name] = repr(gc_exc)
             print(f"[graph] gc step {name} failed: {gc_exc!r}", flush=True)
@@ -1464,7 +1515,12 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
                 discard = db.unsuccessful_graph_versions(con, source.kb_id) - {graph_version}
         except Exception as gc_exc:
             errors["discard"] = repr(gc_exc)
+    protect = {str(v) for v in (protect or ()) if str(v)} - {graph_version}
+    discard = set(discard) - protect
     result["graph_gc_discard"] = sorted(discard)
+    if protect:
+        result["graph_gc_protect"] = sorted(protect)
+        print(f"[graph] gc: resumable versions kept outside the quota: {sorted(protect)}", flush=True)
     if discard:
         print(f"[graph] gc: unsuccessful versions discarded outright: {sorted(discard)}", flush=True)
     if grace_seconds > 0 and not dry_run:
@@ -1472,20 +1528,21 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
         time.sleep(grace_seconds)
     gc_step("graph_gc", lambda: delete_old_graph_collections(
         q, source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=dry_run,
-        keep_latest=keep, discard_versions=discard))
+        keep_latest=keep, discard_versions=discard, protect_versions=protect))
     gc_step("workspace_gc", lambda: _prune_graph_workspaces(
         settings, source, keep_version=graph_version, retention_days=settings.graph_gc_retention_days,
-        keep_latest=keep, discard_versions=discard, dry_run=dry_run), step=False)
+        keep_latest=keep, discard_versions=discard, protect_versions=protect, dry_run=dry_run), step=False)
     if settings.graph_neo4j_import_after_build:
         from .neo4j_import import delete_old_neo4j_graph_versions
 
         gc_step("neo4j_graph_gc", lambda: delete_old_neo4j_graph_versions(
             settings, sources=[source], retention_days=settings.neo4j_graph_retention_days, dry_run=dry_run,
-            keep_latest=keep, discard_versions=discard))
-    # The kept versions (active + inside the keep window) keep their records too: the status card still has
-    # their sizes and figures after a rollback to them
-    kept = {graph_version} | {str(r.get("graph_version") or "") for r in (result.get("graph_gc") or {}).get("skipped_collections", [])
-                             if r.get("reason") in ("aliased", "active_version", "within_keep_latest", "within_retention")}
+            keep_latest=keep, discard_versions=discard, protect_versions=protect))
+    # The kept versions (active, inside the keep window, kept for a resume) keep their records too: the status
+    # card still has their sizes and figures after a rollback to them
+    kept = {graph_version} | protect | {
+        str(r.get("graph_version") or "") for r in (result.get("graph_gc") or {}).get("skipped_collections", [])
+        if r.get("reason") in ("aliased", "active_version", "within_keep_latest", "within_retention", "resumable")}
 
     def prune_records() -> int:
         if dry_run:
@@ -1810,12 +1867,16 @@ def adopt_current_graph(settings: Settings, *, source_key: str, source: KBSource
 
 
 def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSource, graph_version: str,
-                           q: Any = None, grace_seconds: int | None = None) -> dict[str, Any]:
+                           q: Any = None, grace_seconds: int | None = None, force: bool = False) -> dict[str, Any]:
     """Roll the live graph back to an earlier version that is still kept. Switches the Qdrant aliases,
     activates the Neo4j version (re-imported from the workspace when its projection is gone), records it
     (the target becomes the latest successful build; newer successful versions are marked rolled_back) and
     finally deletes the rejected version together with anything beyond the keep window, with the usual GC
     rule. The target's workspace (graph.json) must still exist: incremental appends replay from it.
+    The target has to be a version that was built (its record is done or rolled_back): a half-finished version
+    left by a paused / failed build, or a version without a record, is refused unless ``force`` is given. Before
+    the switch the point counts of its collections and its Neo4j projection are compared with the figures
+    recorded when it was built; a projection that does not match is re-imported from the workspace.
     Shares the build lock with builds: refused while a build is running."""
     if not source.graph_enabled:
         raise ValueError(f"source {source_key!r} has graph_enabled=false")
@@ -1843,22 +1904,28 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
         if not paths.graph_file.exists():
             raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: workspace {paths.graph_file} is gone "
                              "(incremental appends replay from it)")
+        target = _rollback_target_check(settings, source, q, graph_version=graph_version, force=force)
         result: dict[str, Any] = {"source": source_key, "kb_id": source.kb_id, "source_collection": source.collection,
-                                  "from_graph_version": current, "graph_version": graph_version, "steps": []}
+                                  "from_graph_version": current, "graph_version": graph_version, "steps": [],
+                                  "target": target["summary"]}
         use_neo4j = bool(getattr(settings, "graph_neo4j_import_after_build", False))
         if use_neo4j:
-            from .neo4j_import import activate_neo4j_graph_version, count_version_nodes, import_graph_to_neo4j, neo4j_driver
+            from .neo4j_import import (activate_neo4j_graph_version, count_version_nodes, counts_match,
+                                       import_graph_to_neo4j, neo4j_counts, neo4j_driver)
 
             driver = neo4j_driver(settings)
             try:
                 nodes = count_version_nodes(driver, source.kb_id, graph_version)
+                expected = target["neo4j_expected"]
+                intact = bool(nodes > 0 and expected and counts_match(expected, neo4j_counts(driver, source.kb_id, graph_version)))
             finally:
                 driver.close()
-            if nodes <= 0:
-                # The target's Neo4j projection is gone: re-import it from the workspace, without activating
+            if not intact:
+                # The target's Neo4j projection is gone, or does not match the recorded counts (a half-written
+                # projection): re-import it from the workspace, without activating
                 result["neo4j_reimport"] = import_graph_to_neo4j(
                     settings, source_key=source_key, source=source, graph_version=graph_version,
-                    activate=False, require_qdrant_aliases=False)
+                    replace=True, activate=False, require_qdrant_aliases=False)
                 result["steps"].append("neo4j_reimport")
         alias_result = activate_graph_aliases(q, source_collection=source.collection, graph_version=graph_version)
         result["qdrant_alias_activation"] = alias_result
@@ -1890,6 +1957,50 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
         return result
     finally:
         guard.release()
+
+
+def _rollback_target_check(settings: Settings, source: KBSource, q: Any, *, graph_version: str, force: bool) -> dict[str, Any]:
+    """Whether the rollback target is a version that was built and is still complete. A record that is not done
+    / rolled_back (paused, failed, still running), or no record at all, is refused unless ``force`` is given:
+    with KEEP=1 such half-finished versions are the only ones a rollback could reach, and switching to one also
+    marks the good live version rolled_back and deletes it (2026-09-29 audit). Collections whose point count
+    differs from the figure recorded at build time are always refused, forced or not: they were written only
+    in part. Returns {"summary": goes into the result, "neo4j_expected": the Neo4j counts recorded at build
+    time, empty when none were recorded}."""
+    with db.connect(settings.state_db) as con:
+        row = db.graph_build_by_version(con, source.collection, graph_version)
+    status = str(row["status"]) if row is not None else ""
+    if row is None and not force:
+        raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: no build record for this version; "
+                         "pass --force to adopt it as built")
+    if row is not None and status not in ("done", "rolled_back") and not force:
+        raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: its build record is {status!r}, "
+                         "not a finished build; pass --force only if you are sure the version is complete")
+    manifest: dict[str, Any] = {}
+    if row is not None:
+        try:
+            manifest = json.loads(row["manifest_json"] or "{}") or {}
+        except (TypeError, ValueError):
+            manifest = {}
+    recorded = ((manifest.get("enrich") or {}).get("collections") or {}) if isinstance(manifest.get("enrich"), dict) else {}
+    counts: dict[str, dict[str, Any]] = {}
+    mismatched: list[str] = []
+    for graph_type in GRAPH_VECTOR_TYPES:
+        collection = graph_collection_name(source.collection, graph_type, graph_version)
+        if not collection_exists(q, collection):
+            continue                      # required types were checked by the caller; an optional type without a collection had no rows
+        actual = int(q.count(collection_name=collection, exact=True).count)
+        want = (recorded.get(graph_type) or {}).get("points") if isinstance(recorded.get(graph_type), dict) else None
+        counts[graph_type] = {"points": actual, "recorded": want}
+        if want is not None and int(want) != actual:
+            mismatched.append(f"{collection}: points={actual} recorded={want}")
+        elif want is None and graph_type not in GRAPH_OPTIONAL_TYPES and actual <= 0:
+            mismatched.append(f"{collection}: empty")
+    if mismatched:
+        raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: graph collection(s) incomplete: {mismatched}")
+    expected = (manifest.get("neo4j_import") or {}).get("expected_counts") if isinstance(manifest.get("neo4j_import"), dict) else None
+    return {"summary": {"record_status": status or None, "forced": bool(force), "collections": counts},
+            "neo4j_expected": dict(expected) if isinstance(expected, dict) else {}}
 
 
 def _record_rollback(con, settings: Settings, source: KBSource, *, source_key: str, graph_version: str,

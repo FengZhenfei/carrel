@@ -533,6 +533,48 @@ class GraphGcSafetyNetTests(unittest.TestCase):
             finally:
                 holder.release()
             self.assertEqual((out["skipped"], out["reason"]), (True, "graph build running"))
+            self.assertEqual(out["yielded_to"], "graph_build")           # the wrapper script reports a yield, not a failure
             free = maintenance.graph_gc(settings, dry_run=True)          # no graph-enabled base: nothing to do, lock released
             self.assertEqual((free["skipped"], free["sources"]), (False, {}))
             self.assertEqual(free["keep_latest"], 2)
+
+    def test_graph_gc_keeps_the_resumable_version_outside_the_quota(self) -> None:
+        """Nightly GC: the newest paused / failed version is kept for a resume (not deleted, not counted); older
+        half-finished versions are deleted outright."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from kb_pipeline import db, maintenance
+        from kb_pipeline.graph import build as build_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                for bid, status, started in (("good", "done", 100), ("fail1", "failed", 200), ("paused", "cancelled", 300)):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                        "status, started_at, build_kind) VALUES(?, 'kb_1', 'kb_1', 'kb_1', ?, ?, ?, 'full')",
+                        (bid, "v-" + bid, status, started))
+            source = SimpleNamespace(kb_id="kb_1", collection="kb_1", graph_enabled=True)
+            settings = SimpleNamespace(runtime_dir=Path(tmp), state_db=state, sources={"kb_1": source},
+                                       graph_gc_keep_versions=1, qdrant_url="http://127.0.0.1:1", qdrant_api_key=None)
+            seen: dict = {}
+
+            def fake_gc(settings, source, **kwargs):
+                seen.update(kwargs)
+                return {"result": {}, "steps": [], "errors": {}}
+
+            with mock.patch.object(build_mod, "gc_graph_versions", fake_gc), \
+                    mock.patch("kb_pipeline.vector.qdrant.client", lambda *a, **k: object()), \
+                    mock.patch("kb_pipeline.vector.qdrant.graph_alias_targets",
+                               lambda q, collection: {"entity": "graph_1_entity__v-good"}), \
+                    mock.patch("kb_pipeline.vector.qdrant.parse_graph_collection_name",
+                               lambda name: {"graph_version": "v-good"}):
+                out = maintenance.graph_gc(settings, dry_run=True)
+            self.assertFalse(out["skipped"])
+            self.assertEqual(seen["graph_version"], "v-good")
+            self.assertEqual(seen["protect"], {"v-paused"})
+            self.assertEqual(seen["discard"], {"v-fail1"})
+            self.assertEqual(seen["keep_latest"], 1)

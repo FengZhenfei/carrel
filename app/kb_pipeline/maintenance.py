@@ -262,7 +262,8 @@ def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: boo
     """Nightly safety net: clean every base's superseded graph versions (Qdrant collections, Neo4j versions,
     workspace directories, build records) with the same "active plus N - 1" rule as the end of a build. The
     end-of-build GC only runs when that base builds, so idle bases and bases whose GC failed rely on this one.
-    The whole round is skipped while a build runs (the build lock cannot be taken)."""
+    The newest paused / failed version is kept for a resume, outside the keep window. The whole round is
+    skipped while a build runs (the build lock cannot be taken)."""
     from .graph.build import gc_graph_versions
     from .graph.lock import GraphBuildLock
     from .vector.qdrant import client as qdrant_client
@@ -274,7 +275,8 @@ def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: boo
     try:
         lock.acquire()
     except RuntimeError:
-        return {"skipped": True, "reason": "graph build running", "dry_run": dry_run, "keep_latest": keep}
+        return {"skipped": True, "reason": "graph build running", "yielded_to": "graph_build",
+                "dry_run": dry_run, "keep_latest": keep}
     try:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
         for key, source in sorted(settings.sources.items(), key=lambda kv: kv[1].kb_id):
@@ -286,13 +288,16 @@ def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: boo
                 if parsed:
                     versions.add(str(parsed["graph_version"]))
             active = next(iter(versions)) if len(versions) == 1 else ""
+            # The newest paused / failed version is kept for a resume: not deleted and not counted against the
+            # "latest N versions"; older half-finished versions are deleted outright
             try:
                 with db.connect(settings.state_db) as con:
-                    discard = db.unsuccessful_graph_versions(con, source.kb_id, superseded_only=True) - {active}
+                    resumable = db.resumable_graph_versions(con, source.kb_id) - {active}
+                    discard = db.unsuccessful_graph_versions(con, source.kb_id) - resumable - {active}
             except sqlite3.OperationalError:
-                discard = set()
+                resumable, discard = set(), set()
             gc = gc_graph_versions(settings, source, q=q, graph_version=active, keep_latest=keep, discard=discard,
-                                   grace_seconds=0, dry_run=dry_run)
+                                   protect=resumable, grace_seconds=0, dry_run=dry_run)
             out["sources"][source.kb_id] = {"source": key, "active_graph_version": active or None, **gc["result"]}
             if gc["errors"]:
                 out["errors"][source.kb_id] = gc["errors"]
