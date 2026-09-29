@@ -13,19 +13,17 @@ from .limits import (
     normalize_profile, normalize_type_definitions,
 )
 from .models import GraphRebuildPolicy, KBSource
-from .utils import load_env_file
+from .utils import load_env_file, pin_tokenizer_cache
 from .vector.layout import VectorLayout
 
 
 BASE_DIR = Path(os.getenv("KB_LOCAL_BASE_DIR", Path(__file__).resolve().parents[2]))
 DEFAULT_ENV_FILE = BASE_DIR / "app" / ".env"
-DEFAULT_QDRANT_CREDENTIALS = BASE_DIR / "secrets" / "qdrant-credentials.txt"
 
 
 @dataclass(frozen=True)
 class Settings:
     env_file: Path
-    qdrant_credentials_file: Path
     state_db: Path
     mirror_root: Path
     opensearch_url: str
@@ -69,7 +67,6 @@ class Settings:
     vlm_failure_retry_ratio: float
     mineru_url: str
     mineru_timeout_seconds: int
-    vlm_timeout_seconds: int
     parse_enabled: bool
     min_file_age_seconds: int
     max_file_bytes: int
@@ -121,10 +118,9 @@ def _default_env_file() -> Path:
 def load_settings(env_file: str | Path | None = None) -> Settings:
     selected_env = Path(env_file or os.getenv("KB_ENV_FILE") or _default_env_file())
     load_env_file(selected_env)
+    runtime_dir = Path(os.getenv("KB_RUNTIME_DIR", str(BASE_DIR / "runtime")))
+    pin_tokenizer_cache(runtime_dir)
 
-    # Credentials are read from the env file only; secrets/qdrant-credentials.txt is a path from the Mac era,
-    # and that directory is long gone.
-    qdrant_credentials = Path(os.getenv("QDRANT_CREDENTIALS_FILE", str(DEFAULT_QDRANT_CREDENTIALS)))
     qdrant_key = os.getenv("QDRANT_API_KEY")
     # The password is read from the env file only. The macOS Keychain fallback was a leftover from the Mac
     # era: Linux has no security command, so it only ever spawned a subprocess bound to fail.
@@ -144,17 +140,17 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
 
     return Settings(
         env_file=selected_env,
-        qdrant_credentials_file=qdrant_credentials,
         mirror_root=mirror_root,
         state_db=state_db,
         opensearch_url=os.getenv("OPENSEARCH_URL", "http://127.0.0.1:9200"),
-        runtime_dir=Path(os.getenv("KB_RUNTIME_DIR", str(BASE_DIR / "runtime"))),
+        runtime_dir=runtime_dir,
         cache_dir=Path(os.getenv("KB_CACHE_DIR", str(BASE_DIR / "runtime" / "parse_cache" / "kb-pipeline"))),
         log_dir=Path(os.getenv("KB_LOG_DIR", str(BASE_DIR / "logs"))),
         qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
         qdrant_api_key=qdrant_key,
-        # Defaults point at this host rather than the cloud: with a missing or misspelled env key, requests
-        # used to silently go to the cloud endpoint (empty key → 401, but the request had already been sent).
+        # Model service defaults all point at this host (addresses and model names match the services in the
+        # compose stack): a missing or misspelled env key must not silently send requests to a public endpoint --
+        # once a request is out, the text and images have already left this machine.
         embedding_base_url=os.getenv("EMBEDDING_BASE_URL", "http://127.0.0.1:8101/v1"),
         embedding_model_id=os.getenv("EMBEDDING_MODEL_ID", "qwen3-embedding-0.6b"),
         embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
@@ -195,7 +191,6 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         # (12-18h) directly, so once MinerU hung (GPU hang) the worker sat silently on its lock for a whole
         # day while the heartbeat kept renewing the lease.
         mineru_timeout_seconds=int(os.getenv("MINERU_TIMEOUT_SECONDS", "3600")),
-        vlm_timeout_seconds=int(os.getenv("VLM_TIMEOUT_SECONDS", "180")),
         parse_enabled=os.getenv("KB_PARSE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
         min_file_age_seconds=int(os.getenv("KB_MIN_FILE_AGE_SECONDS", "180")),
         # 0 = unlimited. Default 200MB: single files above this size are almost always logs / data exports

@@ -64,7 +64,7 @@ def list_source_files(
     for path in sorted(root.rglob("*")):
         if limit is not None and len(result) >= limit:
             break
-        if not path.is_file() or should_skip(path):
+        if not path.is_file() or should_skip(path, root):
             continue
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_EXTS and path.name not in SUPPORTED_FILENAMES:
@@ -82,7 +82,7 @@ def list_source_files(
             continue
         rel_path = normalize_rel_path(str(path.relative_to(root)))
         file_key = stable_int(f"file:{source.kb_id}:{rel_path}")
-        if min_age_seconds > 0 and now - stat.st_mtime < min_age_seconds:
+        if still_settling(stat.st_mtime, now, min_age_seconds):
             # Still settling: skip parsing this round, but report it as present.
             if too_recent_keys is not None:
                 too_recent_keys.add(file_key)
@@ -153,7 +153,7 @@ def list_recent_source_files(
     for path in sorted(root.rglob("*")):
         if limit is not None and len(result) >= limit:
             break
-        if not path.is_file() or should_skip(path):
+        if not path.is_file() or should_skip(path, root):
             continue
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_EXTS and path.name not in SUPPORTED_FILENAMES:
@@ -161,12 +161,21 @@ def list_recent_source_files(
         if not inside_boundary(path, boundary):
             continue
         try:
-            age = now - path.stat().st_mtime
+            mtime = path.stat().st_mtime
         except FileNotFoundError:
             continue
-        if age < min_age_seconds:
+        if still_settling(mtime, now, min_age_seconds):
             result.append(path)
     return result
+
+
+def still_settling(mtime: float, now: float, min_age_seconds: int) -> bool:
+    """Whether the file was only just written and is still inside its settling period. A modification time in
+    the future (a device with a wrong clock, files unpacked across time zones, kept as is by rsync -a) does not
+    mean "just written": one off by a few seconds waits like a fresh file, one further off than the settling
+    period is treated as stable -- otherwise it would be put off until that moment arrives, neither parsed
+    nor reported."""
+    return min_age_seconds > 0 and abs(now - mtime) < min_age_seconds
 
 
 def inside_boundary(path: Path, boundary: Path) -> bool:
@@ -181,7 +190,16 @@ def inside_boundary(path: Path, boundary: Path) -> bool:
     return real == boundary or boundary in real.parents
 
 
-def should_skip(path: Path) -> bool:
+def should_skip(path: Path, root: Path | None = None) -> bool:
+    """Hidden files, files under hidden directories and the temporary files of sync tools are not ingested.
+    When root (the KB directory) is given, only the path relative to the KB counts: the KB directory itself or
+    one of its parents starting with a dot (a mirror root under a location like ~/.local/share) must not leave
+    the whole KB without a single scanned file."""
+    if root is not None:
+        try:
+            path = path.relative_to(root)
+        except ValueError:
+            pass
     parts = path.parts
     name = path.name
     if name.startswith(".") or name.startswith("._") or name.startswith("~$"):

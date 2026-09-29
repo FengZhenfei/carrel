@@ -169,7 +169,10 @@ set -e
 # summary). Previously only the console's polling and the worker's own 5-minute timer kicked it, so with the
 # console in the background or closed, "the pipeline has started" merely meant the jobs were queued
 # (2026-09-08). KB_SCAN_KICK_WORKER=0 turns this off.
-queued_jobs="$(grep -oE 'scan summary: .*jobs=[0-9]+' "$SCAN_OUT" | grep -oE 'jobs=[0-9]+' | tail -1 | cut -d= -f2)"
+# The trailing || true is load-bearing: when the scan fails its output has no summary line, grep returns 1, and
+# pipefail + set -e would kill the script on this line -- the failure branch below (restore the flag, say why,
+# pass the exit code through) would never be reached.
+queued_jobs="$(grep -oE 'scan summary: .*jobs=[0-9]+' "$SCAN_OUT" | grep -oE 'jobs=[0-9]+' | tail -1 | cut -d= -f2 || true)"
 rm -f "$SCAN_OUT"; SCAN_OUT=""
 if [[ "${KB_SCAN_KICK_WORKER:-1}" =~ ^(1|true|yes|on)$ && "${queued_jobs:-0}" -gt 0 ]] && command -v systemctl >/dev/null 2>&1; then
   if systemctl --user start --no-block carrel-worker.service >/dev/null 2>&1; then

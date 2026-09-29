@@ -118,19 +118,23 @@ def schedule_file(
         }
         if old is not None and str(old["status"]) == "deleted" and change.job_type == "metadata_update":
             payload["reactivate"] = True
-        job_id = db.enqueue_job(
-            con,
-            ingest_run_id=ingest_run_id,
-            file_id=file_id,
-            kb_id=file.kb_id,
-            collection=file.collection,
-            file_key=file.file_key,
-            job_type=change.job_type,
-            parser_profile=parse_profile,
-            priority=priority,
-            payload=payload,
-            dedupe_key=dedupe_key,
-        )
+        # A job with the same key already in the queue (queued, backing off or running) is not queued again and
+        # does not count as queued this round: the scan script kicks the worker by the number of newly queued
+        # jobs, and counting it would kick the worker for nothing every minute while that job backs off
+        if db.active_job_for_dedupe_key(con, dedupe_key) is None:
+            job_id = db.enqueue_job(
+                con,
+                ingest_run_id=ingest_run_id,
+                file_id=file_id,
+                kb_id=file.kb_id,
+                collection=file.collection,
+                file_key=file.file_key,
+                job_type=change.job_type,
+                parser_profile=parse_profile,
+                priority=priority,
+                payload=payload,
+                dedupe_key=dedupe_key,
+            )
     return change.change_type, job_id
 
 
@@ -246,6 +250,7 @@ def requeue_failed_lifecycle_jobs(con: sqlite3.Connection, *, ingest_run_id: str
         if not isinstance(payload, dict):
             payload = {}
         payload["requeued_from"] = str(latest["job_id"])
+        payload.pop("deferred", None)      # "service not ready" deferrals were the old job's; the new one starts over
         db.enqueue_job(
             con,
             ingest_run_id=ingest_run_id,
@@ -264,7 +269,14 @@ def requeue_failed_lifecycle_jobs(con: sqlite3.Connection, *, ingest_run_id: str
     return requeued
 
 
-def requeue_single_file(con: sqlite3.Connection, *, ingest_run_id: str, file_row: sqlite3.Row) -> str | None:
+def requeue_single_file(
+    con: sqlite3.Connection,
+    *,
+    ingest_run_id: str,
+    file_row: sqlite3.Row,
+    reason: str = "manual retry from web console",
+    priority: int = 50,
+) -> str | None:
     """Web-console retry for one file: enqueue a parse job for the file's
     current version+profile through the normal queue (same dedupe key and
     worker lease as the automatic pipeline, so no conflicting side channel).
@@ -286,10 +298,31 @@ def requeue_single_file(con: sqlite3.Connection, *, ingest_run_id: str, file_row
         file_key=int(file_row["file_key"]),
         job_type="parse",
         parser_profile=profile,
-        priority=50,
-        payload={"reason": "manual retry from web console", "source_path": str(file_row["source_path"])},
+        priority=priority,
+        payload={"reason": reason, "source_path": str(file_row["source_path"])},
         dedupe_key=dedupe_key,
     )
+
+
+RERUN_PRIORITY = 120      # a whole-KB re-parse comes after everyday parsing
+
+
+def _ask_rerun(con: sqlite3.Connection, running_job: sqlite3.Row, reason: str) -> bool:
+    """A job with the same key is running: it uses the KB configuration as of the moment it started, and once it
+    is done the file would not be queued again. Note the request in its payload so the worker queues one more
+    run after this one (worker._rerun_if_asked)."""
+    try:
+        payload = json.loads(running_job["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["rerun"] = reason
+    cur = con.execute(
+        "UPDATE jobs SET payload_json = ? WHERE job_id = ? AND status = 'running'",
+        (json.dumps(payload, ensure_ascii=False), str(running_job["job_id"])),
+    )
+    return bool(cur.rowcount)
 
 
 def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str, reason: str) -> int:
@@ -306,7 +339,12 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
     ).fetchall():
         profile = parser_profile_for_path(_Path(str(row["filename"])))
         dedupe_key = f"parse:{row['file_id']}:{row['content_version']}:{profile}"
-        if db.active_job_for_dedupe_key(con, dedupe_key) is not None:
+        active = db.active_job_for_dedupe_key(con, dedupe_key)
+        if active is not None:
+            # A queued job that has not started yet parses with the new configuration anyway; a running one
+            # has to go once more when it is done
+            if str(active["status"]) == "running" and _ask_rerun(con, active, reason):
+                requeued += 1
             continue
         db.enqueue_job(
             con,
@@ -317,7 +355,7 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
             file_key=int(row["file_key"]),
             job_type="parse",
             parser_profile=profile,
-            priority=120,
+            priority=RERUN_PRIORITY,
             payload={"reason": reason, "source_path": str(row["source_path"])},
             dedupe_key=dedupe_key,
         )

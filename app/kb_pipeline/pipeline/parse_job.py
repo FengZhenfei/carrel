@@ -13,10 +13,11 @@ from .. import search_fts
 from ..chunking.chunker import blocks_to_chunks, embedding_context_for, embedding_input
 from ..chunking.diagnose import chunk_diagnostics, summarize_line
 from ..config import Settings
-from ..embedding.client import EmbeddingClient
+from ..embedding.client import EmbeddingClient, EmbeddingInputRejected
 from ..embedding.visual import VisualEmbeddingClient
 from ..models import ParsedBlock, UnifiedChunk
 from ..models import KBSource
+from ..parsers.code_symbols import LANGUAGE_BY_SUFFIX
 from ..parsers.common import parser_profile_for_path
 from ..parsers.docx_enhanced import parse_docx_enhanced
 from ..parsers.html_dom import parse_html_dom
@@ -42,18 +43,37 @@ TABLE_SUFFIXES = {".xlsx", ".xls", ".csv"}
 
 # The definition moved to parsers.errors (the router raises it too); the name is kept here so the worker and
 # the tests keep importing it from this module
-from ..parsers.errors import NonRetryableParseError  # noqa: E402,F401
-
-
-
-class JobCancelled(RuntimeError):
-    """The user closed or deleted this knowledge base mid-parse. Not a failure: no retry is counted, no
-    failure is recorded, the worker marks the job cancelled directly. The checkpoint is stage() -- every
-    phase boundary and every per-image VLM callback passes through it, so the worst-case wait is "the
-    current step", not "the current knowledge base"."""
+from ..parsers.errors import JobCancelled, NonRetryableParseError  # noqa: E402,F401
 
 
 def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.Row) -> str:
+    committed = [False]
+    try:
+        return _parse_and_index(con, settings, job, committed)
+    except JobCancelled:
+        raise
+    except Exception:
+        if committed[0]:
+            _withdraw_cancel(con, job)
+        raise
+
+
+def _withdraw_cancel(con: sqlite3.Connection, job: sqlite3.Row) -> None:
+    """The job failed after it had already written to the vector store: a cancellation arriving now is too late
+    to take effect. Withdraw the cancel flag so the worker backs off and retries it as an ordinary failure and
+    the retry finishes the indexing; left in place, the flag would cancel the retry as soon as it starts and
+    leave the vector store and the state database on two different versions."""
+    try:
+        owner = job["locked_by"] if "locked_by" in job.keys() else None
+        con.execute(
+            "UPDATE jobs SET cancel_requested = 0 WHERE job_id = ? AND status = 'running' AND (? IS NULL OR locked_by = ?)",
+            (str(job["job_id"]), owner, owner),
+        )
+    except Exception:
+        pass
+
+
+def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.Row, committed: list[bool]) -> str:
     file_row = db.get_file_by_id(con, str(job["file_id"]))
     if file_row is None:
         raise NonRetryableParseError(f"file row not found for {job['file_id']}")
@@ -95,6 +115,8 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
     last_cancel_check = [0.0]
 
     def check_cancelled(force: bool = False) -> None:
+        if committed[0]:
+            return
         # A failed read (lock contention etc.) must not take the parse down: cancellation is best-effort, the
         # next checkpoint looks again.
         now = time.time()
@@ -126,9 +148,16 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
             pass
 
     stage("Parsing document", force=True)
-    blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage)
+    # A temporary fault in the text-layer repair makes the job retry; on the last attempt the document is stored
+    # with a degraded flag instead, so that a document is not kept out of the index forever
+    last_attempt = int(job["retry_count"] or 0) >= settings.job_max_retries
+    blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage,
+                           text_layer_repair="final" if last_attempt else "retry")
     print(f"[parse] blocks={len(blocks)} file={file_row['source_path']}", flush=True)
     event(f"Parsed into {len(blocks)} blocks")
+    degraded = sum(1 for block in blocks if block.metadata.get("degraded"))
+    if degraded:
+        event(f"Characters lost from the text layer were not recovered; {degraded} blocks carry the degraded mark")
     table_stats = table_ambiguity_summary(blocks)
     if table_stats["flagged"]:
         print(f"[parse] table_ambiguous={table_stats['flagged']} verified={table_stats['verified']} "
@@ -195,7 +224,17 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
     doc_name = str(file_row["rel_path"] or file_row["filename"] or "").rsplit(".", 1)[0].replace("/", " > ")
     for chunk in chunks:
         chunk.embedding_context = embedding_context_for(chunk, doc_name=doc_name)
-    text_vectors = embedder.embed([embedding_input(chunk) for chunk in chunks])
+    try:
+        text_vectors = embedder.embed([embedding_input(chunk) for chunk in chunks])
+    except EmbeddingInputRejected as exc:
+        # The service rejected one chunk for its content (most likely over the embedding model's length limit):
+        # retrying the same file gives the same result however often, so skip the job-level retries and the
+        # daily automatic requeue; name the chunk so one can see which cell or line could not be split
+        bad = chunks[exc.index]
+        raise NonRetryableParseError(
+            f"The embedding service rejected chunk {exc.index + 1}/{len(chunks)} (block_id={bad.block.block_id}, "
+            f"{bad.token_count} tokens): {exc.reason[:300]}"
+        ) from exc
     print(f"[parse] embeddings={len(text_vectors)} batches={(len(chunks) + settings.embedding_batch - 1) // settings.embedding_batch}", flush=True)
     event(f"{len(text_vectors)} text vectors")
 
@@ -204,6 +243,9 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
     # the text embeddings, one vector per picture (the first chunk of a block).
     stage("Visual embedding", force=True)
     visual_vectors = _embed_visual_chunks(settings, chunks, cache_dir)
+    rejected = len({chunk.block.block_id for chunk in chunks if chunk.block.metadata.get("visual_embed_status")})
+    if rejected:
+        event(f"The visual embedding service rejected {rejected} images; they have no visual vector")
     named_vectors: list[dict[str, list[float]]] = []
     for chunk, text_vector in zip(chunks, text_vectors, strict=True):
         vector: dict[str, list[float]] = {TEXT_VECTOR: text_vector}
@@ -263,6 +305,11 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
         )
         for chunk in chunks
     ]
+    # From here on the job counts as committed; the later stages only record progress and no longer check for
+    # cancellation: points are being written to the vector store, and stopping now would leave "new chunks in the
+    # vector store, old chunks in the state database", which a re-parse of the same version does not heal
+    # because the scan judges the file unchanged.
+    committed[0] = True
     upsert_chunks(
         q,
         collection,
@@ -405,7 +452,9 @@ def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_d
 
 
 def _is_intentionally_empty(path: Path) -> bool:
-    if path.suffix.lower() not in {*TEXT_SUFFIXES, ".csv"} and path.name not in TEXT_FILENAMES:
+    # Every suffix that is read as text counts: the code suffixes chunked by symbol (.mjs / .lua ...) are not all
+    # in TEXT_SUFFIXES
+    if path.suffix.lower() not in {*TEXT_SUFFIXES, *LANGUAGE_BY_SUFFIX, ".csv"} and path.name not in TEXT_FILENAMES:
         return False
     try:
         size = path.stat().st_size
@@ -528,7 +577,11 @@ def _parse_blocks(
     parser_profile: str,
     file_row: sqlite3.Row,
     stage_cb=None,
+    *,
+    text_layer_repair: str = "cached",
 ) -> list[ParsedBlock]:
+    """text_layer_repair: see parse_pdf_enhanced. The default uses the cache only: the chunk preview takes the
+    default, so MinerU is never called inside the web process."""
     suffix = path.suffix.lower()
 
     vlm_progress = vlm_progress_callback(stage_cb)
@@ -571,6 +624,7 @@ def _parse_blocks(
             caption_cache_root=caption_cache_root,
             vlm_prompt=vlm_prompt,
             progress_cb=vlm_progress,
+            text_layer_repair=text_layer_repair,
         )
     if suffix == ".pptx":
         return parse_pptx_enhanced(
@@ -660,18 +714,22 @@ def _source_for_file(settings: Settings, kb_id: str):
     jobs picked up after the console changed the chunk size or the prompt are still parsed with the old values,
     and after the directory of a base was renamed the boundary is checked against the old name, the job is
     judged non-retryable and the scan keeps the file blocked (2026-09-29 audit). The snapshot is only consulted
-    when the registry has no such base (extra sources outside the mirror). In neither place: the base is not
-    enrolled or has been disabled, and the job is cancelled -- a retry would change nothing, and a failure
-    would block the automatic requeue after the base is enabled again."""
+    when the registry has no such base (extra sources outside the mirror). When the base is not enrolled or has
+    been disabled (its registry row is not active, or it is in neither place), the job is cancelled -- a retry
+    would change nothing, and a failure would block the automatic requeue after the base is enabled again. A
+    registry row that exists but is not active never falls back to the snapshot: the snapshot is still the one
+    from before the base was disabled or its directory vanished, and the directory name may be wrong by now."""
     from .. import discovery
 
     row = None
     try:
         with db.connect(settings.state_db) as con:
-            row = con.execute("SELECT * FROM kb_sources WHERE kb_id = ? AND status = 'active'", (kb_id,)).fetchone()
+            row = con.execute("SELECT * FROM kb_sources WHERE kb_id = ?", (kb_id,)).fetchone()
     except (sqlite3.Error, TypeError, AttributeError):
         row = None                        # no registry yet (before the migration) or a test stub without a state db
     if row is not None:
+        if str(row["status"]) != "active":
+            raise JobCancelled(f"Knowledge base {kb_id} is not enrolled or has been disabled; job cancelled")
         try:
             return discovery.source_from_row(Path(settings.mirror_root), row)
         except Exception as exc:
@@ -782,6 +840,10 @@ def _payload_for_chunk(
         # (the first chunk of the block); doubles as the has-visual-vector flag.
         if visual_model:
             payload["visual_embedding_model"] = visual_model
+        elif block.metadata.get("visual_embed_status"):
+            # The visual embedding service rejected this picture: the point has no visual vector, and the reason
+            # travels with the payload instead of living only in the memory of this parse
+            payload["visual_embed_status"] = block.metadata["visual_embed_status"]
     if block.visual_summary:
         payload["visual_summary"] = block.visual_summary
     for key in (

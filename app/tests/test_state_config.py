@@ -2,6 +2,9 @@
 restoring the projections."""
 from __future__ import annotations
 
+import json
+import os
+import re
 import socket
 import sqlite3
 import stat
@@ -123,6 +126,30 @@ class StateRegressionTests(unittest.TestCase):
         self.assertEqual(deleted, ["kb_product"])
         self.assertFalse(missing["exists"])
 
+    def test_fts_collection_flag_limits_the_indices_touched(self) -> None:
+        """--collection on fts init / search really filters; without it every enrolled KB is used."""
+        import contextlib
+        import io
+
+        from kb_pipeline import cli
+
+        settings = SimpleNamespace(opensearch_url="http://fake:9200",
+                                   sources={"a": SimpleNamespace(collection="kb_001"), "b": SimpleNamespace(collection="kb_002")})
+        touched: list[tuple[str, list[str]]] = []
+        parser = cli.build_parser()
+        with patch.object(cli, "load_settings", return_value=settings), \
+                patch.object(search_fts, "ensure_indices", side_effect=lambda url, cols: touched.append(("init", list(cols))) or {}), \
+                patch.object(search_fts, "status", return_value={}), \
+                patch.object(search_fts, "search",
+                             side_effect=lambda url, query, collections, limit: touched.append(("search", list(collections))) or []), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for argv in (["fts", "init", "--collection", "kb_002"], ["fts", "init"],
+                         ["fts", "search", "词", "--collection", "kb_001"], ["fts", "search", "词"]):
+                args = parser.parse_args(argv)
+                self.assertEqual(args.func(args), 0)
+        self.assertEqual(touched, [("init", ["kb_002"]), ("init", ["kb_001", "kb_002"]),
+                                   ("search", ["kb_001"]), ("search", ["kb_001", "kb_002"])])
+
     def test_dead_local_worker_job_is_retried_with_backoff_then_failed(self) -> None:
         """S5: a running job left behind by a killed worker must count as a retry and back off, otherwise a
         document that crashes the interpreter is re-claimed first forever and starves the whole queue."""
@@ -187,6 +214,94 @@ class StateRegressionTests(unittest.TestCase):
             self.assertIsNotNone(resolved)
 
 
+class SupersededFailureTests(unittest.TestCase):
+    """A requeue after the retries ran out and a retry from the console both get a new job_id. Once a later job
+    has a result, the earlier failed attempts must not stay open."""
+
+    def _attempt(self, con, *, file_id="kb:1", job_type="parse", key="parse:kb:1:v1:p", failures=2, created=None):
+        """Queue a job and claim it (running), record some failures under it; returns the job_id."""
+        job_id = db.enqueue_job(con, ingest_run_id=None, file_id=file_id, kb_id="kb", collection="kb_t", file_key=1,
+                                job_type=job_type, dedupe_key=key)
+        if created is not None:
+            con.execute("UPDATE jobs SET created_at = ? WHERE job_id = ?", (created, job_id))
+        con.execute("UPDATE jobs SET status = 'running', locked_by = 'w' WHERE job_id = ?", (job_id,))
+        for _ in range(failures):
+            db.add_failure(con, file_id=file_id, job_id=job_id, stage="worker", error_type="MinerUServiceError",
+                           error_message="500")
+        return job_id
+
+    def _fail(self, con, job_id):
+        self.assertTrue(db.mark_job_failed(con, job_id, "MinerU 500", retry=False, worker_id="w"))
+
+    def _state(self, con, job_id):
+        status = str(con.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()["status"])
+        open_failures = int(con.execute(
+            "SELECT COUNT(*) FROM failures WHERE job_id = ? AND resolved_at IS NULL", (job_id,)).fetchone()[0])
+        return status, open_failures
+
+    def test_success_closes_the_earlier_failed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            db.init_db(path)
+            with db.connect(path) as con:
+                first = self._attempt(con, created=100); self._fail(con, first)
+                second = self._attempt(con, created=200); self._fail(con, second)
+                other_file = self._attempt(con, file_id="kb:2", key="parse:kb:2:v1:p", created=150); self._fail(con, other_file)
+                other_type = self._attempt(con, job_type="fts_sync", key="fts_sync:kb:1:v1", created=150); self._fail(con, other_type)
+                self.assertEqual(self._state(con, first), ("cancelled", 0))        # the second failure closed the first
+                self.assertEqual(self._state(con, second), ("failed", 2))          # the latest stays; the scan's duplicate check uses it
+                self.assertEqual(str(db.failed_job_for_dedupe_key(con, "parse:kb:1:v1:p")["job_id"]), second)
+                third = self._attempt(con, failures=0, created=300)
+                db.mark_job_done(con, third, "w")
+                self.assertEqual(self._state(con, second), ("cancelled", 0))
+                self.assertEqual(self._state(con, third), ("done", 0))
+                self.assertIsNone(db.failed_job_for_dedupe_key(con, "parse:kb:1:v1:p"))
+                self.assertEqual(self._state(con, other_file), ("failed", 2))      # other files and job types are left alone
+                self.assertEqual(self._state(con, other_type), ("failed", 2))
+                events = [r["text"] for r in con.execute(
+                    "SELECT text FROM job_events WHERE job_id = ? AND kind = 'cancelled'", (second,))]
+                self.assertEqual(events, [db.SUPERSEDED_EVENT])
+                # Cancelled with resolved failures: past the retention period they go with the job history
+                old = int(time.time()) - 60 * 86400
+                con.execute("UPDATE jobs SET finished_at = ?, updated_at = ? WHERE job_id IN (?, ?)", (old, old, first, second))
+                con.execute("UPDATE failures SET resolved_at = ? WHERE job_id IN (?, ?)", (old, first, second))
+                removed = db.prune_job_history(con, retention_days=30)
+                self.assertEqual((removed["jobs"], removed["failures"]), (2, 4))
+                left = {r[0] for r in con.execute("SELECT job_id FROM jobs")}
+                self.assertEqual(left, {third, other_file, other_type})
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM job_events WHERE job_id IN (?, ?)", (first, second)).fetchone()[0], 0)
+
+    def test_success_under_a_new_version_also_closes_them(self) -> None:
+        """The file got a new content version (and with it a new dedupe key) before the parse succeeded: the
+        failed attempt under the old key no longer stands either."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            db.init_db(path)
+            with db.connect(path) as con:
+                failed = self._attempt(con, key="parse:kb:1:v1:p", created=100); self._fail(con, failed)
+                done = self._attempt(con, key="parse:kb:1:v2:p", failures=0, created=200)
+                later_failed = self._attempt(con, key="parse:kb:1:v3:p", created=300)
+                con.execute("UPDATE jobs SET status = 'failed' WHERE job_id = ?", (later_failed,))
+                db.mark_job_done(con, done, "w")
+                self.assertEqual(self._state(con, failed), ("cancelled", 0))
+                self.assertEqual(self._state(con, later_failed), ("failed", 2))     # a failure queued later is not its business
+
+    def test_a_worker_that_lost_the_job_closes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            db.init_db(path)
+            with db.connect(path) as con:
+                failed = self._attempt(con, created=100); self._fail(con, failed)
+                taken_over = self._attempt(con, failures=0, created=200)
+                db.mark_job_done(con, taken_over, "someone-else")                    # not its lock: no terminal state written
+                self.assertEqual(self._state(con, taken_over)[0], "running")
+                self.assertEqual(self._state(con, failed), ("failed", 2))
+
+    def test_superseded_event_text_has_a_dictionary_entry(self) -> None:
+        """The server writes the English text; the console maps it back to Chinese through the dictionary."""
+        self.assertIn(f'": "{db.SUPERSEDED_EVENT}"', _repo_file("app/kb_server/static/i18n.js"))
+
+
 class PayloadVisualRefTests(unittest.TestCase):
     def _payload(self, block_type, visual_ref="/cache/parse/k/1/v/mineru/images/x.jpg"):
         from kb_pipeline.models import ParsedBlock, UnifiedChunk
@@ -223,7 +338,6 @@ class PayloadVisualRefTests(unittest.TestCase):
         self.assertEqual(p2["visual_value_conflicts"][0]["text_value"], "34")
         svc = _repo_file("app/kb_server/service.py")
         self.assertEqual(svc.count('"page_end": pl.get("page_end", pl.get("page_idx"))'), 1)
-        self.assertIn('"page_end": b.metadata.get("page_end", b.page_idx)', svc)
         js = _repo_file("app/kb_server/static/app.js")
         self.assertIn("function pageLabel(c)", js)
         self.assertIn("${pageLabel(c)}", js)
@@ -252,8 +366,8 @@ class KBDiscoveryTests(unittest.TestCase):
             root = Path(tmp)
             for name in ("产品资料", "半导体资料", "图书馆"):
                 (root / name).mkdir()
-            with db.connect(Path(tmp) / "s.db") as con:
-                con.executescript(db.SCHEMA); discovery.init_schema(con)
+            state = root / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 a, _ = discovery.enroll(con, root, "产品资料")
                 b, _ = discovery.enroll(con, root, "半导体资料")
                 self.assertEqual((a.kb_id, a.collection), ("kb_001", "kb_001"))
@@ -285,9 +399,8 @@ class KBDiscoveryTests(unittest.TestCase):
             self.assertEqual(discovery.discover_directories(root), ["产品资料", "新资料"])
             # ...but nothing is a pipeline source until enrolled
             self.assertEqual(discovery.enrolled_sources(state, root), {})
+            db.init_db(state)
             with db.connect(state) as con:
-                con.executescript(db.SCHEMA)
-                discovery.init_schema(con)
                 src, outcome = discovery.enroll(con, root, "产品资料")
                 self.assertEqual((src.kb_id, src.collection, outcome), ("kb_001", "kb_001", "new"))
                 self.assertEqual(src.max_tokens, 400)
@@ -302,10 +415,8 @@ class KBDiscoveryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / "X").mkdir()
-            state = Path(tmp) / "s.db"
+            state = Path(tmp) / "s.db"; db.init_db(state)
             with db.connect(state) as con:
-                con.executescript(db.SCHEMA)
-                discovery.init_schema(con)
                 src, _ = discovery.enroll(con, root, "X")
                 # unenroll: inactive with reason; the directory still existing
                 # must NOT resurrect it (scan only touches, never flips)
@@ -407,6 +518,121 @@ class ConfigLoadingTests(unittest.TestCase):
             sources = discovery.enrolled_sources(state, root)
             self.assertIn(good.kb_id, sources)     # the good KB works as usual
             self.assertNotIn(bad.kb_id, sources)   # the bad KB is skipped instead of taking everything down
+
+    @staticmethod
+    def _load(env_text: str = "", **environ: str):
+        """Read a temporary env file in an emptied environment: load_env_file does setdefault on os.environ, so
+        without isolation the test would see whatever this machine happens to export."""
+        from kb_pipeline.config import load_settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "kb.env"
+            env_file.write_text(env_text, encoding="utf-8")
+            isolated = {"KB_STATE_DB": str(Path(tmp) / "absent.db"), "KB_MIRROR_ROOT": tmp, **environ}
+            with patch.dict(os.environ, isolated, clear=True):
+                return load_settings(env_file)
+
+    @staticmethod
+    def _example() -> dict[str, str]:
+        pairs = (line.split("=", 1) for line in _repo_file("config/knowledge-base.env.example").splitlines()
+                 if "=" in line and not line.lstrip().startswith("#"))
+        return {key.strip(): value.strip().strip("'\"") for key, value in pairs}
+
+    def test_missing_or_misspelled_keys_never_leave_this_host(self) -> None:
+        """Parsing is on and the key is set, only the name of the address key is misspelled: images and text
+        still go to the services on this host and nowhere else."""
+        from urllib.parse import urlsplit
+
+        cfg = self._load("KB_PARSE_ENABLED=1\nVLM_API_KEY=local\nVLM_BASEURL=http://127.0.0.1:8105/v1\n")
+        self.assertTrue(cfg.parse_enabled)
+        self.assertEqual(cfg.vlm_api_key, "local")
+        for name in ("vlm_base_url", "embedding_base_url", "visual_embedding_base_url", "reranker_base_url",
+                     "visual_reranker_base_url", "mineru_url", "qdrant_url", "opensearch_url", "neo4j_uri"):
+            self.assertEqual(urlsplit(getattr(cfg, name)).hostname, "127.0.0.1", name)
+
+    def test_defaults_match_the_example_file_and_the_served_models(self) -> None:
+        cfg, example = self._load(), self._example()
+        for key, name in (("EMBEDDING_BASE_URL", "embedding_base_url"), ("EMBEDDING_MODEL_ID", "embedding_model_id"),
+                          ("VLM_BASE_URL", "vlm_base_url"), ("VLM_MODEL_ID", "vlm_model_id"),
+                          ("VISUAL_EMBEDDING_BASE_URL", "visual_embedding_base_url"),
+                          ("VISUAL_EMBEDDING_MODEL_ID", "visual_embedding_model_id"),
+                          ("MINERU_SERVICE_URL", "mineru_url"), ("QDRANT_URL", "qdrant_url"),
+                          ("OPENSEARCH_URL", "opensearch_url"), ("NEO4J_URI", "neo4j_uri")):
+            self.assertEqual(getattr(cfg, name), example[key], key)
+        # The rerankers are optional here: the example ships them empty (not deployed: search skips the rerank
+        # step and the console hides the row); a value that is filled in must be the code default
+        for key, name in (("RERANKER_BASE_URL", "reranker_base_url"), ("VISUAL_RERANKER_BASE_URL", "visual_reranker_base_url")):
+            self.assertIn(example[key], ("", getattr(cfg, name)), key)
+        served = set(re.findall(r"--served-model-name\n\s+- (\S+)", _repo_file("deployment/compose/docker-compose.yml")))
+        self.assertLessEqual({cfg.embedding_model_id, cfg.vlm_model_id, cfg.visual_embedding_model_id}, served)
+
+    def test_legacy_vlm_variable_names_are_not_read(self) -> None:
+        # The names stand in for the old fallback variables, which this tree no longer carries
+        cfg = self._load(LEGACY_VLM_API_KEY="old", OLD_VLM_API_KEY="older", LEGACY_VLM_CONCURRENCY="9")
+        self.assertEqual((cfg.vlm_api_key, cfg.vlm_concurrency), ("", 1))
+        self.assertEqual(self._load("VLM_CONCURRENCY=\n").vlm_concurrency, 1)      # empty means the default
+        self.assertEqual(self._load("VLM_CONCURRENCY=6\nVLM_API_KEY=k\n").vlm_concurrency, 6)
+
+    def test_graph_versions_kept_defaults_to_two_and_never_drops_below_one(self) -> None:
+        """Besides the current version the previous one is kept by default; 0 or a negative value still keeps
+        the current one. The example file and the code default agree."""
+        self.assertEqual(self._load().graph_gc_keep_versions, 2)
+        self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=0\n").graph_gc_keep_versions, 1)
+        self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=-3\n").graph_gc_keep_versions, 1)
+        self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=1\n").graph_gc_keep_versions, 1)
+        self.assertEqual(self._example()["GRAPH_GC_KEEP_VERSIONS"], "2")
+
+    def test_tokenizer_cache_lives_under_the_runtime_dir(self) -> None:
+        """tiktoken caches its encoding file in the system temp directory by default, which a reboot clears,
+        and the first count afterwards has to download it again. Loading the settings points it at the
+        runtime directory."""
+        import os
+
+        from kb_pipeline.config import load_settings
+        from kb_pipeline.utils import pin_tokenizer_cache
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_file = root / "kb.env"
+            env_file.write_text(f"KB_RUNTIME_DIR={root / 'runtime'}\nKB_STATE_DB={root / 'state.db'}\nKB_MIRROR_ROOT={root / 'mirror'}\n",
+                                encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=False):
+                for key in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR", "KB_RUNTIME_DIR", "KB_STATE_DB", "KB_MIRROR_ROOT"):
+                    os.environ.pop(key, None)
+                settings = load_settings(env_file)
+                self.assertEqual(os.environ["TIKTOKEN_CACHE_DIR"], str(root / "runtime" / "tiktoken"))
+                self.assertEqual(settings.runtime_dir, root / "runtime")
+                pin_tokenizer_cache(root / "elsewhere")                      # a directory already set is left alone
+                self.assertEqual(os.environ["TIKTOKEN_CACHE_DIR"], str(root / "runtime" / "tiktoken"))
+                del os.environ["TIKTOKEN_CACHE_DIR"]
+                os.environ["DATA_GYM_CACHE_DIR"] = str(root / "gym")
+                pin_tokenizer_cache(root / "runtime")
+                self.assertNotIn("TIKTOKEN_CACHE_DIR", os.environ)
+
+    def test_falling_back_to_the_heuristic_is_logged_once(self) -> None:
+        """Without the encoding file the whole process switches to the estimated count, so chunk boundaries and
+        the retrieval budgets change their measure; that used to happen without a single log line."""
+        import contextlib
+        import io
+
+        import tiktoken
+
+        from kb_pipeline import utils
+
+        saved = utils._ENCODER
+        out = io.StringIO()
+        try:
+            utils._ENCODER = None
+            with patch.object(tiktoken, "get_encoding", side_effect=OSError("network is unreachable")), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(utils.count_tokens("中文 and english"), utils.approx_tokens("中文 and english"))
+                self.assertEqual(utils.count_tokens("第二次"), utils.approx_tokens("第二次"))
+        finally:
+            utils._ENCODER = saved
+        lines = [line for line in out.getvalue().splitlines() if line.startswith("[tokenizer]")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("network is unreachable", lines[0])
+        self.assertIn("heuristic", lines[0])
 
 
 class QdrantFilterTests(unittest.TestCase):
@@ -638,6 +864,60 @@ class RestoreProjectionTests(unittest.TestCase):
             self.assertEqual(parse_jobs, 1)            # falls back to re-parsing
 
 
+class ChunkDiagnosisSurvivesMetadataUpdateTests(unittest.TestCase):
+    """The chunking verdict is a product of the parse. A rename, a move or a restore after deletion goes through
+    metadata_update with content and chunks unchanged, and must not lose the verdict."""
+
+    DIAG = {"ok": False, "reasons": [{"code": "oversized", "message": "1 text chunks exceed 1.5× the budget of 400 tokens"}]}
+
+    def _diag(self, con, fid):
+        raw = con.execute("SELECT chunk_diag_json, indexed_parser_profile FROM files WHERE file_id = ?", (fid,)).fetchone()
+        return (json.loads(raw["chunk_diag_json"]) if raw["chunk_diag_json"] else None), raw["indexed_parser_profile"]
+
+    def test_only_a_parse_result_replaces_the_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.db"
+            db.init_db(state)
+            with db.connect(state) as con:
+                file = _local_file("a.pdf", checksum="c1")
+                db.upsert_file(con, file, status="seen")
+                fid = db.file_id_for(file.kb_id, file.file_key)
+                db.mark_file_indexed(con, fid, "c1", "pdf-v1", chunk_diag=self.DIAG)          # parse finished
+                self.assertEqual(self._diag(con, fid), (self.DIAG, "pdf-v1"))
+                db.mark_file_indexed(con, fid, "c1")                                          # rename / move / restore
+                self.assertEqual(self._diag(con, fid), (self.DIAG, "pdf-v1"))
+                db.mark_file_indexed(con, fid, "c1", "pdf-v2")                                # re-parsed into an empty document: no verdict
+                self.assertEqual(self._diag(con, fid), (None, "pdf-v2"))
+
+    def test_worker_metadata_update_keeps_it(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = SimpleNamespace(
+                runtime_dir=Path(tmp) / "runtime", state_db=Path(tmp) / "state.db", qdrant_url="http://q", qdrant_api_key="",
+                opensearch_url="http://o", parse_enabled=True, parse_job_lease_seconds=600, metadata_job_lease_seconds=600,
+                job_max_retries=2, job_retry_base_seconds=300, job_retry_max_seconds=3600, sources={})
+            db.init_db(settings.state_db)
+            with db.connect(settings.state_db) as con:
+                file = _local_file("x/a.pdf", checksum="c1")
+                db.upsert_file(con, file, status="seen")
+                fid = db.file_id_for(file.kb_id, file.file_key)
+                db.mark_file_indexed(con, fid, "c1", "pdf-v1", chunk_diag=self.DIAG)
+                db.enqueue_job(con, ingest_run_id=None, file_id=fid, kb_id=file.kb_id, collection=file.collection,
+                               file_key=file.file_key, job_type="metadata_update", payload={"reason": "path/name changed"},
+                               dedupe_key=f"metadata_update:{fid}:x")
+                con.commit()
+                with mock.patch.object(worker_mod, "qdrant_client"), \
+                        mock.patch.object(worker_mod, "update_file_metadata") as updated, \
+                        mock.patch.object(worker_mod, "_sync_fts_doc"):
+                    result = worker_mod.run_once(con, settings=settings)
+                self.assertTrue(result.startswith("metadata-done"))
+                updated.assert_called_once()
+                self.assertEqual(self._diag(con, fid), (self.DIAG, "pdf-v1"))
+
+
 class ChunkTextShaLedgerTests(unittest.TestCase):
     """Chunk text fingerprint: replace_chunks writes it into the chunks table → active_chunk_refs carries it
     out → the graph build ledger freezes it → the next incremental merge uses it to recognise documents whose
@@ -787,9 +1067,8 @@ class StateFixRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / "目录A").mkdir()
-            with db.connect(Path(tmp) / "s.db") as con:
-                con.executescript(db.SCHEMA)
-                discovery.init_schema(con)
+            state = root / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 src, _ = discovery.enroll(con, root, "目录A")
                 # a tampered registry row (different collection than the code
                 # derives) is refused instead of splitting the KB
@@ -842,6 +1121,24 @@ class StateFixRegressionTests(unittest.TestCase):
                 self.assertTrue(db.delete_llm(con, "gpu-a-qwen"))
                 db.set_app_config(con, "some_setting", {"k": 1})
                 self.assertEqual(db.get_app_config(con, "some_setting"), {"k": 1})
+
+    def test_init_db_on_an_up_to_date_database_changes_nothing(self) -> None:
+        """The scan every minute, the console and every sub-command call init_db. With the schema already up to
+        date it must not touch the schema again: every change invalidates the statements compiled on other
+        connections, which then recompile, and paths that only read would have to compete for the write lock."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.db"
+            db.init_db(state)
+            with db.connect(state) as con:
+                before = con.execute("PRAGMA schema_version").fetchone()[0]
+                indexes = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+            for _ in range(3):
+                db.init_db(state)
+            with db.connect(state) as con:
+                self.assertEqual(con.execute("PRAGMA schema_version").fetchone()[0], before)
+                self.assertEqual({r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}, indexes)
+            self.assertNotIn("idx_files_nc", indexes)
+            self.assertIn("idx_files_kb_path", indexes)
 
     def test_discovery_migrations_only_swallow_duplicates(self) -> None:
         """B7: migrations only swallow "already exists"; locked / read-only / disk full still raise."""

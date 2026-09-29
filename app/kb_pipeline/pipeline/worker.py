@@ -12,6 +12,7 @@ import traceback
 from .. import db
 from .. import search_fts
 from ..config import Settings
+from ..parsers.errors import service_unreachable
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
 from ..vector.qdrant import client as qdrant_client
@@ -171,6 +172,7 @@ def run_once(
                 return f"parse-cancelled:{job['job_id']}:deleted"
             result = process_parse_job(con, settings, job)
             db.mark_job_done(con, job["job_id"], current_worker_id)
+            _rerun_if_asked(con, job)
             return result
         raise RuntimeError(f"unknown job_type={job_type}")
     except JobCancelled as exc:
@@ -199,6 +201,16 @@ def run_once(
             con.commit()
             print(f"[worker] job={job['job_id']} kb={job['kb_id']} cancelled while failing ({exc!r})", flush=True)
             return f"cancelled:{job['job_id']}" if owned else f"superseded:{job['job_id']}"
+        if settings is not None and service_unreachable(exc):
+            # After a boot the parsing, embedding and image-description services can take over ten minutes to become
+            # ready, while the worker starts claiming jobs after two: not reaching them is not a failure of this file
+            delay = db.defer_job(
+                con, job["job_id"], repr(exc), worker_id=current_worker_id,
+                base_delay_seconds=settings.job_retry_base_seconds, max_delay_seconds=settings.job_retry_max_seconds,
+                max_deferrals=settings.job_max_retries,
+            )
+            if delay is not None:
+                return f"deferred:{job['job_id']}:delay={delay}s:{exc!r}"
         should_retry = _should_retry(job, settings, exc)
         retry_delay = _retry_delay_seconds(job, settings) if should_retry else 0
         db.add_failure(
@@ -217,6 +229,29 @@ def run_once(
     finally:
         if heartbeat is not None:
             heartbeat.stop()
+
+
+def _rerun_if_asked(con: sqlite3.Connection, job: sqlite3.Row) -> None:
+    """The console's "Re-parse all" reached this file again while this run was in progress (recorded by
+    scheduler._ask_rerun): queue one more run once it is done. That run re-reads the KB configuration when it
+    starts, so it uses the changed one."""
+    from .scheduler import RERUN_PRIORITY, requeue_single_file
+
+    row = con.execute("SELECT status, payload_json FROM jobs WHERE job_id = ?", (job["job_id"],)).fetchone()
+    if row is None or str(row["status"]) != "done":
+        return
+    try:
+        reason = json.loads(str(row["payload_json"] or "{}")).get("rerun")
+    except (AttributeError, ValueError):
+        reason = None
+    file_row = db.get_file_by_id(con, str(job["file_id"])) if reason else None
+    if file_row is None or str(file_row["status"]) == "deleted":
+        return
+    queued = requeue_single_file(
+        con, ingest_run_id=str(job["ingest_run_id"] or "") or "rerun", file_row=file_row,
+        reason=str(reason), priority=RERUN_PRIORITY,
+    )
+    print(f"[worker] re-parse requested while job={job['job_id']} was running; queued={queued}", flush=True)
 
 
 def _should_retry(job: sqlite3.Row, settings: Settings | None, exc: Exception) -> bool:

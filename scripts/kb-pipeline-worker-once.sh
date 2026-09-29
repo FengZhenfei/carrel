@@ -83,9 +83,12 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   fi
 fi
 
+BATCH_OUT=""
 cleanup() {
   rm -f "$RUNNING_FLAG"
   rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+  [[ -n "$BATCH_OUT" ]] && rm -f "$BATCH_OUT"
+  return 0   # whether cleanup succeeds must not affect the exit code (as in kb-pipeline-scan.sh)
 }
 trap cleanup EXIT
 touch "$RUNNING_FLAG"
@@ -118,6 +121,7 @@ JOBS_PER_PROCESS="${KB_WORKER_JOBS_PER_PROCESS:-10}"
 # the remainder.
 START_TS="$(date +%s)"
 MAX_SECONDS="${KB_WORKER_MAX_SECONDS:-5400}"
+BATCH_OUT="$(mktemp "${TMPDIR:-/tmp}/kb-worker.XXXXXX")"
 while true; do
   touch "$RUNNING_FLAG"
   if [[ "$MAX_SECONDS" -gt 0 ]]; then
@@ -129,14 +133,27 @@ while true; do
   else
     remaining=0
   fi
+  # How many jobs this batch may still take: the per-run cap counts jobs, not batches
+  batch=$(( MAX_JOBS_PER_RUN - processed ))
+  if [[ "$batch" -le 0 ]]; then
+    echo "=== $(ts) KB worker reached per-run cap processed=${processed} (timer picks up the rest) ==="
+    break
+  fi
+  [[ "$batch" -gt "$JOBS_PER_PROCESS" ]] && batch="$JOBS_PER_PROCESS"
+  # Output reaches the journal as it happens (tee) while a copy is kept for the checks below. Capturing the
+  # whole batch and printing it only when the process ended showed nothing in journalctl -f during long jobs,
+  # and a killed unit lost the batch's output entirely.
   set +e
-  output="$("$PY" -m kb_pipeline --env-file "$ENV_FILE" worker --once \
-      --max-jobs "$JOBS_PER_PROCESS" --max-seconds "$remaining" 2>&1)"
-  status=$?
+  "$PY" -m kb_pipeline --env-file "$ENV_FILE" worker --once \
+      --max-jobs "$batch" --max-seconds "$remaining" 2>&1 | tee "$BATCH_OUT"
+  status=${PIPESTATUS[0]}
   set -e
-  printf '%s\n' "$output"
+  # Every job's result takes one line, like parse-done:job_... or retry:job_...: count the lines, so the jobs
+  # already finished are counted even when the process crashes midway
+  handled="$(grep -cE '^[a-z-]+:job_' "$BATCH_OUT" || true)"
+  processed=$((processed + handled))
   if [[ "$status" -ne 0 ]]; then
-    if printf '%s\n' "$output" | grep -q 'database is locked'; then
+    if grep -q 'database is locked' "$BATCH_OUT"; then
       lock_waits=$((lock_waits + 1))
       echo "=== $(ts) KB worker state db locked (wait ${lock_waits}/${MAX_LOCK_WAITS}, ${LOCK_WAIT_SECONDS}s) processed=${processed} ==="
       if [[ "$lock_waits" -ge "$MAX_LOCK_WAITS" ]]; then
@@ -157,19 +174,14 @@ while true; do
     fi
     continue
   fi
-  if printf '%s\n' "$output" | grep -qx 'no-job'; then
+  if grep -qx 'no-job' "$BATCH_OUT"; then
     echo "=== $(ts) KB worker loop idle processed=${processed} ==="
     break
   fi
-  if printf '%s\n' "$output" | grep -q '^time-budget-reached '; then
+  if grep -q '^time-budget-reached ' "$BATCH_OUT"; then
     echo "=== $(ts) KB worker stopped on time budget processed=${processed} (timer picks up the rest) ==="
     break
   fi
-  processed=$((processed + 1))
   lock_waits=0
-  if [[ "$processed" -ge "$MAX_JOBS_PER_RUN" ]]; then
-    echo "=== $(ts) KB worker reached per-run cap processed=${processed} (timer picks up the rest) ==="
-    break
-  fi
 done
 echo "=== $(ts) KB worker loop end processed=${processed} ==="

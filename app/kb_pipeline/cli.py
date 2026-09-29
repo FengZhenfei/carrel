@@ -14,8 +14,8 @@ from pathlib import Path
 from . import db
 from . import discovery, search_fts
 from .config import load_settings
-from .graph.build import (GraphBuildInterrupted, adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild,
-                          llm_ready, rollback_graph_version)
+from .graph.build import (GraphBuildCalledOff, GraphBuildInterrupted, adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild,
+                          graph_retirable, kb_still_active, llm_ready, retire_graph, rollback_graph_version)
 from .graph.llm import LLMInterrupted
 from .graph.lock import build_lock_held, build_lock_path, clear_lock_leftovers
 from .graph.neo4j_import import delete_neo4j_graph_version, import_graph_to_neo4j, neo4j_status
@@ -30,6 +30,7 @@ from .maintenance import (
     qdrant_graph_collection_gc,
     qdrant_inactive_gc,
     status as maintenance_status,
+    wait_out_short_locks,
     weekly_cache_cleanup,
 )
 from .parsers.service_clients import mineru_health
@@ -213,18 +214,35 @@ def cmd_scan(args: argparse.Namespace) -> int:
         scanned_sources.append((key, source, files, current_seen_ids, current_checksum_counts, too_recent_keys))
 
     with db.connect(settings.state_db) as state_con:
-        run_id = "dry-run" if args.dry_run else db.begin_run(state_con, "scan", note="manual scan")
+        # This row is deleted again at the end of a round in which nothing happened (see below); it is inserted
+        # first so that the write lock is held from here on
+        run_id = "dry-run" if args.dry_run else db.begin_run(state_con, "scan")
+        lifecycle_events = 0
 
         # ── KB lifecycle: register what is present, surface what vanished ──
         # A KB whose top-level directory disappeared is handled exactly like
         # its files would be: every file goes through the delete queue (worker
         # marks points inactive, drops OpenSearch rows), the KB row flips to
         # inactive, and the daily GC drops the collection after the retention
-        # window. Nothing is deleted on sight; a returning directory flips the
-        # row back and files reactivate via the normal restore path.
+        # window. Nothing is deleted on sight. A directory that comes back does
+        # not revive the KB by itself: it is re-enabled from the console.
         present_kb_ids = {source.kb_id for _, source, *_ in scanned_sources}
         vanished: list = []
         skipped_kb_ids: set[str] = set()
+        # The source list was read when the scan started, and a KB may have been closed or permanently deleted
+        # during the seconds spent listing files. Check the registry once more while holding the write lock: a
+        # KB no longer registered, or no longer active, gets no jobs this round -- otherwise file rows and parse
+        # jobs would be inserted again for a KB that does not exist, where no cleanup could ever find them.
+        # Extra sources outside the mirror never enter the registry and are exempt.
+        from .config import _load_extra_sources
+
+        active_now = {str(row["kb_id"]) for row in discovery.known_sources(state_con) if str(row["status"]) == "active"}
+        unregistered = {src.kb_id for src in _load_extra_sources(settings.mirror_root).values()}
+        for _, source, *_ in scanned_sources:
+            if source.kb_id not in active_now and source.kb_id not in unregistered:
+                print(f"[scan] kb skipped: {source.kb_id} ({source.source_root}): closed or deleted while this scan "
+                      "was listing files", file=sys.stderr, flush=True)
+                skipped_kb_ids.add(source.kb_id)
         if not args.source and args.limit is None:
             # "Everything vanished at once" is indistinguishable from a missing
             # or unmounted mirror root. The file-level delete circuit breaker has been removed (see
@@ -251,15 +269,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     flush=True,
                 )
                 if not args.dry_run:
-                    db.finish_run(
-                        state_con,
-                        run_id,
-                        added_count=0,
-                        updated_count=0,
-                        moved_count=0,
-                        deleted_count=0,
-                        failed_count=0,
-                    )
+                    state_con.execute("DELETE FROM ingest_runs WHERE ingest_run_id = ?", (run_id,))
                 return 2
             if not args.dry_run:
                 for _, source, *_ in scanned_sources:
@@ -276,6 +286,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
                         continue
             for row in discovery.known_sources(state_con):
                 if row["kb_id"] in present_kb_ids:
+                    continue
+                # A KB whose permanent deletion is in progress or did not finish: its external stores are torn down
+                # as a whole, with nothing to soft-delete file by file. Queueing delete jobs for it as for an
+                # inactive KB would have the worker modify collections already dropped, and the pending jobs would
+                # make maintenance think the KB still has work left and not continue the deletion
+                if str(row["status"]) != "active" and str(row["inactive_reason"] or "") in discovery.DELETE_PENDING_REASONS:
                     continue
                 # Present on disk but refused by the link policy (third review, item 1): that is not "vanished".
                 # Nothing is scanned, deactivated or queued for deletion; the console shows directory_linked
@@ -301,6 +317,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     print(f"[scan] kb vanished: {gone.kb_id} ({gone.source_root}); marking inactive, queueing deletes dry_run={args.dry_run}")
                     if not args.dry_run:
                         discovery.mark_inactive(state_con, gone.kb_id)
+                        lifecycle_events += 1
                 vanished.append(gone)
             # Directory rename detection (2026-09-06): when a KB deactivated because its directory vanished
             # and an unenrolled directory with matching content appears on disk, treat it as a rename -- the
@@ -313,6 +330,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                       f"(matched {report['matched']}/{report['total']}, verified {report['verified']}) dry_run={args.dry_run}")
                 if not args.dry_run:
                     discovery.adopt_directory(state_con, settings.mirror_root, report["kb_id"], report["dir"])
+                    lifecycle_events += 1
                     vanished = [g for g in vanished if g.kb_id != report["kb_id"]]    # no delete jobs for it anymore
         # vanished KBs ride the same per-source delete scheduling below with an
         # empty seen-set.
@@ -367,7 +385,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             if requeued:
                 stats.jobs += requeued
                 print(f"[scan] requeued_failed_lifecycle_jobs={requeued} dry_run={args.dry_run}")
-        if not args.dry_run:
+        if not args.dry_run and (stats.jobs or lifecycle_events):
             db.finish_run(
                 state_con,
                 run_id,
@@ -377,6 +395,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 deleted_count=stats.deleted,
                 failed_count=stats.parse_failed,
             )
+        elif not args.dry_run:
+            # One round a minute, and in most rounds nothing is queued and no KB changes: leave no record
+            state_con.execute("DELETE FROM ingest_runs WHERE ingest_run_id = ?", (run_id,))
     print(
         "scan summary: "
         f"seen={stats.seen} added={stats.added} content_changed={stats.content_changed} parser_changed={stats.parser_changed} "
@@ -463,7 +484,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     print(f"time-budget-reached done={done}", flush=True)
                     break
             return 0
-        raise SystemExit("continuous worker is intentionally not enabled before first parsing approval")
+        raise SystemExit("only --once is supported: the worker runs as rounds started by its systemd timer")
 
 
 def cmd_health(args: argparse.Namespace) -> int:
@@ -623,6 +644,9 @@ def cmd_fts(args: argparse.Namespace) -> int:
     else:
         raise ValueError(f"unknown fts command: {args.fts_command}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_reset(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
     db.init_db(settings.state_db)
@@ -692,6 +716,8 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
+    if args.cleanup_command not in ("status", "graph-gc"):      # these two do not check service_busy
+        wait_out_short_locks(settings)      # the scan / mirror sync locks last seconds: wait for them before judging busy
     if args.cleanup_command == "status":
         result = maintenance_status(settings)
     elif args.cleanup_command == "weekly":
@@ -725,6 +751,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if result.get("skipped"):
             result["kb_sources_gc"] = {"skipped": True, "reason": "parse-assets-gc skipped"}
         else:
+            wait_out_short_locks(settings)  # the previous step ran a while; the next scan round may just be starting
             result["kb_sources_gc"] = kb_sources_gc(settings, retention_days=retention_days, dry_run=args.dry_run)
     elif args.cleanup_command == "qdrant-backfill-inactive-at":
         inactive_at_ts = args.inactive_at_ts
@@ -744,11 +771,14 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         print("[cleanup] skipped: a graph build is running (its own clean-up covers this round); exiting 75",
               file=sys.stderr, flush=True)
         return 75
-    if isinstance(result, dict) and result.get("skipped"):
-        # Being blocked by service_busy is not success. Exit 75 so the systemd unit's Restart=on-failure
-        # retries after 15 minutes -- otherwise one collision would mean the whole maintenance round of
-        # the day (or week / month) is silently skipped, and Persistent does not make it up either.
-        print("[cleanup] skipped because the service was busy; exiting 75 so the unit retries",
+    if isinstance(result, dict) and (result.get("skipped") or (result.get("kb_sources_gc") or {}).get("skipped")):
+        # Being blocked by service_busy is not success. Exit 75 so the wrapper script (kb-cleanup.sh) retries
+        # after a while and, once its retries are used up, counts a yield -- otherwise one collision would mean
+        # the whole maintenance round of the day (or week / month) is silently skipped.
+        # The expired inactive-KB hard delete that parse-assets-gc runs next counts too when it is blocked: its
+        # result sits one level down, the outer level used to exit 0 regardless, and an expired KB stayed a day
+        # longer. A retry runs the previous step again with nothing left to reclaim, which costs little.
+        print("[cleanup] skipped because the service was busy; exiting 75 so the wrapper retries",
               file=sys.stderr, flush=True)
         return 75
     return 0
@@ -763,8 +793,8 @@ def _rebuild_blocked(settings, source) -> dict | None:
 
     This used to use the global service_busy: any running job of any KB, any worker process, any of the
     five locks, even a non-empty MinerU queue, all made it yield. So during the hours of loading one big
-    KB, the other KBs that had long finished parsing never got a turn, while this check only ran once a
-    day. The embedding concurrency budget is partitioned anyway (pipeline 20 + graph build 10 + 2
+    KB, the other KBs that had long finished parsing had to yield at every round of the check. The
+    embedding concurrency budget is partitioned anyway (pipeline 20 + graph build 10 + 2
     reserved for retrieval = max_num_seqs 32), so there is no need to yield to each other.
 
     The graph build lock is the only global condition kept: it serializes graph builds by design (one at
@@ -781,6 +811,18 @@ def _rebuild_blocked(settings, source) -> dict | None:
     return None
 
 
+def _fresh_source(settings, source):
+    """Re-read this KB's configuration from the registry by kb_id when its turn comes. A round of checks runs
+    serially: a KB earlier in the round may build for hours while the later ones still hold the copy read when
+    the process started -- a graph switched off meanwhile would still be built, and changed labels would be
+    built with the old ones and only judged "configuration changed" in the next round.
+    A KB not in the registry (an extra source outside the mirror) keeps the copy read at start-up."""
+    from .graph.schema_flow import reload_source
+
+    try:
+        return reload_source(settings, source)
+    except KeyError:
+        return source
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -884,7 +926,12 @@ def cmd_graph(args: argparse.Namespace) -> int:
             raise ValueError("--force-full requires --execute and exactly one --source")
         for key, source in selected:
             try:
-                if force_full:
+                source = _fresh_source(settings, source)
+                closed = not kb_still_active(settings, source.kb_id)
+                if closed:
+                    decision = {"source": key, "kb_id": source.kb_id, "graph_enabled": bool(source.graph_enabled),
+                                "due": False, "reason": "kb_closed"}
+                elif force_full:
                     decision = {"source": key, "kb_id": source.kb_id, "collection": source.collection,
                                 "graph_enabled": True, "due": True, "reason": "forced_by_operator"}
                 else:
@@ -908,6 +955,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
                         # rather than letting the full rebuild get stuck at this step
                         from .graph.schema_flow import resuggest_for_rebuild
 
+                        was_paused = bool(source.graph_paused)
                         try:
                             source, info = resuggest_for_rebuild(
                                 settings, source, baseline_version=decision.get("baseline_graph_version"))
@@ -916,15 +964,33 @@ def cmd_graph(args: argparse.Namespace) -> int:
                             print(f"[graph] {key}: schema resuggest failed, building with the current version: {exc!r}",
                                   file=sys.stderr, flush=True)
                         decision["schema_resuggest"] = info
+                        # There is no run record yet during the minutes spent re-extracting labels, so switching
+                        # the graph off or pausing it meanwhile only saved the configuration: go by what was read
+                        # after the re-extraction
+                        if not source.graph_enabled or (source.graph_paused and not was_paused):
+                            decision["build_skipped"] = {
+                                "reason": "paused_by_operator" if source.graph_enabled else "disabled"}
+                            return
                     decision["build"] = build_graph(
                         settings, source_key=key, source=source, dry_run=args.dry_run,
                         allow_existing_graph_version=False,
                     )
 
-                if args.execute and decision.get("due"):
+                if closed:
+                    pass
+                elif args.execute and decision.get("due"):
                     # The first build (no successful version yet) does not re-extract: that label version is
                     # usually the one the user just extracted; without one, the build fills it in itself
                     run_full(resuggest=decision.get("reason") != "no_successful_build")
+                elif args.execute and decision.get("reason") == "no_active_content":
+                    # The KB was emptied: without a corpus neither an append nor a rebuild ever comes, so the
+                    # current graph is retired here; an empty KB that never had a graph needs nothing
+                    if not args.dry_run and graph_retirable(settings, source):
+                        blocked = _rebuild_blocked(settings, source)
+                        if blocked:
+                            decision["build_skipped"] = blocked
+                        else:
+                            decision["retired"] = retire_graph(settings, source_key=key, source=source)
                 elif args.execute:
                     append = evaluate_append(settings, source_key=key, source=source)
                     decision["append"] = append
@@ -951,9 +1017,10 @@ def cmd_graph(args: argparse.Namespace) -> int:
                     "collection": source.collection,
                     "error": repr(exc),
                 }
-                # The process was asked to stop (pause, base closed, service stopped): record this base and
-                # finish, do not go on to build the next one
-                stop_requested = isinstance(exc, (GraphBuildInterrupted, LLMInterrupted))
+                # The process was asked to stop (service stopped, the console stopped the build process): record
+                # this base and finish, do not go on to build the next one. When only this base's own switch
+                # called the build off (the process got no signal), go on with the bases after it
+                stop_requested = isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) and not isinstance(exc, GraphBuildCalledOff)
             results.append(decision)
             if args.execute and not args.dry_run:
                 # Record one row with this round's decision for this KB; the console status card uses it to say
@@ -1204,7 +1271,7 @@ def build_parser() -> argparse.ArgumentParser:
     fts = sub.add_parser("fts", help="Manage the OpenSearch keyword index")
     fts_sub = fts.add_subparsers(dest="fts_command", required=True)
     fts_init = fts_sub.add_parser("init", help="Create the OpenSearch indices (one per collection)")
-    fts_init.add_argument("--collection", action="append", default=None, help="Accepted for symmetry; init does not filter")
+    fts_init.add_argument("--collection", action="append", default=None, help="Collection to create the index for; can be repeated (default: every enrolled KB)")
     fts_init.set_defaults(func=cmd_fts)
     fts_status = fts_sub.add_parser("status", help="Show OpenSearch index counts")
     fts_status.add_argument("--collection", action="append", default=None, help="Collection to compare; can be repeated")
@@ -1221,7 +1288,7 @@ def build_parser() -> argparse.ArgumentParser:
     fts_sync_doc.set_defaults(func=cmd_fts)
     fts_search = fts_sub.add_parser("search", help="Run an OpenSearch keyword search")
     fts_search.add_argument("query")
-    fts_search.add_argument("--collection", action="append", default=None, help="Accepted for symmetry; search returns indexed rows")
+    fts_search.add_argument("--collection", action="append", default=None, help="Collection to search; can be repeated (default: every enrolled KB)")
     fts_search.add_argument("--limit", type=int, default=10)
     fts_search.set_defaults(func=cmd_fts)
 
@@ -1384,7 +1451,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph_neo4j_delete.add_argument("--dry-run", action="store_true")
     graph_neo4j_delete.set_defaults(func=cmd_graph)
 
-    graph_query = graph_sub.add_parser("query", help="Graph recall prototype: question -> entity/relation seeds -> Neo4j expansion -> chunks")
+    graph_query = graph_sub.add_parser("query", help="Graph recall: question -> entity/relation seeds -> Neo4j expansion -> chunks")
     add_graph_source_args(graph_query)
     graph_query.add_argument("question")
     graph_query.add_argument("--hops", type=int, default=2)

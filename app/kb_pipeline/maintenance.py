@@ -23,7 +23,7 @@ from .graph.lock import GraphBuildLock, build_lock_held, build_lock_path, clear_
 class PartialDeleteError(RuntimeError):
     """A delete left some storage side uncleaned. Carries the completed parts and the failure reasons so
     the console can tell the user honestly -- the registry row is kept as delete_failed and the next GC
-    round retries."""
+    round retries (without waiting out the retention period)."""
 
     def __init__(self, kb_id: str, entry: dict[str, Any], errors: list[str]) -> None:
         super().__init__("; ".join(errors))
@@ -75,7 +75,6 @@ def status(settings: Settings) -> dict[str, object]:
         "sizes": {
             "cache_dir": human_size(dir_size(settings.cache_dir)),
             "parse_assets": human_size(dir_size(settings.cache_dir / "parse")),
-            "runtime_parse_cache": human_size(dir_size(settings.runtime_dir / "parse_cache")),
             "logs": human_size(dir_size(settings.log_dir)),
             "history_cache_rotations": human_size(dir_size(history / "cache_rotations")),
             "history_log_rotations": human_size(dir_size(history / "log_rotations")),
@@ -94,26 +93,17 @@ def weekly_cache_cleanup(settings: Settings, *, dry_run: bool = False) -> dict[s
         return {"skipped": True, "reason": "service busy", "busy_reasons": reasons}
 
     rotation_root = settings.runtime_dir / "history" / "cache_rotations" / ts()
-    sources = [
-        (settings.runtime_dir / "parse_cache" / "mineru_api_output", rotation_root / "mineru_api_output"),
-        (settings.runtime_dir / "parse_cache" / "service_warmup", rotation_root / "service_warmup"),
-    ]
     moved: dict[str, int] = {
-        # vlm-cache is the cross-version caption/vector cache -- rotating it
-        # away weekly would force a full VLM+embed recompute of every figure.
+        # Under cache_dir the pipeline itself only writes parse and vlm-cache, each reclaimed its own way
+        # (vlm-cache is the cross-version caption / vector cache -- rotating it away would send every image
+        # through the models again); anything else that shows up here is rotated away, keeping the latest few.
         str(settings.cache_dir): move_dir_contents(settings.cache_dir, rotation_root / "kb-pipeline", dry_run=dry_run, exclude_names={"parse", "vlm-cache"}),
     }
-    for src, dst in sources:
-        moved[str(src)] = move_dir_contents(src, dst, dry_run=dry_run)
 
     ds_store = remove_named_files([settings.runtime_dir, settings.log_dir], ".DS_Store", dry_run=dry_run)
     keep = int(os.getenv("KB_CACHE_ROTATION_KEEP", "2"))
     pruned = prune_old_dirs(settings.runtime_dir / "history" / "cache_rotations", keep=keep, dry_run=dry_run)
-    vlm_cache_pruned = prune_old_files(
-        settings.cache_dir / "vlm-cache",
-        max_age_days=int(os.getenv("KB_VLM_CACHE_MAX_AGE_DAYS", "180")),
-        dry_run=dry_run,
-    )
+    vlm_cache = prune_vlm_cache(settings.cache_dir, dry_run=dry_run)
     return {
         "skipped": False,
         "dry_run": dry_run,
@@ -121,7 +111,8 @@ def weekly_cache_cleanup(settings: Settings, *, dry_run: bool = False) -> dict[s
         "moved_entries": moved,
         "removed_ds_store": ds_store,
         "pruned_rotations": [path.name for path in pruned],
-        "vlm_cache_pruned": vlm_cache_pruned,
+        "vlm_cache_pruned": vlm_cache["removed"],
+        "vlm_cache": vlm_cache,
     }
 
 
@@ -659,6 +650,15 @@ def _hard_delete_kb(settings: Settings, con, *, kb_id: str, collection: str, err
         errors.append(f"{kb_id}: opensearch drop failed: {exc!r}")
     try:
         entry["sqlite"] = db.purge_kb_state(con, kb_id)
+        # KB ids are never reused, so these two would be rows nobody ever cleans up: the "extracting" mark of
+        # label extraction and the verdict recorded by the scheduled check
+        from .graph.schema_flow import SUGGEST_MARK_PREFIX
+
+        con.execute("DELETE FROM app_config WHERE key = ?", (SUGGEST_MARK_PREFIX + kb_id,))
+        try:
+            con.execute("DELETE FROM graph_checks WHERE kb_id = ?", (kb_id,))
+        except sqlite3.OperationalError:
+            pass      # no table yet: the scheduled check never ran on this state database
     except Exception as exc:
         purge_failed = True
         errors.append(f"{kb_id}: sqlite purge failed: {exc!r}")
@@ -698,49 +698,75 @@ def delete_kb_now(settings: Settings, *, kb_id: str) -> dict[str, Any]:
     has nothing to do with this KB and must not be killed)."""
     from . import discovery
 
+    with db.connect(settings.state_db) as con:
+        discovery.init_schema(con)
+        row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+    if row is None:
+        raise KeyError(kb_id)
     # The busy check is per KB: a global gate would mean that any KB parsing, a scan lock existing, or even
     # a non-empty MinerU queue refuses deleting another KB; with the scan running every minute that is
     # almost the normal state. Delete means "terminate the running jobs along with it": first stop this
     # KB's graph build, then this KB's parse jobs, and only touch external storage once both are confirmed
-    # dead. If the lock is still held, it belongs to **another** KB's graph build -- that build has nothing
-    # to do with this KB, cannot be killed, and the only option is to refuse.
+    # dead.
     graph_stopped = stop_graph_build_now(settings, kb_id=kb_id, reason="Build terminated by “Delete knowledge base”")
     if not graph_stopped.get("stopped"):
         raise ValueError("The graph build process could not be terminated; deletion abandoned rather than left half done. Try again later")
-    if build_lock_held(build_lock_path(settings)):
-        raise ValueError("Another knowledge base is building its graph; delete after it finishes")
-    jobs_stopped = stop_kb_parse_jobs(
-        settings, kb_id=kb_id, reason="cancelled because the knowledge base is being deleted", kill=True
-    )
-    if not jobs_stopped.get("stopped"):
-        raise ValueError(
-            "Parse jobs could not be terminated; deletion abandoned rather than leaving orphaned collections. Try again later"
-            f" (terminated={jobs_stopped.get('terminated')})"
+    # Hold the graph build lock from the moment the build is confirmed stopped until the deletion is done, as
+    # "Delete knowledge graph" does: deleting takes minutes, and without the lock the scheduled check could
+    # start a build for the same KB meanwhile, leaving a build record without a registry row, an empty work
+    # dir or graph database nodes. Not getting the lock = someone else holds it, and that build is not ours
+    # to kill.
+    guard = GraphBuildLock(settings)
+    try:
+        guard.acquire()
+    except RuntimeError as exc:
+        from .graph.schema_flow import suggest_in_progress
+
+        if suggest_in_progress(settings, kb_id) is not None:
+            # A build takes the lock first, then extracts labels, and only then writes its build record:
+            # during those minutes there is no process for the code above to stop
+            raise ValueError(
+                "This knowledge base is extracting labels (the preparation before a build), which cannot be stopped; delete after it finishes, usually a few minutes"
+            ) from exc
+        raise ValueError("Another knowledge base is building its graph or being deleted; delete after it finishes") from exc
+    try:
+        jobs_stopped = stop_kb_parse_jobs(
+            settings, kb_id=kb_id, reason="cancelled because the knowledge base is being deleted", kill=True
         )
-    errors: list[str] = []
-    with db.connect(settings.state_db) as con:
-        discovery.init_schema(con)
-        row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
-        if row is None:
-            raise KeyError(kb_id)
-        # Void the queued / retry jobs and commit immediately before touching external storage. Deletion
-        # spans several network calls to Qdrant / Neo4j / OpenSearch, during which SQLite holds no write
-        # lock: a worker starting in that window would claim this KB's queued jobs and, after the
-        # collection is dropped, recreate it via ensure_collection, leaving an ownerless zombie collection.
-        cancelled = con.execute(
-            "UPDATE jobs SET status='cancelled', error=?, finished_at=?, updated_at=?, "
-            "locked_by=NULL, locked_until=NULL WHERE kb_id=? AND status IN ('queued','retry')",
-            ("cancelled because the knowledge base is being deleted", int(time.time()),
-             int(time.time()), kb_id),
-        ).rowcount
-        con.commit()
-        if cancelled:
-            print(f"[delete] cancelled {cancelled} pending job(s) before dropping {kb_id}", flush=True)
-        entry = _hard_delete_kb(settings, con, kb_id=kb_id, collection=str(row["collection"]), errors=errors)
-        entry["cancelled_jobs"] = int(cancelled or 0) + int(jobs_stopped.get("cancelled") or 0)
-        entry["stopped_jobs"] = jobs_stopped
-        entry["stopped_graph_build"] = graph_stopped
-        con.commit()
+        if not jobs_stopped.get("stopped"):
+            raise ValueError(
+                "Parse jobs could not be terminated; deletion abandoned rather than leaving orphaned collections. Try again later"
+                f" (terminated={jobs_stopped.get('terminated')})"
+            )
+        errors: list[str] = []
+        with db.connect(settings.state_db) as con:
+            # Mark the registry row as being deleted and void the queued / retry jobs, commit immediately, and
+            # only then touch external storage. Deletion spans several network calls to Qdrant / Neo4j /
+            # OpenSearch and takes minutes for a large KB, during which SQLite holds no write lock:
+            # - with the registry row still active, the scan keeps registering files, the scheduled check keeps
+            #   starting builds for it and the check before a build is published lets it through; and if the
+            #   process dies midway, nothing shows that the KB was half deleted;
+            # - a worker starting in that window would claim this KB's queued jobs and, after the collection is
+            #   dropped, recreate it via ensure_collection, leaving an ownerless zombie collection.
+            now = int(time.time())
+            con.execute(
+                "UPDATE kb_sources SET status='inactive', inactive_reason='deleting', "
+                "inactive_at=COALESCE(inactive_at, ?) WHERE kb_id=?", (now, kb_id))
+            cancelled = con.execute(
+                "UPDATE jobs SET status='cancelled', error=?, finished_at=?, updated_at=?, "
+                "locked_by=NULL, locked_until=NULL WHERE kb_id=? AND status IN ('queued','retry')",
+                ("cancelled because the knowledge base is being deleted", now, now, kb_id),
+            ).rowcount
+            con.commit()
+            if cancelled:
+                print(f"[delete] cancelled {cancelled} pending job(s) before dropping {kb_id}", flush=True)
+            entry = _hard_delete_kb(settings, con, kb_id=kb_id, collection=str(row["collection"]), errors=errors)
+            entry["cancelled_jobs"] = int(cancelled or 0) + int(jobs_stopped.get("cancelled") or 0)
+            entry["stopped_jobs"] = jobs_stopped
+            entry["stopped_graph_build"] = graph_stopped
+            con.commit()
+    finally:
+        guard.release()
     entry.update({"kb_id": kb_id, "errors": errors})
     if errors:
         # The console used to report "completely deleted" on any HTTP 200. An incomplete delete must be
@@ -779,11 +805,13 @@ def kb_sources_gc(settings: Settings, *, retention_days: int, dry_run: bool = Fa
             # so applying that rule would mean it never expires -- the 7-day automatic deletion promised by
             # the dialog would be an empty promise. Reopening clears inactive_at, so anything reaching this
             # point has definitely not been opened for a whole retention period.
-            # delete_failed left by a failed hard delete is not protected by "directory still there" either:
-            # the console promised "retried by the next maintenance round", and a KB whose derived data was
-            # cleared while its source directory remains matched the skip condition exactly, so it was never
-            # retried (final review F07)
-            if reason not in ("unenrolled", "delete_failed") and str(row["source_root"]) in present:
+            # A permanent deletion that did not finish (delete_failed, or deleting left behind when the
+            # process died midway) is not protected by "directory still there" either: the console promised
+            # "retried by the next maintenance round", and a KB whose derived data was cleared while its
+            # source directory remains matches the skip condition exactly, so applying the rule would mean it
+            # is never retried. Reaching this point means no deletion is in progress: the busy check above
+            # looks at the graph build lock, which a deletion holds from start to end
+            if reason not in ("unenrolled", *discovery.DELETE_PENDING_REASONS) and str(row["source_root"]) in present:
                 # The directory is back. Note that the scan does **not** revive it automatically --
                 # touch_seen deliberately only refreshes last_seen and never flips the status; revival can
                 # only be an explicit reopen in the console (enroll() goes through reactivated, files are
@@ -870,8 +898,9 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
 
     from .vector.qdrant import client as qdrant_client
     from .vector.qdrant import active_doc_point_count
-    from .vector.qdrant import delete_inactive_doc_version_older_than
+    from .vector.qdrant import delete_expired_inactive_points
     from .vector.qdrant import delete_malformed_inactive_points
+    from .vector.qdrant import expired_inactive_point_ids
     from .vector.qdrant import inactive_doc_versions_older_than
 
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
@@ -925,42 +954,63 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
                     continue
                 kb_id, file_key = parsed
                 content_version = str(group["content_version"])
-                checksum = str(group.get("sha256") or content_version)
-                active_matches = _active_same_hash_count(con, kb_id, checksum)
-                if active_matches:
-                    skipped.append({"reason": "active_same_hash", "active_matches": active_matches, **group})
-                    continue
+                file_id = db.file_id_for(kb_id, file_key)
+                in_use = _version_in_use(db.get_file_by_id(con, file_id), content_version, cutoff_ts)
+                if not in_use:
+                    # Leave the whole group alone while another live file with the same content exists in the
+                    # same KB, the same rule as the deleted-files section below
+                    twins = [row for row in db.active_files_by_checksum(con, kb_id, content_version)
+                             if str(row["file_id"]) != file_id]
+                    if twins:
+                        skipped.append({"reason": "active_same_hash", "active_matches": len(twins), **group})
+                        continue
 
                 try:
-                    point_count = delete_inactive_doc_version_older_than(
-                        q,
-                        collection,
-                        doc_id=doc_id,
-                        content_version=content_version,
-                        cutoff_ts=cutoff_ts,
-                        dry_run=dry_run,
-                    )
+                    candidates = expired_inactive_point_ids(
+                        q, collection, doc_id=doc_id, content_version=content_version, cutoff_ts=cutoff_ts)
+                except Exception as exc:
+                    errors.append(f"{collection}:{doc_id}:{content_version}: list inactive points failed: {exc!r}")
+                    continue
+                # Points still active in the ledger are not deleted; while the version is in use, the deleted
+                # batch (kept for a restore) is not deleted either
+                held = {"active", "deleted"} if in_use else {"active"}
+                status_of = db.chunk_status_by_point(con, file_id, candidates)
+                point_ids = [p for p in candidates if status_of.get(p) not in held]
+                kept_points = len(candidates) - len(point_ids)
+                # Clear the ledger and commit first, then delete the points: if this is interrupted, the points
+                # left are listed again next round; the other way round, rows left behind would have no points to
+                # go by and nobody would ever clean them up. Commit per group so that the write lock is not held
+                # across the network calls that follow.
+                chunk_count = db.delete_inactive_chunks(con, file_id, point_ids, dry_run=dry_run)
+                if not dry_run:
+                    con.commit()
+                totals["sqlite_chunks"] += chunk_count
+                try:
+                    point_count = len(point_ids) if dry_run else delete_expired_inactive_points(
+                        q, collection, point_ids, cutoff_ts)
                 except Exception as exc:
                     errors.append(f"{collection}:{doc_id}:{content_version}: qdrant delete failed: {exc!r}")
                     continue
-                file_id = db.file_id_for(kb_id, file_key)
-                chunk_count = _delete_chunks_for_version(con, file_id, content_version, dry_run=dry_run)
-                cache_result = _remove_tree(
-                    parse_root / kb_id / str(file_key) / _safe_version(content_version),
-                    dry_run=dry_run,
-                )
+                totals["qdrant_points"] += point_count
+                cache_dir = parse_root / kb_id / str(file_key) / _safe_version(content_version)
+                # Look at the files row once more before deleting the cache: the scan may have just taken the
+                # file back during the steps above
+                if in_use or kept_points or _version_in_use(db.get_file_by_id(con, file_id), content_version, cutoff_ts):
+                    cache_result = {"path": str(cache_dir), "exists": cache_dir.exists(), "removed": False, "bytes": 0}
+                else:
+                    cache_result = _remove_tree(cache_dir, dry_run=dry_run)
+                    totals["cache_dirs"] += int(cache_result["removed"] or dry_run and cache_result["exists"])
+                    totals["cache_bytes"] += int(cache_result["bytes"])
                 qdrant_versions.append(
                     {
                         **group,
+                        "in_use": in_use,
                         "qdrant_points_deleted": point_count,
+                        "qdrant_points_kept": kept_points,
                         "sqlite_chunks_deleted": chunk_count,
                         "cache_dir": cache_result,
                     }
                 )
-                totals["qdrant_points"] += point_count
-                totals["sqlite_chunks"] += chunk_count
-                totals["cache_dirs"] += int(cache_result["removed"] or dry_run and cache_result["exists"])
-                totals["cache_bytes"] += int(cache_result["bytes"])
 
         for row in db.deleted_files_older_than(con, cutoff_ts):
             kb_id = str(row["kb_id"])
@@ -1081,19 +1131,39 @@ def qdrant_backfill_inactive_at(
     }
 
 
-def service_busy(settings: Settings) -> tuple[bool, list[str]]:
+# The two locks that are each held for a few seconds every minute: the scan, and the push into the mirror
+_SHORT_LOCKS = frozenset({"kb_scan", "mirror_sync"})
+
+
+def _mirror_lock_is_orphan(lock: Path) -> bool:
+    """The mirror sync lock is created on this machine over ssh by the machine that pushes the mirror: a killed
+    push or a power cut leaves it behind, and only that machine's next push reclaims it. Older than
+    KB_MIRROR_LOCK_STALE_SECONDS it counts as an orphan and not as busy (it is ignored, not removed), the same
+    rule and the same variable as the scan script -- otherwise, while the pushing machine is away, a lock that
+    nobody holds would keep blocking the whole maintenance chain."""
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return False
+    return age >= int(os.getenv("KB_MIRROR_LOCK_STALE_SECONDS", "3600"))
+
+
+def _busy_state(settings: Settings) -> tuple[list[str], list[str]]:
+    """(locks held, every reason for being busy). No reasons means not busy."""
+    held: list[str] = []
     reasons: list[str] = []
-    busy = False
     for name in ("kb_worker", "kb_scan", "mirror_sync", "graph_build"):
         lock = settings.runtime_dir / "state" / f"{name}.lock.d"
         if lock.exists():
             if name == "graph_build" and not build_lock_held(lock):
                 continue                      # the graph build lock is judged by flock, not by the directory
-            busy = True
+            if name == "mirror_sync" and _mirror_lock_is_orphan(lock):
+                print(f"[maintenance] ignoring orphaned mirror sync lock: {lock}", flush=True)
+                continue
+            held.append(name)
             reasons.append(f"lock exists: {lock}")
 
     if _pgrep(str(settings.runtime_dir.parent / "app" / ".venv" / "bin" / "python") + r".*kb_pipeline.*worker"):
-        busy = True
         reasons.append("kb_pipeline worker process running")
 
     if settings.state_db.exists():
@@ -1109,9 +1179,7 @@ def service_busy(settings: Settings) -> tuple[bool, list[str]]:
                     "ORDER BY started_at ASC LIMIT 10",
                     (int(time.time()),),
                 ).fetchall()
-                if rows:
-                    busy = True
-                    reasons.extend(f"running job: {row['job_id']} {row['kb_id']} {row['job_type']}" for row in rows)
+                reasons.extend(f"running job: {row['job_id']} {row['kb_id']} {row['job_type']}" for row in rows)
                 stale = con.execute(
                     "SELECT COUNT(*) FROM jobs WHERE status = 'running' AND COALESCE(locked_until, 0) < ?",
                     (int(time.time()),),
@@ -1119,14 +1187,32 @@ def service_busy(settings: Settings) -> tuple[bool, list[str]]:
                 if int(stale):
                     print(f"[maintenance] ignoring {int(stale)} running job(s) with an expired lease", flush=True)
         except sqlite3.Error as exc:
-            busy = True
             reasons.append(f"state db unavailable: {exc!r}")
 
     mineru_busy = _mineru_busy(settings.mineru_url)
     if mineru_busy:
-        busy = True
         reasons.append(mineru_busy)
-    return busy, reasons
+    return held, reasons
+
+
+def service_busy(settings: Settings) -> tuple[bool, list[str]]:
+    _, reasons = _busy_state(settings)
+    return bool(reasons), reasons
+
+
+def wait_out_short_locks(settings: Settings, *, timeout: float = 60.0, poll: float = 2.0) -> None:
+    """When only the scan lock / mirror sync lock stand in the way, wait for them to be released and then
+    return, for at most timeout seconds; when not busy, or busy for any other reason, return at once. When the
+    timer fires, a maintenance task often starts at the same moment as the once-a-minute scan, and these two
+    locks are held for a few seconds only: without waiting, yielding once to a lock held for seconds costs 15
+    minutes, and a few such collisions in a row are even recorded as consecutive yields."""
+    deadline = time.time() + timeout
+    while True:
+        held, reasons = _busy_state(settings)
+        short_only = bool(reasons) and len(reasons) == len(held) and set(held) <= _SHORT_LOCKS
+        if not short_only or time.time() >= deadline:
+            return
+        time.sleep(poll)
 
 
 def move_dir_contents(src: Path, dst: Path, *, dry_run: bool, exclude_names: set[str] | None = None) -> int:
@@ -1169,15 +1255,19 @@ def _active_same_hash_count(con: sqlite3.Connection, kb_id: str, checksum: str) 
     return len(db.active_files_by_checksum(con, kb_id, checksum))
 
 
-def _delete_chunks_for_version(con: sqlite3.Connection, file_id: str, content_version: str, *, dry_run: bool) -> int:
-    row = con.execute(
-        "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ? AND content_version = ?",
-        (file_id, content_version),
-    ).fetchone()
-    count = int(row["c"] if row else 0)
-    if not dry_run and count:
-        db.delete_chunks_for_version(con, file_id, content_version)
-    return count
+def _version_in_use(file_row: sqlite3.Row | None, content_version: str, cutoff_ts: int) -> bool:
+    """Whether the parse cache and restore ledger of this content version are still used, judged by the files
+    row alone: it is the file's current content version, or the indexed version still being served (the two
+    differ while the content has changed and the new version is not parsed yet). A deleted file may still be
+    restored as it was within the retention period, so it counts as in use too; only past the retention
+    period, or once the files row is gone, is the version unused."""
+    if file_row is None:
+        return False
+    if content_version not in {str(file_row["content_version"] or ""), str(file_row["indexed_version"] or "")}:
+        return False
+    if str(file_row["status"]) != "deleted":
+        return True
+    return int(file_row["last_seen_at"] or 0) >= cutoff_ts
 
 
 def _purge_file_state(con: sqlite3.Connection, file_id: str, *, dry_run: bool) -> dict[str, int]:
@@ -1264,21 +1354,57 @@ def gzip_file_and_truncate(src: Path, dst: Path) -> None:
         handle.truncate(len(tail))
 
 
-def prune_old_files(root: Path, *, max_age_days: int, dry_run: bool = False) -> int:
-    if not root.is_dir():
-        return 0
-    cutoff = time.time() - max_age_days * 86400
-    removed = 0
-    for path in root.rglob("*"):
+# Entries written only just now are kept for a while: the console's chunk preview writes this cache too, and
+# it is outside what service_busy checks
+VLM_CACHE_GRACE_SECONDS = 24 * 3600
+
+
+def prune_vlm_cache(cache_dir: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """The caches of image descriptions, visual vectors and table checks live under vlm-cache keyed by image
+    hash, shared across versions and documents; file names start with the image's sha256. Whether an entry
+    stays follows the references: while the parse cache still holds the image, the entry stays and never
+    expires however old it is (expiring it would send every image through the models again at the next
+    re-parse); once the parse cache is reclaimed (the file or the KB deleted, an old version replaced), the
+    image's transcription and vectors go with it. When the parse cache directory is missing, or an image in it
+    cannot be read, nothing is deleted this round: the references are not fully counted, so there is no
+    telling."""
+    from .vision.images import IMAGE_SUFFIXES, file_hash
+
+    root = cache_dir / "vlm-cache"
+    parse_root = cache_dir / "parse"
+    out: dict[str, Any] = {"entries": 0, "referenced": 0, "removed": 0, "unreadable_images": 0}
+    if not root.is_dir() or not parse_root.is_dir():
+        return out
+    referenced: set[str] = set()
+    for path in parse_root.rglob("*"):
+        if path.suffix.lower() not in IMAGE_SUFFIXES or not path.is_file():
+            continue
         try:
-            if not path.is_file() or path.stat().st_mtime >= cutoff:
-                continue
+            referenced.add(file_hash(path))
+        except OSError:
+            out["unreadable_images"] += 1
+    cutoff = time.time() - VLM_CACHE_GRACE_SECONDS
+    stale: list[Path] = []
+    for path in root.rglob("*"):
+        image_hash = path.name[:64]
+        if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", image_hash):
+            continue
+        out["entries"] += 1
+        if image_hash in referenced:
+            out["referenced"] += 1
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                stale.append(path)
         except OSError:
             continue
-        removed += 1
-        if not dry_run:
+    if out["unreadable_images"]:
+        return out
+    out["removed"] = len(stale)
+    if not dry_run:
+        for path in stale:
             path.unlink(missing_ok=True)
-    return removed
+    return out
 
 
 def _pgrep(pattern: str) -> bool:

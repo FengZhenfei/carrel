@@ -138,6 +138,11 @@ _MIGRATIONS = (
 
 _SKIP_DIR_RE = re.compile(r"^[._~]|^\$RECYCLE|^System Volume|^lost\+found$")
 
+# KBs whose permanent deletion is in progress or did not finish. The registry row is kept only to find the
+# external resources not yet deleted (collection, index, graph); it is not an inactive KB that can be restored:
+# no retention period applies, it cannot be re-enabled, and no other directory can adopt it.
+DELETE_PENDING_REASONS = ("deleting", "delete_failed")
+
 
 def allocate_kb_id(con: sqlite3.Connection) -> str:
     """kb_id == collection == kb_<NNN>, allocated at first enrollment from a
@@ -354,6 +359,7 @@ def enroll(con: sqlite3.Connection, mirror_root: Path, name: str) -> tuple[KBSou
     kb_id = str(row["kb_id"])
     if str(row["collection"]) != kb_id:
         raise CollectionMismatch(kb_id, str(row["collection"]), kb_id)
+    _refuse_half_deleted(row)
     outcome = "already" if str(row["status"]) == "active" else "reactivated"
     con.execute(
         "UPDATE kb_sources SET status='active', last_seen_at=?, inactive_at=NULL, inactive_reason=NULL "
@@ -361,6 +367,16 @@ def enroll(con: sqlite3.Connection, mirror_root: Path, name: str) -> tuple[KBSou
         (ts, kb_id),
     )
     return source_from_row(mirror_root, con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()), outcome
+
+
+def _refuse_half_deleted(row: sqlite3.Row) -> None:
+    """A KB deleted halfway cannot come back as it was: its state rows and parse cache are most likely gone
+    already while the external stores still hold points that were not deleted, so re-enabling it would give a
+    KB whose records do not add up."""
+    if str(row["status"]) != "active" and str(row["inactive_reason"] or "") in DELETE_PENDING_REASONS:
+        raise ValueError(f"The permanent deletion of {row['kb_id']} has not finished, so it cannot be re-enabled or "
+                         "adopted; it continues at the next maintenance run, or click \"Delete knowledge base\" again "
+                         "in the console")
 
 
 def kb_label(kb_id: str, source_root: str | None) -> str:
@@ -435,6 +451,7 @@ def adopt_directory(con: sqlite3.Connection, mirror_root: Path, kb_id: str, new_
     row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
     if row is None:
         raise KeyError(kb_id)
+    _refuse_half_deleted(row)
     old_name = str(row["source_root"])
     if old_name == new_name:
         raise ValueError(f"{kb_id} already lives in {new_name!r}")
@@ -550,9 +567,15 @@ def known_sources(con: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def inactive_older_than(con: sqlite3.Connection, cutoff_ts: int) -> list[sqlite3.Row]:
+    """Inactive KBs due for hard deletion: those inactive longer than the retention period, plus those whose
+    permanent deletion did not finish. The latter ignore the retention period -- when a deletion fails,
+    inactive_at records the moment of the deletion, so applying the retention period would wait a full 7 days
+    before retrying and keep the leftover text 7 days longer."""
+    marks = ",".join("?" for _ in DELETE_PENDING_REASONS)
     return con.execute(
-        "SELECT * FROM kb_sources WHERE status='inactive' AND inactive_at IS NOT NULL AND inactive_at < ? ORDER BY inactive_at",
-        (cutoff_ts,),
+        f"SELECT * FROM kb_sources WHERE status='inactive' AND (inactive_reason IN ({marks}) "
+        "OR (inactive_at IS NOT NULL AND inactive_at < ?)) ORDER BY inactive_at",
+        (*DELETE_PENDING_REASONS, cutoff_ts),
     ).fetchall()
 
 

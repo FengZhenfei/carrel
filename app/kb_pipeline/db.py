@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_kb ON files(kb_id);
-CREATE INDEX IF NOT EXISTS idx_files_nc ON files(file_key);
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_checksum ON files(kb_id, checksum);
 
@@ -199,7 +198,8 @@ CREATE TABLE IF NOT EXISTS graph_checks (
   decision_json TEXT NOT NULL
 );
 
--- Extraction units: how one build split the corpus (the text lives in the work dir's units.jsonl; only sizes here).
+-- No longer written: units.jsonl in the work dir is the unit table of record and this table has no reader. It is
+-- still created because the cleanup statements of graph / KB deletion name it and would fail without it.
 CREATE TABLE IF NOT EXISTS graph_units (
   graph_build_id TEXT NOT NULL,
   unit_id TEXT NOT NULL,
@@ -401,15 +401,25 @@ def begin_graph_build(
     return build_id
 
 
-def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds: int = 3600) -> list[str]:
+def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds: int = 3600,
+                                 lock_path: str | Path | None = None) -> list[str]:
     """Re-mark graph build records that are still 'running' although their process is dead as failed.
 
     When the graph build subprocess is SIGKILLed, taken down together with systemd, or loses power,
     nobody writes a terminal state: the console shows "building" forever, "build now" and "delete
     graph" are refused forever, and the midnight rebuild yields forever. Parse jobs heal themselves
     through leases; this gives graph builds the same ability: on the same host, liveness is judged by
-    the pid; on another host (or for historical rows without a pid) by heartbeat timeout. Returns the
-    ids of the reclaimed records."""
+    the build lock; on another host (or for historical rows without a pid) by heartbeat timeout. Returns
+    the ids of the reclaimed records.
+
+    Same host: the build process holds the build lock (flock, released by the kernel the moment the process
+    dies) from writing its record until it ends, and the lock directory records its pid. When nobody holds the
+    lock, or the holder is not the pid recorded on the row, the row is a dead record. Checking only whether the
+    pid still exists would leave a dead record 'running' for good once another process reuses the pid. Without
+    lock_path the lock directory next to the state database is used (the default layout); only when there is no
+    lock file there (the state database was moved, a test stub) does it fall back to judging by pid."""
+    from .graph.lock import LOCK_DIR_NAME, LOCK_FILE_NAME, build_lock_held, build_lock_holder
+
     hostname = socket.gethostname()
     now = now_ts()
     recovered: list[str] = []
@@ -420,19 +430,35 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
         ).fetchall()
     except sqlite3.OperationalError:
         return recovered  # migration has not run yet
+    if not rows:
+        return recovered
+    if lock_path is None:
+        db_file = str(con.execute("PRAGMA database_list").fetchone()[2] or "")
+        lock_path = Path(db_file).parent / LOCK_DIR_NAME if db_file else None
+    lock_known = lock_path is not None and (Path(lock_path) / LOCK_FILE_NAME).exists()
+    # 0 = nobody holds the lock; None = someone holds it but has not recorded a pid yet (just acquired): alive
+    holder: int | None = 0
+    if lock_known and build_lock_held(Path(lock_path)):
+        holder = build_lock_holder(Path(lock_path)).get("pid")
     for row in rows:
         host = str(row["worker_host"] or "")
         pid = int(row["worker_pid"] or 0)
         last_seen = int(row["heartbeat_at"] or row["started_at"] or 0)
         if host == hostname and pid > 0:
-            alive = True
-            try:
-                os.kill(pid, 0)
-            except (OSError, ValueError):
-                alive = False
-            if alive:
-                continue
-            reason = f"Graph build process no longer exists (pid={pid}); marked failed by the reaper"
+            if lock_known:
+                if holder is None or holder == pid:
+                    continue
+                reason = (f"Graph build process no longer exists (pid={pid}, it does not hold the build lock); "
+                          "marked failed by the reaper")
+            else:
+                alive = True
+                try:
+                    os.kill(pid, 0)
+                except (OSError, ValueError):
+                    alive = False
+                if alive:
+                    continue
+                reason = f"Graph build process no longer exists (pid={pid}); marked failed by the reaper"
         else:
             if now - last_seen < max(60, stale_after_seconds):
                 continue
@@ -446,18 +472,6 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
     if recovered:
         con.commit()
     return recovered
-
-
-def touch_graph_build(con: sqlite3.Connection, graph_build_id: str) -> None:
-    """Graph build heartbeat: called together with set_graph_build_stage, commits immediately."""
-    try:
-        con.execute(
-            "UPDATE graph_builds SET heartbeat_at = ? WHERE graph_build_id = ?",
-            (now_ts(), graph_build_id),
-        )
-        con.commit()
-    except sqlite3.OperationalError:
-        pass
 
 
 def finish_graph_build(
@@ -518,10 +532,9 @@ def replace_graph_build_chunks(
     con.executemany(
         """
         INSERT OR REPLACE INTO graph_build_chunks(
-          graph_build_id, point_id, chunk_uid, doc_id, content_version,
-          block_id, block_start, block_end, text_sha
+          graph_build_id, point_id, chunk_uid, doc_id, content_version, text_sha
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             (
@@ -530,9 +543,6 @@ def replace_graph_build_chunks(
                 str(chunk.get("chunk_uid") or ""),
                 str(chunk.get("doc_id") or ""),
                 str(chunk.get("content_version") or ""),
-                chunk.get("block_id"),
-                chunk.get("block_start"),
-                chunk.get("block_end"),
                 (str(chunk.get("text_sha")) if chunk.get("text_sha") else None),
             )
             for chunk in chunks
@@ -577,7 +587,7 @@ def graph_build_chunk_refs(con: sqlite3.Connection, graph_build_id: str) -> list
             # text_sha has to come along: a resumed build recomputes the corpus fingerprint from this ledger at
             # the end; without it the result differs from the one recorded at the start and the build cannot be
             # resumed once more (2026-09-29 audit)
-            "SELECT point_id, chunk_uid, doc_id, content_version, block_id, block_start, block_end, text_sha "
+            "SELECT point_id, chunk_uid, doc_id, content_version, text_sha "
             "FROM graph_build_chunks WHERE graph_build_id = ? ORDER BY doc_id, chunk_uid",
             (graph_build_id,),
         )
@@ -678,21 +688,6 @@ def _is_sample_build(row: sqlite3.Row) -> bool:
     except (TypeError, ValueError):
         return False
     return bool((manifest.get("input") or {}).get("doc_filter"))
-
-
-def replace_graph_units(con: sqlite3.Connection, graph_build_id: str, units: Iterable[Any]) -> int:
-    con.execute("DELETE FROM graph_units WHERE graph_build_id = ?", (graph_build_id,))
-    rows = [
-        (graph_build_id, str(u.unit_id), str(u.doc_id), " > ".join(u.section_path), int(u.n_tokens),
-         len(u.chunk_uids), int(u.order))
-        for u in units
-    ]
-    con.executemany(
-        "INSERT OR REPLACE INTO graph_units(graph_build_id, unit_id, doc_id, section, n_tokens, chunk_count, unit_order) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )
-    return len(rows)
 
 
 def graph_extraction_unit_ids(con: sqlite3.Connection, kb_id: str, fingerprint: str, *,
@@ -804,11 +799,6 @@ def load_graph_facts(con: sqlite3.Connection, kb_id: str, fingerprint: str, unit
     return out
 
 
-def graph_fact_count(con: sqlite3.Connection, kb_id: str) -> int:
-    row = con.execute("SELECT COUNT(*) AS n FROM graph_facts WHERE kb_id = ?", (kb_id,)).fetchone()
-    return int(row["n"] if row else 0)
-
-
 def delete_graph_facts(con: sqlite3.Connection, kb_id: str) -> int:
     cur = con.execute("DELETE FROM graph_facts WHERE kb_id = ?", (kb_id,))
     return int(cur.rowcount or 0)
@@ -828,16 +818,24 @@ def prune_graph_builds(con: sqlite3.Connection, kb_id: str, *, keep_versions: It
     """Keep only the useful graph build records: the running one, the latest successful one, and every row
     started after the latest full-rebuild version (the rebuild policy counts appends from them, and the
     status card's "N appends since the last full rebuild" relies on them too). Older rows are deleted
-    together with their chunk ledger, phase markers and unit table -- once artifacts are only kept from
-    the current version onward, hoarding the records makes no sense. Returns the number of deleted
-    records. ``keep_versions``: versions whose artifacts are still kept (the active one and those inside the
-    keep window); their records stay too, so the status card still has figures after a rollback to them."""
+    together with their chunk ledger and phase markers -- once artifacts are only kept from the current
+    version onward, hoarding the records makes no sense. Returns the number of deleted records.
+    ``keep_versions``: versions whose artifacts are still kept (the active one, those inside the keep window
+    and the one kept for a resume); their records stay too, so the status card still has figures after a
+    rollback to them.
+    Among the records kept, only those somebody reads keep their chunk ledger: the current version (the
+    baseline of appends), the latest full-rebuild version (the baseline of the rebuild policy), keep_versions
+    (rollback, resume) and the running one. The rest are kept only to be counted, yet each carries a ledger
+    the size of the whole KB: every append adds one more, and they pile up as long as no full rebuild comes.
+    Neither the current version nor the full-rebuild version can be a trial build, the same rule as
+    latest_successful_graph_build, which reads these two baselines."""
     kept_versions = {str(v) for v in keep_versions if str(v)}
     rows = con.execute(
-        "SELECT graph_build_id, graph_version, status, build_kind, started_at, finished_at FROM graph_builds WHERE kb_id = ?",
+        "SELECT graph_build_id, graph_version, status, build_kind, started_at, finished_at, manifest_json "
+        "FROM graph_builds WHERE kb_id = ?",
         (kb_id,)).fetchall()
     ts = lambda r: int(r["finished_at"] or r["started_at"] or 0)
-    done = [r for r in rows if str(r["status"]) == "done"]
+    done = [r for r in rows if str(r["status"]) == "done" and not _is_sample_build(r)]
     latest_done = max(done, key=ts, default=None)
     last_full = max((r for r in done if str(r["build_kind"] or "full") == "full"), key=ts, default=None)
     floor_ts = int(last_full["started_at"] or 0) if last_full is not None else 0
@@ -850,9 +848,16 @@ def prune_graph_builds(con: sqlite3.Connection, kb_id: str, *, keep_versions: It
     for i in range(0, len(stale), 200):
         batch = stale[i:i + 200]
         marks = ",".join("?" * len(batch))
-        for table in ("graph_build_chunks", "graph_build_phases", "graph_units"):
+        for table in ("graph_build_chunks", "graph_build_phases"):
             con.execute(f"DELETE FROM {table} WHERE graph_build_id IN ({marks})", batch)
         con.execute(f"DELETE FROM graph_builds WHERE graph_build_id IN ({marks})", batch)
+    ledger = {str(r["graph_build_id"]) for r in rows
+              if str(r["status"]) == "running" or str(r["graph_version"] or "") in kept_versions}
+    ledger |= {str(r["graph_build_id"]) for r in (latest_done, last_full) if r is not None}
+    counted_only = sorted(keep - ledger)
+    for i in range(0, len(counted_only), 200):
+        batch = counted_only[i:i + 200]
+        con.execute(f"DELETE FROM graph_build_chunks WHERE graph_build_id IN ({','.join('?' * len(batch))})", batch)
     return len(stale)
 
 
@@ -916,20 +921,23 @@ def graph_extraction_flag_counts(con: sqlite3.Connection, kb_id: str, fingerprin
     return out
 
 
-def prune_graph_extractions(con: sqlite3.Connection, kb_id: str, keep_unit_ids: Iterable[str]) -> int:
+def prune_graph_extractions(con: sqlite3.Connection, kb_id: str, keep_unit_ids: Iterable[str], *,
+                            table: str = "graph_extractions") -> int:
     """Drop extraction cache rows that no longer correspond to any existing unit (deleting a document or
     changing its text changes the unit_id, so old rows only take up space). Rows of existing units are
     kept regardless of fingerprint: switching the configuration and back still hits the cache. Called
     after a full build completes, and only for whole-corpus builds (not trial builds with doc_ids),
-    otherwise cache outside the trial scope would be deleted by mistake."""
+    otherwise cache outside the trial scope would be deleted by mistake.
+    With table="graph_facts" it prunes the facts cache: stored by (kb, unit, fingerprint) as well, same rule."""
+    assert table in ("graph_extractions", "graph_facts")
     keep = {str(u) for u in keep_unit_ids}
     stale = [str(r["unit_id"]) for r in con.execute(
-        "SELECT DISTINCT unit_id FROM graph_extractions WHERE kb_id = ?", (kb_id,)) if str(r["unit_id"]) not in keep]
+        f"SELECT DISTINCT unit_id FROM {table} WHERE kb_id = ?", (kb_id,)) if str(r["unit_id"]) not in keep]
     removed = 0
     for i in range(0, len(stale), 500):
         batch = stale[i:i + 500]
         cur = con.execute(
-            f"DELETE FROM graph_extractions WHERE kb_id = ? AND unit_id IN ({','.join('?' * len(batch))})",
+            f"DELETE FROM {table} WHERE kb_id = ? AND unit_id IN ({','.join('?' * len(batch))})",
             (kb_id, *batch))
         removed += int(cur.rowcount or 0)
     return removed
@@ -987,6 +995,24 @@ def get_file_by_path(con: sqlite3.Connection, kb_id: str, source_path: str) -> s
     ).fetchone()
 
 
+# Jobs past the retention period that may be cleaned up. The latest successful parse job of every file still
+# present is kept: the file table's "Indexed at" and the job timeline both come from it, and once it is gone a
+# file not re-parsed for 30 days shows nothing but a dash.
+_PRUNABLE_JOBS_SQL = """
+    status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?
+    AND NOT (
+      job_type = 'parse' AND status = 'done'
+      AND EXISTS (SELECT 1 FROM files f WHERE f.file_id = jobs.file_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM jobs later
+        WHERE later.file_id = jobs.file_id AND later.job_type = 'parse' AND later.status = 'done'
+          AND (COALESCE(later.finished_at, 0) > COALESCE(jobs.finished_at, 0)
+               OR (COALESCE(later.finished_at, 0) = COALESCE(jobs.finished_at, 0) AND later.rowid > jobs.rowid))
+      )
+    )
+"""
+
+
 def prune_job_history(con: sqlite3.Connection, *, retention_days: int = 30, dry_run: bool = False) -> dict[str, int]:
     """Clean up long-finished jobs and failure records. These rows used to be deleted only when a knowledge
     base or file was deleted: failure records carry a 4000-character stack trace, every full re-parse
@@ -998,12 +1024,11 @@ def prune_job_history(con: sqlite3.Connection, *, retention_days: int = 30, dry_
         removed["failures"] = int(con.execute(
             "SELECT COUNT(*) FROM failures WHERE resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)).fetchone()[0])
         removed["jobs"] = int(con.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?",
-            (cutoff,)).fetchone()[0])
+            f"SELECT COUNT(*) FROM jobs WHERE {_PRUNABLE_JOBS_SQL}", (cutoff,)).fetchone()[0])
         # events that only become orphans once their job is deleted count as well
         removed["job_events"] = int(con.execute(
-            "SELECT COUNT(*) FROM job_events WHERE job_id NOT IN (SELECT job_id FROM jobs WHERE NOT "
-            "(status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?))", (cutoff,)).fetchone()[0])
+            "SELECT COUNT(*) FROM job_events WHERE job_id NOT IN "
+            f"(SELECT job_id FROM jobs WHERE NOT ({_PRUNABLE_JOBS_SQL}))", (cutoff,)).fetchone()[0])
         try:
             removed["ingest_runs"] = int(con.execute(
                 "SELECT COUNT(*) FROM ingest_runs WHERE COALESCE(finished_at, started_at) < ?", (cutoff,)).fetchone()[0])
@@ -1013,9 +1038,7 @@ def prune_job_history(con: sqlite3.Connection, *, retention_days: int = 30, dry_
     cur = con.execute(
         "DELETE FROM failures WHERE resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,))
     removed["failures"] = int(cur.rowcount or 0)
-    cur = con.execute(
-        "DELETE FROM jobs WHERE status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?",
-        (cutoff,))
+    cur = con.execute(f"DELETE FROM jobs WHERE {_PRUNABLE_JOBS_SQL}", (cutoff,))
     removed["jobs"] = int(cur.rowcount or 0)
     cur = con.execute("DELETE FROM job_events WHERE job_id NOT IN (SELECT job_id FROM jobs)")
     removed["job_events"] = int(cur.rowcount or 0)
@@ -1255,11 +1278,6 @@ _JOBS_MIGRATIONS = (
     "DROP INDEX IF EXISTS idx_files_nc",
     # Chunking acceptance verdict (chunking/diagnose.py), written with indexed_version on a successful parse
     "ALTER TABLE files ADD COLUMN chunk_diag_json TEXT",
-    # The old pipeline froze block spans into the chunk ledger; the columns stay (SQLite cannot easily drop
-    # columns) but the new pipeline no longer writes them.
-    "ALTER TABLE graph_build_chunks ADD COLUMN block_id TEXT",
-    "ALTER TABLE graph_build_chunks ADD COLUMN block_start INTEGER",
-    "ALTER TABLE graph_build_chunks ADD COLUMN block_end INTEGER",
     # Build kind: full = full rebuild; append = incremental append (only extracts new units, replays the
     # resolution decisions, reuses vectors). The rebuild policy only takes full builds as its baseline --
     # otherwise a single append would reset the "new content" counter and a full rebuild would never come.
@@ -1495,10 +1513,39 @@ def mark_job_done(con: sqlite3.Connection, job_id: str, worker_id: str | None = 
     )
     if cur.rowcount:
         con.execute("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'done', 'Done')", (job_id, ts))
+        supersede_failed_attempts(con, job_id)
     con.execute(
         "UPDATE failures SET resolved_at = COALESCE(resolved_at, ?) WHERE job_id = ?",
         (ts, job_id),
     )
+
+
+SUPERSEDED_EVENT = "Superseded by a later task for the same file"
+
+
+def supersede_failed_attempts(con: sqlite3.Connection, job_id: str) -> int:
+    """This job reached a terminal state (success, or a failure with its retries used up): earlier failures of
+    the same file and job type no longer count on their own. Their failure records are marked resolved and the
+    jobs themselves become cancelled, to be cleaned up with the job history in due course. A file keeps at most
+    its latest job of a type as failed: the scan's duplicate check and the requeue of compensation jobs both look
+    at the latest one, and older ones left in place only pile up -- every requeue is a new job_id, and whether it
+    succeeds or fails again, nobody ever collected the earlier failed jobs and their failure records with stack
+    traces. Returns how many jobs were superseded."""
+    row = con.execute("SELECT file_id, job_type, created_at FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if row is None or not row["file_id"]:
+        return 0
+    earlier = [str(r["job_id"]) for r in con.execute(
+        "SELECT job_id FROM jobs WHERE file_id = ? AND job_type = ? AND status = 'failed' AND job_id != ? AND created_at <= ?",
+        (row["file_id"], row["job_type"], job_id, row["created_at"]))]
+    ts = now_ts()
+    for start in range(0, len(earlier), _SQL_IN_BATCH):
+        batch = earlier[start : start + _SQL_IN_BATCH]
+        marks = ",".join("?" for _ in batch)
+        con.execute(f"UPDATE failures SET resolved_at = COALESCE(resolved_at, ?) WHERE job_id IN ({marks})", (ts, *batch))
+        con.execute(f"UPDATE jobs SET status = 'cancelled', updated_at = ? WHERE job_id IN ({marks})", (ts, *batch))
+        con.executemany("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'cancelled', ?)",
+                        [(jid, ts, SUPERSEDED_EVENT) for jid in batch])
+    return len(earlier)
 
 
 def release_job(con: sqlite3.Connection, job_id: str) -> None:
@@ -1558,6 +1605,7 @@ def release_crashed_job(
             """,
             (attempts, f"{reason} (attempts={attempts})"[:4000], ts, ts, job_id, expected_owner, expected_owner),
         )
+        supersede_failed_attempts(con, job_id)
     else:
         con.execute(
             """
@@ -1789,6 +1837,7 @@ def mark_job_failed(
         if cur.rowcount:
             con.execute("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'error', ?)",
                         (job_id, ts, error[:4000]))
+            supersede_failed_attempts(con, job_id)
     return bool(cur.rowcount)
 
 
@@ -1808,13 +1857,6 @@ def add_failure(
         """,
         (new_id("failure"), file_id, job_id, stage, error_type, error_message[:4000], now_ts()),
     )
-
-
-def recent_jobs(con: sqlite3.Connection, limit: int = 20) -> Iterable[sqlite3.Row]:
-    return con.execute(
-        "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
 
 
 def get_file_by_id(con: sqlite3.Connection, file_id: str) -> sqlite3.Row | None:
@@ -1876,18 +1918,22 @@ def mark_file_indexed(
     *,
     chunk_diag: dict[str, Any] | None = None,
 ) -> None:
+    """A finished parse comes with parser_profile and the chunking verdict (an empty document has no verdict and
+    writes an empty one). A call without parser_profile is not a parse -- a rename, a move or a restore after
+    deletion only flips the status while content and chunks stay the same, so the profile and the verdict keep
+    their values."""
     con.execute(
         """
         UPDATE files
         SET indexed_version = ?,
             indexed_parser_profile = COALESCE(?, indexed_parser_profile),
-            chunk_diag_json = ?,
+            chunk_diag_json = CASE WHEN ? IS NULL THEN chunk_diag_json ELSE ? END,
             status = CASE WHEN status = 'deleted' THEN 'deleted' ELSE 'indexed' END,
             last_seen_at = ?
         WHERE file_id = ?
         """,
-        (content_version, parser_profile, json.dumps(chunk_diag, ensure_ascii=False) if chunk_diag else None,
-         now_ts(), file_id),
+        (content_version, parser_profile, parser_profile,
+         json.dumps(chunk_diag, ensure_ascii=False) if chunk_diag else None, now_ts(), file_id),
     )
 
 
@@ -1939,7 +1985,7 @@ def kb_parse_busy(con: sqlite3.Connection, kb_id: str) -> int:
     """How many parse jobs of this knowledge base are still in flight.
 
     The single criterion for "can we build the graph / extract labels", shared by manual triggers and
-    the automatic rebuild at 00:00 every day. Only looks at **this knowledge base itself**: building a
+    the scheduled graph maintenance check. Only looks at **this knowledge base itself**: building a
     graph while the corpus is still growing yields half a graph, while another KB being parsed has
     nothing to do with this one -- the embedding concurrency budget is partitioned (pipeline 20 + graph
     build 10 + 2 reserved for retrieval = max_num_seqs 32), so there is no need to yield to each other.
@@ -2038,17 +2084,37 @@ def mark_chunks_inactive(con: sqlite3.Connection, file_id: str) -> int:
     return int(cur.rowcount or 0)
 
 
-def delete_chunks_for_version(con: sqlite3.Connection, file_id: str, content_version: str) -> int:
-    row = con.execute(
-        "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ? AND content_version = ?",
-        (file_id, content_version),
-    ).fetchone()
-    count = int(row["c"] if row else 0)
-    con.execute(
-        "DELETE FROM chunks WHERE file_id = ? AND content_version = ?",
-        (file_id, content_version),
-    )
-    return count
+def chunk_status_by_point(con: sqlite3.Connection, file_id: str, point_ids: Iterable[str]) -> dict[str, str]:
+    """The status of each of these points in the chunk ledger ({point_id: status}); points not in the ledger are
+    left out."""
+    ids = [str(p) for p in point_ids]
+    out: dict[str, str] = {}
+    for start in range(0, len(ids), _SQL_IN_BATCH):
+        batch = ids[start : start + _SQL_IN_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        for row in con.execute(
+            f"SELECT point_id, status FROM chunks WHERE file_id = ? AND point_id IN ({placeholders})",
+            (file_id, *batch),
+        ):
+            out[str(row["point_id"])] = str(row["status"])
+    return out
+
+
+def delete_inactive_chunks(con: sqlite3.Connection, file_id: str, point_ids: Iterable[str], *, dry_run: bool = False) -> int:
+    """For reclaiming: delete the chunk rows of these points, only the inactive ones (old batches left by
+    re-chunking the same version, old rows replaced by a newer version). Active rows are the current chunks and
+    deleted rows are the batch kept for a restore after the file was deleted; neither is removed here. dry_run
+    counts without deleting."""
+    ids = [str(p) for p in point_ids]
+    removed = 0
+    for start in range(0, len(ids), _SQL_IN_BATCH):
+        batch = ids[start : start + _SQL_IN_BATCH]
+        where = f"file_id = ? AND status = 'inactive' AND point_id IN ({','.join('?' for _ in batch)})"
+        if dry_run:
+            removed += int(con.execute(f"SELECT COUNT(*) FROM chunks WHERE {where}", (file_id, *batch)).fetchone()[0])
+        else:
+            removed += int(con.execute(f"DELETE FROM chunks WHERE {where}", (file_id, *batch)).rowcount or 0)
+    return removed
 
 
 # Whole-KB queries go through subselects instead of expanded IN (...) lists:
@@ -2149,13 +2215,6 @@ def _count_in(con: sqlite3.Connection, table: str, column: str, values: list[str
     return total
 
 
-def _delete_in(con: sqlite3.Connection, table: str, column: str, values: list[str]) -> None:
-    for start in range(0, len(values), _SQL_IN_BATCH):
-        batch = values[start : start + _SQL_IN_BATCH]
-        placeholders = ",".join("?" for _ in batch)
-        con.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", batch)
-
-
 def _count_failure_refs(con: sqlite3.Connection, file_ids: list[str], job_ids: list[str]) -> int:
     clauses: list[str] = []
     params: list[str] = []
@@ -2182,3 +2241,47 @@ def _delete_failure_refs(con: sqlite3.Connection, file_ids: list[str], job_ids: 
         params.extend(job_ids)
     if clauses:
         con.execute(f"DELETE FROM failures WHERE {' OR '.join(clauses)}", params)
+
+
+def defer_job(
+    con: sqlite3.Connection,
+    job_id: str,
+    error: str,
+    *,
+    worker_id: str,
+    base_delay_seconds: int,
+    max_delay_seconds: int,
+    max_deferrals: int,
+) -> int | None:
+    """A service the job depends on cannot be reached (not up yet, or restarting): put the job back in the queue
+    until it is ready, without counting a retry. The number of deferrals is kept under "deferred" in the job
+    payload and the wait doubles each time; a job gives way at most max_deferrals times, after which None is
+    returned and the caller treats it as an ordinary failure -- a document that brings the service down every
+    time must not stay queued forever. Only jobs still owned by this worker are touched. Returns the number of
+    seconds to wait this time."""
+    row = con.execute(
+        "SELECT payload_json FROM jobs WHERE job_id = ? AND status = 'running' AND locked_by = ?",
+        (job_id, worker_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    deferred = int(payload.get("deferred") or 0)
+    if deferred >= max_deferrals:
+        return None
+    delay = max(1, min(int(max_delay_seconds), int(base_delay_seconds) * (2 ** deferred)))
+    payload["deferred"] = deferred + 1
+    ts = now_ts()
+    text = f"Service not ready, trying again in {delay}s (not counted as a retry): {error}"
+    con.execute(
+        "UPDATE jobs SET status = 'retry', next_attempt_at = ?, error = ?, payload_json = ?, updated_at = ?, "
+        "locked_by = NULL, locked_until = NULL WHERE job_id = ?",
+        (ts + delay, text[:4000], json.dumps(payload, ensure_ascii=False), ts, job_id),
+    )
+    con.execute("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'retry', ?)", (job_id, ts, text[:1000]))
+    return delay

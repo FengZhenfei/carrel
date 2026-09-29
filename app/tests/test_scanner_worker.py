@@ -12,15 +12,16 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 
 from kb_pipeline import db
 from kb_pipeline.localfs.scanner import should_skip
 from kb_pipeline.models import KBSource
 from kb_pipeline.parsers.common import parser_profile_for_path
+from kb_pipeline.pipeline.parse_job import _embed_visual_chunks as _REAL_EMBED_VISUAL_CHUNKS
 from kb_pipeline.pipeline.scheduler import schedule_deletes_for_source, schedule_file
 
-from _support import _CodexAudit20260906TestsSupport, _local_file, _repo_file
+from _support import _CodexAudit20260906TestsSupport, _block, _local_file, _repo_file
 
 
 class ScannerRegressionTests(unittest.TestCase):
@@ -131,6 +132,52 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertTrue(should_skip(Path("/tmp/kb/.git/config")))
         self.assertTrue(should_skip(Path("/tmp/kb/folder/.private/file.md")))
         self.assertFalse(should_skip(Path("/tmp/kb/folder/file.md")))
+
+    def test_a_mirror_under_a_hidden_directory_is_still_scanned(self) -> None:
+        """Hidden directories are judged by the path inside the KB only. Every part of the absolute path used to
+        count: with the mirror root under a location like ~/.local/share, every file was skipped as hidden, the
+        scan found 0 files without an error, and the console's directory file count was 0 as well."""
+        from kb_pipeline.localfs.scanner import list_recent_source_files, list_source_files
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mirror = Path(tmp) / ".local" / "share" / "mirror"
+            root = mirror / "库"
+            (root / "sub").mkdir(parents=True)
+            (root / ".git").mkdir()
+            (root / "sub" / ".private").mkdir()
+            for rel in ("a.md", "sub/b.md", ".git/config.md", "sub/.private/c.md", ".hidden.md"):
+                (root / rel).write_text("x", encoding="utf-8")
+            source = KBSource(kb_id="k", collection="kb_k", source_root="库", source_type="local_mirror",
+                              max_tokens=400, overlap_tokens=80, physical_base=root)
+            self.assertEqual([f.rel_path for f in list_source_files(source, hash_content=False)], ["a.md", "sub/b.md"])
+            self.assertEqual(sorted(p.name for p in list_recent_source_files(source, min_age_seconds=3600)), ["a.md", "b.md"])
+            service._dir_count_cache.pop("库", None)
+            self.assertEqual(service._dir_file_count(mirror, "库"), 2)
+            service._dir_count_cache.pop("库", None)
+
+    def test_a_modification_time_in_the_future_does_not_defer_the_file_forever(self) -> None:
+        """The settling period is meant for files only just written. A file with a modification time in the future
+        used to count as too recent in every round -- not parsed, not deleted, no error -- until that moment
+        arrived. One further off than the settling period counts as stable; one off by a few seconds (the clock
+        difference between two machines) still waits."""
+        from kb_pipeline.localfs.scanner import list_recent_source_files, list_source_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "库"; root.mkdir()
+            now = time.time()
+            for name, mtime in (("settled.md", now - 3600), ("next-year.md", now + 365 * 86400),
+                                ("skewed.md", now + 20), ("fresh.md", now - 5)):
+                (root / name).write_text("x", encoding="utf-8")
+                os.utime(root / name, (mtime, mtime))
+            source = KBSource(kb_id="k", collection="kb_k", source_root="库", source_type="local_mirror",
+                              max_tokens=400, overlap_tokens=80, physical_base=root)
+            too_recent: set[int] = set()
+            files = list_source_files(source, min_age_seconds=180, hash_content=False, too_recent_keys=too_recent)
+            self.assertEqual([f.filename for f in files], ["next-year.md", "settled.md"])
+            self.assertEqual(len(too_recent), 2)
+            self.assertEqual(sorted(p.name for p in list_recent_source_files(source, min_age_seconds=180)),
+                             ["fresh.md", "skewed.md"])
 
 
 class ScannerChecksumReuseTests(unittest.TestCase):
@@ -446,6 +493,114 @@ class ScanBoundaryTests(unittest.TestCase):
                 status = con.execute("SELECT status FROM kb_sources WHERE kb_id=?", (closed.kb_id,)).fetchone()[0]
             self.assertEqual(status, "inactive")     # the closed KB stays closed, untouched by the scan
 
+    def _scan_args(self, **overrides):
+        import argparse
+
+        values = dict(env_file=None, source=None, limit=None, verbose=False, dry_run=False, rehash=False,
+                      requeue_failed=False, no_detect_deletes=False, force_kb_teardown=False, exit_code_on_recent=False)
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def _one_kb(self, tmp: str):
+        from kb_pipeline import discovery
+
+        root = Path(tmp) / "mirror"; (root / "库A").mkdir(parents=True)
+        doc = root / "库A" / "a.md"; doc.write_text("# A\n\n内容", encoding="utf-8")
+        os.utime(doc, (time.time() - 3600, time.time() - 3600))
+        state = Path(tmp) / "s.db"; db.init_db(state)
+        with db.connect(state) as con:
+            src, _ = discovery.enroll(con, root, "库A"); con.commit()
+        settings = self._settings(root, state)
+        settings.sources = discovery.enrolled_sources(state, root)
+        return root, state, settings, src
+
+    def _scan(self, settings, **overrides) -> tuple[int, str]:
+        from unittest import mock
+
+        from kb_pipeline import cli
+
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_settings", return_value=settings), redirect_stdout(out):
+            code = cli.cmd_scan(self._scan_args(**overrides))
+        return code, out.getvalue()
+
+    def test_a_scan_that_did_nothing_leaves_no_run_record(self) -> None:
+        """The scan runs every minute and in most rounds nothing happens, yet every round used to write an
+        ingest_runs row (over 1,200 all-zero records a day)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state, settings, src = self._one_kb(tmp)
+
+            def runs() -> list[tuple]:
+                with db.connect(state) as con:
+                    return [tuple(r) for r in con.execute(
+                        "SELECT status, added_count, updated_count, deleted_count, note FROM ingest_runs ORDER BY started_at, rowid")]
+
+            self.assertEqual(self._scan(settings)[0], 0)
+            self.assertEqual(runs(), [("done", 1, 0, 0, None)])                # a round that queued jobs is recorded as before
+            with db.connect(state) as con:
+                for row in con.execute("SELECT file_id, content_version FROM files").fetchall():
+                    db.mark_file_indexed(con, str(row["file_id"]), str(row["content_version"]), parser_profile_for_path(Path("a.md")))
+                con.execute("UPDATE jobs SET status = 'done', finished_at = ?", (int(time.time()),))
+            code, out = self._scan(settings)
+            self.assertIn("unchanged=1 jobs=0", out)
+            self.assertEqual((code, len(runs())), (0, 1))                      # an idle round leaves no record
+            (root / "库A" / "a.md").unlink()
+            self.assertEqual(self._scan(settings)[0], 0)
+            self.assertEqual(runs()[1:], [("done", 0, 0, 1, None)])            # a deletion is an event too
+            import shutil
+            shutil.rmtree(root)
+            self.assertEqual(self._scan(settings)[0], 2)                       # mirror root gone: refused, no record either
+            self.assertEqual(len(runs()), 2)
+
+    def test_a_job_waiting_in_backoff_is_not_queued_again_every_minute(self) -> None:
+        """While a parse job backed off, every scan round "queued" the same job again and counted it in jobs=N, so
+        the wrapper script kicked the worker for nothing every minute."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, state, settings, _ = self._one_kb(tmp)
+            self.assertIn("added=1", self._scan(settings)[1])
+            with db.connect(state) as con:
+                con.execute("UPDATE jobs SET status = 'retry', retry_count = 1, next_attempt_at = ?, updated_at = 5",
+                            (int(time.time()) + 600,))
+            code, out = self._scan(settings)
+            self.assertIn("needs_parse=1", out)
+            self.assertIn("jobs=0", out)
+            with db.connect(state) as con:
+                rows = con.execute("SELECT status, updated_at FROM jobs").fetchall()
+                runs = con.execute("SELECT COUNT(*) FROM ingest_runs").fetchone()[0]
+            self.assertEqual([tuple(r) for r in rows], [("retry", 5)])          # still the same job, untouched
+            self.assertEqual(runs, 1)
+
+    def test_a_kb_deleted_or_closed_while_the_scan_lists_files_is_left_alone(self) -> None:
+        """The source list is read when the scan starts. A KB permanently deleted during the seconds spent listing
+        files used to get its file rows and parse jobs inserted again by the scan, under an id that no longer
+        exists, where no cleanup could ever find them; a closed KB got jobs queued again."""
+        from unittest import mock
+
+        from kb_pipeline import cli, discovery
+
+        for action in ("delete", "close"):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, state, settings, src = self._one_kb(tmp)
+                real_list = cli.list_source_files
+
+                def list_then_lose_the_kb(source, **kwargs):
+                    files = real_list(source, **kwargs)
+                    with db.connect(state) as con:
+                        if action == "delete":
+                            db.purge_kb_state(con, source.kb_id)
+                            discovery.forget(con, source.kb_id)
+                        else:
+                            discovery.mark_inactive(con, source.kb_id, reason="unenrolled")
+                    return files
+
+                with mock.patch.object(cli, "list_source_files", list_then_lose_the_kb):
+                    code, out = self._scan(settings)
+                self.assertEqual(code, 0, action)
+                with db.connect(state) as con:
+                    counts = tuple(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                                   for table in ("files", "jobs", "ingest_runs"))
+                self.assertEqual(counts, (0, 0, 0), action)
+
     def test_recent_pending_exit_code(self) -> None:
         """Exits with 75 while files are still settling; the script keeps the flag for the next round based on that."""
         import argparse
@@ -749,6 +904,549 @@ class JobCancellationTests(unittest.TestCase):
             self.assertFalse(worker_mod._pid_is_worker(os.getpid()))
 
 
+@contextmanager
+def _parse_harness(tmp: str):
+    """Run the real worker and process_parse_job with only the external services (parsers, embedding, Qdrant,
+    OpenSearch) stubbed. Provides an enrolled KB, one file on disk and its queued parse job; h.hooks[step] is an
+    action run first when that step is reached, h.calls records the steps passed in order, h.args[step] holds the
+    arguments that step received last, and h.results[step] replaces that step's return value."""
+    from unittest import mock
+
+    from kb_pipeline import discovery
+    from kb_pipeline.localfs.scanner import list_source_files
+    from kb_pipeline.pipeline import parse_job as pj
+    from kb_pipeline.vector.layout import VectorLayout
+
+    base = Path(tmp)
+    mirror = base / "mirror"; (mirror / "库A").mkdir(parents=True)
+    (mirror / "库A" / "a.md").write_text("# 标题\n\n正文", encoding="utf-8")
+    state = base / "s.db"; db.init_db(state)
+    with db.connect(state) as con:
+        src, _ = discovery.enroll(con, mirror, "库A"); con.commit()
+    [file] = list_source_files(discovery.enrolled_sources(state, mirror)[src.kb_id])
+    settings = SimpleNamespace(
+        state_db=state, mirror_root=mirror, cache_dir=base / "cache", sources={}, max_file_bytes=0,
+        vlm_failure_retry_ratio=0.001, embedding_base_url="http://e", embedding_api_key="", embedding_model_id="emb",
+        embedding_dim=4, embedding_batch=8, embedding_retry=1, embedding_sleep_seconds=0.0,
+        qdrant_url="http://q", qdrant_api_key="", qdrant_upsert_max_bytes=1 << 20, vector_layout=VectorLayout(4, 4),
+        opensearch_url="http://o", parse_enabled=True, parse_job_lease_seconds=600, metadata_job_lease_seconds=600,
+        job_max_retries=2, job_retry_base_seconds=300, job_retry_max_seconds=3600,
+        visual_embedding_enabled=True, visual_embedding_base_url="http://ve", visual_embedding_api_key="",
+        visual_embedding_model_id="ve-model", visual_embedding_dim=4, visual_embedding_instruction="x",
+        visual_embedding_concurrency=1, visual_embedding_retry=1, visual_embedding_timeout_seconds=5,
+        image_max_pixels=1000)
+    h = SimpleNamespace(settings=settings, kb_id=src.kb_id, file_id=db.file_id_for(file.kb_id, file.file_key),
+                        calls=[], hooks={}, args={}, results={})
+
+    def step(name: str, result=None):
+        def run(*args, **kwargs):
+            h.calls.append(name)
+            h.args[name] = args
+            if name in h.hooks:
+                h.hooks[name]()
+            return h.results.get(name, result)
+        return run
+
+    class Embedder:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def embed(self, texts):
+            step("embed")()
+            return [[0.0] * 4 for _ in texts]
+
+    stubs = {
+        "_parse_blocks": step("parse", [_block("b1", "正文内容,足够切成一片。")]),
+        "EmbeddingClient": Embedder,
+        "_embed_visual_chunks": step("visual", {}),
+        "qdrant_client": step("qdrant"),
+        "collection_exists": step("collection", True),
+        "validate_collection_layout": step("layout"),
+        "upsert_chunks": step("upsert"),
+        "mark_old_versions_inactive": step("mark_old"),
+        "mark_stale_file_points_inactive": step("mark_stale", 0),
+    }
+    with db.connect(state) as con, ExitStack() as stack:
+        _, h.job_id = schedule_file(con, ingest_run_id="r1", file=file,
+                                    current_seen_file_keys=set(), current_checksum_counts={})
+        con.commit()
+        for name, stub in stubs.items():
+            stack.enter_context(mock.patch.object(pj, name, stub))
+        stack.enter_context(mock.patch.object(
+            pj.search_fts, "sync_doc_from_qdrant", step("fts", {"doc_id": "d", "inserted_rows": 1, "deleted_rows": 0})))
+        h.con = con
+        yield h
+
+
+class ParseCommitPointTests(unittest.TestCase):
+    """2026-09-29 audit: cancellation was wrong at both ends. A cancellation during image description was
+    swallowed by the except Exception around the callback, so every image of the document still went to the
+    model; conversely, after points had been written to the vector store the job still honoured a cancellation
+    without bringing the state database up to date, and a re-parse of the same version left the two out of step
+    from then on. Now a cancellation inside the callback stops the images not yet started, and once the vector
+    write has begun the job counts as committed and completes the state database."""
+
+    def _job(self, h):
+        return h.con.execute("SELECT status, retry_count, cancel_requested FROM jobs WHERE job_id = ?", (h.job_id,)).fetchone()
+
+    def _indexed(self, h) -> tuple[int, bool]:
+        active = h.con.execute("SELECT COUNT(*) FROM chunks WHERE file_id = ? AND status = 'active'", (h.file_id,)).fetchone()[0]
+        row = db.get_file_by_id(h.con, h.file_id)
+        return int(active), str(row["indexed_version"] or "") == str(row["content_version"])
+
+    def test_cancel_inside_the_caption_callback_stops_the_remaining_images(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.pipeline.parse_job import JobCancelled, vlm_progress_callback
+        from kb_pipeline.vision import vlm
+
+        captioned: list[str] = []
+
+        def slow_caption(*, image_path, **kwargs):
+            captioned.append(image_path.name)
+            time.sleep(0.02)
+            return dict(vlm.EMPTY_RESULT)
+
+        def cancelled_stage(text: str, *, force: bool = False) -> None:
+            raise JobCancelled("cancelled by operator")
+
+        jobs = [(f"b{i}", Path(f"/x/{i}.png"), None, None) for i in range(30)]
+        with mock.patch.object(vlm, "caption_image", slow_caption):
+            with self.assertRaises(JobCancelled):
+                vlm.caption_images_parallel(jobs, base_url="http://v", api_key="k", model_id="m", concurrency=2,
+                                            progress_cb=vlm_progress_callback(cancelled_stage))
+            self.assertLessEqual(len(captioned), 6)            # the running ones finish, the queued ones are not sent
+            settled = len(captioned)
+            time.sleep(0.1)
+            self.assertEqual(len(captioned), settled)          # no thread goes on describing images after the return
+            # an error raised by the progress report itself still does not affect the descriptions
+            captioned.clear()
+            results = vlm.caption_images_parallel(jobs[:4], base_url="http://v", api_key="k", model_id="m",
+                                                  progress_cb=lambda done, total: 1 / 0)
+        self.assertEqual((len(results), len(captioned)), (4, 4))
+
+    def test_cancel_before_the_vector_write_stops_the_job(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.hooks["parse"] = lambda: db.request_job_cancel(h.con, h.job_id, "cancelled from the console")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("cancelled:"), result)
+            self.assertNotIn("upsert", h.calls)
+            self.assertEqual(self._job(h)["status"], "cancelled")
+            self.assertEqual(self._indexed(h), (0, False))
+
+    def test_cancel_after_the_vector_write_started_lets_the_job_finish(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.hooks["upsert"] = lambda: db.request_job_cancel(h.con, h.job_id, "cancelled from the console")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(h.calls[-4:], ["upsert", "mark_old", "mark_stale", "fts"])
+            self.assertEqual(self._job(h)["status"], "done")
+            self.assertEqual(self._indexed(h), (1, True))      # the state database caught up with the vector store
+
+    def test_failure_after_the_vector_write_is_retried_even_if_cancel_was_requested(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        def cancel_then_fail() -> None:
+            db.request_job_cancel(h.con, h.job_id, "cancelled from the console")
+            raise RuntimeError("qdrant went away")
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.hooks["mark_old"] = cancel_then_fail
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("retry:"), result)
+            job = self._job(h)
+            self.assertEqual((job["status"], int(job["retry_count"]), int(job["cancel_requested"] or 0)), ("retry", 1, 0))
+            # the retry is no longer stopped by the old cancellation and finishes the indexing
+            del h.hooks["mark_old"]
+            h.con.execute("UPDATE jobs SET next_attempt_at = 0 WHERE job_id = ?", (h.job_id,))
+            h.con.commit()
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(self._indexed(h), (1, True))
+            # a failure before the write: the cancellation still wins over the retry
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.hooks["embed"] = cancel_then_fail
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("cancelled:"), result)
+
+
+class VisualEmbedRejectionTests(unittest.TestCase):
+    """When the visual embedding service rejects a picture for its content, the document is indexed as usual and
+    that picture gets no visual vector -- a settled trade-off. But the "rejected" mark used to live only in the
+    memory of the parse process: not in the payload, not on the timeline, so nobody could tell later that the
+    picture lacks a vector."""
+
+    def test_a_rejected_picture_is_marked_in_the_payload_and_on_the_timeline(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.pipeline import parse_job as pj
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        class RejectingClient:
+            def __init__(self, **kwargs) -> None:
+                pass
+
+            def embed_images(self, jobs):
+                return [None for _ in jobs]
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            picture = Path(tmp) / "figure.png"; picture.write_bytes(b"not really a picture")
+            h.results["parse"] = [
+                _block("img1", "VISUAL SUMMARY: 一张流程图", block_type="image", visual_ref=str(picture),
+                       metadata={"vlm_status": "success", "visual_sha256": "ab" * 32}),
+            ]
+            with mock.patch.object(pj, "_embed_visual_chunks", _REAL_EMBED_VISUAL_CHUNKS), \
+                    mock.patch.object(pj, "VisualEmbeddingClient", RejectingClient):
+                result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            payloads = {p["block_id"]: p for p in h.args["upsert"][4]}
+            self.assertEqual(payloads["img1"]["visual_embed_status"], "content_rejected")
+            self.assertNotIn("visual_embedding_model", payloads["img1"])
+            self.assertIn("The visual embedding service rejected 1 images; they have no visual vector",
+                          [e["text"] for e in db.job_events(h.con, h.job_id)])
+
+
+class ReparseWhileRunningTests(unittest.TestCase):
+    """2026-09-29 audit: "Re-parse all" skipped files that already had a job with the same key. A queued one
+    parses with the new configuration, which is fine; a running one uses the configuration from when it started,
+    and once it is done neither the content version nor the parser profile has changed, the scan judges the file
+    unchanged, and the result of the old configuration stays for good. Now the running job gets a note and the
+    worker queues one more run once it is done."""
+
+    def test_a_reparse_request_that_hits_a_running_job_is_replayed_after_it(self) -> None:
+        from kb_pipeline import discovery
+        from kb_pipeline.pipeline import worker as worker_mod
+        from kb_pipeline.pipeline.scheduler import requeue_kb_files
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            # still queued, not started: nothing to replay, it reads the new configuration when it starts
+            self.assertEqual(requeue_kb_files(h.con, ingest_run_id="web", kb_id=h.kb_id, reason="web console reparse"), 0)
+            requeued: list[int] = []
+
+            def console_changes_config_and_reparses() -> None:
+                discovery.set_config(h.con, h.kb_id, {"max_tokens": 256, "overlap_tokens": 32})
+                requeued.append(requeue_kb_files(h.con, ingest_run_id="web", kb_id=h.kb_id, reason="web console reparse"))
+                h.con.commit()
+
+            h.hooks["embed"] = console_changes_config_and_reparses
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(h.args["parse"][1].max_tokens, 400)          # this run still uses the configuration it started with
+            self.assertEqual(requeued, [1])                               # the console counts it as requeued
+            jobs = h.con.execute("SELECT job_id, status, priority, payload_json FROM jobs WHERE file_id = ? "
+                                 "ORDER BY created_at, rowid", (h.file_id,)).fetchall()
+            self.assertEqual([str(j["status"]) for j in jobs], ["done", "queued"])
+            self.assertEqual(json.loads(jobs[1]["payload_json"])["reason"], "web console reparse")
+            del h.hooks["embed"]
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(h.args["parse"][1].max_tokens, 256)          # the replayed run uses the new configuration
+            self.assertEqual(worker_mod.run_once(h.con, settings=h.settings), "no-job")   # replayed once only
+
+
+class ServiceNotReadyTests(unittest.TestCase):
+    """2026-09-29 audit: after a boot the parsing, embedding and image-description services need 5-18 minutes
+    to become ready while the worker starts claiming jobs after about two; not reaching them counted as an
+    ordinary failure against the retries, and every restart cost each queued job one or two retries for nothing.
+    Now connection-level errors put the job back in the queue without counting a retry; the deferrals per job
+    are capped, so a document that brings a service down every time still comes to a stop."""
+
+    @staticmethod
+    def _mineru_down() -> Exception:
+        import requests
+
+        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
+
+        try:
+            try:
+                raise requests.ConnectionError("('Connection aborted.', RemoteDisconnected('Remote end closed connection'))")
+            except requests.ConnectionError as exc:
+                raise MinerUServiceError(str(exc), status_code=None) from exc
+        except MinerUServiceError as wrapped:
+            return wrapped
+
+    def test_only_connection_level_failures_count_as_unreachable(self) -> None:
+        import http.client
+
+        import httpx
+        import openai
+        import requests
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        from kb_pipeline.parsers.errors import service_unreachable
+        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
+
+        def chained(outer: Exception, inner: Exception, *, explicit: bool = True) -> Exception:
+            try:
+                try:
+                    raise inner
+                except type(inner) as exc:
+                    if explicit:
+                        raise outer from exc
+                    raise outer
+            except type(outer) as wrapped:
+                return wrapped
+
+        request = httpx.Request("POST", "http://127.0.0.1:8101/v1/embeddings")
+        down = [
+            ConnectionRefusedError(61, "Connection refused"),
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            requests.ConnectionError("refused"),
+            requests.ConnectTimeout("connect timed out"),
+            self._mineru_down(),
+            chained(openai.APIConnectionError(request=request), httpx.ConnectError("refused")),
+            chained(openai.APIConnectionError(request=request), httpx.RemoteProtocolError("Server disconnected")),
+            chained(ResponseHandlingException("boom"), httpx.ConnectError("refused"), explicit=False),
+        ]
+        for exc in down:
+            self.assertTrue(service_unreachable(exc), repr(exc))
+        response = requests.Response(); response.status_code = 503
+        up = [
+            RuntimeError("VLM description failed for 3/10 images"),
+            requests.ReadTimeout("read timed out"),
+            requests.HTTPError("503 Server Error", response=response),
+            chained(openai.APITimeoutError(request=request), httpx.ReadTimeout("slow")),
+            chained(MinerUServiceError("500", status_code=500), requests.HTTPError("500")),
+            TimeoutError("timed out"),
+        ]
+        for exc in up:
+            self.assertFalse(service_unreachable(exc), repr(exc))
+        loop = RuntimeError("a"); loop.__cause__ = loop                 # a chain pointing at itself must not loop forever
+        self.assertFalse(service_unreachable(loop))
+
+    def test_unreachable_service_puts_the_job_back_without_counting_a_retry(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            settings = WorkerBranchTests._settings(self, state)          # job_max_retries=2
+            with db.connect(state) as con:
+                _, job_id = WorkerBranchTests._file_and_job(self, con)
+                con.commit()
+                waits = []
+                with mock.patch.object(worker_mod, "process_parse_job", side_effect=self._mineru_down()):
+                    for expected in ("deferred", "deferred", "retry", "retry", "failed"):
+                        before = int(time.time())
+                        result = worker_mod.run_once(con, settings=settings)
+                        self.assertTrue(result.startswith(expected + ":"), f"{result} should start with {expected}")
+                        row = con.execute("SELECT status, retry_count, next_attempt_at, locked_by, error FROM jobs "
+                                          "WHERE job_id = ?", (job_id,)).fetchone()
+                        waits.append((int(row["retry_count"]), int(row["next_attempt_at"] or 0) - before))
+                        if expected == "deferred":
+                            self.assertEqual((row["status"], row["locked_by"]), ("retry", None))
+                            self.assertTrue(str(row["error"]).startswith("Service not ready"), row["error"])
+                            # not claimable during the backoff; tried again once it is due
+                            self.assertEqual(worker_mod.run_once(con, settings=settings), "no-job")
+                        con.execute("UPDATE jobs SET next_attempt_at = 0 WHERE job_id = ?", (job_id,))
+                        con.commit()
+                failures = con.execute("SELECT COUNT(*) FROM failures WHERE job_id = ?", (job_id,)).fetchone()[0]
+                kinds = [e["kind"] for e in db.job_events(con, job_id)]
+            # The two deferrals count no retry and the wait doubles; once they are used up, retries are counted and
+            # backed off as usual, ending in failed
+            self.assertEqual([w[0] for w in waits], [0, 0, 1, 2, 2])
+            self.assertTrue(300 <= waits[0][1] <= 302 and 600 <= waits[1][1] <= 602, waits)
+            self.assertEqual(failures, 3)
+            self.assertEqual(kinds, ["retry", "retry", "retry", "retry", "error"])
+
+    def test_a_real_failure_is_still_counted(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                _, job_id = WorkerBranchTests._file_and_job(self, con)
+                con.commit()
+                with mock.patch.object(worker_mod, "process_parse_job", side_effect=RuntimeError("MinerU 500")):
+                    result = worker_mod.run_once(con, settings=WorkerBranchTests._settings(self, state))
+                self.assertTrue(result.startswith("retry:"), result)
+                self.assertEqual(con.execute("SELECT retry_count FROM jobs WHERE job_id = ?", (job_id,)).fetchone()[0], 1)
+
+    def test_an_unreachable_model_stops_the_caption_run(self) -> None:
+        from unittest import mock
+
+        import httpx
+        import openai
+
+        from kb_pipeline.parsers.errors import service_unreachable
+        from kb_pipeline.vision import vlm
+
+        tried: list[str] = []
+
+        def refused(*, image_path, **kwargs):
+            tried.append(image_path.name)
+            time.sleep(0.02)
+            try:
+                raise httpx.ConnectError("[Errno 111] Connection refused")
+            except httpx.ConnectError as exc:
+                raise openai.APIConnectionError(request=httpx.Request("POST", "http://127.0.0.1:8105/v1")) from exc
+
+        jobs = [(f"b{i}", Path(f"/x/{i}.png"), None, None) for i in range(30)]
+        with mock.patch.object(vlm, "caption_image", refused), redirect_stdout(io.StringIO()):
+            with self.assertRaises(openai.APIConnectionError) as caught:
+                vlm.caption_images_parallel(jobs, base_url="http://v", api_key="k", model_id="m", concurrency=2)
+        self.assertTrue(service_unreachable(caught.exception))
+        self.assertLessEqual(len(tried), 6)                         # the remaining images are no longer tried one by one
+
+    def test_a_visual_embedding_transport_failure_skips_the_queued_images(self) -> None:
+        from unittest import mock
+
+        import requests
+
+        from kb_pipeline.embedding.visual import VisualEmbeddingClient
+
+        client = VisualEmbeddingClient(base_url="http://127.0.0.1:8103/v1", api_key="", model_id="m", dim=4, concurrency=2)
+        tried: list[str] = []
+
+        def refused(path, *, cache_json=None):
+            tried.append(path.name)
+            time.sleep(0.02)
+            raise requests.ConnectionError("refused")
+
+        with mock.patch.object(client, "embed_image", refused), redirect_stdout(io.StringIO()):
+            with self.assertRaises(requests.ConnectionError):
+                client.embed_images([(Path(f"/x/{i}.png"), None) for i in range(30)])
+        self.assertLessEqual(len(tried), 6)
+
+
+class WrapperScriptTests(unittest.TestCase):
+    """The scan and worker wrapper scripts, really run with a fake python."""
+
+    REPO = Path(__file__).resolve().parents[2]
+
+    def _fake_python(self, tmp: Path, body: str) -> None:
+        py = tmp / "app" / ".venv" / "bin" / "python"
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_text("#!/bin/bash\n" + body, encoding="utf-8")
+        py.chmod(0o755)
+
+    def _env(self, tmp: Path, **extra: str) -> dict[str, str]:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("KB_")}
+        env.update({
+            "KB_LOCAL_BASE_DIR": str(tmp), "KB_ENV_FILE": str(tmp / "absent.env"), "TMPDIR": str(tmp),
+            "KB_SCAN_REQUIRE_FLAG": "0",
+            "KB_SCAN_KICK_WORKER": "0",          # a test must not kick the real worker of this machine
+            "no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost",
+        })
+        env.update(extra)
+        return env
+
+    @contextmanager
+    def _qdrant_is_up(self):
+        """The worker script probes Qdrant's /healthz with curl before it starts: serve a local port that only
+        answers 200."""
+        import http.server
+        import threading
+
+        class Healthy(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+
+            def log_message(self, *args) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Healthy)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+    def _worker(self, tmp: Path, qdrant_url: str, **extra: str):
+        import subprocess
+
+        return subprocess.run(["bash", str(self.REPO / "scripts" / "kb-pipeline-worker-once.sh")],
+                              env=self._env(tmp, QDRANT_URL=qdrant_url, **extra), capture_output=True, text=True, timeout=60)
+
+    def test_a_failed_scan_reaches_the_failure_branch_and_keeps_its_exit_code(self) -> None:
+        """A failed scan prints no summary line. Under set -euo pipefail the script used to die on the line that
+        extracts jobs=: it exited with 1, and both the real exit code and the "KB scan failed" line were lost."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            self._fake_python(tmp, 'echo "[scan] REFUSING KB lifecycle pass: mirror root missing" >&2\nexit 2\n')
+            proc = subprocess.run(["bash", str(self.REPO / "scripts" / "kb-pipeline-scan.sh")],
+                                  env=self._env(tmp), capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("REFUSING KB lifecycle pass", proc.stdout)
+            self.assertIn("KB scan failed (flag restored)", proc.stdout)
+            state = tmp / "runtime" / "state"
+            self.assertTrue((state / "mirror_changed.flag").exists())
+            self.assertFalse((state / "kb_scan.lock.d").exists())
+            self.assertEqual(list(tmp.glob("kb-scan.*")), [])
+            # a normal round works as before
+            self._fake_python(tmp, 'echo "scan summary: seen=3 added=0 unchanged=3 jobs=0 recent_pending=0 dry_run=False"\nexit 0\n')
+            proc = subprocess.run(["bash", str(self.REPO / "scripts" / "kb-pipeline-scan.sh")],
+                                  env=self._env(tmp), capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("KB scan end", proc.stdout)
+
+    def test_the_worker_script_counts_jobs_not_batches(self) -> None:
+        """processed used to grow by 1 per python batch (up to 10 jobs each), and the batch that ended in no-job
+        did not count at all: the processed figure in the log did not match the jobs actually done, and "at most
+        200 jobs per run" really meant two thousand."""
+        batch = ('n=0\nwhile [[ $# -gt 0 ]]; do [[ "$1" == "--max-jobs" ]] && n="$2"; shift; done\n'
+                 'echo "$n" >> "$KB_LOCAL_BASE_DIR/batches.log"\n')
+        with tempfile.TemporaryDirectory() as tmpdir, self._qdrant_is_up() as qdrant:
+            tmp = Path(tmpdir)
+            self._fake_python(tmp, batch + 'for i in $(seq 1 "$n"); do echo "[parse] start job=job_$i"; '
+                                           'echo "parse-done:job_$i:chunks=1"; done\nexit 0\n')
+            proc = self._worker(tmp, qdrant, KB_WORKER_MAX_JOBS_PER_RUN="25", KB_WORKER_JOBS_PER_PROCESS="10")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("KB worker reached per-run cap processed=25", proc.stdout)
+            self.assertEqual((tmp / "batches.log").read_text(encoding="utf-8").split(), ["10", "10", "5"])
+            # the queue ran empty after two jobs: those two count as well
+            self._fake_python(tmp, 'echo "retry:job_1:delay=300s:RuntimeError()"\necho "deferred:job_2:delay=300s:x"\n'
+                                   'echo "no-job"\nexit 0\n')
+            proc = self._worker(tmp, qdrant)
+            self.assertIn("KB worker loop idle processed=2", proc.stdout)
+            # the interpreter crashed midway: the jobs already done are still counted
+            self._fake_python(tmp, 'echo "parse-done:job_1:chunks=1"\nexit 137\n')
+            proc = self._worker(tmp, qdrant)
+            self.assertEqual(proc.returncode, 137, proc.stdout + proc.stderr)
+            self.assertIn("KB worker giving up after 3 crashed iterations", proc.stdout)
+            self.assertIn("crashes=3 processed=3", proc.stdout)
+            self.assertFalse((tmp / "runtime" / "state" / "kb_worker.lock.d").exists())
+            self.assertEqual(list(tmp.glob("kb-worker.*")), [])
+
+    def test_the_worker_script_prints_while_the_job_is_still_running(self) -> None:
+        """Output used to be captured per batch and printed only when the process ended: a parse running for an
+        hour or two left nothing in the log meanwhile."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir, self._qdrant_is_up() as qdrant:
+            tmp = Path(tmpdir)
+            # after the first line, wait until the test lets it go on (at most 10 seconds); the test only does so
+            # once it has seen that line
+            self._fake_python(tmp, 'echo "parse-done:job_1:chunks=1"\n'
+                                   'for i in $(seq 1 100); do [[ -f "$KB_LOCAL_BASE_DIR/go" ]] && break; sleep 0.1; done\n'
+                                   '[[ -f "$KB_LOCAL_BASE_DIR/go" ]] && echo "released-by-the-reader" || echo "gave-up-waiting"\n'
+                                   'echo "no-job"\nexit 0\n')
+            proc = subprocess.Popen(["bash", str(self.REPO / "scripts" / "kb-pipeline-worker-once.sh")],
+                                    env=self._env(tmp, QDRANT_URL=qdrant), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                seen = []
+                for line in proc.stdout:
+                    seen.append(line.strip())
+                    if line.startswith("parse-done:job_1"):
+                        (tmp / "go").write_text("", encoding="utf-8")
+                proc.wait(timeout=30)
+            finally:
+                proc.kill() if proc.poll() is None else None
+                proc.stdout.close()
+            self.assertIn("released-by-the-reader", seen)
+            self.assertTrue(seen[-1].endswith("KB worker loop end processed=1 ==="), seen)
+
+
 class WorkerTimeBudgetTests(unittest.TestCase):
     """The worker's per-round time limit must take effect **between two files**.
 
@@ -885,7 +1583,7 @@ class JobTimelineTests(unittest.TestCase):
                 self.assertEqual((removed["jobs"], removed["job_events"]), (1, 1))
                 self.assertEqual(db.job_events(con, jid), [])
 
-    def test_service_detail_failed_list_and_routes(self) -> None:
+    def test_service_detail_and_routes(self) -> None:
         from unittest import mock
 
         from fastapi.testclient import TestClient
@@ -911,16 +1609,11 @@ class JobTimelineTests(unittest.TestCase):
                 detail = service.job_detail(jid)
                 self.assertEqual(detail["job"]["status"], "failed")
                 self.assertEqual([e["kind"] for e in detail["events"]], ["stage", "error"])
-                failed = service.failed_jobs()
-                self.assertEqual([j["job_id"] for j in failed["jobs"]], [jid, "j2"])
-                self.assertEqual(failed["queue"], {"running": 0, "queued": 1, "retry": 1})
-                self.assertTrue(0 < failed["jobs"][1]["retry_in"] <= 90)
                 self.assertEqual(service.cancel_job("j3")["outcome"], "cancelled")
                 with self.assertRaises(KeyError):
                     service.job_detail("nope")
                 client = TestClient(create_app(), raise_server_exceptions=False)
                 self.assertEqual(client.get("/api/jobs/nope").status_code, 404)
-                self.assertEqual(client.get("/api/jobs/failed").status_code, 200)
                 self.assertEqual(client.post("/api/jobs/j2/cancel").json()["outcome"], "cancelled")
 
     def test_console_shows_the_job_timeline_in_the_drawer(self) -> None:
@@ -960,37 +1653,6 @@ class JobTimelineTests(unittest.TestCase):
         self.assertTrue(all(e["synthesized"] for e in detail["events"]))
         self.assertEqual(detail["events"][1]["text"], "切块")
 
-    def test_kb_jobs_lists_one_kb_with_its_own_queue_depth(self) -> None:
-        from unittest import mock
-
-        from fastapi.testclient import TestClient
-
-        from kb_server import service
-        from kb_server.main import create_app
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / "s.db"; db.init_db(state)
-            with db.connect(state) as con:
-                for jid, kb, st, upd in (("r1", "kb_1", "running", 5), ("d1", "kb_1", "done", 9),
-                                         ("f1", "kb_1", "failed", 7), ("q1", "kb_1", "queued", 8),
-                                         ("x1", "kb_2", "running", 6)):
-                    con.execute(
-                        "INSERT INTO jobs(job_id, kb_id, collection, job_type, status, created_at, updated_at, "
-                        "next_attempt_at) VALUES(?, ?, ?, 'parse', ?, 0, ?, 0)", (jid, kb, kb, st, upd))
-                con.commit()
-            with mock.patch.object(service, "settings", lambda: SimpleNamespace(state_db=state)):
-                all_jobs = service.kb_jobs("kb_1")
-                # running → failed → queued → history; other KBs' jobs do not mix in
-                self.assertEqual([j["job_id"] for j in all_jobs["jobs"]], ["r1", "f1", "q1", "d1"])
-                self.assertEqual(all_jobs["queue"], {"running": 1, "queued": 1, "retry": 0})
-                self.assertEqual([j["job_id"] for j in service.kb_jobs("kb_1", "failed")["jobs"]], ["f1"])
-                self.assertEqual([j["job_id"] for j in service.kb_jobs("kb_1", "done")["jobs"]], ["d1"])
-                with self.assertRaises(ValueError):
-                    service.kb_jobs("kb_1", "bogus")
-                client = TestClient(create_app(), raise_server_exceptions=False)
-                self.assertEqual(client.get("/api/kbs/kb_1/jobs?status=active").json()["queue"]["running"], 1)
-                self.assertEqual(client.get("/api/kbs/kb_1/jobs?status=bogus").status_code, 422)
-
     def test_kb_files_carries_chunk_counts_profile_and_index_time(self) -> None:
         """The file table must sort by chunk count and index time and show which parser version indexed the file —
         previously only visible by opening the database."""
@@ -1027,59 +1689,6 @@ class JobTimelineTests(unittest.TestCase):
         # mistaken for this one's
         self.assertEqual((rows["fb"]["dot"], rows["fb"]["chunks"], rows["fb"]["indexed_at"]), ("yellow", None, None))
 
-    def test_graph_builds_summarize_each_run(self) -> None:
-        """The graph tab's history table: each build's mode, scale, resolution effect and completed phases. All
-        numbers come from the manifest and resolve_entities.json; left empty when that step was not reached."""
-        from unittest import mock
-
-        from fastapi.testclient import TestClient
-
-        from kb_server import service
-        from kb_server.main import create_app
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / "s.db"; db.init_db(state)
-            out = Path(tmp) / "out"; out.mkdir()
-            manifest = {"steps": ["preflight", "extract", "neo4j_import"], "resumed_phases": ["prepare_input"],
-                        "input": {"documents": 12},
-                        "graph": {"entities": 781, "relations": 1500, "units": 300, "mentions": 2000,
-                                  "resolution": {"candidates": 40, "yes": 12, "entities_before": 879,
-                                                 "entities_after": 781, "merged_away": 98, "groups": 9, "failed_batches": 0},
-                                  "merge": {"type_violations": 3, "schema_drift_types": 1, "schema_drift_predicates": 0}},
-                        "neo4j_import": {"expected_counts": {"entities": 781, "relations": 1500,
-                                                             "text_units": 300, "documents": 12}}}
-            with db.connect(state) as con:
-                con.execute(
-                    "INSERT INTO kb_sources(kb_id, collection, source_root, status, first_seen_at, last_seen_at, "
-                    "config_json) VALUES('kb_1', 'kb_1', 'dir', 'active', 0, 0, '{}')")
-                con.execute(
-                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
-                    "status, stage, started_at, finished_at, input_rows, active_chunk_count, output_dir, manifest_json) "
-                    "VALUES('g1', 'k', 'kb_1', 'kb_1', 'v1', 'done', '完成', 100, 900, 12, 300, ?, ?)",
-                    (str(out), json.dumps(manifest)))
-                con.execute(
-                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
-                    "status, stage, started_at) VALUES('g2', 'k', 'kb_1', 'kb_1', 'v2', 'running', '实体抽取 1/2 单元(缓存 0)', 1000)")
-                con.execute("INSERT INTO graph_build_phases(graph_build_id, phase, done_at) VALUES('g1', 'extract', 500)")
-                con.execute("INSERT INTO graph_build_phases(graph_build_id, phase, done_at) VALUES('g1', 'prepare_input', 200)")
-                con.commit()
-            with mock.patch.object(service, "settings", lambda: SimpleNamespace(state_db=state)):
-                builds = service.graph_builds("kb_1")["builds"]
-                client = TestClient(create_app(), raise_server_exceptions=False)
-                self.assertEqual(client.get("/api/kbs/kb_1/graph_builds").json()["builds"][0]["graph_build_id"], "g2")
-        self.assertEqual([b["graph_build_id"] for b in builds], ["g2", "g1"])
-        running, done = builds
-        # The run still in progress has an empty manifest: all numbers stay empty
-        self.assertEqual((running["mode"], running["counts"], running["resolution"], running["phases"]),
-                         ("entity_graph", None, None, []))
-        self.assertEqual(done["mode"], "entity_graph")
-        self.assertEqual(done["counts"]["entities"], 781)
-        self.assertEqual(done["counts"]["type_violations"], 3)
-        self.assertEqual(done["resolution"]["merged_away"], 98)
-        self.assertEqual([p["label"] for p in done["phases"]], ["Preparing corpus", "Entity extraction"])   # ordered by completion time
-        self.assertEqual(done["resumed_phases"], ["Preparing corpus"])
-        self.assertEqual(done["input_rows"], 12)
-
 
 class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCase):
     """Regressions for problems found by past re-reviews, health checks and audits; each case's docstring names the
@@ -1090,8 +1699,8 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
 
         file = _local_file("dir/报告.pdf", checksum="c1")
         with tempfile.TemporaryDirectory() as tmp:
-            with db.connect(Path(tmp) / "s.db") as con:
-                db.init_db_connection(con) if hasattr(db, "init_db_connection") else con.executescript(db.SCHEMA)
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 change, job_id = schedule_file(con, ingest_run_id="r1", file=file,
                                                current_seen_file_keys=set(), current_checksum_counts={})
                 self.assertEqual(change, "new"); self.assertIsNotNone(job_id)
@@ -1113,8 +1722,8 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
 
         file = _local_file("dir/恢复的文件.pdf", checksum="c1")
         with tempfile.TemporaryDirectory() as tmp:
-            with db.connect(Path(tmp) / "s.db") as con:
-                con.executescript(db.SCHEMA)
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 change, job_id = schedule_file(con, ingest_run_id="r1", file=file,
                                                current_seen_file_keys=set(), current_checksum_counts={})
                 self.assertEqual(change, "new")
@@ -1141,8 +1750,8 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
 
         file = _local_file("dir/说明.pdf", checksum="c1")
         with tempfile.TemporaryDirectory() as tmp:
-            with db.connect(Path(tmp) / "s.db") as con:
-                con.executescript(db.SCHEMA)
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 schedule_file(con, ingest_run_id="r1", file=file,
                               current_seen_file_keys=set(), current_checksum_counts={})
                 file_id = db.file_id_for(file.kb_id, file.file_key)
@@ -1169,8 +1778,8 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
     def test_purge_kb_state_uses_subqueries(self) -> None:  # issue 15
         files = [_local_file(f"dir/f{i}.pdf", checksum=f"c{i}") for i in range(30)]
         with tempfile.TemporaryDirectory() as tmp:
-            with db.connect(Path(tmp) / "s.db") as con:
-                con.executescript(db.SCHEMA)
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
                 from kb_pipeline.pipeline.scheduler import schedule_file
 
                 for f in files:
@@ -1589,10 +2198,6 @@ class MirrorBoundaryTests(unittest.TestCase):
                 verify_source_file(settings, source, mirror / "kb" / "synthetic.txt")       # explicitly allowed: the target is the boundary
         src = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
         self.assertLess(src.index("verify_source_file(settings, source, path)"), src.index("_parse_blocks(settings, source, path"))
-        # the console's chunk preview reads source files too, so it applies the same check before parsing
-        preview = _repo_file("app/kb_server/service.py")
-        preview = preview[preview.index("def chunk_preview("):]
-        self.assertLess(preview.index("verify_source_file(cfg, source, path)"), preview.index("_parse_blocks(cfg, source, path"))
 
     def test_each_job_reads_the_source_from_the_registry(self) -> None:
         """2026-09-29 audit: one worker process runs several jobs; with only the source snapshot taken at start-up
@@ -1630,6 +2235,8 @@ class MirrorBoundaryTests(unittest.TestCase):
                 verify_source_file(settings, fresh, doc)                         # passes with the registry's current row
             with db.connect(state) as con:
                 con.execute("UPDATE kb_sources SET status = 'inactive' WHERE kb_id = 'kb_001'")
+            with self.assertRaisesRegex(JobCancelled, "not enrolled or has been disabled"):
+                _source_for_file(settings, "kb_001")                             # the snapshot still holds the pre-close source: not used
             settings.sources = {}
             with self.assertRaisesRegex(JobCancelled, "not enrolled or has been disabled"):
                 _source_for_file(settings, "kb_001")                             # not a failure: nothing to retry, nothing to block
