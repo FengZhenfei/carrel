@@ -14,11 +14,12 @@ from pathlib import Path
 from . import db
 from . import discovery, search_fts
 from .config import load_settings
-from .graph.build import adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild, llm_ready
+from .graph.build import adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild, llm_ready, rollback_graph_version
 from .graph.lock import build_lock_held, build_lock_path, clear_lock_leftovers
 from .graph.neo4j_import import delete_neo4j_graph_version, import_graph_to_neo4j, neo4j_status
 from .localfs.scanner import list_recent_source_files, list_source_files
 from .maintenance import (
+    graph_gc,
     kb_sources_gc,
     monthly_log_cleanup,
     neo4j_graph_gc,
@@ -699,6 +700,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             delete_unparseable=args.delete_unparseable,
         )
+    elif args.cleanup_command == "graph-gc":
+        result = graph_gc(settings, keep_latest=args.keep_latest, dry_run=args.dry_run)
     elif args.cleanup_command == "parse-assets-gc":
         retention_days = args.retention_days if args.retention_days is not None else settings.qdrant_inactive_retention_days
         result = parse_assets_gc(settings, retention_days=retention_days, dry_run=args.dry_run)
@@ -970,6 +973,14 @@ def cmd_graph(args: argparse.Namespace) -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 0
 
+    if args.graph_command == "rollback":
+        if len(selected) != 1:
+            raise ValueError("rollback requires exactly one selected source (--source / --collection)")
+        (key, source), = selected
+        result = rollback_graph_version(settings, source_key=key, source=source, graph_version=args.graph_version)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0
+
     if args.graph_command == "neo4j-import":
         if len(selected) != 1 and args.graph_version:
             raise ValueError("--graph-version can only be used with a single selected source")
@@ -1216,7 +1227,7 @@ def build_parser() -> argparse.ArgumentParser:
     qdrant_gc.set_defaults(func=cmd_cleanup)
     qdrant_graph_gc = cleanup_sub.add_parser(
         "qdrant-graph-gc",
-        help="Delete unaliased versioned graph Qdrant collections older than retention",
+        help="Days-only manual tool: delete unaliased graph collections older than retention (the keep-N rule is cleanup graph-gc)",
     )
     qdrant_graph_gc.add_argument("--retention-days", type=int, default=None)
     qdrant_graph_gc.add_argument(
@@ -1228,7 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
     qdrant_graph_gc.set_defaults(func=cmd_cleanup)
     neo4j_graph_gc_parser = cleanup_sub.add_parser(
         "neo4j-graph-gc",
-        help="Delete inactive Neo4j graph projection versions older than retention",
+        help="Days-only manual tool: delete inactive Neo4j graph versions older than retention (the keep-N rule is cleanup graph-gc)",
     )
     neo4j_graph_gc_parser.add_argument("--retention-days", type=int, default=None)
     neo4j_graph_gc_parser.add_argument(
@@ -1238,6 +1249,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     neo4j_graph_gc_parser.add_argument("--dry-run", action="store_true")
     neo4j_graph_gc_parser.set_defaults(func=cmd_cleanup)
+    graph_gc_parser = cleanup_sub.add_parser(
+        "graph-gc",
+        help="Delete superseded graph versions of every base with the active-plus-N-1 rule (same as the end of a build; skipped while a build runs)",
+    )
+    graph_gc_parser.add_argument("--keep-latest", type=int, default=None, help="Override GRAPH_GC_KEEP_VERSIONS")
+    graph_gc_parser.add_argument("--dry-run", action="store_true")
+    graph_gc_parser.set_defaults(func=cmd_cleanup)
     parse_assets_gc_parser = cleanup_sub.add_parser(
         "parse-assets-gc",
         help="Delete expired inactive points, SQLite rows, and parse asset dirs after retention",
@@ -1305,6 +1323,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_graph_source_args(graph_adopt)
     graph_adopt.add_argument("--graph-version", default=None)
     graph_adopt.set_defaults(func=cmd_graph)
+
+    graph_rollback = graph_sub.add_parser("rollback", help="Roll the live graph back to a kept earlier version (switch aliases, activate the Neo4j version, record it); the rejected version is deleted afterwards")
+    add_graph_source_args(graph_rollback)
+    graph_rollback.add_argument("--graph-version", required=True, help="Version to switch back to (must still be inside the kept N versions)")
+    graph_rollback.set_defaults(func=cmd_graph)
 
     graph_neo4j_import = graph_sub.add_parser("neo4j-import", help="Import a completed graph version into Neo4j")
     add_graph_source_args(graph_neo4j_import)

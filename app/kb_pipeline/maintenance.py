@@ -258,6 +258,49 @@ def neo4j_graph_gc(
     return result
 
 
+def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: bool = False) -> dict[str, object]:
+    """Nightly safety net: clean every base's superseded graph versions (Qdrant collections, Neo4j versions,
+    workspace directories, build records) with the same "active plus N - 1" rule as the end of a build. The
+    end-of-build GC only runs when that base builds, so idle bases and bases whose GC failed rely on this one.
+    The whole round is skipped while a build runs (the build lock cannot be taken)."""
+    from .graph.build import gc_graph_versions
+    from .graph.lock import GraphBuildLock
+    from .vector.qdrant import client as qdrant_client
+    from .vector.qdrant import graph_alias_targets, parse_graph_collection_name
+
+    keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 2) or 2))
+    out: dict[str, object] = {"skipped": False, "dry_run": dry_run, "keep_latest": keep, "sources": {}, "errors": {}}
+    lock = GraphBuildLock(settings)
+    try:
+        lock.acquire()
+    except RuntimeError:
+        return {"skipped": True, "reason": "graph build running", "dry_run": dry_run, "keep_latest": keep}
+    try:
+        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        for key, source in sorted(settings.sources.items(), key=lambda kv: kv[1].kb_id):
+            if not getattr(source, "graph_enabled", False):
+                continue
+            versions: set[str] = set()
+            for target in graph_alias_targets(q, source.collection).values():
+                parsed = parse_graph_collection_name(str(target)) if target else None
+                if parsed:
+                    versions.add(str(parsed["graph_version"]))
+            active = next(iter(versions)) if len(versions) == 1 else ""
+            try:
+                with db.connect(settings.state_db) as con:
+                    discard = db.unsuccessful_graph_versions(con, source.kb_id, superseded_only=True) - {active}
+            except sqlite3.OperationalError:
+                discard = set()
+            gc = gc_graph_versions(settings, source, q=q, graph_version=active, keep_latest=keep, discard=discard,
+                                   grace_seconds=0, dry_run=dry_run)
+            out["sources"][source.kb_id] = {"source": key, "active_graph_version": active or None, **gc["result"]}
+            if gc["errors"]:
+                out["errors"][source.kb_id] = gc["errors"]
+    finally:
+        lock.release()
+    return out
+
+
 # Only kill processes whose command line carries this marker. Graph builds and parse workers are both
 # `python -m kb_pipeline …`, and pids get recycled by the system -- for a stale graph_builds row that
 # sat there for days, the pid may long belong to someone else's process (worst case, this host's own web

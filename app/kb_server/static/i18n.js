@@ -516,6 +516,7 @@ const ZH_EN = {
   "自动重建新增比例格式无效: 如 20% 或 0.2,留空表示不按增量": "Invalid auto-rebuild new-content percentage: use 20% or 0.2; empty means no delta condition",
   "自动重建条件组合方式只能是 or 或 and": "The auto-rebuild condition operator must be or / and",
   "缺少标签版本 id": "Missing label version id",
+  "缺少 graph_version": "graph_version is required",
   "建图任务进行中,暂不能修改步骤模型,请等它结束或先关闭知识图谱": "A graph build is running; step models cannot be changed now. Wait for it to finish or turn the knowledge graph off first",
   "建图任务被「关闭知识图谱」停止": "Build stopped by “Turn off knowledge graph”",
   "知识库未开启": "The knowledge base is not enabled",

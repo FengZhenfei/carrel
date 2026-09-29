@@ -809,7 +809,7 @@ class GraphBuildRecordPruneTests(unittest.TestCase):
                 self.assertEqual(db.count_graph_builds_since(con, "kb_1", kind="append", since_ts=110), 2)   # policy counts unaffected
                 self.assertEqual(db.prune_graph_builds(con, "kb_1"), 0)
         src = _repo_file("app/kb_pipeline/graph/build.py")
-        self.assertIn('return db.prune_graph_builds(con, source.kb_id)', src)                      # the end-of-build cleanup still prunes records
+        self.assertIn('return db.prune_graph_builds(con, source.kb_id, keep_versions=kept)', src)                      # the end-of-build cleanup still prunes records
         # Codex 2026-09-13 F05: the sample list is capped at 50 and the total kept separately; the API uses the
         # total; truncation in this run and truncation in the cached assets are reported separately
         self.assertIn('"partial_units_total": sum(', src)
@@ -1363,7 +1363,7 @@ class IncrementalAppendTests(unittest.TestCase):
         out = delete_old_graph_collections(FakeQ(), source_collections=["kb_003"], retention_days=14, dry_run=True, keep_latest=2)
         self.assertEqual({d["collection"] for d in out["deleted"]}, set(names[4:]))          # versions 3, 4 and 5 (one of each collection)
         self.assertTrue(all(d["reason"] == "beyond_keep_latest" for d in out["deleted"]))
-        self.assertEqual({s["reason"] for s in out["skipped_collections"]}, {"aliased", "within_retention"})
+        self.assertEqual({s["reason"] for s in out["skipped_collections"]}, {"aliased", "active_version", "within_keep_latest"})
         untouched = delete_old_graph_collections(FakeQ(), source_collections=["kb_003"], retention_days=14, dry_run=True)
         self.assertEqual(untouched["deleted"], [])                                            # no keep_latest = by age only
 
@@ -1875,3 +1875,188 @@ class GraphBuildFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalT
         self.assertEqual(input_drift(ledger[:2], [ref("p1", "alpha"), ref("p2", "beta")]),
                          {"missing": 0, "text_mismatch": 0, "version_mismatch": 0})
         self.assertIn("raise GraphInputIncomplete(", _repo_file("app/kb_pipeline/graph/build.py"))
+
+
+class GraphVersionRetentionTests(unittest.TestCase):
+    """2026-09-29: keeping N versions is unconditional -- the active version plus the N-1 newest others, whatever
+    their age; the rollback command switches the live graph back to a kept version, marks the rejected version
+    rolled_back and deletes it right after."""
+
+    @staticmethod
+    def _versions(days: list[int]) -> list[str]:
+        import time
+
+        return [f"003-{time.strftime('%Y%m%d-%H%M%S', time.localtime(time.time() - d * 86400))}-{i:06x}"
+                for i, d in enumerate(days)]
+
+    def test_keep_window_is_age_independent_and_counts_the_active_version(self) -> None:
+        from kb_pipeline.vector.qdrant import delete_old_graph_collections, graph_collection_name
+
+        versions = self._versions([10, 20, 30, 40])            # v0 active; v1 onward are older than the 14-day retention
+        names = {(v, t): graph_collection_name("kb_003", t, v) for v in versions for t in ("entity", "relation")}
+
+        class FakeQ:
+            def get_aliases(self):
+                return SimpleNamespace(aliases=[SimpleNamespace(alias_name="graph_003_entity", collection_name=names[(versions[0], "entity")])])
+
+            def get_collections(self):
+                return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in names.values()])
+
+        out = delete_old_graph_collections(FakeQ(), source_collections=["kb_003"], retention_days=14, dry_run=True, keep_latest=2)
+        deleted = {d["collection"]: d["reason"] for d in out["deleted"]}
+        self.assertEqual(set(deleted), {names[(v, t)] for v in versions[2:] for t in ("entity", "relation")})
+        self.assertEqual(set(deleted.values()), {"beyond_keep_latest"})
+        skipped = {s["collection"]: s["reason"] for s in out["skipped_collections"]}
+        self.assertEqual(skipped[names[(versions[0], "entity")]], "aliased")
+        self.assertEqual(skipped[names[(versions[0], "relation")]], "active_version")      # the active version's unaliased collection stays too
+        self.assertEqual(skipped[names[(versions[1], "entity")]], "within_keep_latest")   # the 20-day-old previous version stays
+        only_active = delete_old_graph_collections(FakeQ(), source_collections=["kb_003"], retention_days=14, dry_run=True, keep_latest=1)
+        self.assertEqual({d["collection"] for d in only_active["deleted"]}, {n for (v, t), n in names.items() if v != versions[0]})
+        days_only = delete_old_graph_collections(FakeQ(), source_collections=["kb_003"], retention_days=14, dry_run=True)
+        self.assertEqual({d["reason"] for d in days_only["deleted"]}, {"expired"})        # no keep window = the manual days-only rule
+        self.assertEqual({d["graph_version"] for d in days_only["deleted"]}, set(versions[1:]))
+
+    def test_neo4j_keep_window_is_age_independent(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import neo4j_import as n4
+
+        versions = self._versions([10, 20, 30])
+        deleted: list[str] = []
+        fakes = dict(
+            neo4j_driver=lambda settings: SimpleNamespace(close=lambda: None),
+            active_neo4j_graph_version=lambda driver, kb_id: versions[0],
+            neo4j_graph_versions=lambda driver, kb_id: [{"graph_version": v, "imported_at": None} for v in versions],
+            count_version_nodes=lambda driver, kb_id, version: 10,
+            delete_version=lambda driver, kb_id, version: deleted.append(version) or 10,
+        )
+        with mock.patch.multiple(n4, **fakes):
+            out = n4.delete_old_neo4j_graph_versions(SimpleNamespace(), sources=[SimpleNamespace(kb_id="kb_003", collection="kb_003")],
+                                                     retention_days=14, dry_run=False, keep_latest=2)
+        src = out["sources"]["kb_003"]
+        self.assertEqual([(d["graph_version"], d["reason"]) for d in src["deleted"]], [(versions[2], "beyond_keep_latest")])
+        self.assertEqual({s["graph_version"]: s["reason"] for s in src["skipped"]}, {versions[0]: "active", versions[1]: "within_keep_latest"})
+        self.assertEqual(deleted, [versions[2]])
+
+    def test_workspace_keep_window_is_age_independent(self) -> None:
+        import os
+        import time
+
+        from kb_pipeline.graph.build import _prune_graph_workspaces
+
+        versions = self._versions([10, 20, 30])
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "work" / "003"
+            for i, v in enumerate(versions):
+                (parent / v).mkdir(parents=True)
+                old = time.time() - (10 + 10 * i) * 86400
+                os.utime(parent / v, (old, old))
+            settings = SimpleNamespace(graph_work_dir=Path(tmp))
+            source = SimpleNamespace(collection="kb_003")
+            out = _prune_graph_workspaces(settings, source, keep_version=versions[0], retention_days=14, keep_latest=2)
+            self.assertEqual([Path(d).name for d in out["removed_dirs"]], [versions[2]])
+            self.assertEqual(sorted(p.name for p in parent.iterdir()), sorted(versions[:2]))
+            dry = _prune_graph_workspaces(settings, source, keep_version=versions[0], retention_days=14, keep_latest=1, dry_run=True)
+            self.assertEqual([Path(d).name for d in dry["removed_dirs"]], [versions[1]])
+            self.assertTrue((parent / versions[1]).exists())                                  # dry_run deletes nothing
+
+    def test_prune_keeps_the_rows_of_kept_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                def row(bid, kind, status, started, finished):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                        "status, started_at, finished_at, build_kind) VALUES(?, 'k', 'kb_1', 'kb_1', ?, ?, ?, ?, ?)",
+                        (bid, "v-" + bid, status, started, finished, kind))
+                row("old_full", "full", "done", 50, 60)
+                row("full", "full", "done", 100, 110)
+                row("a1", "append", "done", 200, 210)
+                self.assertEqual(db.prune_graph_builds(con, "kb_1", keep_versions={"v-old_full"}), 0)     # a kept version keeps its record
+                self.assertEqual(db.prune_graph_builds(con, "kb_1"), 1)
+
+    def test_rolled_back_versions_are_discarded_even_when_newest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            with db.connect(state) as con:
+                for bid, status, started in (("good", "done", 100), ("bad", "rolled_back", 200), ("paused", "cancelled", 300)):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                        "status, started_at, build_kind) VALUES(?, 'k', 'kb_1', 'kb_1', ?, ?, ?, 'full')",
+                        (bid, "v-" + bid, status, started))
+                # the newest paused version is left for a resume; a rolled-back one is discarded regardless
+                self.assertEqual(db.unsuccessful_graph_versions(con, "kb_1", superseded_only=True), {"v-bad"})
+                self.assertEqual(db.unsuccessful_graph_versions(con, "kb_1"), {"v-bad", "v-paused"})
+
+    def test_rollback_switches_records_and_discards_the_rejected_version(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import build as build_mod
+        from kb_pipeline.models import KBSource
+        from kb_pipeline.vector.qdrant import graph_collection_name
+
+        old, new = self._versions([3, 1])
+        types = ("entity", "relation", "spec", "page")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "s.db"; db.init_db(state)
+            source = KBSource(kb_id="kb_003", collection="kb_003", source_root="r", source_type="local_mirror",
+                              max_tokens=400, overlap_tokens=80, physical_base=root / "r", graph_enabled=True)
+            settings = SimpleNamespace(state_db=state, runtime_dir=root / "rt", graph_work_dir=root / "graph",
+                                       graph_neo4j_import_after_build=False, graph_gc_keep_versions=2,
+                                       graph_gc_retention_days=14, neo4j_graph_retention_days=14, graph_gc_grace_seconds=0,
+                                       qdrant_url="http://q", qdrant_api_key=None)
+            for v in (old, new):
+                (root / "graph" / "work" / "003" / v).mkdir(parents=True)
+                (root / "graph" / "work" / "003" / v / "graph.json").write_text("{}", encoding="utf-8")
+            with db.connect(state) as con:
+                for bid, v, kind, started, finished in (("b_old", old, "full", 100, 110), ("b_new", new, "append", 200, 210)):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                        "started_at, finished_at, build_kind, cache_fingerprint) VALUES(?, 'kb_003', 'kb_003', 'kb_003', ?, 'done', ?, ?, ?, 'fp')",
+                        (bid, v, started, finished, kind))
+            names = {(v, t): graph_collection_name("kb_003", t, v) for v in (old, new) for t in types}
+            aliases = {f"graph_003_{t}": names[(new, t)] for t in types}
+            deleted: list[str] = []
+
+            class FakeQ:
+                def get_aliases(self):
+                    return SimpleNamespace(aliases=[SimpleNamespace(alias_name=a, collection_name=c) for a, c in aliases.items()])
+
+                def get_collections(self):
+                    return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in names.values()])
+
+                def collection_exists(self, name):
+                    return name in names.values()
+
+                def delete_collection(self, *args, **kwargs):
+                    deleted.append(args[0] if args else kwargs.get("collection_name"))
+                    return True
+
+            def fake_activate(q, *, source_collection, graph_version, graph_types=None):
+                previous = dict(aliases)
+                for t in types:
+                    aliases[f"graph_003_{t}"] = names[(graph_version, t)]
+                return {"previous": previous, "targets": dict(aliases), "changed": True, "skipped": []}
+
+            with mock.patch.object(build_mod, "activate_graph_aliases", fake_activate), \
+                    mock.patch.object(build_mod, "active_source_chunks", lambda s, src: []):
+                with self.assertRaisesRegex(ValueError, "already the active"):
+                    build_mod.rollback_graph_version(settings, source_key="kb_003", source=source, graph_version=new, q=FakeQ())
+                out = build_mod.rollback_graph_version(settings, source_key="kb_003", source=source, graph_version=old, q=FakeQ())
+            self.assertEqual((out["from_graph_version"], out["graph_version"]), (new, old))
+            self.assertEqual(out["records"], {"graph_build_id": "b_old", "record": "updated", "rejected": [new]})
+            self.assertEqual(aliases["graph_003_entity"], names[(old, "entity")])
+            self.assertEqual(set(deleted), {names[(new, t)] for t in types})                 # the rejected version is deleted right away
+            self.assertFalse((root / "graph" / "work" / "003" / new).exists())
+            self.assertTrue((root / "graph" / "work" / "003" / old).exists())
+            with db.connect(state) as con:
+                status = {r["graph_version"]: r["status"] for r in con.execute("SELECT graph_version, status FROM graph_builds")}
+                self.assertEqual(status, {old: "done", new: "rolled_back"})
+                self.assertEqual(db.latest_successful_graph_build(con, "kb_003")["graph_version"], old)   # the append baseline follows the rollback
+                self.assertEqual(db.unsuccessful_graph_versions(con, "kb_003"), {new})
+            # refused when the target's workspace is gone: incremental appends replay from it
+            (root / "graph" / "work" / "003" / old / "graph.json").unlink()
+            with mock.patch.object(build_mod, "activate_graph_aliases", fake_activate):
+                with self.assertRaisesRegex(ValueError, "workspace"):
+                    build_mod.rollback_graph_version(settings, source_key="kb_003", source=source, graph_version=new, q=FakeQ())

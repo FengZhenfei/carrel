@@ -205,7 +205,7 @@ def _graph_status(con, kb_id: str, dir_name: str, config: dict[str, Any]) -> str
     if not effective.get("graph_enabled"):
         return "disabled"
     row = con.execute(
-        "SELECT status FROM graph_builds WHERE kb_id=? ORDER BY started_at DESC LIMIT 1",
+        "SELECT status FROM graph_builds WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
         (kb_id,),
     ).fetchone()
     if row is None:
@@ -279,7 +279,7 @@ def _graph_build_info(con, kb_id: str, collection: str = "") -> dict[str, Any] |
     row = con.execute(
         "SELECT graph_build_id, graph_version, status, stage, started_at, finished_at, error, "
         "cache_fingerprint, source_content_hash, build_kind FROM graph_builds "
-        "WHERE kb_id=? ORDER BY started_at DESC LIMIT 1",
+        "WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
         (kb_id,),
     ).fetchone()
     if row is None:
@@ -1484,7 +1484,7 @@ def pause_graph_build(kb_id: str) -> dict[str, Any]:
         if row is None:
             raise KeyError(kb_id)
         latest = con.execute(
-            "SELECT status FROM graph_builds WHERE kb_id=? ORDER BY started_at DESC LIMIT 1",
+            "SELECT status FROM graph_builds WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
             (kb_id,),
         ).fetchone()
     if latest is None or str(latest["status"]) != "running":

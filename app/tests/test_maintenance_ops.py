@@ -88,6 +88,7 @@ class ScheduledCleanupCoverageTests(unittest.TestCase):
         "qdrant-gc": "qdrant_inactive_gc",
         "qdrant-graph-gc": "qdrant_graph_collection_gc",
         "neo4j-graph-gc": "neo4j_graph_gc",
+        "graph-gc": "graph_gc",
         "parse-assets-gc": "parse_assets_gc",
     }
 
@@ -508,3 +509,30 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
                 result = maintenance.kb_sources_gc(stub, retention_days=7)
             self.assertEqual(hard_delete.call_count, 1)
             self.assertEqual({e["kb_id"] for e in result["dropped"]}, {a.kb_id})
+
+
+class GraphGcSafetyNetTests(unittest.TestCase):
+    """Nightly graph-gc: shares the build lock with builds and skips the whole round while one runs; bases without
+    a graph are left alone."""
+
+    def test_graph_gc_skips_while_a_build_holds_the_lock(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from kb_pipeline import maintenance
+        from kb_pipeline.graph.lock import GraphBuildLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = SimpleNamespace(runtime_dir=Path(tmp), state_db=Path(tmp) / "s.db", sources={},
+                                       graph_gc_keep_versions=2, qdrant_url="http://127.0.0.1:1", qdrant_api_key=None)
+            holder = GraphBuildLock(settings)
+            holder.acquire()
+            try:
+                out = maintenance.graph_gc(settings, dry_run=True)
+            finally:
+                holder.release()
+            self.assertEqual((out["skipped"], out["reason"]), (True, "graph build running"))
+            free = maintenance.graph_gc(settings, dry_run=True)          # no graph-enabled base: nothing to do, lock released
+            self.assertEqual((free["skipped"], free["sources"]), (False, {}))
+            self.assertEqual(free["keep_latest"], 2)

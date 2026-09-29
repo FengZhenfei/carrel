@@ -37,6 +37,14 @@ mineru_output_gc() {
   echo "=== $(date '+%F %T') mineru-output-gc: removed ${removed:-0} output dir(s) older than ${MINERU_OUTPUT_KEEP_MINUTES} min ==="
 }
 
+# Graph-version safety net: the end-of-build GC only runs when that base builds, so idle bases and bases
+# whose GC failed rely on this one. Same "active plus N-1" rule (GRAPH_GC_KEEP_VERSIONS); the whole round
+# is skipped while a build runs.
+graph_versions_gc() {
+  "$PY" -m kb_pipeline --env-file "$ENV_FILE" cleanup graph-gc \
+    || { echo "=== $(date '+%F %T') graph-gc: cleanup failed ==="; return 1; }
+}
+
 # Weekly host clutter (2026-09-08, the user asked for all of it to rotate automatically):
 # - runtime/scratch: the agreed place for temporary scripts / comparison output; entries older than
 #   KB_SCRATCH_KEEP_DAYS (default 14 days) are removed;
@@ -100,6 +108,7 @@ while :; do
     maint_defer_clear "cleanup-$COMMAND"
     if [[ "$COMMAND" == "parse-assets-gc" ]]; then
       mineru_output_gc || true    # failing to clear the intermediate output is not a maintenance failure
+      graph_versions_gc || true   # graph-version safety net; a failure here is not a maintenance failure either
     fi
     if [[ "$COMMAND" == "weekly" ]]; then
       host_housekeeping || true   # host clutter, same as above

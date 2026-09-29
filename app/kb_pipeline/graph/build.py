@@ -46,11 +46,14 @@ from ..vector.qdrant import (
     LEGACY_GRAPH_VECTOR_TYPES,
     activate_graph_aliases,
     client as qdrant_client,
+    collection_exists,
     delete_old_graph_collections,
     drop_graph_aliases,
+    graph_alias_targets,
     graph_collection_alias,
     graph_collection_name,
     graph_collection_short_name,
+    graph_version_timestamp,
     parse_graph_collection_name,
     restore_graph_aliases,
 )
@@ -1265,52 +1268,13 @@ def build_graph(
 
         if run_gc and should_activate:
             stage("Cleaning up old versions")
-            keep_latest = max(1, int(getattr(settings, "graph_gc_keep_versions", 3) or 3))
-            gc_errors: dict[str, str] = {}
-
-            def gc_step(name: str, fn: Callable[[], Any], *, step: bool = True) -> None:
-                # The four cleanups are independent: one failing (2026-09-13, Neo4j deleting old versions hit the
-                # transaction memory limit) must not drag the other three down
-                try:
-                    result[name] = fn()
-                    if step:
-                        result["steps"].append(name)
-                except Exception as gc_exc:
-                    gc_errors[name] = repr(gc_exc)
-                    print(f"[graph] gc step {name} failed: {gc_exc!r}", flush=True)
-
-            # Versions left by pauses / failures: superseded once this version is built, they take no retention
-            # slot and are deleted from all three places together
-            discard: set[str] = set()
-            try:
-                with db.connect(settings.state_db) as con:
-                    discard = db.unsuccessful_graph_versions(con, source.kb_id) - {graph_version}
-            except Exception as gc_exc:
-                gc_errors["discard"] = repr(gc_exc)
-            result["graph_gc_discard"] = sorted(discard)
-            if discard:
-                print(f"[graph] gc: unsuccessful versions discarded outright: {sorted(discard)}", flush=True)
-            gc_step("graph_gc", lambda: delete_old_graph_collections(
-                q, source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=False,
-                keep_latest=keep_latest, discard_versions=discard))
-            gc_step("workspace_gc", lambda: _prune_graph_workspaces(
-                settings, source, keep_version=graph_version, retention_days=settings.graph_gc_retention_days,
-                keep_latest=keep_latest, discard_versions=discard), step=False)
-            if settings.graph_neo4j_import_after_build:
-                from .neo4j_import import delete_old_neo4j_graph_versions
-
-                gc_step("neo4j_graph_gc", lambda: delete_old_neo4j_graph_versions(
-                    settings, sources=[source], retention_days=settings.neo4j_graph_retention_days, dry_run=False,
-                    keep_latest=keep_latest, discard_versions=discard))
-
-            def prune_records() -> int:
-                with db.connect(settings.state_db) as con:
-                    return db.prune_graph_builds(con, source.kb_id)
-
-            gc_step("build_records_pruned", prune_records, step=False)
-            if gc_errors:
-                result["graph_gc_errors"] = gc_errors
-                result["graph_gc_error"] = "; ".join(f"{k}: {v}" for k, v in gc_errors.items())
+            gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version,
+                                   grace_seconds=int(getattr(settings, "graph_gc_grace_seconds", 0) or 0))
+            result.update(gc["result"])
+            result["steps"].extend(gc["steps"])
+            if gc["errors"]:
+                result["graph_gc_errors"] = gc["errors"]
+                result["graph_gc_error"] = "; ".join(f"{k}: {v}" for k, v in gc["errors"].items())
 
         stage("Done")
         with db.connect(settings.state_db) as con:
@@ -1415,42 +1379,122 @@ def _cached_extract_summary(settings: Settings, source: KBSource, schema: Extrac
 
 
 def _prune_graph_workspaces(settings: Settings, source: KBSource, *, keep_version: str, retention_days: int,
-                            keep_latest: int | None = None, discard_versions: Iterable[str] = ()) -> dict[str, Any]:
-    """Delete this KB's expired per-version workspace directories: past the retention days, or outside the most
-    recent keep_latest versions. The current version is always kept; the LLM cache is shared across versions and
-    left alone. discard_versions: versions left by pauses / failures, deleted outright without taking a slot (the
-    same rule as the Qdrant / Neo4j cleanup)."""
+                            keep_latest: int | None = None, discard_versions: Iterable[str] = (),
+                            dry_run: bool = False) -> dict[str, Any]:
+    """Delete this base's superseded per-version workspace directories with the same rule as the Qdrant /
+    Neo4j GC: with ``keep_latest`` the ``keep_version`` (active) directory plus the ``keep_latest - 1`` newest
+    other directories are kept unconditionally and everything older is deleted, age plays no part; without
+    ``keep_latest`` directories whose mtime is past the retention are deleted. ``keep_version`` is always kept;
+    the LLM cache is shared across versions and untouched. Directories are ranked by the timestamp in the
+    version id (mtime when the name is not a version id).
+    ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright."""
     short = graph_collection_short_name(source.collection)
     cutoff = time.time() - max(1, retention_days) * 86400
     discard = {str(v) for v in discard_versions if str(v)} - {keep_version}
     removed: list[str] = []
     parent = settings.graph_work_dir / "work" / short
     if parent.is_dir():
-        dirs = []
+        dirs: list[tuple[float, float, Path]] = []
         for version_dir in parent.iterdir():
             if not version_dir.is_dir():
                 continue
             try:
-                dirs.append((version_dir.stat().st_mtime, version_dir))
+                mtime = version_dir.stat().st_mtime
             except OSError:
                 continue
+            stamp = graph_version_timestamp(version_dir.name)
+            dirs.append((float(stamp) if stamp is not None else mtime, mtime, version_dir))
         dirs.sort(key=lambda item: -item[0])
+        slots: int | None = None
+        if keep_latest is not None:
+            slots = max(0, int(keep_latest) - (1 if keep_version and (parent / keep_version).is_dir() else 0))
         rank = 0
-        for mtime, version_dir in dirs:
-            if version_dir.name in discard:
-                shutil.rmtree(version_dir, ignore_errors=True)
-                removed.append(str(version_dir))
-                continue
-            beyond = keep_latest is not None and rank >= keep_latest
-            rank += 1
+        for _stamp, mtime, version_dir in dirs:
             if version_dir.name == keep_version:
                 continue
-            if mtime >= cutoff and not beyond:
+            if version_dir.name in discard:
+                if not dry_run:
+                    shutil.rmtree(version_dir, ignore_errors=True)
+                removed.append(str(version_dir))
                 continue
-            shutil.rmtree(version_dir, ignore_errors=True)
+            if slots is not None:
+                keep = rank < slots
+                rank += 1
+            else:
+                keep = mtime >= cutoff
+            if keep:
+                continue
+            if not dry_run:
+                shutil.rmtree(version_dir, ignore_errors=True)
             removed.append(str(version_dir))
     return {"removed_dirs": removed, "retention_days": retention_days, "keep_latest": keep_latest,
-            "discard_versions": sorted(discard)}
+            "discard_versions": sorted(discard), "dry_run": dry_run}
+
+
+def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_version: str,
+                      keep_latest: int | None = None, discard: set[str] | None = None,
+                      grace_seconds: int = 0, dry_run: bool = False) -> dict[str, Any]:
+    """One base's version GC, shared by the end of a build, a rollback and the nightly graph-gc: Qdrant
+    collections, workspace directories and Neo4j versions are cleaned with the same "graph_version (active)
+    plus the keep_latest - 1 newest others" rule, then the build records are pruned. The four steps are
+    independent: one failing does not drag the others down (2026-09-13: deleting old Neo4j versions hit the
+    transaction memory limit). When ``discard`` is not given it is read from the records (cancelled / failed /
+    rolled-back versions).
+    ``grace_seconds``: wait after switching versions so searches still running at the switch finish with the
+    old collections before they are deleted.
+    Returns {"result": per-step results, "steps": step names to record, "errors": failed steps}."""
+    keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 2) or 2))
+    result: dict[str, Any] = {}
+    steps: list[str] = []
+    errors: dict[str, str] = {}
+
+    def gc_step(name: str, fn: Callable[[], Any], *, step: bool = True) -> None:
+        try:
+            result[name] = fn()
+            if step:
+                steps.append(name)
+        except Exception as gc_exc:
+            errors[name] = repr(gc_exc)
+            print(f"[graph] gc step {name} failed: {gc_exc!r}", flush=True)
+
+    if discard is None:
+        discard = set()
+        try:
+            with db.connect(settings.state_db) as con:
+                discard = db.unsuccessful_graph_versions(con, source.kb_id) - {graph_version}
+        except Exception as gc_exc:
+            errors["discard"] = repr(gc_exc)
+    result["graph_gc_discard"] = sorted(discard)
+    if discard:
+        print(f"[graph] gc: unsuccessful versions discarded outright: {sorted(discard)}", flush=True)
+    if grace_seconds > 0 and not dry_run:
+        print(f"[graph] gc: waiting {grace_seconds}s for searches in flight before deleting superseded versions", flush=True)
+        time.sleep(grace_seconds)
+    gc_step("graph_gc", lambda: delete_old_graph_collections(
+        q, source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=dry_run,
+        keep_latest=keep, discard_versions=discard))
+    gc_step("workspace_gc", lambda: _prune_graph_workspaces(
+        settings, source, keep_version=graph_version, retention_days=settings.graph_gc_retention_days,
+        keep_latest=keep, discard_versions=discard, dry_run=dry_run), step=False)
+    if settings.graph_neo4j_import_after_build:
+        from .neo4j_import import delete_old_neo4j_graph_versions
+
+        gc_step("neo4j_graph_gc", lambda: delete_old_neo4j_graph_versions(
+            settings, sources=[source], retention_days=settings.neo4j_graph_retention_days, dry_run=dry_run,
+            keep_latest=keep, discard_versions=discard))
+    # The kept versions (active + inside the keep window) keep their records too: the status card still has
+    # their sizes and figures after a rollback to them
+    kept = {graph_version} | {str(r.get("graph_version") or "") for r in (result.get("graph_gc") or {}).get("skipped_collections", [])
+                             if r.get("reason") in ("aliased", "active_version", "within_keep_latest", "within_retention")}
+
+    def prune_records() -> int:
+        if dry_run:
+            return 0
+        with db.connect(settings.state_db) as con:
+            return db.prune_graph_builds(con, source.kb_id, keep_versions=kept)
+
+    gc_step("build_records_pruned", prune_records, step=False)
+    return {"result": result, "steps": steps, "errors": errors}
 
 
 def _install_build_signal_handlers(stop_event: threading.Event | None = None):
@@ -1763,3 +1807,135 @@ def adopt_current_graph(settings: Settings, *, source_key: str, source: KBSource
         "active_doc_count": len({chunk["doc_id"] for chunk in chunks if chunk.get("doc_id")}),
         "aliases": targets,
     }
+
+
+def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSource, graph_version: str,
+                           q: Any = None, grace_seconds: int | None = None) -> dict[str, Any]:
+    """Roll the live graph back to an earlier version that is still kept. Switches the Qdrant aliases,
+    activates the Neo4j version (re-imported from the workspace when its projection is gone), records it
+    (the target becomes the latest successful build; newer successful versions are marked rolled_back) and
+    finally deletes the rejected version together with anything beyond the keep window, with the usual GC
+    rule. The target's workspace (graph.json) must still exist: incremental appends replay from it.
+    Shares the build lock with builds: refused while a build is running."""
+    if not source.graph_enabled:
+        raise ValueError(f"source {source_key!r} has graph_enabled=false")
+    graph_version = str(graph_version or "").strip()
+    if not graph_version:
+        raise ValueError("graph_version is required")
+    guard = GraphBuildLock(settings)          # same lock as a build: never switch versions under a running build
+    guard.acquire()
+    try:
+        q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        current_versions: set[str] = set()
+        for target in graph_alias_targets(q, source.collection).values():
+            parsed = parse_graph_collection_name(str(target)) if target else None
+            if parsed:
+                current_versions.add(str(parsed["graph_version"]))
+        current = next(iter(current_versions)) if len(current_versions) == 1 else None
+        if graph_version in current_versions:
+            raise ValueError(f"{graph_version} is already the active graph version of {source.kb_id}")
+        required = [t for t in GRAPH_VECTOR_TYPES if t not in GRAPH_OPTIONAL_TYPES]
+        missing = [graph_collection_name(source.collection, t, graph_version) for t in required
+                   if not collection_exists(q, graph_collection_name(source.collection, t, graph_version))]
+        if missing:
+            raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: graph collection(s) missing: {missing}")
+        paths = graph_paths(settings, source, graph_version)
+        if not paths.graph_file.exists():
+            raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: workspace {paths.graph_file} is gone "
+                             "(incremental appends replay from it)")
+        result: dict[str, Any] = {"source": source_key, "kb_id": source.kb_id, "source_collection": source.collection,
+                                  "from_graph_version": current, "graph_version": graph_version, "steps": []}
+        use_neo4j = bool(getattr(settings, "graph_neo4j_import_after_build", False))
+        if use_neo4j:
+            from .neo4j_import import activate_neo4j_graph_version, count_version_nodes, import_graph_to_neo4j, neo4j_driver
+
+            driver = neo4j_driver(settings)
+            try:
+                nodes = count_version_nodes(driver, source.kb_id, graph_version)
+            finally:
+                driver.close()
+            if nodes <= 0:
+                # The target's Neo4j projection is gone: re-import it from the workspace, without activating
+                result["neo4j_reimport"] = import_graph_to_neo4j(
+                    settings, source_key=source_key, source=source, graph_version=graph_version,
+                    activate=False, require_qdrant_aliases=False)
+                result["steps"].append("neo4j_reimport")
+        alias_result = activate_graph_aliases(q, source_collection=source.collection, graph_version=graph_version)
+        result["qdrant_alias_activation"] = alias_result
+        result["steps"].append("activate_qdrant_aliases")
+        if use_neo4j:
+            try:
+                result["neo4j_activation"] = activate_neo4j_graph_version(settings, source=source, graph_version=graph_version)
+            except Exception:
+                try:
+                    restore_graph_aliases(q, alias_result["previous"])
+                    result["steps"].append("rollback_qdrant_aliases")
+                except Exception as rollback_exc:
+                    result["inconsistent"] = {"qdrant_aliases": "new", "neo4j": "old", "rollback_error": repr(rollback_exc)}
+                    print(f"[graph] alias restore failed during rollback; Qdrant and Neo4j versions now disagree: {rollback_exc!r}", flush=True)
+                raise
+            result["steps"].append("activate_neo4j")
+        chunks = active_source_chunks(settings, source)
+        with db.connect(settings.state_db) as con:
+            result["records"] = _record_rollback(con, settings, source, source_key=source_key, graph_version=graph_version,
+                                                 rolled_back_from=current, chunks=chunks, output_dir=str(paths.output_dir))
+        result["steps"].append("record")
+        grace = int(grace_seconds if grace_seconds is not None else getattr(settings, "graph_gc_grace_seconds", 0) or 0)
+        gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version, grace_seconds=grace)
+        result.update(gc["result"])
+        result["steps"].extend(gc["steps"])
+        if gc["errors"]:
+            result["graph_gc_errors"] = gc["errors"]
+        print(f"[graph] rollback {source.kb_id}: {current} -> {graph_version}; rejected={result['records'].get('rejected')}", flush=True)
+        return result
+    finally:
+        guard.release()
+
+
+def _record_rollback(con, settings: Settings, source: KBSource, *, source_key: str, graph_version: str,
+                     rolled_back_from: str | None, chunks: list[dict[str, str]], output_dir: str) -> dict[str, Any]:
+    """Build records after a rollback: the target becomes the latest successful build (finished_at bumped to
+    now, so the append baseline follows it); newer successful versions are marked rolled_back, which makes
+    them non-resumable and deleted at the next GC. When the target has no record any more (pruned long ago)
+    one is created under the current configuration: the fingerprint of the current config, the corpus snapshot
+    of the active chunks now."""
+    now = int(time.time())
+    row = con.execute("SELECT * FROM graph_builds WHERE source_collection = ? AND graph_version = ? LIMIT 1",
+                      (source.collection, graph_version)).fetchone()
+    target_ts = int(row["finished_at"] or row["started_at"] or 0) if row is not None else None
+    if target_ts is not None:
+        newer = con.execute(
+            "SELECT graph_build_id, graph_version FROM graph_builds WHERE kb_id = ? AND status = 'done' "
+            "AND graph_version != ? AND COALESCE(finished_at, started_at) > ?",
+            (source.kb_id, graph_version, target_ts)).fetchall()
+    else:
+        newer = con.execute(
+            "SELECT graph_build_id, graph_version FROM graph_builds WHERE kb_id = ? AND status = 'done' AND graph_version != ?",
+            (source.kb_id, graph_version)).fetchall()
+    rejected = sorted(str(r["graph_version"]) for r in newer)
+    for r in newer:
+        con.execute("UPDATE graph_builds SET status = 'rolled_back', error = ? WHERE graph_build_id = ?",
+                    (f"rolled back to {graph_version}", str(r["graph_build_id"])))
+    note = {"at": now, "from": rolled_back_from, "rejected": rejected}
+    if row is not None:
+        try:
+            manifest = json.loads(row["manifest_json"] or "{}")
+        except (TypeError, ValueError):
+            manifest = {}
+        manifest["rollback"] = note
+        con.execute("UPDATE graph_builds SET status = 'done', finished_at = ?, error = NULL, manifest_json = ? WHERE graph_build_id = ?",
+                    (now, json.dumps(manifest, ensure_ascii=False), str(row["graph_build_id"])))
+        return {"graph_build_id": str(row["graph_build_id"]), "record": "updated", "rejected": rejected}
+    fingerprint = ""
+    try:
+        fingerprint = graph_cache_fingerprint(settings, source)
+    except Exception:
+        pass
+    build_id = db.begin_graph_build(con, source_key=source_key, kb_id=source.kb_id, source_collection=source.collection,
+                                    graph_version=graph_version, cache_fingerprint=fingerprint, build_kind="full")
+    db.replace_graph_build_chunks(con, build_id, chunks)
+    db.finish_graph_build(con, build_id, status="done", active_chunk_count=len(chunks),
+                          active_doc_count=len({c["doc_id"] for c in chunks if c.get("doc_id")}),
+                          source_content_hash=source_snapshot_hash(chunks), output_dir=output_dir,
+                          manifest={"adopted": True, "rollback": note})
+    return {"graph_build_id": build_id, "record": "created", "rejected": rejected}

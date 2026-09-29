@@ -82,7 +82,7 @@ model weights, memory settings, and container logs.
 | `carrel-scan.timer` | 30 seconds, then every minute | Scan and queue file changes |
 | `carrel-worker.timer` | 1 minute, then every 5 minutes | Process queued ingestion work |
 | `carrel-graph-rebuild.timer` | 10 minutes, then every 2 hours | Incremental graph updates or policy-triggered rebuilds |
-| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup parse-assets-gc`: expired inactive index points, parse assets, old job rows and disabled libraries past retention. Graph versions are pruned by the build itself (`GRAPH_GC_KEEP_VERSIONS`) and by `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` |
+| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup parse-assets-gc` (followed by `cleanup graph-gc`, the keep-N graph-version GC): expired inactive index points, parse assets, old job rows and disabled libraries past retention. Graph versions are pruned by the build itself (`GRAPH_GC_KEEP_VERSIONS`) and by `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` |
 | `carrel-cache-weekly.timer` | 1 hour, then every 7 days | Rotate project caches |
 | `carrel-logs-monthly.timer` | 2 hours, then every 30 days | Rotate logs |
 
@@ -107,10 +107,10 @@ Run `app/.venv/bin/kb --help` and each subcommand's `--help` for arguments.
 | `qdrant ensure-collections`, `ensure-graph-collections` | Create missing collections |
 | `fts init/status/rebuild/sync-doc/search` | Keyword index administration |
 | `graph build/append/check-rebuild [--execute] [--force-full]` | Full build, incremental append, policy check (what the timer runs) |
-| `graph adopt-current/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | Graph version baseline and Neo4j projection |
+| `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | Graph version baseline, rollback to a kept earlier version, and Neo4j projection |
 | `graph query/factcheck/status` | Graph inspection and evaluation |
 | `search eval/make-set` | Retrieval evaluation and question-set preparation |
-| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/parse-assets-gc [--dry-run]` | Retention and maintenance (what the timers run) |
+| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/graph-gc/parse-assets-gc [--dry-run]` | Retention and maintenance (what the timers run) |
 | `reset --source kb_NNN [--all] --yes` | Wipe one base's state, caches and indexes and recreate its collection |
 
 When systemd manages the worker, trigger its unit to run an ingestion pass. For example, using an actual knowledge-base ID:

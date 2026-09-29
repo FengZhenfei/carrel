@@ -814,15 +814,17 @@ def delete_graph_extractions(con: sqlite3.Connection, kb_id: str) -> int:
     return int(cur.rowcount or 0)
 
 
-def prune_graph_builds(con: sqlite3.Connection, kb_id: str) -> int:
+def prune_graph_builds(con: sqlite3.Connection, kb_id: str, *, keep_versions: Iterable[str] = ()) -> int:
     """Keep only the useful graph build records: the running one, the latest successful one, and every row
     started after the latest full-rebuild version (the rebuild policy counts appends from them, and the
     status card's "N appends since the last full rebuild" relies on them too). Older rows are deleted
     together with their chunk ledger, phase markers and unit table -- once artifacts are only kept from
     the current version onward, hoarding the records makes no sense. Returns the number of deleted
-    records."""
+    records. ``keep_versions``: versions whose artifacts are still kept (the active one and those inside the
+    keep window); their records stay too, so the status card still has figures after a rollback to them."""
+    kept_versions = {str(v) for v in keep_versions if str(v)}
     rows = con.execute(
-        "SELECT graph_build_id, status, build_kind, started_at, finished_at FROM graph_builds WHERE kb_id = ?",
+        "SELECT graph_build_id, graph_version, status, build_kind, started_at, finished_at FROM graph_builds WHERE kb_id = ?",
         (kb_id,)).fetchall()
     ts = lambda r: int(r["finished_at"] or r["started_at"] or 0)
     done = [r for r in rows if str(r["status"]) == "done"]
@@ -830,7 +832,8 @@ def prune_graph_builds(con: sqlite3.Connection, kb_id: str) -> int:
     last_full = max((r for r in done if str(r["build_kind"] or "full") == "full"), key=ts, default=None)
     floor_ts = int(last_full["started_at"] or 0) if last_full is not None else 0
     keep = {str(r["graph_build_id"]) for r in rows
-            if str(r["status"]) == "running" or int(r["started_at"] or 0) >= floor_ts}
+            if str(r["status"]) == "running" or int(r["started_at"] or 0) >= floor_ts
+            or str(r["graph_version"] or "") in kept_versions}
     if latest_done is not None:
         keep.add(str(latest_done["graph_build_id"]))
     stale = [str(r["graph_build_id"]) for r in rows if str(r["graph_build_id"]) not in keep]
@@ -862,9 +865,11 @@ def unsuccessful_graph_versions(con: sqlite3.Connection, kb_id: str, *, supersed
     out: set[str] = set()
     for r in rows:
         version = str(r["graph_version"] or "")
-        if str(r["status"]) not in ("cancelled", "failed") or not version or version in alive:
+        status = str(r["status"])
+        if status not in ("cancelled", "failed", "rolled_back") or not version or version in alive:
             continue
-        if floor is not None and int(r["started_at"] or 0) >= floor:
+        # A rolled-back version was rejected on purpose: never kept for a resume, discarded at the next GC
+        if status != "rolled_back" and floor is not None and int(r["started_at"] or 0) >= floor:
             continue
         out.add(version)
     return out

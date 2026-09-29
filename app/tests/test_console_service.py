@@ -1450,6 +1450,27 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
         self.assertIn("allow_redirects=False", _repo_file("app/kb_pipeline/embedding/visual.py"))
         self.assertIn("allow_redirects=False", _repo_file("app/kb_search/channels.py"))
 
+    def test_graph_status_ignores_rolled_back_versions(self) -> None:
+        """The version rejected by a rollback keeps its record (status rolled_back); the status card and the graph status
+        ignore it and show the version rolled back to."""
+        from kb_pipeline import db as dbm
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "s.db"
+            dbm.init_db(state_db)
+            with dbm.connect(state_db) as con:
+                con.execute("INSERT INTO kb_sources(kb_id, collection, source_root, status, first_seen_at, last_seen_at, config_json) "
+                            "VALUES('kb_1', 'kb_1', 'dir', 'active', 0, 0, '{}')")
+                for bid, status, started in (("good", "done", 100), ("bad", "rolled_back", 200)):
+                    con.execute(
+                        "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                        "started_at, finished_at, build_kind) VALUES(?, 'k', 'kb_1', 'kb_1', ?, ?, ?, ?, 'full')",
+                        (bid, "v-" + bid, status, started, started + 10))
+                self.assertEqual(service._graph_status(con, "kb_1", "dir", {"graph_enabled": True}), "ok")
+                info = service._graph_build_info(con, "kb_1")
+                self.assertEqual((info["graph_version"], info["status"]), ("v-good", "done"))
+
     def test_save_llm_requires_connectivity_ok(self) -> None:
         from unittest import mock
 

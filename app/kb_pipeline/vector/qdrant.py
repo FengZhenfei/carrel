@@ -300,15 +300,21 @@ def delete_old_graph_collections(
     keep_latest: int | None = None,
     discard_versions: Iterable[str] = (),
 ) -> dict[str, object]:
-    """Delete expired graph version collections: past retention_days, or (when keep_latest is given) not
-    among the KB's latest keep_latest versions -- incremental append makes versions arrive often, each
-    version is a full set of collections, and keeping by days alone would fill the disk. A collection an
-    alias points to is never deleted.
-    discard_versions: versions left by paused / failed builds (db.unsuccessful_graph_versions); they take no
-    slot among the latest keep_latest versions and are deleted outright -- a half-finished version ranked
-    by timestamp would occupy a slot and push out the previous good graph (2026-09-13)."""
+    """Delete superseded graph-version collections. Two modes:
+    with ``keep_latest`` (the end-of-build GC and the nightly graph-gc): the aliased (active) version plus the
+    ``keep_latest - 1`` newest other versions are kept unconditionally and everything older is deleted; age plays
+    no part, so a rollback target does not disappear just because the knowledge base was idle for two weeks
+    (before 2026-09-29 the two rules were OR-ed and a version inside the keep window was deleted once it was
+    older than ``retention_days``).
+    Without ``keep_latest`` (the manual qdrant-graph-gc): days only, unaliased versions older than
+    ``retention_days`` are deleted.
+    ``discard_versions``: cancelled / failed / rolled-back versions take no keep slot and are deleted outright.
+    Aliased collections are never deleted; the active version's unaliased optional collections (spec / page)
+    stay with it."""
     if retention_days < 1:
         raise ValueError("retention_days must be >= 1")
+    if keep_latest is not None and int(keep_latest) < 1:
+        raise ValueError("keep_latest must be >= 1")
 
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
     discard = {str(v) for v in discard_versions if str(v)}
@@ -323,30 +329,42 @@ def delete_old_graph_collections(
         if parsed is None or parsed["source_short"] not in selected_sources:
             continue
         candidates.append((item.name, parsed))
-    # Rank each KB's versions by time, newest first (the entity / relation / fact collections of one version
-    # share a rank)
+    # Per source: a version with any aliased collection is the active one and takes a slot of its own; the
+    # other versions compete for the remaining slots in timestamp order, newest first
+    active_of: dict[str, set[str]] = {}
+    for collection, parsed in candidates:
+        if collection in alias_targets:
+            active_of.setdefault(str(parsed["source_short"]), set()).add(str(parsed["graph_version"]))
     rank_of: dict[tuple[str, str], int] = {}
+    slots_of: dict[str, int] = {}
     if keep_latest is not None:
         by_source: dict[str, dict[str, int]] = {}
         for _, parsed in candidates:
-            ts = graph_version_timestamp(str(parsed["graph_version"]))
-            if ts is not None and str(parsed["graph_version"]) not in discard:
-                by_source.setdefault(str(parsed["source_short"]), {})[str(parsed["graph_version"])] = ts
+            short, version = str(parsed["source_short"]), str(parsed["graph_version"])
+            ts = graph_version_timestamp(version)
+            if ts is not None and version not in discard and version not in active_of.get(short, ()):
+                by_source.setdefault(short, {})[version] = ts
+        for short in selected_sources:
+            slots_of[short] = max(0, int(keep_latest) - len(active_of.get(short, ())))
         for short, versions in by_source.items():
             for rank, version in enumerate(sorted(versions, key=lambda v: -versions[v])):
                 rank_of[(short, version)] = rank
 
     for collection, parsed in candidates:
         record: dict[str, object] = {"collection": collection, **parsed}
+        short, version = str(parsed["source_short"]), str(parsed["graph_version"])
         if collection in alias_targets:
             skipped_collections.append({**record, "reason": "aliased"})
             continue
-        if str(parsed["graph_version"]) in discard:
+        if version in active_of.get(short, ()):
+            skipped_collections.append({**record, "reason": "active_version"})
+            continue
+        if version in discard:
             delete_status = delete_collection(q, collection, dry_run=dry_run)
             deleted.append({**record, "reason": "unsuccessful", "status": delete_status})
             continue
 
-        version_ts = graph_version_timestamp(str(parsed["graph_version"]))
+        version_ts = graph_version_timestamp(version)
         if version_ts is None:
             if not delete_unparseable:
                 skipped_collections.append({**record, "reason": "unparseable_version_timestamp"})
@@ -356,22 +374,26 @@ def delete_old_graph_collections(
             continue
 
         record["version_ts"] = version_ts
-        rank = rank_of.get((str(parsed["source_short"]), str(parsed["graph_version"])))
-        beyond = keep_latest is not None and rank is not None and rank >= keep_latest
-        if version_ts >= cutoff_ts and not beyond:
+        if keep_latest is not None:
+            rank = rank_of.get((short, version), 0)
+            if rank < slots_of.get(short, 0):
+                skipped_collections.append({**record, "reason": "within_keep_latest", "rank": rank})
+                continue
+            delete_status = delete_collection(q, collection, dry_run=dry_run)
+            deleted.append({**record, "reason": "beyond_keep_latest", "status": delete_status})
+            continue
+        if version_ts >= cutoff_ts:
             skipped_collections.append({**record, "reason": "within_retention"})
             continue
-
         delete_status = delete_collection(q, collection, dry_run=dry_run)
-        deleted.append({**record, "reason": "beyond_keep_latest" if (beyond and version_ts >= cutoff_ts) else "expired",
-                        "status": delete_status})
+        deleted.append({**record, "reason": "expired", "status": delete_status})
 
     return {
         "dry_run": dry_run,
         "retention_days": retention_days,
+        "cutoff_ts": cutoff_ts,
         "keep_latest": keep_latest,
         "discard_versions": sorted(discard),
-        "cutoff_ts": cutoff_ts,
         "selected_sources": sorted(selected_sources),
         "deleted": deleted,
         "skipped_collections": skipped_collections,

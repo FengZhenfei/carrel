@@ -90,6 +90,7 @@ class Settings:
     # incremental append makes versions arrive more often, each version is a full set of collections, and
     # without a cap the disk fills up.
     graph_gc_keep_versions: int
+    graph_gc_grace_seconds: int
     neo4j_uri: str
     neo4j_user: str
     neo4j_password: str | None
@@ -226,6 +227,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         # 1 version only (morning of 2026-09-06); the Codex review advised keeping at least one accepted
         # version.
         graph_gc_keep_versions=max(1, int(os.getenv("GRAPH_GC_KEEP_VERSIONS", "2"))),
+        graph_gc_grace_seconds=max(0, int(os.getenv("GRAPH_GC_GRACE_SECONDS", "60"))),
         graph_neo4j_import_batch_size=int(os.getenv("GRAPH_NEO4J_IMPORT_BATCH_SIZE", "1000")),
         console_services=parse_console_services(os.getenv("KB_CONSOLE_SERVICES")),
         sources=sources,

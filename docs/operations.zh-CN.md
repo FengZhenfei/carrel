@@ -66,7 +66,7 @@ journalctl --user -u carrel-web --since -5min
 | `carrel-scan.timer` | 30 秒后首次执行，之后每分钟 | 扫描变化并排队 |
 | `carrel-worker.timer` | 1 分钟后首次执行，之后每 5 分钟 | 消费入库任务 |
 | `carrel-graph-rebuild.timer` | 10 分钟后首次执行，之后每 2 小时 | 增量更新，或按策略整库重建 |
-| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 运行 `kb cleanup parse-assets-gc`：清理保留期已过的失活索引点、解析资产、旧任务记录和已关闭的知识库。图版本由建图收尾阶段（`GRAPH_GC_KEEP_VERSIONS`）以及 `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` 清理 |
+| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 运行 `kb cleanup parse-assets-gc`（随后跑 `cleanup graph-gc`，按留 N 版规则清理图谱版本）：清理保留期已过的失活索引点、解析资产、旧任务记录和已关闭的知识库。图版本由建图收尾阶段（`GRAPH_GC_KEEP_VERSIONS`）以及 `kb cleanup qdrant-graph-gc` / `neo4j-graph-gc` 清理 |
 | `carrel-cache-weekly.timer` | 1 小时后首次执行，之后每 7 天 | 轮换项目缓存 |
 | `carrel-logs-monthly.timer` | 2 小时后首次执行，之后每 30 天 | 轮换日志 |
 
@@ -87,10 +87,10 @@ journalctl --user -u carrel-web --since -5min
 | `qdrant ensure-collections`、`ensure-graph-collections` | 创建缺失集合 |
 | `fts init/status/rebuild/sync-doc/search` | 关键词索引管理 |
 | `graph build/append/check-rebuild [--execute] [--force-full]` | 整库建图、增量并入、按策略检查是否该重建（定时器跑的就是它） |
-| `graph adopt-current/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | 图版本基线与 Neo4j 投影管理 |
+| `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | 图版本基线、回退到保留的旧版本、Neo4j 投影管理 |
 | `graph query/factcheck/status` | 图谱检查与评测 |
 | `search eval/make-set` | 检索评测与题集准备 |
-| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/parse-assets-gc [--dry-run]` | 保留期与维护操作（定时器跑的就是这些） |
+| `cleanup status/weekly/monthly/qdrant-gc/qdrant-graph-gc/neo4j-graph-gc/graph-gc/parse-assets-gc [--dry-run]` | 保留期与维护操作（定时器跑的就是这些） |
 | `reset --source kb_NNN [--all] --yes` | 清空指定知识库的状态、缓存和索引并重建其集合 |
 
 由 systemd 管理 worker 时，通过对应服务单元触发一轮入库。以下编号需替换成实际知识库编号：
