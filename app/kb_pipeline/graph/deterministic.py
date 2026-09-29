@@ -26,7 +26,7 @@ from .extract import ExtractionResult
 from .facts import fact_id, normalize_fact
 from .units import Unit
 
-VERSION = "det-v5"
+VERSION = "det-v6"
 
 TYPES = ("module", "class", "function", "method", "constant", "package", "repository", "skill", "instructions", "readme",
          "config_file", "document")
@@ -287,6 +287,38 @@ class DeterministicExtractor:
                     return cand
         return self._suffix_match(module.replace(".", "/")) if module and not level else None
 
+    def _resolve_submodule(self, importer_rel: str, module: str, name: str, level: int, target_rel: str | None) -> str | None:
+        """Look for c of ``from a.b import c`` as a submodule: only c.py / c/__init__.py below the package directory
+        of a.b. When a.b resolved to a package in the base (__init__.py) its directory is searched; a relative import
+        gets its directory from the level; when a.b is not in the base (a package without __init__.py) the whole
+        path a/b/c has to match. This must not go through _suffix_match: that strips leading segments one by one,
+        so ``from qdrant_client.http import models`` of an external package ends with just ``models`` and lands on
+        any models.py in the base, and the edge to the external package is lost as well (2026-09-29 audit)."""
+        name = str(name or "").strip()
+        if not name or name == "*":
+            return None
+        tails = (f"{name}.py", f"{name}/__init__.py")
+        if target_rel is not None:
+            if target_rel.rsplit("/", 1)[-1] != "__init__.py":
+                return None                                   # a.b is a module file, it has no submodules
+            stem = target_rel.rsplit("/", 1)[0] if "/" in target_rel else ""
+        elif level:
+            base = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
+            for _ in range(level - 1):
+                base = base.rsplit("/", 1)[0] if "/" in base else ""
+            stem = "/".join(part for part in (base, str(module or "").replace(".", "/")) if part)
+        else:
+            path = str(module or "").replace(".", "/").strip("/")
+            if not path or ":" in path or "\\" in path:
+                return None
+            hits = [f for f in self.known_files for tail in tails if f == f"{path}/{tail}" or f.endswith(f"/{path}/{tail}")]
+            return sorted(set(hits), key=lambda f: (len(f.split("/")), f))[0] if hits else None
+        for tail in tails:
+            cand = f"{stem}/{tail}" if stem else tail
+            if cand in self.known_files:
+                return cand
+        return None
+
     def _import_map(self, rel: str) -> dict[str, tuple[str | None, str | None, str | None]]:
         """Names in this file -> (in-KB module rel_path | None, symbol name | None, external package name | None)."""
         out: dict[str, tuple[str | None, str | None, str | None]] = {}
@@ -306,7 +338,7 @@ class DeterministicExtractor:
                 # from a.b import c: when c is not a symbol defined in module a.b, try the submodule a/b/c.py first,
                 # for relative imports too (`from .. import db`, `from .graph import build` are the usual in-package
                 # forms; both used to lose their calls / imports edges).
-                sub = self._resolve_module(rel, f"{module}.{name}" if module else name, level)
+                sub = self._resolve_submodule(rel, module, str(name), level, target_rel)
                 if sub and sub != target_rel:
                     out[local] = (sub, None, None)
                     continue

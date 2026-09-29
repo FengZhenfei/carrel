@@ -1109,6 +1109,53 @@ class DeterministicBuilderTests(unittest.TestCase):
                 self.assertIn(t, triples, t)
             self.assertNotIn(("app/pkg/pipeline/worker.py", "imports", "app/pkg/graph/__init__.py"), triples)
 
+    def test_external_imports_never_land_on_a_same_named_file(self) -> None:
+        """2026-09-29 audit: the submodule fallback resolved ``from qdrant_client.http import models`` to a models.py
+        in the base and dropped the edge to the external package. Submodules are only looked for in the package
+        directory the import names; when the whole path does not match it is an external package."""
+        from kb_pipeline.graph.deterministic import DeterministicExtractor
+        from kb_pipeline.graph.units import ChunkRef, build_units
+        from kb_pipeline.parsers.router import parse_native
+
+        repo = {
+            "app/pkg/__init__.py": "",
+            "app/pkg/models.py": "class Row:\n    pass\n",
+            "app/pkg/utils.py": "def helper():\n    return 1\n",
+            "app/pkg/vector/__init__.py": "",
+            "app/pkg/vector/store.py": ("from qdrant_client.http import models\nfrom django.db import models as dj\n"
+                                        "from requests import utils\nfrom pkg import models as own\nfrom pkg.vector import missing\n"
+                                        "from tools.extra import helper_mod\n\n\n"
+                                        "def point():\n    return models.PointStruct(id=1)\n"),
+            "tools/extra/helper_mod.py": "def run():\n    return 1\n",          # a package without __init__.py: the whole path has to match
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            refs = []
+            for i, (rel, text) in enumerate(repo.items(), 1):
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                refs += [ChunkRef(point_id=f"p{i}-{k}", chunk_uid=f"c{i}-{k}", doc_id=f"kb_x:{i}", content_version="v", chunk_index=k,
+                                  block_id=b.block_id, block_type=b.block_type, section_path=list(b.metadata.get("section_path") or []),
+                                  text=b.text, n_tokens=max(1, len(b.text) // 4), rel_path=rel, filename=rel.rsplit("/", 1)[-1])
+                         for k, b in enumerate(parse_native(path, ""))]
+            units = build_units(refs, kb_id="kb_x", unit_chunks=3)
+            det = DeterministicExtractor(units, file_for=lambda rel: root / rel, kb_id="kb_x")
+            imports = det._import_map("app/pkg/vector/store.py")
+            self.assertEqual(imports["models"], (None, "models", "qdrant_client"))         # an external package, not the base's models.py
+            self.assertEqual(imports["dj"], (None, "models", "django"))
+            self.assertEqual(imports["utils"], (None, "utils", "requests"))
+            self.assertEqual(imports["own"], ("app/pkg/models.py", None, None))            # a package of the base still resolves to its submodule
+            self.assertEqual(imports["helper_mod"], ("tools/extra/helper_mod.py", None, None))
+            self.assertNotEqual(imports.get("missing", (None,))[0], "app/pkg/models.py")
+            rels = []
+            for u in units:
+                if u.rel_path == "app/pkg/vector/store.py":
+                    rels += det.extract(u).relations
+            triples = {(r["source"], r["predicate"], r["target"]) for r in rels}
+            self.assertIn(("app/pkg/vector/store.py", "imports", "qdrant_client"), triples)
+            self.assertIn(("app/pkg/vector/store.py", "imports", "app/pkg/models.py"), triples)   # from `from pkg import models`
+
     def test_extraction_fingerprint_only_changes_with_deterministic_units(self) -> None:
         from kb_pipeline.graph.build import extraction_fingerprint
 
@@ -1749,6 +1796,73 @@ class WideTableRenderingTests(unittest.TestCase):
         self.assertEqual(table_render_tag(self.NATIVE), table_render_tag(self.MARKDOWN))
         self.assertTrue(table_render_tag(self.NATIVE).startswith("wide-table-v1"))
         self.assertEqual(table_render_tag(self.NARROW), "")
+
+    # 2026-09-29 audit: positions are checked before names are assigned by position
+    LEAD_EMPTY = ("SHEET: editions\nROWS: 2-4\nHEADER: | Spec | Team | Pro | Plus | Standard | Flagship\n"
+                  "| Editors | - | Web | Web | Web | Web+PC\n"
+                  "|  | Private | Public |  | Hybrid\n"
+                  "Storage | Quota | 100G | 1T | 1T | 2T | Unlimited")
+    SPLIT_PIECES = ("SHEET: survey\nROWS: 7-7\nHEADER: Submitted | ID | Team | Question 1 | Question 2 | Question 3\n"
+                    "Submitted: 2026-08-24 08:42:00 | Question 2: less stock on hand, fewer stock-outs\n"
+                    "Submitted: 2026-08-24 08:42:00 | F: sales of the last 7/14/30 days")
+    DOUBLE_LABELLED = ("SHEET: features\nROWS: 9-9\nHEADER: Module | Level 1 | Level 2 | Level 3 | Description | Public\n"
+                       "Module: Module: Contacts | Level 1: Description: use the group in documents | Level 2: Public: yes")
+    MD_PIECES = ("| Model | a | b | c | d | e |\n|---|---|---|---|---|---|\n"
+                 "| Model: customer model | c: provided by the customer | column 9: note |\n"
+                 "| In-house model | 1 | 0 |\n"
+                 "| Open model | 1 | 0 | 1 | 0 | 1 |")
+
+    def test_rows_with_an_empty_first_cell_keep_their_columns(self) -> None:
+        """A row whose first cell is empty starts with "| " in the text and has lost one empty cell; it is put back
+        before names are assigned, otherwise the whole row shifts one column to the left."""
+        from kb_pipeline.graph.tabletext import RENDER_TAG, RENDER_TAG_REALIGNED, expand_wide_tables, table_render_tag
+
+        out = expand_wide_tables(self.LEAD_EMPTY)
+        self.assertIn("Spec: Editors | Team: - | Pro: Web | Plus: Web | Standard: Web | Flagship: Web+PC", out)
+        self.assertIn("Team: Private | Pro: Public | Standard: Hybrid", out)                       # two empty cells in a row
+        self.assertIn("A: Storage | Spec: Quota | Team: 100G", out)                                # unnamed first header cell: column letter
+        self.assertNotIn("Spec: Private", out)
+        self.assertFalse([line for line in out.split("\n") if line.startswith("| Spec:")])          # the first version merged "| " into the first cell
+        self.assertIn("HEADER: | Spec | Team", out)                                                # prefix lines untouched
+        self.assertEqual(table_render_tag(self.LEAD_EMPTY), RENDER_TAG_REALIGNED)
+        self.assertNotEqual(RENDER_TAG, RENDER_TAG_REALIGNED)
+        self.assertEqual(table_render_tag(self.NATIVE), RENDER_TAG)                                # same rendering, same version, cache kept
+
+    def test_rows_that_already_carry_column_names_are_left_alone(self) -> None:
+        """The continuation pieces of an over-long row are already "column: value" and skip empty cells; pairing them
+        by position once more puts every value under the wrong column."""
+        from kb_pipeline.graph.tabletext import RENDER_TAG_REALIGNED, expand_wide_tables, table_render_tag
+
+        self.assertIsNone(expand_wide_tables(self.SPLIT_PIECES))                                   # nothing to rewrite: the original text is used
+        self.assertEqual(table_render_tag(self.SPLIT_PIECES), "")
+        mixed = self.SPLIT_PIECES + "\n2026-08-25 09:00:00 | 17 | Purchasing | x | y | z"
+        out = expand_wide_tables(mixed)
+        self.assertIn("Submitted: 2026-08-24 08:42:00 | Question 2: less stock on hand, fewer stock-outs\n", out)
+        self.assertIn("Submitted: 2026-08-24 08:42:00 | F: sales of the last 7/14/30 days", out)
+        self.assertIn("Submitted: 2026-08-25 09:00:00 | ID: 17 | Team: Purchasing | Question 1: x | Question 2: y | Question 3: z", out)
+        self.assertNotIn("Submitted: Submitted", out)
+        self.assertEqual(table_render_tag(mixed), RENDER_TAG_REALIGNED)
+        # chunk text the chunker already paired by position once more: the inner name is the right one
+        fixed = expand_wide_tables(self.DOUBLE_LABELLED)
+        self.assertIn("Module: Contacts | Description: use the group in documents | Public: yes", fixed)
+        self.assertNotIn("Module: Module", fixed)
+        self.assertNotIn("Level 2: Public", fixed)
+        self.assertEqual(table_render_tag(self.DOUBLE_LABELLED), RENDER_TAG_REALIGNED)
+        # an ordinary row whose value happens to start with a column name does not qualify: not every cell is named
+        plain = ("SHEET: s\nROWS: 1-1\nHEADER: Module | Level 1 | Level 2 | Level 3 | Description | Public\n"
+                 "Module: Contacts | groups | dynamic | scenes | text | yes")
+        self.assertIn("Module: Module: Contacts | Level 1: groups", expand_wide_tables(plain))
+
+    def test_markdown_rows_with_unreliable_positions_are_left_alone(self) -> None:
+        from kb_pipeline.graph.tabletext import RENDER_TAG_REALIGNED, expand_wide_tables, table_render_tag
+
+        out = expand_wide_tables(self.MD_PIECES)
+        self.assertIn("| Model: customer model | c: provided by the customer | column 9: note |", out)   # a continuation piece, untouched
+        self.assertIn("| In-house model | 1 | 0 |", out)                 # cell count differs from the header: no names assigned
+        self.assertIn("Model: Open model | a: 1 | b: 0 | c: 1 | d: 0 | e: 1", out)
+        self.assertNotIn("Model: Model", out)
+        self.assertNotIn("Model: In-house model", out)
+        self.assertEqual(table_render_tag(self.MD_PIECES), RENDER_TAG_REALIGNED)
 
     def test_only_expanded_units_get_a_new_unit_id(self) -> None:
         from kb_pipeline.graph.tabletext import table_render_tag
