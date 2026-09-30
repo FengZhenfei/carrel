@@ -46,6 +46,16 @@ _RANGE_RE = re.compile(
     rf"^(?P<lo>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*\s*(?:to|~|–|—|-|至|到|\.\.\.?)\s*"
     rf"(?P<hi>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*$"
 )
+# A currency sign directly in front of a number ($85,000, A$21,050) is its unit, not part of the number: the value
+# stays as written and the number is parsed as usual, so amounts can be compared and put in a series. When letters
+# follow ($85K, $1.05M) they abbreviate a magnitude, 85 is not the number, and the value remains text
+_CURRENCY = r"(?:[A-Z]{1,3})?[$¥€£₩₹]"
+_MONEY_RE = re.compile(
+    rf"^(?P<cmp><=|>=|[<>≤≥~≈±])?\s*(?P<cur>{_CURRENCY})\s*(?P<num>{_PLAIN_NUMBER})(?:\s*[\(（][^\)）]{{0,40}}[\)）])?$"
+)
+_MONEY_RANGE_RE = re.compile(
+    rf"^(?P<cur>{_CURRENCY})\s*(?P<lo>{_PLAIN_NUMBER})\s*(?:to|~|–|—|-|至|到)\s*(?:{_CURRENCY})?\s*(?P<hi>{_PLAIN_NUMBER})$"
+)
 _EXPR_RE = re.compile(r"[A-Za-z_}\)]\s*[+\-×x\*/]\s*[\d(]|[\d\)]\s*[+\-×x\*/]\s*[A-Za-z_({\\]")
 _IDENT_RE = re.compile(r"[A-Za-z]+_[A-Za-z0-9{}]+|\\[A-Za-z]+|[A-Za-z]+\{")
 _COMPOUND_SPLIT_RE = re.compile(r"\s*(?:/|,|;|、|\band\b|与|和)\s*")
@@ -97,8 +107,9 @@ def _nfkc(text: str) -> str:
 def classify_value(value: Any) -> dict[str, Any]:
     """What kind of thing a value field is:
       scalar     the whole string is one number (comparator, unit, footnote, bracketed remark allowed): '0.160',
-                 '-40°C', '≤ 10', '10 mA (typ)'
-      range      two numbers around a range marker: '2.7 to 3.6', '-40 ~ +85'
+                 '-40°C', '≤ 10', '10 mA (typ)'; also a number with a currency sign directly in front of it
+                 ('$85,000', reported with currency)
+      range      two numbers around a range marker: '2.7 to 3.6', '-40 ~ +85', '$310,000-$485,000'
       expression a relative value with variables / arithmetic: 'V_CC + 0.5', '0.8 × V_DD', 'VCC/2'; cannot be
                  evaluated without variable bindings
       text       anything else ('n/a', 'Max', '20/25/45', '12,50')
@@ -121,6 +132,19 @@ def classify_value(value: Any) -> dict[str, Any]:
         lo, hi = _to_float(m.group("lo")), _to_float(m.group("hi"))
         if lo is not None and hi is not None:
             return {"kind": "range", "num": None, "lo": lo, "hi": hi}
+    m = _MONEY_RE.fullmatch(text)
+    if m:
+        num = _to_float(m.group("num"))
+        if num is not None:
+            out = {"kind": "scalar", "num": num, "currency": m.group("cur")}
+            if m.group("cmp"):
+                out["cmp"] = m.group("cmp")
+            return out
+    m = _MONEY_RANGE_RE.fullmatch(text)
+    if m:
+        lo, hi = _to_float(m.group("lo")), _to_float(m.group("hi"))
+        if lo is not None and hi is not None:
+            return {"kind": "range", "num": None, "lo": lo, "hi": hi, "currency": m.group("cur")}
     if _NUMBER_RE.search(text) and (_EXPR_RE.search(text) or _IDENT_RE.search(text)):
         return {"kind": "expression", "num": None}
     return {"kind": "text", "num": None}
@@ -321,6 +345,8 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
     for field, text in (("value", value), ("min", lo), ("typ", typ), ("max", hi)):
         info = classify_value(text)
         nums[field] = info["num"]
+        if info.get("currency") and not unit:
+            unit = str(info["currency"])              # empty unit field and the currency written in front of the number: the currency is the unit
         if info["kind"] != "empty":
             kinds[field] = info["kind"]
         if info["kind"] == "range":

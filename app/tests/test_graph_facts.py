@@ -1498,6 +1498,28 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         self.assertIsNone(comparable_number(fact))
         self.assertFalse(_values_equal({"value": "12,50"}, {"value": "1250"}))
 
+    def test_a_currency_sign_in_front_of_a_plain_number_is_its_unit(self) -> None:
+        """Once values were kept as written, "$85,000" as a whole was no longer a number: amounts became text and could
+        be neither compared nor put in a series. A currency sign directly in front of a number is parsed as usual and
+        the currency goes to the unit field when that is empty; when a magnitude abbreviation follows ($85K, $1.05M),
+        85 is not the number and the value remains text."""
+        from kb_pipeline.graph.facts import classify_value, comparable_number, normalize_fact
+
+        for t, want in {"$85,000": 85000.0, "¥245.00": 245.0, "A$21,050": 21050.0, "US$ 1,200": 1200.0, "€99": 99.0,
+                        "$350,000 (2025)": 350000.0}.items():
+            info = classify_value(t)
+            self.assertEqual((info["kind"], info["num"]), ("scalar", want), t)
+        self.assertEqual(classify_value("~$238,000"), {"kind": "scalar", "num": 238000.0, "currency": "$", "cmp": "~"})
+        self.assertEqual(classify_value("$310,000-$485,000"), {"kind": "range", "num": None, "lo": 310000.0, "hi": 485000.0, "currency": "$"})
+        for t in ("$85K", "$1.05M", "$10亿", "约$200,000", "$12,50", "${HOME}_dir", "$defs.item.$ref", "$", "¥?/kg", "高级 $310,000-$485,000"):
+            self.assertEqual(classify_value(t), {"kind": "text", "num": None}, t)
+        fact = normalize_fact({"subject": "某岗位", "property": "平均薪资", "value": "$196,489"})
+        self.assertEqual((fact["value"], fact["value_num"], fact["unit"], fact["unit_canonical"], fact["kinds"]),
+                         ("$196,489", 196489.0, "$", "USD", {"value": "scalar"}))
+        self.assertEqual(comparable_number(fact), 196489.0)
+        kept = normalize_fact({"subject": "某商品", "property": "单价", "value": "¥245.00", "unit": "RMB/件"})
+        self.assertEqual((kept["value_num"], kept["unit"]), (245.0, "RMB/件"))                 # a unit that was written stays
+
     def test_value_fields_are_not_rewritten_as_entity_names(self) -> None:
         """Values, units, conditions and notes used to go through the LaTeX restoration of entity names: every $ or
         backslash was deleted, rewriting currencies, variable names and paths. Now these fields stay as in the source
