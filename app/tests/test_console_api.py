@@ -1214,6 +1214,13 @@ class ConsoleI18nTests(unittest.TestCase):
         self.assertIn('data-v="raw"', js)                      # the raw text stays one click away
         self.assertIn('localStorage.setItem("kb.pvview"', js)
         self.assertIn('.pv-filters .chip[data-f]', js)          # view chips are not filter chips
+        # Spreadsheet blocks (SHEET / ROWS / HEADER: a | b, then one positional row per line) are not Markdown:
+        # they are split like chunker._native_cells (a leading "|" is an empty first cell) and drawn as a table
+        self.assertIn('/^HEADER: ?(.*)$/', js)
+        self.assertIn('if (s.startsWith("|")) s = " " + s;', js)
+        self.assertIn('s.split(" | ").map((c) => c.trim())', js)
+        for marker in ("SHEET", "ROWS", "QUESTION", "ANSWER", "Sheet", "Rows", "Title", "Columns"):
+            self.assertRegex(js, r"const PV_MARKER_RE = /\^\([^/]*\b" + marker + r"\b[^/]*\): \?\(\.\*\)\$/")
 
     def test_every_console_string_has_a_dictionary_entry(self) -> None:
         """Every Chinese string on the static page (text, placeholder, title) and every t("…") key in app.js must be

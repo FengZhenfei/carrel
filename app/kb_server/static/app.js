@@ -1485,9 +1485,24 @@ function pageLabel(c) {
 
 /* ── rendered chunk view. markdown-it draws tables / code / headings, KaTeX the parser's "EQUATION:" lines
    and $$ blocks, and the pipeline's own marker lines (TITLE / CAPTION / VISUAL SUMMARY / ...) become labels.
+   Spreadsheet and CSV blocks are not Markdown: "HEADER: a | b | c" followed by one "a | b | c" line per row
+   (native_table._joined_cells: positional, no outer frame, a leading empty cell makes the line start with "|"),
+   so they are split the way chunker._native_cells does and drawn as a table.
    Document text never turns into HTML: markdown-it runs with html:false (tags are escaped) and KaTeX with
    trust:false. Inline $...$ is left alone: in these documents it is money, not math. ── */
-const PV_MARKER_RE = /^(TITLE|CAPTION|VISUAL SUMMARY|FACTS|ENTITIES|KEYWORDS|FOOTNOTE|IMAGE): ?(.*)$/;
+const PV_MARKER_RE = /^(TITLE|CAPTION|VISUAL SUMMARY|FACTS|ENTITIES|KEYWORDS|FOOTNOTE|IMAGE|SHEET|ROWS|QUESTION|ANSWER|Sheet|Rows|Title|Columns): ?(.*)$/;
+function pvNativeCells(line) {
+  let s = line.trim();
+  if (s.startsWith("|")) s = " " + s;
+  if (s.endsWith("|")) s += " ";
+  return s.split(" | ").map((c) => c.trim());
+}
+function pvNativeTable(header, rows) {
+  const width = Math.max(header.length, ...rows.map((r) => r.length));
+  const cell = (tag, text) => (text.length > 40 ? `<${tag} class="wrap"><div>${esc(text)}</div></${tag}>` : `<${tag}>${esc(text)}</${tag}>`);
+  const tr = (tag, cells) => `<tr>${Array.from({ length: width }, (_, i) => cell(tag, cells[i] || "")).join("")}</tr>`;
+  return `<table class="pv-native"><thead>${tr("th", header)}</thead><tbody>${rows.map((r) => tr("td", r)).join("")}</tbody></table>`;
+}
 let pvMd;
 function pvMarkdown() {
   if (pvMd === undefined) pvMd = typeof markdownit === "function" ? markdownit({ html: false, linkify: false, breaks: true }) : null;
@@ -1514,6 +1529,14 @@ function chunkHtml(text) {
       const parts = [line.slice(2)];
       while (!/\$\$\s*$/.test(parts[parts.length - 1]) && i + 1 < lines.length) parts.push(lines[++i]);
       flush(); out.push(`<div class="pv-eq">${pvMath(parts.join("\n").replace(/\$\$\s*$/, ""))}</div>`); continue;
+    }
+    if ((m = /^HEADER: ?(.*)$/.exec(line))) {                  // a spreadsheet block: the rows run to the next marker or blank line
+      const rows = [];
+      while (i + 1 < lines.length && lines[i + 1].trim() && !PV_MARKER_RE.test(lines[i + 1]) && !/^(HEADER:|EQUATION:|```)/.test(lines[i + 1])) rows.push(pvNativeCells(lines[++i]));
+      flush(); out.push(pvNativeTable(pvNativeCells(m[1]), rows)); continue;
+    }
+    if ((m = /^Columns: ?(.*)$/.exec(line))) {                 // the sheet summary's column list: a header-only table
+      flush(); out.push(`<div class="pv-label"><b>Columns</b></div>${pvNativeTable(pvNativeCells(m[1]), [])}`); continue;
     }
     if ((m = PV_MARKER_RE.exec(line))) { flush(); out.push(`<div class="pv-label"><b>${esc(m[1])}</b>${md.renderInline(m[2])}</div>`); continue; }
     buf.push(line);

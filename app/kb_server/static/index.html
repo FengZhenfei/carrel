@@ -309,6 +309,11 @@ td.path{word-break:break-all;min-width:220px}
 .pv-md table{border-collapse:collapse;margin:6px 0;font-size:12px;display:block;max-width:100%;overflow-x:auto}
 .pv-md th,.pv-md td{border:1px solid var(--line);padding:3px 7px;vertical-align:top;text-align:left}
 .pv-md th{background:var(--well);font-weight:600}
+/* spreadsheet blocks: cells stay on one line so a long note cell cannot squeeze the others to one character per
+   line; a long cell wraps inside its own minimum width and the table scrolls sideways */
+.pv-md table.pv-native th,.pv-md table.pv-native td{white-space:nowrap}
+.pv-md table.pv-native .wrap{white-space:normal}
+.pv-md table.pv-native .wrap>div{min-width:22em}
 .pv-chunk .pv-md pre{margin:6px 0;padding:8px 10px;border:1px solid var(--line-2);border-radius:6px;background:var(--well);font-size:12px;line-height:1.5;
   white-space:pre;max-height:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .pv-md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
@@ -797,6 +802,6 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 <script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
 <script src="vendor/katex.min.js?v=20261001-1"></script>
 <script src="i18n.js?v=20261001-1"></script>
-<script src="app.js?v=20261001-1"></script>
+<script src="app.js?v=20261001-2"></script>
 </body>
 </html>
