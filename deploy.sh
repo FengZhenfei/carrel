@@ -185,23 +185,31 @@ print_detection() {
 
 # ── compose .env ───────────────────────────────────────────────────────────
 write_compose_env() {
-  local flavour compose_files profiles base_image
+  local flavour compose_files profiles base_image wait_url
   if gpu_usable; then flavour=gpu; compose_files="docker-compose.yml:compose.gpu.yml"
   else flavour=cpu; compose_files="docker-compose.yml"; fi
   if [[ "$flavour" == gpu ]]; then base_image="$(hub_image vllm/vllm-openai:v0.21.0)"
   else base_image="$(hub_image python:3.12-slim)"; fi
-  profiles=""; (( WITH_MODELS == 1 )) && profiles="local-models"
+  profiles=""; wait_url=""
+  if (( WITH_MODELS == 1 )); then
+    profiles="local-models"
+    # The parser loads its model only once the last local model server is up
+    # (the servers start in a queue; see deployment/compose/docker-compose.yml).
+    wait_url="http://vlm:8000/health"
+  fi
 
   if [[ -f "$COMPOSE_ENV" ]]; then
     log "keeping existing $COMPOSE_ENV (delete it to re-detect)"
-    # Only the profile follows the command line on re-runs.
+    # Only the profile and the parser's wait follow the command line on re-runs.
     set_kv "$COMPOSE_ENV" COMPOSE_PROFILES "$profiles"
+    set_kv "$COMPOSE_ENV" MINERU_WAIT_FOR_URL "$wait_url"
     return
   fi
   cp "$COMPOSE_DIR/.env.example" "$COMPOSE_ENV"
   chmod 600 "$COMPOSE_ENV"
   set_kv "$COMPOSE_ENV" COMPOSE_FILE "$compose_files"
   set_kv "$COMPOSE_ENV" COMPOSE_PROFILES "$profiles"
+  set_kv "$COMPOSE_ENV" MINERU_WAIT_FOR_URL "$wait_url"
   set_kv "$COMPOSE_ENV" MINERU_FLAVOR "$flavour"
   set_kv "$COMPOSE_ENV" MINERU_BASE_IMAGE "$base_image"
   set_kv "$COMPOSE_ENV" MINERU_MODEL_SOURCE "$MODEL_SOURCE"
@@ -349,15 +357,14 @@ app_install() {
     log "creating app/.venv with $py"
     "$py" -m venv "$ROOT/app/.venv"
   fi
-  log "installing the app into app/.venv"
+  log "installing the app into app/.venv (the pinned versions of app/requirements.lock)"
   if [[ -n "$PIP_INDEX" ]]; then export PIP_INDEX_URL="$PIP_INDEX"; fi
   "$ROOT/app/.venv/bin/python" -m pip install -q --upgrade pip
-  local extras=""
+  "$ROOT/app/.venv/bin/python" -m pip install -q -r "$ROOT/app/requirements.lock" -e "$ROOT/app"
   if [[ "$WITH_PDF_IMAGES" -eq 1 ]]; then
-    extras="[pdf-images]"
     log "installing the optional pdf-images extra (PyMuPDF, AGPL-3.0; see NOTICE.md)"
+    "$ROOT/app/.venv/bin/python" -m pip install -q -r "$ROOT/app/requirements-pdf-images.lock"
   fi
-  "$ROOT/app/.venv/bin/python" -m pip install -q -e "$ROOT/app$extras" pytest
   mkdir -p "$ROOT/runtime/mirror" "$ROOT/logs"
   log "initialising the state database"
   (cd "$ROOT/app" && KB_ENV_FILE="$APP_ENV" KB_LOCAL_BASE_DIR="$ROOT" ./.venv/bin/kb init-db)

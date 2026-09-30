@@ -82,6 +82,18 @@ host_housekeeping() {
   return 0
 }
 
+# Nightly copy of what cannot be regenerated (state database, env files, evaluation sets) into backups/state/,
+# newest KB_BACKUP_KEEP kept. Needs no service, so it runs before the Qdrant wait; a failure is reported but
+# does not count as a maintenance failure.
+state_backup() {
+  local code=0
+  "$PY" -m kb_pipeline --env-file "$ENV_FILE" cleanup backup || code=$?
+  if [[ "$code" -ne 0 ]]; then
+    echo "=== $(date '+%F %T') backup: state backup failed (exit ${code}) ==="
+    return 1
+  fi
+}
+
 COMMAND="${1:-status}"
 shift || true
 
@@ -99,6 +111,7 @@ fi
 # Only the inactive-point / parse-asset GC touches Qdrant: wait for it first (up to 5 minutes); if it never
 # comes up, exit quietly under the deferral count
 if [[ "$COMMAND" == "parse-assets-gc" ]]; then
+  state_backup || true
   maint_wait_qdrant_or_defer "cleanup-$COMMAND" "cleanup $COMMAND: Qdrant not ready"
 fi
 

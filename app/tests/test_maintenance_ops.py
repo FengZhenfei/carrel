@@ -534,6 +534,64 @@ class ParseAssetsGcTests(unittest.TestCase):
             self.assertEqual(delete_expired_inactive_points(w.q, "no-such-collection", listed, cutoff), 0)
 
 
+class StateBackupTests(unittest.TestCase):
+    """The nightly backup takes only what cannot be regenerated (state database, env files, evaluation sets),
+    keeps the newest N copies with tightened permissions, and runs before the nightly round waits for Qdrant."""
+
+    def _base(self, tmp: str) -> tuple[Path, SimpleNamespace]:
+        base = Path(tmp)
+        for rel in ("runtime/state", "runtime/eval", "config", "deployment/compose"):
+            (base / rel).mkdir(parents=True)
+        state = base / "runtime" / "state" / "kb-pipeline.db"
+        db.init_db(state)
+        with db.connect(state) as con:
+            con.execute("INSERT INTO llm_registry(name, base_url, api_key, model_id, notes, builtin, created_at, updated_at) "
+                        "VALUES('m', 'http://x', 'k', 'id', '', 0, 1, 1)")
+            con.commit()
+        (base / "config" / "knowledge-base.env").write_text("A=1\n", encoding="utf-8")
+        (base / "deployment" / "compose" / ".env").write_text("B=2\n", encoding="utf-8")
+        (base / "runtime" / "eval" / "gold.json").write_text("{}", encoding="utf-8")
+        settings = SimpleNamespace(state_db=state, env_file=base / "config" / "knowledge-base.env", runtime_dir=base / "runtime")
+        return base, settings
+
+    def test_backup_copies_state_env_and_eval_and_keeps_n(self) -> None:
+        from kb_pipeline import maintenance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base, settings = self._base(tmp)
+            stamps = iter(("20251231-000000", "20260101-000000", "20260102-000000", "20260103-000000"))   # the dry run takes one too
+            with patch.object(maintenance, "ts", side_effect=lambda: next(stamps)):
+                dry = maintenance.backup_state(settings, base_dir=base, keep=2, dry_run=True)
+                self.assertFalse((base / "backups").exists())                        # a dry run writes nothing
+                self.assertEqual(dry["files"], ["knowledge-base.env", "deployment-compose.env", "eval/gold.json"])
+                first = maintenance.backup_state(settings, base_dir=base, keep=2)
+                second = maintenance.backup_state(settings, base_dir=base, keep=2)
+                third = maintenance.backup_state(settings, base_dir=base, keep=2)
+            target = Path(third["backup_dir"])                                        # the first copy is already pruned (keep=2)
+            self.assertEqual(sorted(p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()),
+                             ["deployment-compose.env", "eval/gold.json", "kb-pipeline.db", "knowledge-base.env"])
+            with db.connect(target / "kb-pipeline.db") as con:                       # the online backup opens as a consistent snapshot
+                self.assertEqual(tuple(con.execute("SELECT name, api_key FROM llm_registry").fetchone()), ("m", "k"))
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((target / "eval").stat().st_mode & 0o777, 0o700)                # subdirectories tightened too
+            for item in target.rglob("*"):
+                if item.is_file():
+                    self.assertEqual(item.stat().st_mode & 0o777, 0o600, item.name)
+            self.assertEqual((base / "backups" / "state").stat().st_mode & 0o777, 0o700)
+            self.assertGreater(first["bytes"], 0)
+            self.assertEqual(first["files"], third["files"])
+            self.assertEqual((second["pruned"], third["pruned"]), ([], ["20260101-000000"]))     # newest two kept
+            self.assertEqual(sorted(p.name for p in (base / "backups" / "state").iterdir()), ["20260102-000000", "20260103-000000"])
+
+    def test_nightly_run_backs_up_before_waiting_for_qdrant(self) -> None:
+        """The backup needs no service: the nightly round backs up first and waits for Qdrant afterwards, so a night
+        on which Qdrant does not come up still has its backup; a failed backup is not a maintenance failure."""
+        script = _repo_file("scripts/kb-cleanup.sh")
+        self.assertIn("cleanup backup", script)
+        self.assertLess(script.index("state_backup || true"), script.index('maint_wait_qdrant_or_defer "cleanup-$COMMAND"'))
+        self.assertIn("KB_BACKUP_KEEP=7", _repo_file("config/knowledge-base.env.example"))
+
+
 class ScheduledCleanupCoverageTests(unittest.TestCase):
     """The cleanup subcommands the timers actually run must cover everything that grows monotonically.
 
@@ -555,6 +613,7 @@ class ScheduledCleanupCoverageTests(unittest.TestCase):
         "neo4j-graph-gc": "neo4j_graph_gc",
         "graph-gc": "graph_gc",
         "parse-assets-gc": "parse_assets_gc",
+        "backup": "backup_state",
     }
 
     def _scheduled_subcommands(self) -> set[str]:
@@ -1137,6 +1196,38 @@ class DependencyDeclarationTests(unittest.TestCase):
         self.assertEqual(optional, self.OPTIONAL)              # the optional extra is PyMuPDF ...
         self.assertEqual(optional & declared, set())           # ... never a required dependency ...
         self.assertLessEqual(optional, imported)               # ... and really used by the code
+
+    def _pins(self, name: str) -> dict[str, str]:
+        pins: dict[str, str] = {}
+        for line in (self.APP / name).read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            m = re.fullmatch(r"([A-Za-z0-9_.-]+)==([A-Za-z0-9_.!+-]+)", line.strip())
+            self.assertIsNotNone(m, line)
+            pins[m.group(1).lower().replace("_", "-")] = m.group(2)
+        return pins
+
+    def test_lock_files_pin_every_declared_dependency_inside_its_range(self) -> None:
+        """requirements.lock is the exact set the suite was run against: every required dependency is in it with a
+        version inside its declared range, pytest too, and nothing but name==version lines. The optional pdf-images
+        extra (AGPL) has its own requirements-pdf-images.lock and never appears in the main one, so a plain install
+        stays free of it. Every declared range carries an upper bound."""
+        import tomllib
+
+        from packaging.requirements import Requirement
+        from packaging.version import Version
+
+        project = tomllib.loads((self.APP / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        main, extra = self._pins("requirements.lock"), self._pins("requirements-pdf-images.lock")
+        optional = [dep for group in project.get("optional-dependencies", {}).values() for dep in group]
+        for dep, pins in [(dep, main) for dep in project["dependencies"]] + [(dep, extra) for dep in optional]:
+            req = Requirement(dep)
+            name = req.name.lower().replace("_", "-")
+            self.assertIn(name, pins, dep)
+            self.assertTrue(req.specifier.contains(Version(pins[name]), prereleases=True), f"{dep} is locked at {pins[name]}")
+            self.assertTrue(any(op in ("<", "<=", "==", "~=") for op in (spec.operator for spec in req.specifier)), f"{dep} has no upper bound")
+        self.assertIn("pytest", main)
+        self.assertEqual({Requirement(dep).name.lower() for dep in optional} & set(main), set())   # the AGPL extra stays out of the main lock
 
 
 class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSupport, unittest.TestCase):

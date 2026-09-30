@@ -1285,6 +1285,68 @@ def _remove_tree(path: Path, *, dry_run: bool) -> dict[str, object]:
     return {"path": str(path), "exists": True, "removed": not dry_run, "bytes": size}
 
 
+def backup_state(settings: Settings, *, base_dir: Path | None = None, keep: int | None = None,
+                 dry_run: bool = False) -> dict[str, Any]:
+    """Keep a copy of what cannot be regenerated: the state database (SQLite online backup, a consistent snapshot
+    even while the pipeline runs; library configuration, the model registry and the extraction caches live in
+    it), the pipeline env file, every deployment/*/.env and the question sets and gold standards under
+    runtime/eval. Vectors, indexes, graphs and the parse cache are recomputed from the mirror and the caches in
+    the state database, so they are left out. Written to <base>/backups/state/<stamp>/ (directory 700, files
+    600); only the newest KB_BACKUP_KEEP copies (default 7) are kept. Needs no service, so the nightly round
+    runs it before waiting for Qdrant."""
+    from .config import BASE_DIR
+
+    base = Path(base_dir) if base_dir else BASE_DIR
+    keep = int(os.getenv("KB_BACKUP_KEEP", "7")) if keep is None else int(keep)
+    root = base / "backups" / "state"
+    target = root / ts()
+    state_db = Path(settings.state_db)
+    copies: list[tuple[str, Path]] = []
+    env_file = Path(settings.env_file)
+    if env_file.is_file():
+        copies.append((env_file.name, env_file))
+    for env in sorted((base / "deployment").glob("*/.env")):
+        copies.append((f"deployment-{env.parent.name}.env", env))
+    eval_dir = settings.runtime_dir / "eval"
+    for item in sorted(eval_dir.iterdir()) if eval_dir.is_dir() else []:
+        if item.is_file():
+            copies.append((f"eval/{item.name}", item))
+    out: dict[str, Any] = {
+        "dry_run": dry_run, "backup_dir": str(target), "keep": keep,
+        "state_db": str(state_db) if state_db.is_file() else None,
+        "files": [name for name, _ in copies], "bytes": 0, "pruned": [],
+    }
+    if dry_run:
+        out["pruned"] = [path.name for path in prune_old_dirs(root, keep=keep - 1, dry_run=True)]
+        return out
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    target.mkdir(mode=0o700)
+    if state_db.is_file():
+        dest = target / state_db.name
+        src = sqlite3.connect(state_db)
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        os.chmod(dest, 0o600)
+    for name, path in copies:
+        dest = target / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+        os.chmod(dest, 0o600)
+    for sub in target.rglob("*"):
+        if sub.is_dir():
+            os.chmod(sub, 0o700)
+    out["bytes"] = sum(item.stat().st_size for item in target.rglob("*") if item.is_file())
+    out["pruned"] = [path.name for path in prune_old_dirs(root, keep=keep, dry_run=False)]
+    return out
+
+
 def prune_old_dirs(parent: Path, *, keep: int, dry_run: bool) -> list[Path]:
     if keep < 0 or not parent.exists():
         return []

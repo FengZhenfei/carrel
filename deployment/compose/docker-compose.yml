@@ -19,6 +19,31 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "3"
 
+x-vllm-environment: &vllm-environment
+  VLLM_USE_DEEP_GEMM: "${VLLM_USE_DEEP_GEMM:-0}"
+
+# The model servers start one after another. Started together, every vLLM
+# process profiles the free GPU memory while the others are still loading or
+# freeing theirs, fails its memory check and restarts until Docker's backoff
+# happens to separate them (one to eight restarts per server on a unified-
+# memory machine, a quarter of an hour until all were up). So each server
+# waits for the previous one's /health before it loads its model
+# (WAIT_FOR_URL, set per service below). depends_on only orders
+# `docker compose up`; the wait inside the container also covers Docker
+# restoring the containers at boot. The NVIDIA image's own entrypoint is kept
+# when present, and the `vllm serve ...` command of each service runs as
+# written under either image.
+x-vllm-entrypoint: &vllm-entrypoint
+  - bash
+  - -c
+  - |
+    if [ -n "$$WAIT_FOR_URL" ]; then
+      until curl -fsS "$$WAIT_FOR_URL" >/dev/null 2>&1; do sleep 5; done
+    fi
+    if [ -x /opt/nvidia/nvidia_entrypoint.sh ]; then exec /opt/nvidia/nvidia_entrypoint.sh "$$@"; fi
+    exec "$$@"
+  - vllm-wait
+
 x-vllm-common: &vllm-common
   image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.21.0}
   restart: unless-stopped
@@ -26,8 +51,8 @@ x-vllm-common: &vllm-common
   gpus: all
   profiles: ["local-models"]
   logging: *default-logging
-  environment:
-    VLLM_USE_DEEP_GEMM: "${VLLM_USE_DEEP_GEMM:-0}"
+  entrypoint: *vllm-entrypoint
+  environment: *vllm-environment
   networks:
     - carrel
 
@@ -36,7 +61,9 @@ x-vllm-healthcheck: &vllm-healthcheck
   interval: 30s
   timeout: 5s
   retries: 5
-  start_period: 180s
+  # The last server in the queue starts loading only once the ones before it
+  # are up; a container that is still waiting shows "health: starting".
+  start_period: 900s
 
 services:
   # ── optional local model servers (profile: local-models) ─────────────────
@@ -78,6 +105,12 @@ services:
   reranker:
     <<: *vllm-common
     container_name: carrel-reranker
+    environment:
+      <<: *vllm-environment
+      WAIT_FOR_URL: http://embedding:8000/health
+    depends_on:
+      embedding:
+        condition: service_healthy
     ports:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_RERANKER_PORT:-8102}:8000"
     volumes:
@@ -114,6 +147,12 @@ services:
   vl-embedding:
     <<: *vllm-common
     container_name: carrel-vl-embedding
+    environment:
+      <<: *vllm-environment
+      WAIT_FOR_URL: http://reranker:8000/health
+    depends_on:
+      reranker:
+        condition: service_healthy
     ports:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_EMBEDDING_PORT:-8103}:8000"
     volumes:
@@ -157,6 +196,12 @@ services:
   vl-reranker:
     <<: *vllm-common
     container_name: carrel-vl-reranker
+    environment:
+      <<: *vllm-environment
+      WAIT_FOR_URL: http://vl-embedding:8000/health
+    depends_on:
+      vl-embedding:
+        condition: service_healthy
     ports:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_RERANKER_PORT:-8104}:8000"
     volumes:
@@ -202,6 +247,12 @@ services:
   vlm:
     <<: *vllm-common
     container_name: carrel-vlm
+    environment:
+      <<: *vllm-environment
+      WAIT_FOR_URL: http://vl-reranker:8000/health
+    depends_on:
+      vl-reranker:
+        condition: service_healthy
     ports:
       - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_INSTRUCT_PORT:-8105}:8000"
     volumes:
@@ -244,6 +295,9 @@ services:
   # MINERU_BACKEND_POLICY says so), downloads the matching weights into
   # /models on first start and publishes its decision to /data/output/
   # carrel-mineru.json, which the pipeline reads when MINERU_BACKEND=auto.
+  # With the local-models profile it loads its own model only after the last
+  # model server is up (MINERU_WAIT_FOR_URL, written by deploy.sh); a service
+  # outside the profile cannot depend_on one inside it, hence the variable.
   mineru:
     image: carrel-mineru:${MINERU_VERSION:-3.4.4}-${MINERU_FLAVOR:-gpu}
     build:
@@ -267,6 +321,7 @@ services:
       CUDA_VISIBLE_DEVICES: "${MINERU_CUDA_VISIBLE_DEVICES:-0}"
       MINERU_BACKEND_POLICY: "${MINERU_BACKEND_POLICY:-auto}"
       MINERU_MODEL_SOURCE: "${MINERU_MODEL_SOURCE:-auto}"
+      MINERU_WAIT_FOR_URL: "${MINERU_WAIT_FOR_URL:-}"
       MINERU_VLM_MIN_VRAM_GB: "${MINERU_VLM_MIN_VRAM_GB:-8}"
       MINERU_VLM_MIN_COMPUTE: "${MINERU_VLM_MIN_COMPUTE:-7.0}"
       MINERU_VLM_TARGET_VRAM_GB: "${MINERU_VLM_TARGET_VRAM_GB:-7}"

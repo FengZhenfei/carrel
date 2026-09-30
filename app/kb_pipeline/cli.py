@@ -21,6 +21,7 @@ from .graph.lock import build_lock_held, build_lock_path, clear_lock_leftovers
 from .graph.neo4j_import import delete_neo4j_graph_version, import_graph_to_neo4j, neo4j_status
 from .localfs.scanner import list_recent_source_files, list_source_files
 from .maintenance import (
+    backup_state,
     graph_gc,
     kb_sources_gc,
     monthly_log_cleanup,
@@ -716,7 +717,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
-    if args.cleanup_command not in ("status", "graph-gc"):      # these two do not check service_busy
+    if args.cleanup_command not in ("status", "graph-gc", "backup"):      # these three do not check service_busy
         wait_out_short_locks(settings)      # the scan / mirror sync locks last seconds: wait for them before judging busy
     if args.cleanup_command == "status":
         result = maintenance_status(settings)
@@ -745,6 +746,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         )
     elif args.cleanup_command == "graph-gc":
         result = graph_gc(settings, keep_latest=args.keep_latest, dry_run=args.dry_run)
+    elif args.cleanup_command == "backup":
+        result = backup_state(settings, keep=args.keep, dry_run=args.dry_run)
     elif args.cleanup_command == "parse-assets-gc":
         retention_days = args.retention_days if args.retention_days is not None else settings.qdrant_inactive_retention_days
         result = parse_assets_gc(settings, retention_days=retention_days, dry_run=args.dry_run)
@@ -1355,6 +1358,13 @@ def build_parser() -> argparse.ArgumentParser:
     graph_gc_parser.add_argument("--keep-latest", type=int, default=None, help="Override GRAPH_GC_KEEP_VERSIONS")
     graph_gc_parser.add_argument("--dry-run", action="store_true")
     graph_gc_parser.set_defaults(func=cmd_cleanup)
+    backup_parser = cleanup_sub.add_parser(
+        "backup",
+        help="Copy what cannot be regenerated into backups/state/: the state database (online backup), the pipeline env, deployment/*/.env and the evaluation sets; keep the newest N copies",
+    )
+    backup_parser.add_argument("--keep", type=int, default=None, help="Override KB_BACKUP_KEEP (default 7)")
+    backup_parser.add_argument("--dry-run", action="store_true")
+    backup_parser.set_defaults(func=cmd_cleanup)
     parse_assets_gc_parser = cleanup_sub.add_parser(
         "parse-assets-gc",
         help="Delete expired inactive points, SQLite rows, and parse asset dirs after retention",

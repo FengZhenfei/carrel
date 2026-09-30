@@ -91,7 +91,7 @@ model weights, memory settings, and container logs.
 | `carrel-scan.timer` | 30 seconds, then every minute | Scan and queue file changes |
 | `carrel-worker.timer` | 1 minute, then every 5 minutes | Process queued ingestion work |
 | `carrel-graph-rebuild.timer` | 10 minutes, then every 2 hours | Incremental graph updates or policy-triggered rebuilds |
-| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup parse-assets-gc`, then `cleanup graph-gc`: inactive index points past retention with their chunk rows and parse assets, files deleted longer ago than the undo window, old job rows, disabled libraries past retention and unfinished deletions; graph versions beyond the active one plus N-1 (`GRAPH_GC_KEEP_VERSIONS`, regardless of age, the same rule a finished build applies) |
+| `carrel-qdrant-gc.timer` | 30 minutes, then every 24 hours | `kb cleanup backup` (see below), then `kb cleanup parse-assets-gc`, then `cleanup graph-gc`: inactive index points past retention with their chunk rows and parse assets, files deleted longer ago than the undo window, old job rows, disabled libraries past retention and unfinished deletions; graph versions beyond the active one plus N-1 (`GRAPH_GC_KEEP_VERSIONS`, regardless of age, the same rule a finished build applies) |
 | `carrel-cache-weekly.timer` | 1 hour, then every 7 days | Rotate project caches; drop cached picture descriptions and visual vectors that no picture in the parse cache refers to any more |
 | `carrel-logs-monthly.timer` | 2 hours, then every 30 days | Rotate logs |
 
@@ -104,6 +104,17 @@ deferrals produce exit 75 and a visible failed-unit state; see
 
 Maintenance covers project data by default. Set `KB_HOST_HOUSEKEEPING=1` to
 also clear user-level uv/pip caches and prune Docker caches.
+
+The nightly backup keeps what cannot be recomputed: the state database
+(library configuration, model registry, extraction and fact caches), the
+pipeline env file, the compose `.env` and the evaluation sets under
+`runtime/eval`, as plain copies in `backups/state/<stamp>/` with the newest
+`KB_BACKUP_KEEP` (7) kept. Vectors, indexes, graphs and the parse cache are
+rebuilt from the mirror. To restore, stop the timers and the two services, put
+the env files and `runtime/state/kb-pipeline.db` back from the newest copy,
+start the containers with `docker compose up -d`, then the services and the
+timers; with the caches in the state database intact, a full rebuild does not
+call the remote models again.
 
 ## CLI reference
 
@@ -121,7 +132,7 @@ Run `app/.venv/bin/kb --help` and each subcommand's `--help` for arguments.
 | `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | Graph version baseline, rollback to a kept earlier version, and Neo4j projection |
 | `graph query/factcheck/status` | Graph inspection and evaluation |
 | `search eval/make-set` | Retrieval evaluation and question-set preparation |
-| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc [--dry-run]` | Maintenance status and the cleanups the timers run |
+| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc/backup [--dry-run]` | Maintenance status, the cleanups the timers run and the nightly backup |
 | `cleanup qdrant-gc/qdrant-graph-gc/neo4j-graph-gc [--dry-run]` | Manual tools: `qdrant-gc` deletes expired inactive points only; the other two prune graph versions by age (the two graph retention-days keys) |
 | `reset --source kb_NNN [--all] --yes` | Wipe one base's state, caches and indexes and recreate its collection |
 
@@ -159,6 +170,11 @@ before rebuilding indexes or projections.
 
 ## Development and tests
 
+`deploy.sh` installs the pinned set from `app/requirements.lock`, the versions
+the suite was run against (pytest included); by hand that is
+`app/.venv/bin/pip install -r app/requirements.lock -e app`. After a dependency
+change, regenerate the lock from a virtual environment you have tested with
+`app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml > app/requirements.lock`.
 After installing the application and test dependencies:
 
 ```bash

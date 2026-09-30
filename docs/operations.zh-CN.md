@@ -68,13 +68,15 @@ journalctl --user -u carrel-web --since -5min
 | `carrel-scan.timer` | 30 秒后首次执行，之后每分钟 | 扫描变化并排队 |
 | `carrel-worker.timer` | 1 分钟后首次执行，之后每 5 分钟 | 消费入库任务 |
 | `carrel-graph-rebuild.timer` | 10 分钟后首次执行，之后每 2 小时 | 增量更新，或按策略整库重建 |
-| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 运行 `kb cleanup parse-assets-gc`，随后运行 `cleanup graph-gc`：清理超过保留期的失活索引点及其切块记录和解析资产、删除时间超过撤销窗口的文件、旧任务记录、超过保留期的已关闭知识库以及没删完的知识库；图版本只留现行版加 N−1 个（`GRAPH_GC_KEEP_VERSIONS`，不看天数，与建图收尾同一条规则） |
+| `carrel-qdrant-gc.timer` | 30 分钟后首次执行，之后每 24 小时 | 先运行 `kb cleanup backup`（见下文），再运行 `kb cleanup parse-assets-gc`，随后运行 `cleanup graph-gc`：清理超过保留期的失活索引点及其切块记录和解析资产、删除时间超过撤销窗口的文件、旧任务记录、超过保留期的已关闭知识库以及没删完的知识库；图版本只留现行版加 N−1 个（`GRAPH_GC_KEEP_VERSIONS`，不看天数，与建图收尾同一条规则） |
 | `carrel-cache-weekly.timer` | 1 小时后首次执行，之后每 7 天 | 轮换项目缓存；解析缓存里已经没有对应图片的图片描述和视觉向量缓存随之删除 |
 | `carrel-logs-monthly.timer` | 2 小时后首次执行，之后每 30 天 | 轮换日志 |
 
 控制台和检索 API 作为常驻服务运行，内存紧张时批处理单元先于它们被终止（`OOMScoreAdjust` 分别为 200 和 100）。定时器按相对间隔执行，不使用日历时刻。入库、建图或同步繁忙时，维护任务可以延后；连续多次延后会以退出码 75 显示失败状态，策略见 `scripts/lib/kb-maint-defer.sh` 和 [systemd 文档](../deployment/systemd/README.md#busy-yield)。
 
 默认维护只处理项目资产。清理用户级 uv/pip 缓存或 Docker 缓存需显式设置 `KB_HOST_HOUSEKEEPING=1`。
+
+每夜备份只留不可再生的内容：状态库（各库配置、模型注册表、抽取与事实缓存）、管线 env、compose 的 `.env` 以及 `runtime/eval` 下的题集，原样复制到 `backups/state/<时间戳>/`，只保留最近 `KB_BACKUP_KEEP`（7）份。向量、索引、图谱和解析缓存都能从镜像重建。恢复时先停定时器和两个服务，从最新一份放回两个 env 与 `runtime/state/kb-pipeline.db`，用 `docker compose up -d` 起容器，再起服务和定时器；状态库里的缓存还在的话，整库重建不会再调用远端模型。
 
 ## 命令行参考
 
@@ -92,7 +94,7 @@ journalctl --user -u carrel-web --since -5min
 | `graph adopt-current/rollback/neo4j-import/neo4j-status/neo4j-delete [--graph-version V]` | 图版本基线、回退到保留的旧版本、Neo4j 投影管理 |
 | `graph query/factcheck/status` | 图谱检查与评测 |
 | `search eval/make-set` | 检索评测与题集准备 |
-| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc [--dry-run]` | 维护状态，以及定时器自动运行的清理 |
+| `cleanup status/weekly/monthly/parse-assets-gc/graph-gc/backup [--dry-run]` | 维护状态、定时器自动运行的清理，以及每夜备份 |
 | `cleanup qdrant-gc/qdrant-graph-gc/neo4j-graph-gc [--dry-run]` | 手动工具：`qdrant-gc` 只删过期的失活点；另外两个按天数清理图版本（对应两个图谱保留天数参数） |
 | `reset --source kb_NNN [--all] --yes` | 清空指定知识库的状态、缓存和索引并重建其集合 |
 
@@ -124,7 +126,7 @@ systemctl --user start --no-block carrel-worker.service
 
 ## 开发与测试
 
-安装应用和测试依赖后执行：
+`deploy.sh` 按 `app/requirements.lock` 安装测试过的那套版本（含 pytest）；手动安装等价于 `app/.venv/bin/pip install -r app/requirements.lock -e app`。依赖有变动时，在测试过的虚拟环境里用 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml > app/requirements.lock` 重新生成锁文件。安装应用和测试依赖后执行：
 
 ```bash
 cd app

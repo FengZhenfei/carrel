@@ -54,7 +54,7 @@
 | 存储 | `QDRANT_URL`、`QDRANT_API_KEY`、`OPENSEARCH_URL`、`NEO4J_URI`、`NEO4J_USER`、`NEO4J_PASSWORD` | 与实际部署的服务对应 |
 | 解析 | `MINERU_SERVICE_URL`、`MINERU_BACKEND`、`MINERU_LANG`、`KB_PARSE_ENABLED`、`KB_MIN_FILE_AGE_SECONDS` | `MINERU_BACKEND=auto` 读取解析容器选定的后端 |
 | 任务 | `KB_JOB_MAX_RETRIES`、`KB_JOB_RETRY_BASE_SECONDS`、`KB_JOB_RETRY_MAX_SECONDS`、`KB_PARSE_JOB_LEASE_SECONDS`、`KB_METADATA_JOB_LEASE_SECONDS` | 重试和任务租约。任务连不上所需的服务时退回队列，不计重试次数：先等基础间隔，之后每次加倍，不超过上限；这样退回达到 `KB_JOB_MAX_RETRIES` 次后记为失败 |
-| 保留期 | `QDRANT_INACTIVE_RETENTION_DAYS`、`KB_CACHE_ROTATION_KEEP`、`KB_LOG_ROTATION_KEEP_MONTHS` | 删除的撤销窗口（模板为 7 天）、缓存与日志轮换的保留份数。图片描述和视觉向量缓存不按时间过期，解析缓存里已经没有对应图片时，才由每周清理删除 |
+| 保留期 | `QDRANT_INACTIVE_RETENTION_DAYS`、`KB_CACHE_ROTATION_KEEP`、`KB_LOG_ROTATION_KEEP_MONTHS`、`KB_BACKUP_KEEP` | 删除的撤销窗口（模板为 7 天）、缓存与日志轮换的保留份数、每夜状态备份的保留份数（7）。图片描述和视觉向量缓存不按时间过期，解析缓存里已经没有对应图片时，才由每周清理删除 |
 | 图谱 | `GRAPH_GC_KEEP_VERSIONS`、`GRAPH_GC_GRACE_SECONDS`、`QDRANT_GRAPH_COLLECTION_RETENTION_DAYS`、`NEO4J_GRAPH_RETENTION_DAYS`、`GRAPH_NEO4J_IMPORT_*` | 每库保留现行版加 N−1 个旧版，不看天数；最新一次暂停 / 失败的版本留给续跑，不删也不占名额（回退用 `kb graph rollback --source <key> --graph-version <旧版>`：目标必须是建成过的版本，集合点数要同建成时对得上，半截版本加 `--force` 才切）；两个保留天数键只对手工的按天清理命令生效；Neo4j 导入 |
 | 建图模型 | `KB_GRAPH_LLM_CONCURRENCY`、`KB_GRAPH_LLM_TIMEOUT`、`KB_GRAPH_CIRCUIT_FAILS` | 并发、超时与熔断 |
 | 控制台 | `KB_WEB_HOST`、`KB_WEB_PORT`、`KB_WEB_TOKEN`、`KB_CONSOLE_SERVICES` | 默认 `127.0.0.1:9800`，默认管理 `database,mineru` 服务组 |

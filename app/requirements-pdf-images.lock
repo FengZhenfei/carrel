@@ -1,0 +1,3 @@
+# The optional pdf-images extra (PyMuPDF, AGPL-3.0; see NOTICE.md), installed by deploy.sh --with-pdf-images.
+# Regenerate with: app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml pdf-images | grep -i '^pymupdf=='
+pymupdf==1.28.2
