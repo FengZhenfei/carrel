@@ -98,7 +98,7 @@ parser at the last of them through `MINERU_WAIT_FOR_URL`. Servers that profile
 the shared memory at the same time fail their memory check and restart until
 Docker's backoff happens to separate them; the queue avoids that both under
 `docker compose up` and when Docker restores the containers at boot. A full
-start takes about the sum of the load times, some ten minutes on a DGX Spark.
+start takes about the sum of the load times.
 A container still waiting shows `health: starting`; if the first server never
 comes up, the ones behind it keep waiting, so look at that one first.
 
