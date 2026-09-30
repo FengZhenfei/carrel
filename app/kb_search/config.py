@@ -69,6 +69,11 @@ class SearchSettings:
     # [494, 0, 0, 0, 0, 0, 0, 1, 3, 0] (top score <= 0.043, the sole exception being one question that
     # happened to have matching content at 0.85). The valley is at 0.1-0.2: 0.1 is used, floor x0.7 =
     # 0.07; no real question loses a result, and every out-of-corpus question lands in below_threshold.
+    # Checked again on 2026-09-30 after the reranker templates got their trailing line breaks back (59 real
+    # questions, 8 out-of-corpus questions): the two ends moved further apart. The top score of a real question
+    # is at least 0.51 with a median of 0.9996 (0.32 / 0.993 with the old template), the top score of an
+    # out-of-corpus question at most 0.0012 (0.055 before); chunk hit@3 and the verdict on the out-of-corpus
+    # questions did not change. 0.1 is still in the valley and stays.
     rerank_threshold: float
     rerank_window_tokens: int     # windowed scoring of long chunks (Q06: about 480 tokens, 32 overlap)
     rerank_overlap_tokens: int
