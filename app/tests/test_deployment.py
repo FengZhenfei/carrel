@@ -208,6 +208,10 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertTrue((REPO / "THIRD_PARTY_LICENSES/Apache-2.0.txt").exists())
         self.assertTrue((REPO / "THIRD_PARTY_LICENSES/GraphRAG-MIT.txt").exists())
         self.assertIn("PyMuPDF", _read("NOTICE.md"))
+        # the console's vendored renderers (MIT) travel with their license texts and a notice entry
+        for name in ("markdown-it", "KaTeX"):
+            self.assertTrue((REPO / f"THIRD_PARTY_LICENSES/{name}-MIT.txt").exists(), name)
+            self.assertIn(f"**{name}**", _read("NOTICE.md"))
         ignore = _read(".gitignore")
         for rule in (".env", ".env.*", "*.env", "!*.env.example"):
             self.assertIn(rule + "\n", ignore)

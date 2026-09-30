@@ -246,6 +246,8 @@ const ZH_EN = {
   "标题 · 补认 {0}": "headings · {0} inferred",
   " · 深度 {0}": " · depth {0}",
   "全部": "All",
+  "渲染": "Rendered",
+  "原文": "Raw text",
   "没有符合筛选的切片": "No chunks match the filter",
   "只显示前 {0} 片": "Only the first {0} chunks are shown",
 

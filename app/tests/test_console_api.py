@@ -1194,6 +1194,27 @@ class ConsoleI18nTests(unittest.TestCase):
         self.assertIn("html[lang=en] body.backend-offline header::after{content:", html)
         self.assertIn("html[lang=en] body.parse-disabled header::before{content:", html)
 
+    def test_chunk_preview_renders_markdown_and_formulas_with_the_vendored_libraries(self) -> None:
+        """The chunk preview draws each chunk as Markdown (tables, code, headings) with the pipeline's marker lines as
+        labels and EQUATION / $$ blocks through KaTeX, next to the raw text the model actually sees. Both renderers are
+        vendored under static/vendor so the console works without the internet; document text never becomes HTML
+        (markdown-it html:false, KaTeX trust:false)."""
+        static = Path(__file__).resolve().parents[1] / "kb_server" / "static"
+        for rel in ("vendor/markdown-it.umd.min.js", "vendor/katex.min.js", "vendor/katex.min.css"):
+            self.assertTrue((static / rel).is_file(), rel)
+        self.assertEqual(len(list((static / "vendor" / "fonts").glob("KaTeX_*.woff2"))), 20)
+        html = _repo_file("app/kb_server/static/index.html")
+        self.assertIn('<link rel="stylesheet" href="vendor/katex.min.css', html)
+        self.assertLess(html.index('<script src="vendor/markdown-it.umd.min.js'), html.index('<script src="i18n.js'))
+        self.assertLess(html.index('<script src="vendor/katex.min.js'), html.index('<script src="i18n.js'))
+        self.assertIn(".pv-chunk .pv-md{", html)
+        js = _repo_file("app/kb_server/static/app.js")
+        self.assertIn("markdownit({ html: false, linkify: false", js)
+        self.assertIn("throwOnError: false, trust: false", js)
+        self.assertIn('data-v="raw"', js)                      # the raw text stays one click away
+        self.assertIn('localStorage.setItem("kb.pvview"', js)
+        self.assertIn('.pv-filters .chip[data-f]', js)          # view chips are not filter chips
+
     def test_every_console_string_has_a_dictionary_entry(self) -> None:
         """Every Chinese string on the static page (text, placeholder, title) and every t("…") key in app.js must be
         in the dictionary; one missing entry leaks a Chinese sentence into the English UI."""

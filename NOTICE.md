@@ -12,6 +12,15 @@ following projects, which keep their own licenses.
   Copyright (c) Microsoft Corporation. The upstream license text is in
   `THIRD_PARTY_LICENSES/GraphRAG-MIT.txt`; the prompts were rewritten and
   extended here (type menus, quantity limits, measurement facts).
+- **markdown-it** 15.0.2 (MIT). Copyright (c) 2014 Vitaly Puzrin, Alex
+  Kocharin. `app/kb_server/static/vendor/markdown-it.umd.min.js` is the
+  unmodified browser build; the console's chunk preview renders chunk text
+  with it. The license text is in `THIRD_PARTY_LICENSES/markdown-it-MIT.txt`.
+- **KaTeX** 0.18.10 (MIT). Copyright (c) 2013-2020 Khan Academy and other
+  contributors. `app/kb_server/static/vendor/katex.min.js`, `katex.min.css`
+  and `fonts/*.woff2` are unmodified files of the release; the same preview
+  renders formulas with them. The license text is in
+  `THIRD_PARTY_LICENSES/KaTeX-MIT.txt`.
 - **Qwen3 reranker chat templates** (Alibaba Cloud, Apache-2.0).
   `deployment/compose/assets/qwen3_reranker.jinja` and
   `qwen3_vl_reranker.jinja` are the templates published with the

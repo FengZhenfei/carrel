@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#f9f9fb">
 <title>Carrel 控制台</title>
 <link rel="icon" href="data:,">
+<link rel="stylesheet" href="vendor/katex.min.css?v=20261001-1">
 <style>
 /* Design direction: the Linear / Vercel Geist / shadcn lineage -- neutral light grey background, white
    cards, 1px hairline borders, minimal shadows, a single indigo accent, restrained 150ms motion.
@@ -300,6 +301,22 @@ td.path{word-break:break-all;min-width:220px}
 .pv-chunk[open] summary .pv-peek{display:none}
 .pv-chunk pre{margin:0;padding:10px 14px 12px;border-top:1px solid var(--line-2);font-size:12.5px;line-height:1.6;
   white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;font-family:inherit}
+.pv-filters .pv-view{margin-left:auto;display:flex;gap:6px}
+/* rendered chunk view: markdown-it output plus the pipeline's marker lines and KaTeX formulas */
+.pv-chunk .pv-md{padding:8px 14px 10px;border-top:1px solid var(--line-2);font-size:12.5px;line-height:1.55;max-height:360px;overflow:auto;word-break:break-word}
+.pv-md p{margin:4px 0}
+.pv-md h1,.pv-md h2,.pv-md h3,.pv-md h4,.pv-md h5,.pv-md h6{font-size:13px;margin:8px 0 4px;font-weight:600}
+.pv-md table{border-collapse:collapse;margin:6px 0;font-size:12px;display:block;max-width:100%;overflow-x:auto}
+.pv-md th,.pv-md td{border:1px solid var(--line);padding:3px 7px;vertical-align:top;text-align:left}
+.pv-md th{background:var(--well);font-weight:600}
+.pv-chunk .pv-md pre{margin:6px 0;padding:8px 10px;border:1px solid var(--line-2);border-radius:6px;background:var(--well);font-size:12px;line-height:1.5;
+  white-space:pre;max-height:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.pv-md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.pv-md ul,.pv-md ol{margin:4px 0;padding-left:20px}
+.pv-md blockquote{margin:4px 0;padding-left:10px;border-left:2px solid var(--line-strong);color:var(--text-2)}
+.pv-md .pv-label{margin:5px 0;color:var(--text-2)}
+.pv-md .pv-label b{display:inline-block;font-size:10.5px;letter-spacing:.04em;color:var(--muted);margin-right:6px;font-weight:600}
+.pv-md .pv-eq{margin:6px 0;overflow-x:auto}
 
 /* ── jobs tab ── */
 .split{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1.45fr);gap:16px;align-items:start}
@@ -777,7 +794,9 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
     <button class="danger" id="confirm-yes">确认</button>
   </div>
 </dialog>
-<script src="i18n.js?v=20260930-5"></script>
-<script src="app.js?v=20260930-5"></script>
+<script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
+<script src="vendor/katex.min.js?v=20261001-1"></script>
+<script src="i18n.js?v=20261001-1"></script>
+<script src="app.js?v=20261001-1"></script>
 </body>
 </html>

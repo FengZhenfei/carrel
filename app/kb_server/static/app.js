@@ -1483,8 +1483,51 @@ function pageLabel(c) {
   return ` · p${esc(String(c.page_idx))}${end}`;
 }
 
+/* ── rendered chunk view. markdown-it draws tables / code / headings, KaTeX the parser's "EQUATION:" lines
+   and $$ blocks, and the pipeline's own marker lines (TITLE / CAPTION / VISUAL SUMMARY / ...) become labels.
+   Document text never turns into HTML: markdown-it runs with html:false (tags are escaped) and KaTeX with
+   trust:false. Inline $...$ is left alone: in these documents it is money, not math. ── */
+const PV_MARKER_RE = /^(TITLE|CAPTION|VISUAL SUMMARY|FACTS|ENTITIES|KEYWORDS|FOOTNOTE|IMAGE): ?(.*)$/;
+let pvMd;
+function pvMarkdown() {
+  if (pvMd === undefined) pvMd = typeof markdownit === "function" ? markdownit({ html: false, linkify: false, breaks: true }) : null;
+  return pvMd;
+}
+function pvMath(latex) {
+  if (typeof katex === "undefined") return `<code>${esc(latex)}</code>`;
+  try { return katex.renderToString(latex, { displayMode: true, throwOnError: false, trust: false, strict: "ignore" }); }
+  catch (e) { return `<code>${esc(latex)}</code>`; }
+}
+function chunkHtml(text) {
+  const md = pvMarkdown();
+  if (!md) return `<pre>${esc(text)}</pre>`;
+  const lines = String(text || "").split("\n"), out = [];
+  let buf = [], inFence = false;
+  const flush = () => { if (buf.length) { out.push(md.render(buf.join("\n"))); buf = []; } };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^```/.test(line)) inFence = !inFence;
+    let m;
+    if (inFence || /^```/.test(line)) { buf.push(line); continue; }
+    if ((m = /^EQUATION: ?(.*)$/.exec(line))) { flush(); out.push(`<div class="pv-eq">${pvMath(m[1])}</div>`); continue; }
+    if (/^\$\$/.test(line)) {                                   // display math on one line or as a $$ ... $$ block
+      const parts = [line.slice(2)];
+      while (!/\$\$\s*$/.test(parts[parts.length - 1]) && i + 1 < lines.length) parts.push(lines[++i]);
+      flush(); out.push(`<div class="pv-eq">${pvMath(parts.join("\n").replace(/\$\$\s*$/, ""))}</div>`); continue;
+    }
+    if ((m = PV_MARKER_RE.exec(line))) { flush(); out.push(`<div class="pv-label"><b>${esc(m[1])}</b>${md.renderInline(m[2])}</div>`); continue; }
+    buf.push(line);
+  }
+  flush();
+  return out.join("");
+}
+function pvView() {
+  try { return localStorage.getItem("kb.pvview") === "raw" ? "raw" : "md"; } catch (e) { return "md"; }
+}
+
 function renderChunkPreview() {
   const { r, filter } = state.preview;
+  const view = state.preview.view || pvView();
   const d = r.diagnostics, s = (d && d.stats) || null;
   const budget = r.max_tokens;
   const isVisual = c => ["table", "image", "chart", "vision"].includes(c.block_type);
@@ -1514,6 +1557,7 @@ function renderChunkPreview() {
     ${s ? chip("tiny", t("碎片"), s.tiny_count) : ""}
     ${ambiguous ? chip("ambiguous", t("表格粘连"), ambiguous) : ""}
     ${types.map(([k, n]) => chip("type:" + k, k, n)).join("")}
+    <span class="pv-view"><span class="chip ${view === "md" ? "on" : ""}" data-v="md">${t("渲染")}</span><span class="chip ${view === "raw" ? "on" : ""}" data-v="raw">${t("原文")}</span></span>
   </div>`;
   const show = r.chunks.filter(c => filter === "all" ? true : filter === "tiny" ? tinyOf(c)
     : filter === "ambiguous" ? tableFlagsOf(c).length > 0 : c.block_type === filter.slice(5));
@@ -1524,12 +1568,17 @@ function renderChunkPreview() {
         <span class="bt">${esc(c.block_type)}${pageLabel(c)}</span>${tableBadge(c)}
         <span class="sp" title="${esc(c.block_id)}">${esc((c.section_path || []).join(" › ") || c.block_id)}</span>
         <span class="pv-peek">${esc(c.text.slice(0, 80).replace(/\s+/g, " "))}</span></summary>
-      <pre>${esc(c.text)}</pre></details>`;
+      ${view === "raw" ? `<pre>${esc(c.text)}</pre>` : `<div class="pv-md">${chunkHtml(c.text)}</div>`}</details>`;
   }).join("");
   const html = head + verdict + stats + filters + (cards || `<div class="empty-state">${t("没有符合筛选的切片")}</div>`) +
     (r.truncated ? `<div class="hint">${t("只显示前 {0} 片", r.chunks.length)}</div>` : "");
   if (!setHtml($("#side-body"), html)) return;
-  $$("#side-body .pv-filters .chip").forEach(el => el.addEventListener("click", () => { state.preview.filter = el.dataset.f; renderChunkPreview(); }));
+  $$("#side-body .pv-filters .chip[data-f]").forEach(el => el.addEventListener("click", () => { state.preview.filter = el.dataset.f; renderChunkPreview(); }));
+  $$("#side-body .pv-filters .chip[data-v]").forEach(el => el.addEventListener("click", () => {
+    state.preview.view = el.dataset.v;
+    try { localStorage.setItem("kb.pvview", el.dataset.v); } catch (e) { /* private mode: not remembered */ }
+    renderChunkPreview();
+  }));
 }
 
 /* ── merges drawer: resolution_log / resolution_rejected from the current version's graph.json -- every
