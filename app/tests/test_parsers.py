@@ -2387,6 +2387,92 @@ class VisualEvidenceTests(unittest.TestCase):
         self.assertNotIn('data["facts"] = []', src)                            # 2026-09-10: facts are no longer wiped wholesale
 
 
+class VlmEndpointFallbackTests(unittest.TestCase):
+    """A hosted OpenAI-compatible endpoint may not take everything the local vLLM server takes: the non-standard
+    repetition_penalty (services that validate their parameters answer 400 to it) and json_schema output. Every
+    request used to carry the penalty with no way out, so such an endpoint failed every picture and no document
+    with figures was indexed. The caption call now gives up what was rejected and keeps the rest."""
+
+    class _Http(Exception):
+        def __init__(self, status: int, message: str) -> None:
+            super().__init__(message)
+            self.status_code = status
+
+    def setUp(self) -> None:
+        vlm._NO_REPETITION_PENALTY.clear()
+        self.addCleanup(vlm._NO_REPETITION_PENALTY.clear)
+        self.calls: list[dict] = []
+
+    def _caption(self, url: str, verdict, *, structured: bool = True, images: int = 1, replies=()) -> list[tuple[bool, bool]]:
+        """Caption pictures against a fake endpoint (one base URL per test: clients are cached per endpoint).
+        verdict(request) returns None to accept or (status, message) to reject. Returns, per request sent,
+        whether it carried the penalty and whether it carried the schema."""
+        calls, http, queue = self.calls, self._Http, list(replies)
+        good = json.dumps({"summary": "ok", "entities": [], "facts": [], "keywords": [], "confidence": "high"})
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                rejected = verdict(kwargs)
+                if rejected:
+                    raise http(*rejected)
+                message = SimpleNamespace(content=queue.pop(0) if queue else good)
+                return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp, patch.object(vlm, "OpenAI", FakeOpenAI):
+                for i in range(images):
+                    image = Path(tmp) / f"image{i}.png"
+                    image.write_bytes(b"not-a-real-image")
+                    result = vlm.caption_image(image_path=image, base_url=url, api_key="k", model_id="m", structured=structured)
+                    self.assertEqual(result["summary"], "ok")
+        finally:
+            shape = [("extra_body" in kw, "response_format" in kw) for kw in calls]
+        return shape
+
+    def test_a_strict_endpoint_loses_only_the_penalty_and_is_remembered(self) -> None:
+        strict = lambda kw: (400, "Unrecognized request argument supplied: repetition_penalty") if "extra_body" in kw else None
+        shape = self._caption("http://strict.test/v1", strict, images=2)
+        # rejected once, the schema stays; the second picture is asked for once, without the parameter
+        self.assertEqual(shape, [(True, True), (False, True), (False, True)])
+        self.assertEqual(self._caption("http://strict-plain.test/v1", strict, structured=False)[3:], [(True, False), (False, False)])
+
+    def test_an_endpoint_without_json_schema_keeps_the_penalty(self) -> None:
+        no_schema = lambda kw: (400, "response_format of type json_schema is not supported") if "response_format" in kw else None
+        shape = self._caption("http://noschema.test/v1", no_schema, images=2)
+        self.assertEqual(shape, [(True, True), (True, False)] * 2)
+        self.assertIn("Output exactly one JSON object", self.calls[1]["messages"][0]["content"][0]["text"])
+
+    def test_a_rejection_that_names_nothing_gives_up_the_schema_first_and_is_not_remembered(self) -> None:
+        bare = lambda kw: (422, "invalid request") if ("extra_body" in kw or "response_format" in kw) else None
+        shape = self._caption("http://bare.test/v1", bare, images=2)
+        self.assertEqual(shape, [(True, True), (True, False), (False, False)] * 2)
+
+    def test_the_degraded_retry_does_not_bring_a_rejected_penalty_back(self) -> None:
+        strict = lambda kw: (400, "Unknown parameter: 'repetition_penalty'") if "extra_body" in kw else None
+        shape = self._caption("http://strict-retry.test/v1", strict, replies=["not json at all"])
+        self.assertEqual([penalty for penalty, _ in shape], [True, False, False])
+        self.calls.clear()
+        self._caption("http://vllm.test/v1", lambda kw: None, replies=["not json at all"])
+        self.assertEqual([kw["extra_body"]["repetition_penalty"] for kw in self.calls], [1.05, 1.15])     # unchanged where it is accepted
+
+    def test_failures_that_are_not_a_rejected_request_are_raised_as_before(self) -> None:
+        for n, status in enumerate((500, 503)):
+            self.calls.clear()
+            with self.assertRaises(self._Http):
+                self._caption(f"http://down{n}.test/v1", lambda kw, s=status: (s, "upstream"))
+            self.assertEqual(len(self.calls), 1)                        # not sent again with fewer features
+        self.calls.clear()
+        with self.assertRaises(self._Http):                             # a bad key is a 4xx for every variant: three tries, then raised
+            self._caption("http://badkey.test/v1", lambda kw: (401, "invalid api key"))
+        self.assertEqual([("extra_body" in kw, "response_format" in kw) for kw in self.calls], [(True, True), (True, False), (False, False)])
+        self.assertEqual(vlm._NO_REPETITION_PENALTY, set())
+
+
 class VlmRunawayStringFieldsTests(unittest.TestCase):
     """2026-09-10, the "automation tasks" screenshot in the product docs KB: the model wrote FACTS into
     summary, repeating "1. task list; 2. task list; ..." up to 516 items, and over 5,000 characters went

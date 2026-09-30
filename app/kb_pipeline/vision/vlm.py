@@ -170,6 +170,24 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     return client
 
 
+# Endpoints (base URL, model) that turned down `repetition_penalty` by name. Later requests leave it out
+# instead of paying a rejected round trip for every image.
+_NO_REPETITION_PENALTY: set[tuple[str, str]] = set()
+
+
+def _rejected_by_endpoint(exc: Exception) -> bool:
+    """The request itself was turned down: a 4xx answer, or an error raised while building it. Connection
+    errors, timeouts and 5xx are not this; sending them again with fewer features only wastes an inference."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if status is not None:
+        return 400 <= status < 500
+    return isinstance(exc, (TypeError, ValueError, KeyError))
+
+
 def image_data_url(path: Path, max_pixels: int | None = DEFAULT_MAX_PIXELS) -> str:
     """Kept as the VLM module's entry point; the normalisation (pass-through
     for PNG/JPEG/WebP within budget, re-encode/downscale otherwise) lives in
@@ -539,8 +557,10 @@ def caption_image(
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
-        "extra_body": {"repetition_penalty": repetition_penalty},
     }
+    endpoint = (base_url, model_id)
+    if endpoint not in _NO_REPETITION_PENALTY:
+        request["extra_body"] = {"repetition_penalty": repetition_penalty}
     constrained = bool(structured)
     if structured:
         request["response_format"] = {
@@ -548,32 +568,36 @@ def caption_image(
             "json_schema": {"name": "visual_block", "schema": RESULT_SCHEMA, "strict": True},
         }
 
-    try:
-        resp = client.chat.completions.create(**request)
-    except Exception as exc:
-        if not structured:
-            raise
-        # Degrade only when the endpoint rejects json_schema. Connection errors / timeouts / 5xx used
-        # to land here too and be re-sent with the unconstrained prompt -- one wasted inference, and
-        # the result was still written to the cache as structured.
-        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    while True:
         try:
-            status = int(status) if status is not None else None
-        except (TypeError, ValueError):
-            status = None
-        if status is not None and not (400 <= status < 500):
-            raise
-        if status is None and not isinstance(exc, (TypeError, ValueError, KeyError)):
-            raise
-        # Endpoint does not support schema-constrained decoding; fall back to
-        # asking for JSON in the prompt and parsing leniently.
-        print(f"[vlm] structured output rejected, retrying unconstrained: {exc!r}", flush=True)
-        constrained = False
-        request.pop("response_format", None)
-        request["messages"][0]["content"][0]["text"] = (
-            effective_prompt + "\n\nOutput exactly one JSON object and nothing else."
-        )
-        resp = client.chat.completions.create(**request)
+            resp = client.chat.completions.create(**request)
+            break
+        except Exception as exc:
+            # Give a feature up only when the endpoint rejects the request itself. Connection errors /
+            # timeouts / 5xx used to land here too and be re-sent with the unconstrained prompt -- one
+            # wasted inference, and the result was still written to the cache as structured.
+            if not _rejected_by_endpoint(exc):
+                raise
+            named = "repetition_penalty" in str(exc)
+            if "extra_body" in request and (named or "response_format" not in request):
+                # repetition_penalty is not part of the OpenAI API: vLLM and most hosts of open models
+                # take it, services that validate their parameters answer 400. Without it the runaway
+                # checks below still catch a description that loops.
+                print(f"[vlm] repetition_penalty rejected, retrying without it: {exc!r}", flush=True)
+                request.pop("extra_body")
+                if named:
+                    _NO_REPETITION_PENALTY.add(endpoint)
+            elif "response_format" in request:
+                # Endpoint does not support schema-constrained decoding; fall back to
+                # asking for JSON in the prompt and parsing leniently.
+                print(f"[vlm] structured output rejected, retrying unconstrained: {exc!r}", flush=True)
+                constrained = False
+                request.pop("response_format")
+                request["messages"][0]["content"][0]["text"] = (
+                    effective_prompt + "\n\nOutput exactly one JSON object and nothing else."
+                )
+            else:
+                raise
 
     content = resp.choices[0].message.content or ""
     finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
@@ -596,7 +620,8 @@ def caption_image(
         # structured description instead of garbage.
         print(f"[vlm] caption unparseable or runaway (finish_reason={finish_reason}); degraded retry", flush=True)
         retry = dict(request)
-        retry["extra_body"] = {"repetition_penalty": max(1.15, repetition_penalty)}
+        if "extra_body" in request:       # an endpoint that rejected the parameter does not get it back
+            retry["extra_body"] = {"repetition_penalty": max(1.15, repetition_penalty)}
         retry["messages"] = [
             {
                 "role": "user",
