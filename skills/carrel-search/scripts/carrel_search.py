@@ -58,8 +58,7 @@ def cite_for(name, rel_path, where):
 
 def add_cites(result):
     """Attach `cite` to every object that names a document (rel_path) and `docs_cite` next to every `docs` list, so
-    the agent pastes citations instead of assembling paths. A fact has no locator of its own and borrows the one of
-    the source or evidence chunk it points at in the same document."""
+    the agent pastes citations instead of assembling paths."""
     if not isinstance(result, dict):
         return
     names = dict(result.get("kb_names") or {})
@@ -68,11 +67,13 @@ def add_cites(result):
     by_n = {s.get("n"): s for s in result.get("sources") or [] if isinstance(s, dict)}
 
     def where_of(obj):
+        if obj.get("place"):
+            return str(obj["place"])
+        # A fact comes from a unit of several chunks and does not say which one holds the value: it takes a locator
+        # only when the chunks it points at in this document agree on it, and stays at document level otherwise.
         linked = [by_n.get(n) for n in obj.get("sources") or [] if not isinstance(n, dict)] + list(obj.get("evidence") or [])
-        for cand in [obj] + linked:
-            if isinstance(cand, dict) and (cand is obj or cand.get("rel_path") == obj.get("rel_path")) and cand.get("place"):
-                return str(cand["place"])
-        return ""
+        places = {str(c["place"]) for c in linked if isinstance(c, dict) and c.get("rel_path") == obj.get("rel_path") and c.get("place")}
+        return places.pop() if len(places) == 1 else ""
 
     def walk(obj, kb):
         if isinstance(obj, list):

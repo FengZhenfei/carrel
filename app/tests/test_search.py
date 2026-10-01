@@ -1839,6 +1839,11 @@ class SkillClientTests(unittest.TestCase):
         c.add_cites(single)
         fact = single["facts"][0]
         self.assertEqual((fact["cite"], [e["cite"] for e in fact["evidence"]]), ("datasheets/a.pdf page 2", ["datasheets/a.pdf page 2", "datasheets/b.pdf page 9"]))
+        split = {"kb_id": "kb_002", "kb_name": "datasheets",
+                 "sources": [{"n": 3, "rel_path": "a.xlsx", "place": "sheet S rows 2–10"}, {"n": 16, "rel_path": "a.xlsx", "place": "sheet S rows 9–21"}],
+                 "specs": [{"n": 1, "rel_path": "a.xlsx", "sources": [3, 16]}, {"n": 2, "rel_path": "a.xlsx", "sources": [16]}]}
+        c.add_cites(split)
+        self.assertEqual([s["cite"] for s in split["specs"]], ["datasheets/a.xlsx", "datasheets/a.xlsx sheet S rows 9–21"])   # chunks that disagree on the location: the fact stops at the document instead of naming the wrong rows
         self.assertEqual(single["entities"][0]["docs_cite"], ["datasheets/a.pdf"])       # a listed entity is cited by its documents
         old_service = {"kb_id": "kb_002", "kb_name": "datasheets", "sources": [{"n": 1, "rel_path": "a.pdf", "position": "page 2 · DC"}]}
         c.add_cites(old_service)
