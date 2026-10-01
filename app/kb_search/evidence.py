@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from kb_pipeline.utils import count_tokens
 
-from .text import adjacent, body_token_set, dedupe_overlaps, is_boilerplate, jaccard, position, same_facts, scope_of, token_set, truncate_tokens
+from .text import adjacent, body_token_set, dedupe_overlaps, is_boilerplate, jaccard, place, position, same_facts, scope_of, token_set, truncate_tokens
 
 EXCERPT_TOKENS = 80          # length of the excerpt kept for a hit over budget (with its position; the full text comes later via /context)
 
@@ -45,7 +45,8 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "chunk_uid": payload.get("chunk_uid"), "doc_id": payload.get("doc_id"), "content_version": payload.get("content_version"),
         "chunk_index": payload.get("chunk_index"), "chunk_total": payload.get("chunk_total"),
         "doc": payload.get("filename"), "rel_path": payload.get("rel_path"), "doc_type": payload.get("doc_type"),
-        "position": position(payload), "page_idx": payload.get("page_idx"), "section_path": list(payload.get("section_path") or []),
+        "position": position(payload), "place": place(payload), "page_idx": payload.get("page_idx"),
+        "section_path": list(payload.get("section_path") or []),
         "block_type": payload.get("block_type"), "block_id": payload.get("block_id"), "text": text,
         "token_count": int(payload.get("token_count") or 0) or count_tokens(text),
         "scores": dict(cand.get("scores") or {}), "recall_sources": list(cand.get("recall_sources") or []),

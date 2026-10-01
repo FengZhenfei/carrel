@@ -120,28 +120,49 @@ def windows(text: str, *, window_tokens: int = 480, overlap_tokens: int = 32) ->
     return [w for w in out if w] or [body]
 
 
-def position(payload: dict[str, Any]) -> str:
-    """Position string: "page 46 · 3. AC Characteristics / 3.2 Timing"; slides and sheets are written
-    by their type. The payload's page_idx / slide_idx are already 1-based page numbers
-    (parsers.common.page_idx adds 1 to MinerU's 0-based index) and are shown as-is here."""
-    parts: list[str] = []
+def _page_part(payload: dict[str, Any]) -> str:
+    """Page / slide / sheet rows inside the file; an empty string for documents without pages (Markdown, Word).
+    The payload's page_idx / slide_idx are already 1-based page numbers (parsers.common.page_idx adds 1 to
+    MinerU's 0-based index) and are shown as-is here."""
     page = payload.get("page_idx")
     slide = payload.get("slide_idx")
     sheet = payload.get("sheet_name")
     if slide is not None and str(slide) != "":
-        parts.append(f"slide {int(slide)}")
-    elif sheet:
+        return f"slide {int(slide)}"
+    if sheet:
         rs, re_ = payload.get("row_start"), payload.get("row_end")
-        parts.append(f"sheet {sheet}" + (f" rows {rs}–{re_}" if rs is not None and re_ is not None else ""))
-    elif page is not None and str(page) != "":
+        return f"sheet {sheet}" + (f" rows {rs}–{re_}" if rs is not None and re_ is not None else "")
+    if page is not None and str(page) != "":
         try:
-            parts.append(f"page {int(page)}")
+            return f"page {int(page)}"
         except (TypeError, ValueError):
             pass
-    section = " / ".join(str(s) for s in (payload.get("section_path") or []) if str(s).strip())
-    if section:
-        parts.append(section)
-    return " · ".join(parts)
+    return ""
+
+
+def position(payload: dict[str, Any]) -> str:
+    """Position string: "page 46 · 3. AC Characteristics / 3.2 Timing"; slides and sheets are written
+    by their type."""
+    parts = [_page_part(payload)]
+    parts.append(" / ".join(str(s) for s in (payload.get("section_path") or []) if str(s).strip()))
+    return " · ".join(p for p in parts if p)
+
+
+PLACE_HEADING_CHARS = 60
+
+
+def place(payload: dict[str, Any]) -> str:
+    """The short locator for citations: page / slide / sheet rows; for documents without pages the deepest
+    heading (cut when too long). Callers append it to the file path as it is; cutting it out of the position
+    string cannot work, because headings themselves contain " / " and " · "."""
+    part = _page_part(payload)
+    if part:
+        return part
+    headings = [str(s).strip() for s in (payload.get("section_path") or []) if str(s).strip()]
+    if not headings:
+        return ""
+    last = headings[-1]
+    return last if len(last) <= PLACE_HEADING_CHARS else last[:PLACE_HEADING_CHARS - 1] + "…"
 
 
 _NUM_SEP_RE = re.compile(r"(?<=\d)[.,](?=\d)")

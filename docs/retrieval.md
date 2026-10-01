@@ -48,6 +48,8 @@ in the service's own environment take precedence over the file.
 | `GET /image/{kb_id}/{point_id}` | Fetch an image associated with a retrieved chunk |
 | `POST /crop` | Crop a selected region of that image |
 | `POST /graph/neighbors` | Fetch evidence-backed relationships around an entity |
+| `POST /graph/entities` | List entities by type, upper class, or name, with a total and paging |
+| `POST /graph/facts` | List the structured facts of a subject, or of a property across subjects, with a total and paging |
 
 The console has a separate `/api` namespace on port 9800 for administration.
 Agents normally use the search service on port 9810.
@@ -140,11 +142,50 @@ checking the source evidence at each step.
 - Directed relationships use `in` and `out` semantically. For undirected
   relationships, use `direction=both` to retrieve either storage direction.
 - The default limit is 20, with a maximum of 100. Results are ranked by weight;
-  `count` records the number of relationships in this response.
+  `count` records the number of relationships in this response, `total` the
+  number under the same filter, and `has_more` whether some were left out.
 - The endpoint returns a single bounded neighborhood. Narrow with `types`
   or adjust `limit` when more focused results are needed.
 - Relationship descriptions summarize linked evidence. Their evidence positions
   can be passed to `/context` to retrieve the original passages.
+
+### Enumerate entities and facts
+
+Use these two endpoints when a question asks for everything of a kind ("all
+products", "every parameter of this device"). Ordinary questions are answered
+by `/search` alone.
+
+`POST /graph/entities` accepts `kb_id` and optional `types`, `parent_types`
+(the upper classes `entity`, `part`, `property`, `process`, `standard`,
+`document`), `name` (text contained in the title or an alias), `limit`
+(50 by default, at most 200), and `offset`. Entities are ordered by
+importance, and each carries `docs` (the documents that mention it most) and
+`doc_count`. The first page also returns `types`: the number of entities per
+type in this knowledge base.
+
+`POST /graph/facts` accepts `kb_id`, a `subject` title or `subject_id`, an
+optional `property` (property name, symbol, or concept name), `match`
+(`auto`, `exact`, or `contains`), `limit`, and `offset`. At least one of
+subject and property is required. Rows have the shape of `specs` in
+`/search` and carry an `evidence` list whose positions can be passed to
+`/context`.
+
+- A matched property brings every spelling of the same normalized concept
+  with it. `match=auto` tries an exact match first and containment only when
+  nothing matched; `property.matched` reports which one applied.
+- With a subject only, the first page also returns `properties`: the
+  properties this subject has, with counts.
+- `total`, `offset`, and `has_more` describe the whole result; request the
+  next page with a larger `offset`.
+- Entity names ignore case and spaces. When a name does not match,
+  `found=false` and `candidates` lists similar entities to choose from by ID.
+- Both endpoints list what the graph registered during extraction. They do not
+  prove that the documents contain nothing else.
+
+Responses carry the knowledge base's folder name (`kb_names` in `/search`,
+`kb_name` elsewhere). A document is cited as `<folder name>/<rel_path>`,
+followed by `place`: the short locator that sources and evidence chunks carry
+(page, slide, or sheet rows; the deepest heading for documents without pages).
 
 ## Interpret the evidence
 

@@ -57,6 +57,25 @@ class NeighborsRequest(BaseModel):
     direction: str = Field(default="both", pattern="^(both|out|in)$")
 
 
+class EntitiesRequest(BaseModel):
+    kb_id: str
+    types: list[str] | None = None                                 # only these entity types (case-insensitive; the types a knowledge base has are in /catalog and in the first page's types)
+    parent_types: list[str] | None = None                          # or by upper class: entity / part / property / process / standard / document
+    name: str | None = Field(default=None, max_length=200)         # a piece of text contained in the title or an alias
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class FactsRequest(BaseModel):
+    kb_id: str
+    subject: str | None = Field(default=None, max_length=200)      # the subject's title or alias (case-insensitive)
+    subject_id: str | None = Field(default=None, max_length=200)   # or the entity id directly
+    prop: str | None = Field(default=None, max_length=200, alias="property")   # property name / symbol / canonical concept name; at least one of subject and property
+    match: str = Field(default="auto", pattern="^(auto|exact|contains)$")      # auto: exact first, containment only when nothing matched
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
 class CropRequest(BaseModel):
     kb_id: str
     point_id: str
@@ -158,4 +177,16 @@ def crop(req: CropRequest) -> Response:
 def graph_neighbors(req: NeighborsRequest) -> dict[str, Any]:
     return _wrap(service.graph_neighbors, req.kb_id, entity=req.entity, entity_id=req.entity_id, limit=req.limit, types=req.types,
                  direction=req.direction)
+
+
+@router.post("/graph/entities", dependencies=[Depends(require_token)])
+def graph_entities(req: EntitiesRequest) -> dict[str, Any]:
+    return _wrap(service.graph_entities, req.kb_id, types=req.types, parent_types=req.parent_types, name=req.name, limit=req.limit,
+                 offset=req.offset)
+
+
+@router.post("/graph/facts", dependencies=[Depends(require_token)])
+def graph_facts(req: FactsRequest) -> dict[str, Any]:
+    return _wrap(service.graph_facts, req.kb_id, subject=req.subject, subject_id=req.subject_id, prop=req.prop, match=req.match,
+                 limit=req.limit, offset=req.offset)
 

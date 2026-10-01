@@ -107,6 +107,29 @@ class TextTests(unittest.TestCase):
         self.assertFalse(is_boilerplate({"section_path": ["3. AC Characteristics"]}))
 
 
+class PlaceTests(unittest.TestCase):
+    def test_place_is_the_short_locator_for_citations(self) -> None:
+        """The short locator appended to the file path in a citation: page / slide / sheet rows when there are any,
+        the deepest heading for documents without pages. It cannot be cut out of the position string: headings
+        themselves contain " / " and " · ", and a cut takes half a heading for the locator."""
+        from kb_search.evidence import source_row
+        from kb_search.text import place, position
+
+        pdf = {"page_idx": 46, "section_path": ["3. AC Characteristics", "3.2 Timing"]}
+        self.assertEqual((position(pdf), place(pdf)), ("page 46 · 3. AC Characteristics / 3.2 Timing", "page 46"))
+        self.assertEqual(place({"slide_idx": 3, "section_path": ["Overview"]}), "slide 3")
+        self.assertEqual(place({"sheet_name": "Prices", "row_start": 6, "row_end": 13}), "sheet Prices rows 6–13")
+        self.assertEqual(place({"sheet_name": "Summary"}), "sheet Summary")
+        md = {"section_path": ["Volume 3 · Bundles (A / B / C)", "Bundles · A / C / Summer offer"]}
+        self.assertEqual(place(md), "Bundles · A / C / Summer offer")           # the whole heading, not the half after a "/"
+        self.assertEqual(position(md), "Volume 3 · Bundles (A / B / C) / Bundles · A / C / Summer offer")
+        long = {"section_path": ["1. " + "a very long heading " * 10]}
+        self.assertEqual((len(place(long)), place(long)[-1]), (60, "…"))
+        self.assertEqual((place({}), place({"page_idx": "", "section_path": ["", " "]})), ("", ""))
+        row = source_row(1, {"point_id": "p1", "kb_id": "kb_001"}, _payload("p1", "d1", 0, "body"))
+        self.assertEqual(row["place"], place(_payload("p1", "d1", 0, "body")))             # source rows carry the same short locator
+
+
 class ConfigTests(unittest.TestCase):
     def test_defaults_are_the_calibrated_values(self) -> None:
         env = {k: v for k, v in os.environ.items() if not k.startswith("KB_SEARCH_")}
@@ -1519,6 +1542,8 @@ class ApiTests(unittest.TestCase):
             def __exit__(self, *a): return False
             def run(self, cypher, **kw):
                 self.calls.append((cypher, kw))
+                if "count(r) AS total" in cypher:
+                    return FakeResult([{"total": 7}])
                 if "RELATED_TO" in cypher:
                     return FakeResult([{"relation_id": "r1", "type": "has_stage", "outgoing": True, "directed": True, "weight": 3.0, "npmi": 0.4, "cooccur": 2,
                                         "description": "FDE 有阶段二", "type_violation": False, "other_id": "e2", "other_title": "阶段二", "other_type": "stage", "other_scope": None, "other_pagerank": 0.1}])
@@ -1535,10 +1560,11 @@ class ApiTests(unittest.TestCase):
             def session(self): return self.s
             def close(self): pass
 
-        src = SimpleNamespace(kb_id="kb_003", collection="kb_003")
+        src = SimpleNamespace(kb_id="kb_003", collection="kb_003", source_root="reports")
         class FakeQ:
             def retrieve(self, collection_name, ids, with_payload, with_vectors):
-                return [SimpleNamespace(id="p7", payload={"is_active": True, "doc_id": "d7", "chunk_index": 3, "content_version": "v1", "page_idx": 4, "rel_path": "x/fde.pdf", "filename": "fde.pdf"})]
+                return [SimpleNamespace(id="p7", payload={"is_active": True, "doc_id": "d7", "chunk_index": 3, "content_version": "v1", "page_idx": 4, "rel_path": "x/fde.pdf", "filename": "fde.pdf",
+                                                          "section_path": ["2. Roles"]})]
 
         with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", return_value=FakeDriver()), \
                 mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="003-v"):
@@ -1547,6 +1573,8 @@ class ApiTests(unittest.TestCase):
         nb = out["neighbors"][0]
         self.assertEqual((nb["type"], nb["direction"], nb["other"]["title"]), ("has_stage", "out", "阶段二"))            # predicate, direction, far end
         self.assertEqual((nb["evidence"][0]["doc_id"], nb["evidence"][0]["chunk_index"], nb["evidence"][0]["active"]), ("d7", 3, True))   # the evidence chunk can be fed to /context directly
+        self.assertEqual((nb["evidence"][0]["position"], nb["evidence"][0]["place"]), ("page 4 · 2. Roles", "page 4"))   # the position string and the short locator for citations, written like the sources of /search
+        self.assertEqual((out["count"], out["total"], out["has_more"], out["kb_name"]), (1, 7, True, "reports"))   # the total is not bounded by limit: an incomplete answer shows
         ss = _settings(token="secret")
         with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
                 mock.patch.object(service, "graph_neighbors", return_value={"found": True}) as gn:
@@ -1570,6 +1598,199 @@ class ApiTests(unittest.TestCase):
         by_name = next(text for text, _, _ in driver.log if "toLower(e.title)" in text)
         self.assertIn("e.id IS NOT NULL", by_name)                                                          # the lookup by name can use the composite index too
 
+    def test_graph_entities_lists_by_type_with_total_and_paging(self) -> None:
+        """ "All of them" questions: entities by type / upper class / name, with a total and paging; the first page
+        also carries the number of entities per type."""
+        from fastapi.testclient import TestClient
+
+        from kb_search import graphwalk
+        from kb_search.main import create_app
+
+        log: list = []
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, cypher, **kw):
+                text = str(getattr(cypher, "text", cypher))
+                log.append((text, getattr(cypher, "timeout", None), kw))
+                if "count(e) AS total" in text:
+                    rows = [{"total": 3}]
+                elif "AS etype" in text:
+                    rows = [{"etype": "product", "parent": "entity", "n": 3}, {"etype": "module", "parent": "part", "n": 9}]
+                elif "MENTIONED_IN" in text:
+                    rows = [{"eid": "e1", "docs": ["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], "doc_count": 7}]
+                else:
+                    rows = [{"id": "e1", "title": "Northwind Suite", "type": "product", "parent_type": "entity", "scope": None, "description": "An office suite. " * 40,
+                             "pagerank": 0.9, "degree": 40, "aliases": ["NW Suite"]},
+                            {"id": "e2", "title": "Northwind Notes", "type": "product", "parent_type": "entity", "scope": None, "description": None,
+                             "pagerank": 0.5, "degree": 12, "aliases": []}]
+                return SimpleNamespace(data=lambda: rows)
+
+        driver = SimpleNamespace(session=lambda: Session(), close=mock.Mock())
+        src = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
+        with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", side_effect=AssertionError("must not create a Neo4j driver")), \
+                mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="005-v"):
+            out = graphwalk.list_entities(SimpleNamespace(), src, types=["Product", " product "], parent_types=["Entity"], name=" Northwind ",
+                                          limit=2, offset=0, driver=driver, timeout=7.0)
+            page2 = graphwalk.list_entities(SimpleNamespace(), src, types=["product"], limit=999, offset=2, driver=driver)
+        self.assertEqual((out["kb_name"], out["graph_version"], out["total"], out["count"], out["has_more"]), ("products", "005-v", 3, 2, True))
+        self.assertEqual(out["filters"], {"types": ["product"], "parent_types": ["entity"], "name": "northwind"})    # case-insensitive, de-duplicated
+        self.assertEqual([e["id"] for e in out["entities"]], ["e1", "e2"])
+        self.assertEqual(len(out["entities"][0]["description"]), 200); self.assertIsNone(out["entities"][1]["description"])   # a listing keeps only the start of a description
+        self.assertEqual((out["entities"][0]["docs"], out["entities"][0]["doc_count"]), (["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], 7))   # items carry their documents: a listing needs no query per item
+        self.assertEqual((out["entities"][1]["docs"], out["entities"][1]["doc_count"]), ([], 0))
+        docs_query = next((t, kw) for t, _, kw in log if "MENTIONED_IN" in t)
+        self.assertEqual((docs_query[1]["ids"], docs_query[1]["top"]), (["e1", "e2"], 3)); self.assertIn("ORDER BY mentions DESC", docs_query[0])
+        self.assertEqual(out["types"], [{"type": "product", "parent_type": "entity", "count": 3}, {"type": "module", "parent_type": "part", "count": 9}])
+        self.assertNotIn("types", page2); self.assertEqual((page2["limit"], page2["offset"]), (200, 2))             # the type summary only on the first page; limit is capped
+        listing = next(t for t, _, _ in log if "SKIP $offset LIMIT $limit" in t)
+        for piece in ("e.id IS NOT NULL", "coalesce(e.boilerplate, false) = false", "coalesce(e.reference, false) = false",
+                      "toLower(e.type) IN $types", "ORDER BY coalesce(e.pagerank, 0) DESC, e.id"):
+            self.assertIn(piece, listing)                                                                           # uses the composite index, skips boilerplate and references, stable order
+        self.assertTrue(all(timeout == 7.0 for _, timeout, kw in log[:4]))                                          # every query carries the transaction timeout
+        self.assertEqual(driver.close.call_count, 0)                                                                # the shared driver is not closed
+        ss = _settings(token="secret")
+        auth = {"Authorization": "Bearer secret"}
+        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)), \
+                mock.patch.object(service, "graph_entities", return_value={"total": 0}) as ge:
+            client = TestClient(create_app())
+            r = client.post("/graph/entities", json={"kb_id": "kb_005", "types": ["product"], "limit": 20, "offset": 40}, headers=auth)
+            self.assertEqual((r.status_code, r.json()), (200, {"total": 0}))
+            self.assertEqual((ge.call_args.kwargs["types"], ge.call_args.kwargs["limit"], ge.call_args.kwargs["offset"]), (["product"], 20, 40))
+            self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005", "limit": 201}, headers=auth).status_code, 422)
+            self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005"}).status_code, 401)
+        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)):
+            self.assertEqual(TestClient(create_app()).post("/graph/entities", json={"kb_id": "kb_009"}, headers=auth).status_code, 404)
+
+    def test_graph_facts_by_subject_and_property(self) -> None:
+        """Facts by subject / property: the subject goes along HAS_SPEC, the property is matched exactly first and by
+        containment second, bringing every spelling of the same concept along; rows come from the payloads of the fact
+        collection, the same projection as the specs of /search, with evidence locators and source verification."""
+        from fastapi.testclient import TestClient
+
+        from kb_pipeline.graph.vectors import point_id_for
+        from kb_search import graphwalk
+        from kb_search.main import create_app
+
+        log: list = []
+        gv = "002-v"
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, cypher, **kw):
+                text = str(getattr(cypher, "text", cypher))
+                log.append((text, kw))
+                rows: list = []
+                if "replace(toLower(e.title), ' ', '') = $name" in text:
+                    rows = [{"id": "e-small", "title": "ZK200", "type": "device", "parent_type": "entity", "scope": None, "description": "", "pagerank": 0.1, "degree": 2, "aliases": []},
+                            {"id": "e-main", "title": "ZK200", "type": "device", "parent_type": "entity", "scope": None, "description": "", "pagerank": 0.2, "degree": 30, "aliases": []}]
+                elif "RETURN DISTINCT f.concept_key AS key" in text:
+                    rows = [] if " = $p" in text else [{"key": "c-vcc"}]            # nothing exact, containment hits one concept
+                elif "count(f) AS total" in text:
+                    rows = [{"total": 5}]
+                elif "AS row" in text:
+                    rows = [{"row": {"id": "f1", "subject": "ZK200", "property": "Supply voltage", "concept": "supply voltage", "concept_key": "c-vcc", "value": "3.3", "unit": "V", "valid_from": "rev A"}},
+                            {"row": {"id": "f2", "subject": "ZK200", "property": "VCC", "concept": "supply voltage", "concept_key": "c-vcc", "value": "3.6", "unit": "V", "valid_from": "rev B"}},
+                            {"row": {"id": "f3", "subject": "ZK200", "property": "Supply voltage result", "concept": "supply voltage", "concept_key": "c-vcc", "value": "3.5", "unit": "V", "valid_from": "rev C"}}]
+                elif "count(f) AS n" in text:
+                    rows = [{"concept": "supply voltage", "concept_key": "c-vcc", "n": 5}, {"concept": "access time", "concept_key": "c-taa", "n": 2}]
+                return SimpleNamespace(data=lambda: rows)
+
+        def spec_payload(fid, prop, value, when, series_index, points):
+            return {"gr_id": fid, "graph_version": gv, "subject": "ZK200", "property": prop, "concept": "supply voltage", "concept_key": "c-vcc", "value": value,
+                    "unit": "V", "unit_canonical": "V", "when": when, "valid_from": when, "series_key": "s-vcc", "series_index": series_index,
+                    "conditions": {}, "kinds": {"value": "scalar"}, "comparable": True, "text": f"ZK200 {prop} {value} V", "rel_path": f"datasheets/{when}.pdf",
+                    "point_ids": points}
+
+        specs = {point_id_for(gv, "f1"): spec_payload("f1", "Supply voltage", "3.3", "rev A", 0, ["p1", "p1b", "p1c", "p1d"]),
+                 point_id_for(gv, "f2"): spec_payload("f2", "VCC", "3.6", "rev B", 1, ["p2"])}        # the payload of f3 cannot be fetched (the alias is switching versions)
+        chunks = {"p1": {"is_active": True, "doc_id": "d1", "rel_path": "datasheets/rev A.pdf", "filename": "rev A.pdf", "chunk_index": 4, "content_version": "v1", "page_idx": 2,
+                         "section_path": ["DC Characteristics"]},
+                  "p1b": {"is_active": False, "doc_id": "d1", "rel_path": "datasheets/rev A.pdf", "chunk_index": 5, "content_version": "v0", "page_idx": 2}}      # p1c and p2 are not in the main collection
+
+        class Q:
+            calls: list = []
+            def retrieve(self, collection_name, ids, with_payload, with_vectors):
+                Q.calls.append((collection_name, list(ids), with_payload))
+                table = specs if collection_name == "graph_002_spec" else chunks
+                return [SimpleNamespace(id=i, payload=table[i]) for i in ids if i in table]
+
+        driver = SimpleNamespace(session=lambda: Session(), close=mock.Mock())
+        src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="datasheets")
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv):
+            out = graphwalk.list_facts(SimpleNamespace(), src, subject=" ZK 200 ", prop=" Voltage ", limit=3, offset=2, fields=service.FACT_FIELDS, q=Q(), driver=driver)
+        self.assertEqual((out["found"], out["subject"]["id"], [m["id"] for m in out["matches"]]), (True, "e-main", ["e-small"]))    # several with the same name: the best connected one, the rest listed
+        self.assertEqual(next(kw for t, kw in log if "$name" in t)["name"], "zk200")                                               # case and spaces do not matter
+        self.assertEqual(out["property"], {"query": "Voltage", "matched": "contains", "concepts": 1})                              # containment only when nothing matched exactly
+        self.assertEqual((out["total"], out["offset"], out["count"], out["has_more"], out["kb_name"]), (5, 2, 3, False, "datasheets"))
+        page = next(t for t, kw in log if "AS row" in t)
+        self.assertIn("(e:Entity {kb_id: $kb, graph_version: $gv, id: $sid})-[:HAS_SPEC]->(f:Spec)", page)                         # along the subject's fact edges
+        self.assertIn("f.concept_key IN $keys OR", page)                                                                         # every spelling of the same concept comes along
+        self.assertEqual(next(kw for t, kw in log if "AS row" in t)["keys"], ["c-vcc"])
+        f1, f2, f3 = out["facts"]
+        self.assertEqual([f["n"] for f in out["facts"]], [3, 4, 5])                                                                # numbering continues from the page offset
+        self.assertEqual((f1["hint"], f1["series_text"]), ("ZK200 · Supply voltage = 3.3 V · rev A", "3.3 V(rev A)、3.6 V(rev B)"))     # the same hints and series as the fact rows of /search
+        self.assertEqual([(e["point_id"], e["active"]) for e in f1["evidence"]], [("p1", True), ("p1b", False), ("p1c", False)])      # at most three evidence chunks per fact
+        self.assertEqual((f1["evidence"][0]["doc_id"], f1["evidence"][0]["chunk_index"], f1["evidence"][0]["position"], f1["evidence"][0]["place"]),
+                         ("d1", 4, "page 2 · DC Characteristics", "page 2"))
+        self.assertEqual((f1["verified"], f1["sources_active"]), (True, "1/3"))
+        self.assertEqual((f2["verified"], f2["sources_active"], f2.get("hint")), (False, "0/1", None))                             # every source point inactive: no hint, not a current fact
+        self.assertEqual((f3["id"], f3["value"], f3["evidence"]), ("f3", "3.5", [])); self.assertNotIn("text", f3)               # payload not fetched: only the basic graph-database fields
+        self.assertEqual(out["degraded"], ["spec_payload_missing: 1"])
+        self.assertNotIn("properties", out)                                                                                      # the property list only on the first page
+        self.assertNotIn("sources", f1); self.assertNotIn("score", f1)
+        self.assertEqual([c[0] for c in Q.calls], ["graph_002_spec", "kb_002"])
+        # only a property (no subject): across subjects, ordered by subject first; no property list on the first page either
+        log.clear()
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv):
+            cross = graphwalk.list_facts(SimpleNamespace(), src, prop="voltage", match="contains", fields=service.FACT_FIELDS, q=None, driver=driver)
+        page = next(t for t, kw in log if "AS row" in t)
+        self.assertIn("MATCH (f:Spec {kb_id: $kb, graph_version: $gv})", page); self.assertIn("ORDER BY coalesce(f.subject, ''),", page)
+        self.assertEqual((cross["subject"], cross["property"]["matched"], [f["n"] for f in cross["facts"]]), (None, "contains", [1, 2, 3]))
+        self.assertNotIn("properties", cross); self.assertTrue(all(f["evidence"] == [] and f.get("verified") is None for f in cross["facts"]))
+        self.assertFalse([t for t, kw in log if " = $p" in t])                                                                   # match=contains does not try exact first
+        # the name did not match: vector candidates, no fact query
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv), \
+                mock.patch.object(graphwalk, "resolve_entity", return_value=[]), \
+                mock.patch.object(graphwalk, "dense_candidates", return_value=[{"id": "e9", "title": "ZK201"}]):
+            miss = graphwalk.list_facts(SimpleNamespace(), src, subject="ZK20", q=None, driver=driver)
+        self.assertEqual((miss["found"], miss["total"], miss["facts"], [c["id"] for c in miss["candidates"]]), (False, 0, [], ["e9"]))
+        ss = _settings(token="secret")
+        auth = {"Authorization": "Bearer secret"}
+        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={"kb_002": src}), ss, None)), \
+                mock.patch.object(graphwalk, "list_facts", return_value={"total": 1}) as lf, \
+                mock.patch.object(channels, "shared_driver", return_value=driver):
+            client = TestClient(create_app())
+            r = client.post("/graph/facts", json={"kb_id": "kb_002", "subject": "ZK200", "property": "VCC", "match": "exact", "limit": 10}, headers=auth)
+            self.assertEqual((r.status_code, r.json()), (200, {"total": 1}))
+            self.assertEqual((lf.call_args.kwargs["prop"], lf.call_args.kwargs["match"], lf.call_args.kwargs["fields"]), ("VCC", "exact", service.FACT_FIELDS))
+            self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_002"}, headers=auth).status_code, 422)                 # at least one of subject and property
+            self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_002", "property": "  "}, headers=auth).status_code, 422)
+            self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_002", "subject": "ZK200", "match": "fuzzy"}, headers=auth).status_code, 422)
+            self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_404", "subject": "ZK200"}, headers=auth).status_code, 404)
+
+    def test_fact_rows_share_one_projection(self) -> None:
+        """Graph recall and the facts endpoint use one payload projection: a field added on one side appears on the other."""
+        from kb_pipeline.graph.recall import spec_result_row
+
+        row = spec_result_row({"gr_id": "f1", "subject": "X", "property": "VCC", "value": "3.3", "unit": "V", "when": "rev B", "point_ids": ("p1",), "kinds": None})
+        self.assertEqual((row["id"], row["subject"], row["value"], row["when"], row["point_ids"], row["kinds"], row["conditions"]), ("f1", "X", "3.3", "rev B", ["p1"], {}, {}))
+        for key in ("concept", "concept_key", "valid_from", "series_key", "conflict_group", "conditions_text", "text", "rel_path", "section", "comparable"):
+            self.assertIn(key, row)
+        self.assertNotIn("score", row)                                         # the retrieval score is added by graph recall itself
+        self.assertIn("evidence", service.FACT_FIELDS + ("evidence",)); self.assertNotIn("sources", service.FACT_FIELDS)
+
+    def test_search_and_context_carry_the_library_folder_name(self) -> None:
+        """A cited path is "folder name / rel_path": /context carries kb_name, so the caller needs no catalog call to
+        build it."""
+        src = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
+        q = SimpleNamespace(scroll=lambda **kw: ([SimpleNamespace(id="p1", payload=_payload("p1", "d1", 0, "body text"))], None))
+        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={"kb_005": src}), _settings(), q)):
+            out = service.context("kb_005", "d1", 0, 0)
+        self.assertEqual((out["kb_name"], len(out["sources"])), ("products", 1))
+
     def test_source_row_budget_and_doc_aggs(self) -> None:
         hits = [{"point_id": f"p{i}", "kb_id": "kb_001", "scores": {"score_text": 0.5}, "recall_sources": ["text"],
                  "payload": _payload(f"p{i}", "d1" if i < 2 else "d2", i, f"第 {i} 段正文内容,各不相同。" * (i + 1))} for i in range(3)]
@@ -1577,6 +1798,64 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([r["n"] for r in rows], [1, 2, 3]); self.assertEqual(stats["neighbors"], 0)
         aggs = doc_aggs(rows)
         self.assertEqual([(a["doc"], a["hits"]) for a in aggs], [("d1.pdf", 2), ("d2.pdf", 1)])
+
+
+class SkillClientTests(unittest.TestCase):
+    """The agent-side client under skills/carrel-search. The agent pastes its citations into answers as they are,
+    so their shape is a contract: a path from the knowledge base's top-level folder plus where in the file."""
+
+    @staticmethod
+    def _client():
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "skills" / "carrel-search" / "scripts" / "carrel_search.py"
+        spec = importlib.util.spec_from_file_location("carrel_search_client", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_citations_start_at_the_knowledge_base_folder(self) -> None:
+        c = self._client()
+        result = {"kbs": ["kb_005"], "kb_names": {"kb_005": "products"},
+                  "sources": [{"n": 1, "kb_id": "kb_005", "rel_path": "vendor/manual.pdf", "position": "page 6 · 1. Setup", "place": "page 6"},
+                              {"n": 2, "kb_id": "kb_005", "rel_path": "vendor/prices.xlsx", "position": "sheet Prices rows 6–13", "place": "sheet Prices rows 6–13"},
+                              {"n": 3, "kb_id": "kb_005", "rel_path": "notes/guide.md", "position": "Part 1 · Overview / A / B install", "place": "A / B install"},
+                              {"n": 4, "kb_id": "kb_009", "rel_path": "x/y.pdf", "position": "", "place": ""}],
+                  "specs": [{"n": 1, "kb_id": "kb_005", "rel_path": "vendor/manual.pdf", "sources": [1]},
+                            {"n": 2, "kb_id": "kb_005", "rel_path": "vendor/manual.pdf", "sources": []}],
+                  "entities": [{"n": 1, "kb_id": "kb_005", "docs": ["vendor/manual.pdf", "notes/guide.md"]}]}
+        c.add_cites(result)
+        self.assertEqual([s["cite"] for s in result["sources"]],
+                         ["products/vendor/manual.pdf page 6", "products/vendor/prices.xlsx sheet Prices rows 6–13",
+                          "products/notes/guide.md A / B install",       # the service's locator as it is: the client never cuts a position string
+                          "x/y.pdf"])                                    # folder name unknown: the path inside the knowledge base
+        self.assertEqual([s["cite"] for s in result["specs"]], ["products/vendor/manual.pdf page 6", "products/vendor/manual.pdf"])   # a fact borrows the locator of the source it points at
+        self.assertEqual(result["entities"][0]["docs_cite"], ["products/vendor/manual.pdf", "products/notes/guide.md"])
+        single = {"kb_id": "kb_002", "kb_name": "datasheets",
+                  "facts": [{"n": 1, "rel_path": "a.pdf", "evidence": [{"point_id": "p1", "rel_path": "a.pdf", "position": "page 2 · DC", "place": "page 2"},
+                                                                      {"point_id": "p2", "rel_path": "b.pdf", "place": "page 9"}]}],
+                  "entities": [{"id": "e1", "docs": ["a.pdf"], "doc_count": 4}]}
+        c.add_cites(single)
+        fact = single["facts"][0]
+        self.assertEqual((fact["cite"], [e["cite"] for e in fact["evidence"]]), ("datasheets/a.pdf page 2", ["datasheets/a.pdf page 2", "datasheets/b.pdf page 9"]))
+        self.assertEqual(single["entities"][0]["docs_cite"], ["datasheets/a.pdf"])       # a listed entity is cited by its documents
+        old_service = {"kb_id": "kb_002", "kb_name": "datasheets", "sources": [{"n": 1, "rel_path": "a.pdf", "position": "page 2 · DC"}]}
+        c.add_cites(old_service)
+        self.assertEqual(old_service["sources"][0]["cite"], "datasheets/a.pdf")          # a service without `place`: the path alone, nothing guessed from the position
+        self.assertNotIn("](", result["sources"][0]["cite"])                # plain text, not a link: files may sit in the mirror directly
+
+    def test_listing_commands_build_their_requests(self) -> None:
+        c = self._client()
+        args = c.parser().parse_args(["entities", "--kb", "kb_005", "--type", "product", "--type", "module", "--parent-type", "entity", "--name", "suite",
+                                      "--limit", "20", "--offset", "40"])
+        self.assertEqual(c.payload(args), {"kb_id": "kb_005", "limit": 20, "offset": 40, "types": ["product", "module"], "parent_types": ["entity"], "name": "suite"})
+        args = c.parser().parse_args(["facts", "--kb", "kb_002", "--subject", "ZK200", "--property", "VCC", "--match", "exact"])
+        self.assertEqual(c.payload(args), {"kb_id": "kb_002", "subject": "ZK200", "property": "VCC", "match": "exact"})
+        with self.assertRaises(ValueError):
+            c.payload(c.parser().parse_args(["facts", "--kb", "kb_002"]))          # at least one of subject and property
+        with self.assertRaises(ValueError):
+            c.payload(c.parser().parse_args(["entities"]))
 
 
 if __name__ == "__main__":

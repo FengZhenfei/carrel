@@ -804,6 +804,9 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             r.pop("entities", None); r.pop("relations", None)
     return {
         "question": question, "kbs": chosen,
+        # the knowledge bases' folder names: callers build the cited path as "folder name / rel_path" without
+        # another catalog call
+        "kb_names": {kb: str(settings.sources[kb].source_root) for kb in chosen if getattr(settings.sources.get(kb), "source_root", None)},
         "sources": sources, "doc_aggs": doc_aggs(sources),
         "entities": numbered(entities[:24], ENTITY_FIELDS + ("kb_id",)),
         "relationships": numbered(relations[:24], RELATION_FIELDS + ("kb_id",)),
@@ -824,7 +827,9 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
     from .evidence import source_row
 
     sources = [source_row(i, {"point_id": r.get("point_id"), "kb_id": kb_id}, r, role="context") for i, r in enumerate(rows, 1)]
-    return {"kb_id": kb_id, "doc_id": doc_id, "sources": sources, "tokens_total": sum(int(s["token_count"]) for s in sources)}
+    root = getattr(settings.sources[kb_id], "source_root", None)
+    return {"kb_id": kb_id, "kb_name": str(root) if root else None, "doc_id": doc_id, "sources": sources,
+            "tokens_total": sum(int(s["token_count"]) for s in sources)}
 
 
 def image(kb_id: str, point_id: str) -> dict[str, Any]:
@@ -866,4 +871,36 @@ def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | N
         raise ValueError("entity or entity_id is required")
     return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
                                q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+
+
+def graph_entities(kb_id: str, *, types: list[str] | None = None, parent_types: list[str] | None = None, name: str | None = None,
+                   limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Entities by type / upper class / name ("all of them" questions), with a total and paging; a knowledge
+    base without a graph answers 404."""
+    from . import graphwalk
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    return graphwalk.list_entities(settings, settings.sources[kb_id], types=types, parent_types=parent_types, name=name, limit=limit,
+                                   offset=offset, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+
+
+FACT_FIELDS = tuple(f for f in SPEC_FIELDS if f not in ("sources", "score"))      # sources travel as each row's evidence, and there is no retrieval score here
+
+
+def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | None = None, prop: str | None = None,
+                match: str = "auto", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Qualified facts by subject / property: rows shaped like the specs of /search, with a total and paging;
+    at least one of subject and property is required."""
+    from . import graphwalk
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    if not (subject or subject_id or str(prop or "").strip()):
+        raise ValueError("subject, subject_id or property is required")
+    return graphwalk.list_facts(settings, settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
+                                limit=limit, offset=offset, fields=FACT_FIELDS, q=q, driver=channels.shared_driver(settings),
+                                timeout=ss.channel_timeout)
 

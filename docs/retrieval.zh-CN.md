@@ -32,6 +32,8 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 | `GET /image/{kb_id}/{point_id}` | 获取检索切块对应的图片 |
 | `POST /crop` | 裁剪该图片中的指定区域 |
 | `POST /graph/neighbors` | 查询实体周围带证据的关系 |
+| `POST /graph/entities` | 按类型、上层类或名称列出实体，带总数和翻页 |
+| `POST /graph/facts` | 列出某个主体的结构化事实，或某个属性在各主体上的事实，带总数和翻页 |
 
 控制台在端口 9800 使用独立的 `/api` 管理接口，智能体通常连接端口 9810 的检索服务。
 
@@ -86,9 +88,25 @@ curl -sS http://127.0.0.1:9810/search \
 `POST /graph/neighbors` 接受 `kb_id`、实体名称 `entity` 或 `entity_id`，以及可选的 `types`、`direction`、`limit`。同名实体有歧义时，应优先使用已返回的实体 ID。多跳追查由多次请求组成，每一步都需核对相关来源。
 
 - 有向关系的 `in`、`out` 表示关系方向；无向关系可用 `direction=both` 查询两个存储方向。
-- 默认返回 20 条，最多 100 条，按权重排序；`count` 记录本次返回的关系数。
+- 默认返回 20 条，最多 100 条，按权重排序；`count` 记录本次返回的关系数，`total` 是同样筛选条件下的总数，`has_more` 表示是否还有未返回的。
 - 接口一次返回有数量上限的邻域，可通过 `types` 缩小范围或调整 `limit`。
 - 关系描述汇总关联证据，其来源位置可用于 `/context` 原文查询。
+
+### 列举实体和事实
+
+问题要求列出某一类的全部内容时（“所有产品”“这个器件的全部参数”）使用这两个接口；普通问题只用 `/search` 即可。
+
+`POST /graph/entities` 接受 `kb_id`，以及可选的 `types`、`parent_types`（上层类 `entity`、`part`、`property`、`process`、`standard`、`document`）、`name`（标题或别名中包含的文字）、`limit`（默认 50，最多 200）和 `offset`。实体按重要程度排序，每个实体带 `docs`（提及它最多的文档）和 `doc_count`。第一页同时返回 `types`，即该知识库各类型的实体数量。
+
+`POST /graph/facts` 接受 `kb_id`、主体名称 `subject` 或 `subject_id`、可选的 `property`（属性名、符号或概念名）、`match`（`auto`、`exact` 或 `contains`）、`limit` 和 `offset`。主体与属性至少提供一个。返回行的结构与 `/search` 的 `specs` 相同，并带 `evidence` 列表，其中的位置可用于 `/context`。
+
+- 属性命中后，同一规范概念下的各种写法一并返回。`match=auto` 先精确匹配，没有结果时才按包含匹配；`property.matched` 说明实际采用的方式。
+- 只提供主体时，第一页同时返回 `properties`，即该主体拥有的属性及数量。
+- `total`、`offset` 和 `has_more` 描述完整结果；用更大的 `offset` 请求下一页。
+- 实体名称不区分大小写、不计空格。名称没有匹配时 `found=false`，`candidates` 列出相近实体，可按 ID 选择。
+- 两个接口列出的是图谱在抽取时登记的内容，不能证明文档里没有其他内容。
+
+响应中带知识库的目录名（`/search` 为 `kb_names`，其余为 `kb_name`）。引用文档时写作 `<目录名>/<rel_path>`，后接 `place`：来源和证据切块自带的短定位（页码、幻灯片或工作表行；不分页的文档为最深一级标题）。
 
 ## 理解返回证据
 

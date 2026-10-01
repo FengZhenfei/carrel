@@ -31,6 +31,8 @@ Below, `$SKILL_DIR` is the actual skill directory and `$WORK_DIR` the existing w
 | `image` | GET `/image/{kb_id}/{point_id}` | Original image bytes; save first, then view |
 | `crop` | POST `/crop` | Deterministic crop of an already confirmed original image |
 | `neighbors` | POST `/graph/neighbors` | One-hop relations of an entity in the current graph: predicate, direction, weight, far-end entity, evidence chunks; the agent decides the next hop itself |
+| `entities` | POST `/graph/entities` | Entities by type / upper class / name, with a total and paging; only when the question asks for a complete set |
+| `facts` | POST `/graph/facts` | Qualified facts by subject / property, with a total and paging; rows shaped like `specs` |
 
 ### Search
 
@@ -127,17 +129,39 @@ Each entry in the response's `neighbors[]` contains:
 - `type` (the predicate), `directed` and `direction`: only for relations with `directed=true` does `out` mean the current entity is the subject and `in` that the far end is. `directed=false` is an undirected association whose `in/out` only reflects the storage direction in the graph database, not a semantic subject/object or causality. Query undirected relations with `both` so that no association is missed because of the storage direction.
 - `weight/npmi/cooccur`, `description` (a model summary, not original text), `type_violation` (a flag that an endpoint type is out of bounds).
 - `other`: the far-end entity's ID, title, type, scope and so on.
-- `evidence[]`: at most 3 chunks per relation, with `point_id/doc_id/chunk_index/content_version/rel_path/page_idx/active`. Take the top-level `kb_id` of the response, then build the range parameters of `/context` from the evidence's `doc_id/content_version` and `chunk_index`; do not pass the whole evidence object as the request. `active=false` means the evidence point has been deactivated and cannot serve as current grounds.
+- `evidence[]`: at most 3 chunks per relation, with `point_id/doc_id/chunk_index/content_version/rel_path/page_idx/position/place/active`. Take the top-level `kb_id` of the response, then build the range parameters of `/context` from the evidence's `doc_id/content_version` and `chunk_index`; do not pass the whole evidence object as the request. `active=false` means the evidence point has been deactivated and cannot serve as current grounds.
 
-**Coverage and truncation:** `limit` defaults to 20 with a range of 1–100; relations are returned in descending weight order. `count` is only the number returned this time; the current API has no `total/has_more/truncated` or pagination parameters.
-When the count reaches `limit`, more relations may remain; narrow with `types` according to the question or raise `limit`. Repeating the same request does not yield a next page. `entity.degree` is no substitute for the total number of relations under the current filters either.
+**Coverage and truncation:** `limit` defaults to 20 with a range of 1–100; relations are returned in descending weight order. `count` is the number returned this time, `total` the number of relations under the same filter, and `has_more=true` means some were left out; there is no pagination parameter.
+In that case narrow with `types` according to the question or raise `limit`. Repeating the same request does not yield a next page.
 `entity.docs` lists at most 12 document paths as source leads, not a complete document list. The graph also filters out some relations, so neighbourhood results cannot prove "all results" in the material; completeness must be checked against the original directory or ledger.
 Multi-hop traversal is done by the caller step by step according to the question, checking the relation and the original evidence at every step; the time per hop varies with the entity and the running load.
+
+### Listing entities and facts
+
+Use these only when the question asks for a complete set (every entity of a kind, every parameter of one subject, one property across subjects); ordinary questions need `/search` only.
+
+```bash
+python3 "$SKILL_DIR/scripts/carrel_search.py" entities --kb "<kb id>" --output "$WORK_DIR/entities-1.json"
+python3 "$SKILL_DIR/scripts/carrel_search.py" entities --kb "<kb id>" --type "<an entity type>" --limit 50 --offset 50 --output "$WORK_DIR/entities-2.json"
+python3 "$SKILL_DIR/scripts/carrel_search.py" facts --kb "<kb id>" --subject "<subject title or alias>" --property "<property name or symbol>" --output "$WORK_DIR/facts-1.json"
+```
+
+Conditions of `entities`: `--type` (repeatable, case-insensitive), `--parent-type` (the upper classes `entity/part/property/process/standard/document`, repeatable), `--name` (text contained in the title or an alias), `--limit` (50 by default, at most 200), `--offset`. The response is `kb_id/kb_name/graph_version/filters/total/offset/limit/count/has_more/entities`; the first page (`offset=0`) also has `types`, the number of entities per type in this knowledge base. Each entry of `entities[]` carries `id/title/type/parent_type/scope/degree/pagerank/aliases`, a `description` cut to 200 characters, `docs` (the 3 documents that mention it most; the client adds `docs_cite`) and `doc_count` (how many documents mention it), in descending `pagerank` order; entities found only on boilerplate pages and reference numbers are not listed.
+
+Conditions of `facts`: `--subject` or `--subject-id`, `--property` (property name / symbol / concept name), `--match` (`auto` tries exact first and containment only when nothing matched, `exact`, `contains`), `--limit`, `--offset`; at least one of subject and property is required, otherwise 422. The response is `kb_id/kb_name/graph_version/found/subject/matches/candidates/property/total/offset/limit/count/has_more/facts`:
+
+- `subject` is the chosen subject entity; with several of the same name the best connected one is taken and the rest are in `matches`, so prefer `--subject-id` when an ID is at hand. Names ignore case and spaces; when nothing matches, `found=false` and `candidates` offers a few entities similar by vector.
+- `property` is `{query, matched, concepts}`: `matched` is the mode that applied (`exact` / `contains`, `null` when neither matched), and every spelling under the matched concepts comes back.
+- `facts[]` has the fields of `specs` in `/search` (`hint`, values and units, conditions, time, `series_text`, `conflict`, `verified/sources_active`) without `sources` numbers and `score`; each row also carries `evidence[]` (at most 3 chunks, the same fields as the evidence of the neighbourhood endpoint), and `n` continues from `offset`. `series_text` covers only the facts of this page.
+- With a subject only, the first page also has `properties`: the properties (concepts) of this subject with counts, at most 50.
+- When `degraded` contains `spec_payload_missing`, those rows hold basic fields only (the graph is switching versions); query again shortly.
+
+Both endpoints list what the graph registered (the result of model extraction), not the full material; a knowledge base without a current graph answers 404.
 
 ## Reading responses
 
 JSON commands: `{"call_id":"<id of this call>","operation":"search","result":{<the service's original response>}}`. With `--output` the complete JSON is saved to a new file and the terminal shows only `response_file`; the file must then be read, and a file pointer must not be treated as evidence already read. For image commands, `result.path` points to the actual file, which needs an image tool to view.
 
-Descriptive names such as `Sources` correspond to the actual lower-case JSON keys `sources/entities/relationships/specs/pages`. Keep `retrieval_summary`, the complete sources and the truncation state; the client does not rerank, does not delete evidence a second time and does not widen the knowledge base selection on its own. `call_id` only distinguishes multiple responses and is not a server-side document identity.
+Descriptive names such as `Sources` correspond to the actual lower-case JSON keys `sources/entities/relationships/specs/pages`. Keep `retrieval_summary`, the complete sources and the truncation state; the client does not rerank, does not delete evidence a second time and does not widen the knowledge base selection on its own. The client adds two citation fields to the result: `cite` on every object that names a document, written as `<knowledge base folder>/<rel_path>` followed by the service's short locator `place` (page, slide or sheet rows; the deepest heading for documents without pages), and the document-level `docs_cite` next to every `docs` list. The path starts at the knowledge base's top-level folder, so it reads the same wherever the files were synced from. `call_id` only distinguishes multiple responses and is not a server-side document identity.
 
 On failure, a JSON error goes to stderr with a non-zero exit code; empty results are never returned silently. All output files are written without overwriting, and the output directory must already exist.

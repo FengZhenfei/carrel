@@ -49,6 +49,51 @@ def settings(args):
     return url, token.strip(), timeout
 
 
+def cite_for(name, rel_path, where):
+    """The ready-to-paste citation of one document: "<KB folder>/<rel_path>", a path that starts at the knowledge
+    base's top-level folder whatever directory the files were synced from, followed by where in the file (the
+    service's short locator: page / slide / sheet rows, or the deepest heading)."""
+    return (str(name) + "/" if name else "") + str(rel_path) + (" " + where if where else "")
+
+
+def add_cites(result):
+    """Attach `cite` to every object that names a document (rel_path) and `docs_cite` next to every `docs` list, so
+    the agent pastes citations instead of assembling paths. A fact has no locator of its own and borrows the one of
+    the source or evidence chunk it points at in the same document."""
+    if not isinstance(result, dict):
+        return
+    names = dict(result.get("kb_names") or {})
+    if result.get("kb_id") and result.get("kb_name"):
+        names[str(result["kb_id"])] = result["kb_name"]
+    by_n = {s.get("n"): s for s in result.get("sources") or [] if isinstance(s, dict)}
+
+    def where_of(obj):
+        linked = [by_n.get(n) for n in obj.get("sources") or [] if not isinstance(n, dict)] + list(obj.get("evidence") or [])
+        for cand in [obj] + linked:
+            if isinstance(cand, dict) and (cand is obj or cand.get("rel_path") == obj.get("rel_path")) and cand.get("place"):
+                return str(cand["place"])
+        return ""
+
+    def walk(obj, kb):
+        if isinstance(obj, list):
+            for item in obj:
+                walk(item, kb)
+            return
+        if not isinstance(obj, dict):
+            return
+        kb = str(obj.get("kb_id") or kb or "")
+        if isinstance(obj.get("rel_path"), str) and obj["rel_path"]:
+            obj["cite"] = cite_for(names.get(kb), obj["rel_path"], where_of(obj))
+        docs = obj.get("docs")
+        if isinstance(docs, list) and docs and all(isinstance(d, str) for d in docs):
+            obj["docs_cite"] = [cite_for(names.get(kb), d, "") for d in docs]
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                walk(value, kb)
+
+    walk(result, str(result.get("kb_id") or ""))
+
+
 def payload(args):
     data = read_object(args.request) if getattr(args, "request", None) else {}
     if args.command == "search":
@@ -84,6 +129,27 @@ def payload(args):
             data["direction"] = args.direction
         if not data.get("kb_id") or not (data.get("entity") or data.get("entity_id")):
             raise ValueError("neighbors requires --kb and one of --entity / --entity-id")
+    if args.command in ("entities", "facts"):
+        if args.kb:
+            data["kb_id"] = args.kb
+        for key in ("limit", "offset"):
+            if getattr(args, key) is not None:
+                data[key] = getattr(args, key)
+        if not data.get("kb_id"):
+            raise ValueError(args.command + " requires --kb")
+    if args.command == "entities":
+        if args.type:
+            data["types"] = args.type
+        if args.parent_type:
+            data["parent_types"] = args.parent_type
+        if args.name:
+            data["name"] = args.name
+    if args.command == "facts":
+        for key, field in (("subject", "subject"), ("subject_id", "subject_id"), ("property", "property"), ("match", "match")):
+            if getattr(args, key):
+                data[field] = getattr(args, key)
+        if not (data.get("subject") or data.get("subject_id") or data.get("property")):
+            raise ValueError("facts requires at least one of --subject / --subject-id / --property")
     return data
 
 
@@ -115,11 +181,24 @@ def parser():
     p.add_argument("--base-url", help="Override service URL; default http://127.0.0.1:9810")
     p.add_argument("--timeout", type=float, help="HTTP timeout seconds (default 60); no automatic retries")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors"):
+    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors", "entities", "facts"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--output", required=name in ("image", "crop"), help="Save to a new file; binary image commands require this")
-        if name in ("search", "context", "crop", "neighbors"):
+        if name in ("search", "context", "crop", "neighbors", "entities", "facts"):
             cmd.add_argument("--request", required=name in ("context", "crop"), help="UTF-8 JSON request file, or - for stdin")
+        if name in ("entities", "facts"):
+            cmd.add_argument("--kb", help="KB ID that has a graph")
+            cmd.add_argument("--limit", type=int, choices=range(1, 201), metavar="1..200")
+            cmd.add_argument("--offset", type=int, help="Skip this many rows (paging)")
+        if name == "entities":
+            cmd.add_argument("--type", action="append", help="Only these entity types; repeat to allow several")
+            cmd.add_argument("--parent-type", action="append", help="Only these upper classes (entity / part / property / process / standard / document)")
+            cmd.add_argument("--name", help="Text contained in the title or an alias")
+        if name == "facts":
+            cmd.add_argument("--subject", help="Subject title or alias (case and spaces ignored)")
+            cmd.add_argument("--subject-id", help="Entity id from a previous response")
+            cmd.add_argument("--property", help="Property name, symbol or concept name")
+            cmd.add_argument("--match", choices=("auto", "exact", "contains"))
         if name == "neighbors":
             cmd.add_argument("--kb", help="KB ID that has a graph")
             cmd.add_argument("--entity", help="Entity title or alias (case-insensitive)")
@@ -153,8 +232,8 @@ def main(argv=None):
             quote = lambda s: urllib.parse.quote(s, safe="")
             route = "/image/" + quote(args.kb) + "/" + quote(args.point_id)
             method, data = "GET", None
-        elif args.command == "neighbors":
-            route, method, data = "/graph/neighbors", "POST", payload(args)
+        elif args.command in ("neighbors", "entities", "facts"):
+            route, method, data = "/graph/" + args.command, "POST", payload(args)
         elif args.command in ("search", "context", "crop"):
             route, method, data = "/" + args.command, "POST", payload(args)
         else:
@@ -174,6 +253,7 @@ def main(argv=None):
             }
         else:
             envelope["result"] = json.loads(raw)
+            add_cites(envelope["result"])
             if args.output:
                 encoded = (json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
                 path = save_new(args.output, encoded)

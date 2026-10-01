@@ -429,6 +429,25 @@ def source_points(rows: list[dict[str, Any]], owner_key: str, *, limit: int = SO
     return {owner: [by_doc[d] for d in spread(sorted(by_doc), limit)] for owner, by_doc in by_owner.items()}
 
 
+def spec_result_row(sp: dict[str, Any]) -> dict[str, Any]:
+    """Payload of one point of the fact collection -> the fact row handed to the caller. Shared by graph recall
+    and the "facts by subject / property" endpoint (kb_search.graphwalk), so the two row shapes cannot drift
+    apart."""
+    return {
+        "id": sp.get("gr_id"), "subject": sp.get("subject"), "property": sp.get("property"), "symbol": sp.get("symbol"),
+        "concept": sp.get("concept"), "concept_key": sp.get("concept_key"),
+        "value": sp.get("value"), "min": sp.get("min"), "typ": sp.get("typ"), "max": sp.get("max"), "unit": sp.get("unit"),
+        "flag": sp.get("flag"), "ref_min": sp.get("ref_min"), "ref_max": sp.get("ref_max"), "bound_distance": sp.get("bound_distance"),
+        "when": sp.get("when"), "valid_from": sp.get("valid_from"), "valid_until": sp.get("valid_until"),
+        "series_key": sp.get("series_key"), "conflict_group": sp.get("conflict_group"),
+        "conditions": sp.get("conditions") or {}, "conditions_text": sp.get("conditions_text"), "text": sp.get("text"), "note": sp.get("note"),
+        "unit_canonical": sp.get("unit_canonical"), "kinds": sp.get("kinds") or {}, "quality": sp.get("quality"),
+        "evidence_conflict": sp.get("evidence_conflict"), "comparable": sp.get("comparable"), "confidence": sp.get("confidence"),
+        "series_index": sp.get("series_index"), "series_len": sp.get("series_len"), "axis": sp.get("axis"), "values_text": sp.get("values_text"),
+        "rel_path": sp.get("rel_path"), "section": sp.get("section"), "point_ids": list(sp.get("point_ids") or []),
+    }
+
+
 class TimedSession:
     """Adds a transaction timeout to every query of the session: Neo4j sets no limit by default, and a query
     keeps running after the caller has given up at its deadline, holding a connection and a thread."""
@@ -782,20 +801,8 @@ def graph_query(
     for c in chunks:
         c["entities"] = sorted({e for e in c["entities"] if e})[:8]
         c["relations"] = sorted(set(c["relations"]))[:6]
-    spec_rows = [{
-        "id": sp.get("gr_id"), "subject": sp.get("subject"), "property": sp.get("property"), "symbol": sp.get("symbol"),
-        "concept": sp.get("concept"), "concept_key": sp.get("concept_key"),
-        "value": sp.get("value"), "min": sp.get("min"), "typ": sp.get("typ"), "max": sp.get("max"), "unit": sp.get("unit"),
-        "flag": sp.get("flag"), "ref_min": sp.get("ref_min"), "ref_max": sp.get("ref_max"), "bound_distance": sp.get("bound_distance"),
-        "when": sp.get("when"), "valid_from": sp.get("valid_from"), "valid_until": sp.get("valid_until"),
-        "series_key": sp.get("series_key"), "conflict_group": sp.get("conflict_group"),
-        "conditions": sp.get("conditions") or {}, "conditions_text": sp.get("conditions_text"), "text": sp.get("text"), "note": sp.get("note"),
-        "unit_canonical": sp.get("unit_canonical"), "kinds": sp.get("kinds") or {}, "quality": sp.get("quality"),
-        "evidence_conflict": sp.get("evidence_conflict"), "comparable": sp.get("comparable"), "confidence": sp.get("confidence"),
-        "series_index": sp.get("series_index"), "series_len": sp.get("series_len"), "axis": sp.get("axis"), "values_text": sp.get("values_text"),
-        "score": round(float(sp.get("_score") or 0), 4), "via": sp.get("_via"), "hits": sp.get("_hits", 0),
-        "rel_path": sp.get("rel_path"), "section": sp.get("section"), "point_ids": list(sp.get("point_ids") or []),
-    } for sp in specs[:top_relations]]
+    spec_rows = [{**spec_result_row(sp), "score": round(float(sp.get("_score") or 0), 4), "via": sp.get("_via"), "hits": sp.get("_hits", 0)}
+                 for sp in specs[:top_relations]]
     page_rows = [{
         "id": pg.get("gr_id"), "kind": pg.get("kind"), "title": pg.get("title"), "score": round(float(pg.get("_score") or 0), 4),
         "summary": pg.get("description"), "text": str(pg.get("text") or "")[:PAGE_TEXT_LIMIT] if with_text else None,
