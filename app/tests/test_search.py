@@ -2083,8 +2083,9 @@ class ApiTests(unittest.TestCase):
 
 
 class SkillClientTests(unittest.TestCase):
-    """The agent-side client under skills/carrel-search. The agent pastes its citations into answers as they are,
-    so their shape is a contract: a path from the knowledge base's top-level folder plus where in the file."""
+    """The agent-side client under skills/carrel-search. The agent copies the reference-file paths it prints into
+    answers as they are, so their shape is a contract: a plain-text path from the knowledge base's top-level folder.
+    Where an entry sits in its file is printed next to it for reading and for reading back."""
 
     @staticmethod
     def _client():
@@ -2109,28 +2110,34 @@ class SkillClientTests(unittest.TestCase):
                   "entities": [{"n": 1, "kb_id": "kb_005", "docs": ["vendor/manual.pdf", "notes/guide.md"]}]}
         c.add_cites(result)
         self.assertEqual([s["cite"] for s in result["sources"]],
-                         ["products/vendor/manual.pdf page 6", "products/vendor/prices.xlsx sheet Prices rows 6–13",
-                          "products/notes/guide.md A / B install",       # the service's locator as it is: the client never cuts a position string
+                         ["products/vendor/manual.pdf · page 6", "products/vendor/prices.xlsx · sheet Prices rows 6–13",
+                          "products/notes/guide.md · A / B install",     # the service's locator as it is: the client never cuts a position string
                           "x/y.pdf"])                                    # folder name unknown: the path inside the knowledge base
-        self.assertEqual([s["cite"] for s in result["specs"]], ["products/vendor/manual.pdf page 6", "products/vendor/manual.pdf"])   # a fact borrows the locator of the source it points at
+        self.assertEqual([s["cite"] for s in result["specs"]], ["products/vendor/manual.pdf · page 6", "products/vendor/manual.pdf"])   # a fact borrows the locator of the source it points at
         self.assertEqual(result["entities"][0]["docs_cite"], ["products/vendor/manual.pdf", "products/notes/guide.md"])
+        # the line a file takes in the answer's reference list: the path alone, as plain text
+        self.assertEqual([s["file"] for s in result["sources"]],
+                         ["products/vendor/manual.pdf", "products/vendor/prices.xlsx", "products/notes/guide.md", "x/y.pdf"])
+        self.assertEqual(result["entities"][0]["docs_file"], ["products/vendor/manual.pdf", "products/notes/guide.md"])
+        self.assertEqual((result["sources"][0]["cite_doc"], result["sources"][0]["cite_at"]), ("products/vendor/manual.pdf", "page 6"))
+        for text in (result["sources"][0]["cite"], result["sources"][0]["file"]):
+            self.assertNotIn("](", text)                                    # never a link: the client does not know where, or whether, a local copy is kept
         single = {"kb_id": "kb_002", "kb_name": "datasheets",
                   "facts": [{"n": 1, "rel_path": "a.pdf", "evidence": [{"point_id": "p1", "rel_path": "a.pdf", "position": "page 2 · DC", "place": "page 2"},
                                                                       {"point_id": "p2", "rel_path": "b.pdf", "place": "page 9"}]}],
                   "entities": [{"id": "e1", "docs": ["a.pdf"], "doc_count": 4}]}
         c.add_cites(single)
         fact = single["facts"][0]
-        self.assertEqual((fact["cite"], [e["cite"] for e in fact["evidence"]]), ("datasheets/a.pdf page 2", ["datasheets/a.pdf page 2", "datasheets/b.pdf page 9"]))
+        self.assertEqual((fact["cite"], [e["cite"] for e in fact["evidence"]]), ("datasheets/a.pdf · page 2", ["datasheets/a.pdf · page 2", "datasheets/b.pdf · page 9"]))
         split = {"kb_id": "kb_002", "kb_name": "datasheets",
                  "sources": [{"n": 3, "rel_path": "a.xlsx", "place": "sheet S rows 2–10"}, {"n": 16, "rel_path": "a.xlsx", "place": "sheet S rows 9–21"}],
                  "specs": [{"n": 1, "rel_path": "a.xlsx", "sources": [3, 16]}, {"n": 2, "rel_path": "a.xlsx", "sources": [16]}]}
         c.add_cites(split)
-        self.assertEqual([s["cite"] for s in split["specs"]], ["datasheets/a.xlsx", "datasheets/a.xlsx sheet S rows 9–21"])   # chunks that disagree on the location: the fact stops at the document instead of naming the wrong rows
-        self.assertEqual(single["entities"][0]["docs_cite"], ["datasheets/a.pdf"])       # a listed entity is cited by its documents
+        self.assertEqual([s["cite"] for s in split["specs"]], ["datasheets/a.xlsx", "datasheets/a.xlsx · sheet S rows 9–21"])   # chunks that disagree on the location: the fact stops at the document instead of naming the wrong rows
+        self.assertEqual(single["entities"][0]["docs_cite"], ["datasheets/a.pdf"])       # a listed entity is placed by its documents
         old_service = {"kb_id": "kb_002", "kb_name": "datasheets", "sources": [{"n": 1, "rel_path": "a.pdf", "position": "page 2 · DC"}]}
         c.add_cites(old_service)
         self.assertEqual(old_service["sources"][0]["cite"], "datasheets/a.pdf")          # a service without `place`: the path alone, nothing guessed from the position
-        self.assertNotIn("](", result["sources"][0]["cite"])                # plain text, not a link: files may sit in the mirror directly
 
     SEARCH = {"call_id": "aaaaaa", "operation": "search", "result": {
         "question": "compare ZK200 and Northwind Gateway", "kbs": ["kb_005"], "kb_names": {"kb_005": "products"},
@@ -2201,8 +2208,9 @@ class SkillClientTests(unittest.TestCase):
         return [c.stored(work, e["call_id"]) for e in envelopes]
 
     def test_compact_view_keeps_what_the_agent_reads_and_points_at(self) -> None:
-        """A command prints a compact view instead of the complete response: the text of the sources with ready citations,
-        facts, page summaries and graph leads, every entry under a label later commands can point at."""
+        """A command prints a compact view instead of the complete response: the text of the sources with the file and
+        place each comes from, facts, page summaries and graph leads, every entry under a label later commands can point
+        at, and at the end the reference files the answer lists."""
         import contextlib
         import tempfile
         from pathlib import Path
@@ -2213,58 +2221,63 @@ class SkillClientTests(unittest.TestCase):
             search, neighbors = self._stored(c, work, self.SEARCH, self.NEIGHBORS)
             view = c.compact(search, work / "aaaaaa.json").splitlines()
             near = c.compact(neighbors, work / "bbbbbb.json").splitlines()
-            tight = c.view_search(search, limit=1500)
             shown = io.StringIO()
             with contextlib.redirect_stdout(shown):
                 c.show(work, ["aaaaaa:S3", "aaaaaa:P1", "aaaaaa:H1.2"])
         self.assertEqual(view[0], "call aaaaaa · search · knowledge base: products (kb_005) · evidence: accepted · 5 hits + 1 neighbouring chunks")
         self.assertIn("gaps in this retrieval: kb_005:graph", view); self.assertIn("routing: weak vector evidence (weak)", view)
         at = view.index
-        # a hit is printed with its text; its neighbouring chunks are named, not printed; a citation is printed once and pointed at afterwards
-        self.assertEqual(view[at("[S1] products/vendor/manual.pdf page 6   (stitched with adjacent chunks)"):][:3],
-                         ["[S1] products/vendor/manual.pdf page 6   (stitched with adjacent chunks)", "ZK200 supports hot standby.",
-                          "     neighbouring chunks (context; show when needed): S3 (page 6)"])
-        picture = ("[S2] products/vendor/board.pdf page 1   (below the relevance threshold; a lead only; picture · confidence high; "
+        # a hit is printed with its text and the chunks next to it follow it; where it comes from is printed once and pointed at afterwards
+        self.assertEqual(view[at("[S1] products/vendor/manual.pdf · page 6   (stitched with adjacent chunks)"):][:4],
+                         ["[S1] products/vendor/manual.pdf · page 6   (stitched with adjacent chunks)", "ZK200 supports hot standby.",
+                          "[S3] neighbouring chunk of S1 · page 6", "The standby unit takes over in 2 s."])
+        picture = ("[S2] products/vendor/board.pdf · page 1   (below the relevance threshold; a lead only; picture · confidence high; "
                    "2 conflicts between the text in the picture and estimated readings; trust the text in the picture; see the picture: image --ref aaaaaa:S2)")
         self.assertEqual(view[at(picture):][:2], [picture, "FACTS: a wiring diagram."])                # the index lines of a picture chunk are left out
-        self.assertNotIn("The standby unit takes over in 2 s.", view)
         self.assertEqual(view[at("[S5] same citation as S4"):][1], ("Step 5 of the setup. " * 12).strip())
-        self.assertIn("documents: manual.pdf (S1); board.pdf (S2)", view)
         self.assertIn("[F1] ZK200 · failover time = 2 s [conflict] — same citation as S1", view)
         self.assertEqual(view[at("[F2] ZK200 · weight: 3 kg [sources no longer active] — products/vendor/sheet.pdf"):][1], "     series: 3 kg (2024), 2.8 kg (2025)")
-        # a fact the service gave no hint reads the same way, and is cited at the chunk its value was found in
-        self.assertIn("[F3] ZK200 · standby power = 3 W @ mode: idle · 2025-03 — products/vendor/manual.pdf page 9", view)
+        # a fact the service gave no hint reads the same way and is placed at the chunk its value was found in; a file
+        # already named by an earlier entry is pointed at, with the entry's own place
+        self.assertIn("[F3] ZK200 · standby power = 3 W @ mode: idle · 2025-03 — same file as S1 · page 9", view)
         self.assertFalse([line for line in view if line.startswith("[P2]")])                           # a source page without body text is left out
         self.assertIn("[P1] subject · ZK200 · sources active 2/2: A gateway controller. (has body text, show aaaaaa:P1) — products/vendor/manual.pdf (one of 2 documents)", view)
         self.assertIn("[H1] ZK200 (product) · named in the question · 30 relations · 12 facts · part_of 20, supports 10", view)
         self.assertIn("     H1.1 ←part_of Control module (4); H1.2 —related_to— Northwind Gateway (9)", view)
-        # entities and relations that read the same are listed once
-        self.assertIn("Entities: [E1] ZK200 (product)", view); self.assertIn("Relations: [R1] ZK200 —supports→ hot standby", view)
+        # entities and relations that read the same are listed once; a matched relation comes without a direction, so
+        # its two ends are joined neutrally instead of by an arrow
+        self.assertIn("Entities: [E1] ZK200 (product)", view)
+        relations = [line for line in view if line.startswith("Relations (")]
+        self.assertEqual(len(relations), 1)
+        self.assertTrue(relations[0].endswith("): [R1] ZK200 —supports— hot standby"))
+        self.assertEqual(c.link({"source": "A", "type": "requires", "target": "B", "directed": True}), "A —requires→ B")
+        # the files the entries come from, one line each: what the answer's reference list is copied from
+        self.assertEqual(view[at("products/vendor/manual.pdf  ← S1 F1 F3"):][:4],
+                         ["products/vendor/manual.pdf  ← S1 F1 F3", "products/vendor/board.pdf  ← S2", "products/vendor/notes.md  ← S4 S5 S6", "products/vendor/sheet.pdf  ← F2"])
         self.assertEqual(view[-1], "complete response: " + str(work / "aaaaaa.json"))
-        # the reminder to tell the user the conclusion before looking further stands where the agent decides its next step
-        self.assertTrue(view[-3].startswith("▶ If you mean to look further: first write the user two or three sentences, as reply text"))
+        # the reminder of what to do with the result stands last, where the agent decides its next step
+        self.assertTrue(view[-3].startswith("▶ Answer directly from the result above, in this order: the answer, the reference files, numbered follow-ups."))
         nothing = dict(search, result=dict(search["result"], retrieval_summary={"evidence_state": "diagnostic", "no_relevant_content": True}))
         self.assertFalse([line for line in c.view_search(nothing) if line.startswith("▶")])            # nothing to conclude from: no reminder
-        # the view stays within its budget: the best hits are printed in full whatever it is, later ones by their opening words
-        self.assertIn(("Step 5 of the setup. " * 12).strip(), tight)
-        self.assertEqual(tight[tight.index("[S6] same citation as S4"):][:2], ["[S6] same citation as S4", "     " + ("Step 6 of the setup. " * 12)[:59] + "…"])
-        self.assertIn("only the opening is shown; full text: show aaaaaa:S6", tight)
-        self.assertLess(c.nbytes(view), c.VIEW_BYTES)
-        # show prints what the view left out: a neighbouring chunk and a page's body as text, anything else with every field
+        self.assertLess(c.nbytes(view), c.PAGE_BYTES)
+        # show prints an entry as it is stored: a neighbouring chunk and a page's body as text, anything else with every field
         out = shown.getvalue().splitlines()
-        self.assertEqual(out[:2], ["[aaaaaa:S3] products/vendor/manual.pdf page 6   (neighbouring chunk of S1)", "The standby unit takes over in 2 s."])
+        self.assertEqual(out[:2], ["[aaaaaa:S3] products/vendor/manual.pdf · page 6   (neighbouring chunk of S1)", "The standby unit takes over in 2 s."])
         self.assertEqual(out[2:5], ["[aaaaaa:P1] subject · ZK200: A gateway controller. — products/vendor/manual.pdf; products/vendor/sheet.pdf", "# ZK200", "Released in 2024."])
         self.assertEqual(json.loads("\n".join(out[6:]))["other"]["id"], "e2")
         self.assertEqual(near[0], "call bbbbbb · neighbors · knowledge base: products (kb_005) · ZK200 (product) · 30 relations in all, 3 here (by weight) · 12 facts under it")
         self.assertIn("relations by kind: part_of 20 (one kind only: --type <predicate>)", near)
         self.assertIn("other entities with this name: ZK200 (module · 2 relations · id=e9)", near)
         self.assertEqual(near[near.index("[N1] ←part_of Control module (module · 4 relations)   (the end types do not fit this kind of relation; judge it by the excerpt)"):][1],
-                         '     "The control module is part of ZK200." — products/vendor/manual.pdf page 2')
+                         '     "The control module is part of ZK200." — products/vendor/manual.pdf · page 2')
         self.assertEqual(near[near.index("[N2] →supports Northwind Gateway (product · 9 relations)"):][1],
                          '     "A block diagram." (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N2 when needed) — same citation as N1')
         # an excerpt shared by several relations is printed once
         self.assertEqual(near[near.index("[N3] →requires Power unit (module · 1 relations)"):][1],
                          "     same excerpt as N2 (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N3 when needed) — same citation as N1")
+        # a hop ends with the files its excerpts come from and the reminder to answer only what the user picked
+        self.assertIn("products/vendor/manual.pdf  ← N1 N2 N3", near)
+        self.assertTrue(near[-3].startswith("▶ Answer only the follow-up the user picked and go no further"))
 
     def test_listings_and_read_back_use_the_same_labels_and_remarks(self) -> None:
         import tempfile
@@ -2276,10 +2289,14 @@ class SkillClientTests(unittest.TestCase):
             entities, none, context = self._stored(c, work, self.ENTITIES, self.NO_FACTS, self.CONTEXT)
             listed, empty, read = c.view_entities(entities), c.view_facts(none), c.view_context(context)
         self.assertIn("entities per type (--type takes the type name; the upper class in brackets goes with --parent-type): product 3 (entity)", listed)
-        self.assertEqual(listed[-1], "[E1] ZK200 (product · 30 relations · 2 documents) — products/vendor/manual.pdf")
+        self.assertIn("[E1] ZK200 (product · 30 relations · 2 documents) — products/vendor/manual.pdf", listed)
+        self.assertEqual(listed[-1], "products/vendor/manual.pdf  ← E1")                              # the document that mentions it most, as a reference file
         self.assertEqual(empty[1:], ["nothing matches"])                                              # no rows: no hint on how to point at one
-        # a picture chunk read back says so and how to fetch the picture; its index lines are left out
-        self.assertEqual(read[1:], ["[S1] products/vendor/board.pdf page 1   (picture · confidence high; see the picture: image --ref eeeeee:S1)", "FACTS: a wiring diagram."])
+        # reading back: the first line names the document, each chunk carries only its place in it; a picture chunk says
+        # so and how to fetch the picture, and its index lines are left out
+        self.assertEqual(read[0], "call eeeeee · context · knowledge base: products (kb_005) · document vendor/board.pdf · 1 chunks · 10 tokens")
+        self.assertEqual(read[1:3], ["[S1] page 1   (picture · confidence high; see the picture: image --ref eeeeee:S1)", "FACTS: a wiring diagram."])
+        self.assertEqual(read[-1], "products/vendor/board.pdf  ← S1")
 
     def test_later_commands_point_at_entries_of_stored_responses(self) -> None:
         """--ref "<call id>:<label>" stands for an entry of an earlier response, so the agent neither retypes ids nor writes
@@ -2310,6 +2327,21 @@ class SkillClientTests(unittest.TestCase):
             self.assertEqual(build("crop", "--ref", "aaaaaa:S2", "--bbox", "0.1,0.2,0.5,0.6"), {"kb_id": "kb_005", "point_id": "p2", "bbox": [0.1, 0.2, 0.5, 0.6]})
             self.assertEqual(build("search", "--question", "failover time", "--in-doc", "aaaaaa:S1", "--block-type", "table"),
                              {"question": "failover time", "kbs": ["kb_005"], "hints": {"block_types": ["table"], "doc_ids": ["d1"]}})
+            # a reference never leads outside the knowledge bases the caller named: the conflict is an error, the
+            # scope is neither widened nor quietly replaced
+            self.assertEqual(build("search", "--question", "failover time", "--kb", "kb_005", "--in-doc", "aaaaaa:S1")["kbs"], ["kb_005"])
+            for conflicting in (("search", "--question", "failover time", "--kb", "kb_009", "--in-doc", "aaaaaa:S1"),
+                                ("neighbors", "--ref", "aaaaaa:H1", "--kb", "kb_009"), ("facts", "--ref", "aaaaaa:H1", "--kb", "kb_009")):
+                with self.assertRaises(ValueError) as raised:
+                    build(*conflicting)
+                self.assertIn("is in kb_005, outside the knowledge base named for this call (kb_009)", str(raised.exception))
+            # a matched relation has two ends and is no starting point: the error gives the lookup by name
+            with self.assertRaises(ValueError) as raised:
+                build("neighbors", "--ref", "aaaaaa:R1")
+            self.assertIn('--kb kb_005 --entity "ZK200" (or "hot standby")', str(raised.exception))
+            # the whole document: an entry that does not say how long its document is asks for as much as one command reads
+            self.assertEqual(build("context", "--ref", "aaaaaa:S1", "--whole"),
+                             {"kb_id": "kb_005", "doc_id": "d1", "chunk_from": 0, "chunk_to": c.CONTEXT_MAX - 1, "content_version": "v1"})
             self.assertEqual(c.chunk_of(*c.resolve(work, "aaaaaa:S2")[:3])[1]["point_id"], "p2")       # the chunk whose picture `image --ref` fetches
             for bad in ("aaaaaa:S9", "aaaaaa:H1.5", "aaaaaa:X1", "cccccc:S1", "S1"):
                 with self.assertRaises(ValueError):
@@ -2320,6 +2352,136 @@ class SkillClientTests(unittest.TestCase):
                 build("context", "--ref", "aaaaaa:E1")                                                  # an entity is not a chunk
             with self.assertRaises(ValueError):
                 build("context", "--ref", "aaaaaa:F2")                                                  # a fact that names no chunk of the response
+
+    def test_nothing_is_cut_and_what_does_not_fit_is_paged(self) -> None:
+        """One printed output stays below what agent harnesses show inline, and nothing is dropped to get there: a view
+        too long for one output is paged, an entry too long for a page continues under its label, and every page says
+        whether the next one has to be read. A whole-document read never passes a part off as the whole."""
+        import contextlib
+        import copy
+        import tempfile
+        from pathlib import Path
+
+        c = self._client()
+        limit = c.PAGE_BYTES
+        size = lambda text: len(text.encode("utf-8"))
+
+        def pages(envelope):
+            out = []
+            while True:
+                try:
+                    out.append(c.compact(envelope, "/tmp/x.json", limit, len(out) + 1))
+                except ValueError:
+                    return out
+
+        def source(n, chars, role="hit", of=None):
+            return {"n": n, "role": role, "of": of, "kb_id": "kb_x", "doc_id": "d1", "content_version": "v1", "rel_path": "a/b.md", "chunk_index": n - 1,
+                    "chunk_total": 40, "point_id": "p%d" % n, "accepted": True, "place": "section %d" % n,
+                    "text": "\n".join("§" * 100 for _ in range(chars // 100))}
+
+        def search(call_id, sources):
+            result = {"kbs": ["kb_x"], "kb_names": {"kb_x": "lib"}, "retrieval_summary": {"evidence_state": "accepted"}, "sources": sources,
+                      "specs": [{"n": i, "kb_id": "kb_x", "subject": "ZK200", "property": "price", "value": str(i), "rel_path": "a/b.md", "sources": [i]}
+                                for i in range(1, 7)],
+                      "pages": [], "entities": [], "relationships": [], "neighborhoods": []}
+            c.add_cites(result)
+            return {"call_id": call_id, "operation": "search", "request": {}, "result": result}
+
+        def context(call_id, sources):
+            result = {"kb_id": "kb_x", "kb_name": "lib", "doc_id": "d1", "sources": sources, "tokens_total": 1}
+            c.add_cites(result)
+            return {"call_id": call_id, "operation": "context", "request": {}, "result": result}
+
+        # the best hits too long for the first page: facts, reference files and the reminder stay on it, the page says
+        # that the next one has to be read, and the full texts follow there
+        got = pages(search("aaaaaa", [source(i, 4500) for i in range(1, 5)] + [source(i, 300) for i in range(5, 9)]))
+        first = got[0]
+        self.assertTrue(all(size(page) <= limit for page in got), [size(page) for page in got])
+        for part in ("━━ Facts ━━", "━━ Reference files", "▶ Answer directly",
+                     "some of the best sources among them. Their full text is on the next page; read it before answering: show aaaaaa --page 2"):
+            self.assertTrue(part in first, part)
+        self.assertIn("more follows, read on: show aaaaaa --page 2)", first.splitlines()[-3])
+        self.assertEqual(got[1].splitlines()[2], "━━ Full text of the sources (continued from the previous page; to be read) ━━")
+        self.assertGreaterEqual("".join(got).count("§"), 4 * 4500 + 4 * 300)                     # every source in full somewhere
+        # the usual overflow, lower-ranked sources and neighbouring chunks: the following pages are supplementary
+        got = pages(search("bbbbbb", [source(i, 600) for i in range(1, 13)] + [source(20 + i, 5000, role="neighbor", of=i) for i in range(1, 7)]))
+        self.assertTrue(all(size(page) <= limit for page in got) and len(got) >= 3, [size(page) for page in got])
+        self.assertTrue("▶ Answer directly" in got[0])
+        for page in got[:-1]:
+            self.assertIn("the next page holds the full text of the other sources, to be read when useful: show bbbbbb --page", page.splitlines()[-3])
+        self.assertEqual(got[1].splitlines()[2], "━━ Full text of the other sources ━━")
+        self.assertEqual(got[-1].splitlines()[-3], "(page %d of %d, the end)" % (len(got), len(got)))
+        # an entry longer than a page starts on the page it falls on and continues under its label
+        got = pages(context("cccccc", [source(1, 200), source(2, 18000), source(3, 200)]))
+        self.assertTrue(len(got) == 2 and all(size(page) <= limit for page in got), [size(page) for page in got])
+        self.assertTrue("[S2] section 2" in got[0]); self.assertGreater(size(got[0]), limit * 0.8)
+        self.assertEqual(got[1].splitlines()[:3], ["call cccccc · context · page 2 of 2", "", "[S2] (continued from the previous page)"])
+        self.assertEqual("".join(got).count("§"), 200 + 18000 + 200)                             # nothing lost at the cut
+        # one line longer than a page (a huge table row) is cut inside the line
+        got = pages(context("dddddd", [dict(source(1, 100), text="§" * 18000)]))
+        self.assertTrue(len(got) == 2 and all(size(page) <= limit for page in got) and "".join(got).count("§") == 18000, [size(page) for page in got])
+        # show with several entries is paged the same way: the same references with --page print the next page
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "abcdef.json").write_text(json.dumps(search("abcdef", [source(i, 4500) for i in range(1, 9)]), ensure_ascii=False), encoding="utf-8")
+            refs, shown = ["abcdef:S%d" % i for i in range(1, 9)], []
+            while True:
+                out = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(out):
+                        c.show(work, refs, page=len(shown) + 1, limit=limit)
+                except ValueError:
+                    break
+                shown.append(out.getvalue())
+            self.assertTrue(len(shown) == 3 and all(size(page) <= limit for page in shown), [size(page) for page in shown])
+            self.assertEqual("".join(shown).count("§"), 8 * 4500)
+            self.assertTrue("read on: show " + " ".join(refs) + " --page 2)" in shown[0])
+            with self.assertRaises(ValueError):
+                c.show(work, ["abcdef", "abcdef:S1"], page=2, limit=limit)                    # a page number goes with one call id or with entries only
+            # reading a whole document: its length is on a source row and decides the range; over the limit is refused
+            (work / "eeeeee.json").write_text(json.dumps(search("eeeeee", [source(1, 100), dict(source(2, 100), doc_id="d2", chunk_total=350)]), ensure_ascii=False), encoding="utf-8")
+            build = lambda *argv: c.payload(c.parser().parse_args(list(argv)), work)
+            self.assertEqual(build("context", "--ref", "eeeeee:S1", "--whole"), {"kb_id": "kb_x", "doc_id": "d1", "chunk_from": 0, "chunk_to": 39, "content_version": "v1"})
+            with self.assertRaises(ValueError) as raised:
+                build("context", "--ref", "eeeeee:S2", "--whole")
+            self.assertIn("this document has 350 chunks, --whole reads up to 300", str(raised.exception))
+            with self.assertRaises(ValueError):
+                build("context", "--ref", "eeeeee:S1", "--after", "400")                        # so is a range beyond what one command reads
+
+        # a range longer than one request is read in consecutive requests and merged, numbered through
+        asked = []
+
+        def serve(total, lengths=True):
+            def fake(url, token, timeout, method, route, data=None):
+                asked.append((data["chunk_from"], data["chunk_to"]))
+                last = data["chunk_to"] if total is None else min(data["chunk_to"], total - 1)
+                rows = [dict({"n": 1, "chunk_index": i, "text": "x"}, **({"chunk_total": total} if lengths and total else {})) for i in range(data["chunk_from"], last + 1)]
+                return json.dumps({"kb_id": "kb_x", "doc_id": "d1", "sources": rows, "tokens_total": len(rows)}).encode(), {}
+            return fake
+
+        request = {"kb_id": "kb_x", "doc_id": "d1", "chunk_from": 0, "chunk_to": c.CONTEXT_MAX - 1}
+        c.request = serve(200)
+        whole = c.read_context("http://x", "t", 5, dict(request), whole=True)
+        self.assertEqual(([row["chunk_index"] for row in whole["sources"]], [row["n"] for row in whole["sources"]], whole["tokens_total"]),
+                         (list(range(200)), list(range(1, 201)), 200))
+        self.assertEqual(asked, [(0, 59), (60, 119), (120, 179), (180, 199)])                    # the length, once known, ends the read without a request past the end
+        # started from an entry that does not carry the document's length (a fact's evidence): the first chunks tell it,
+        # and a document over the limit is refused then instead of being returned in part
+        c.request = serve(350)
+        with self.assertRaises(ValueError) as raised:
+            c.read_context("http://x", "t", 5, dict(request), whole=True)
+        self.assertIn("this document has 350 chunks", str(raised.exception))
+        # the length never shows and the read fills the limit: the result is marked and the view says more may follow
+        c.request = serve(None)
+        partial = c.read_context("http://x", "t", 5, dict(request), whole=True)
+        self.assertTrue(partial["maybe_more"] and len(partial["sources"]) == c.CONTEXT_MAX)
+        view = c.view_context({"call_id": "ffffff", "operation": "context", "result": partial})
+        self.assertIn("there may be more: read on with context --ref ffffff:S300 --before 0 --after 299", view[-1])
+        # a short range stays a single request
+        asked.clear()
+        c.request = serve(200)
+        c.read_context("http://x", "t", 5, {"kb_id": "kb_x", "doc_id": "d1", "chunk_from": 5, "chunk_to": 8})
+        self.assertEqual(asked, [(5, 8)])
 
     def test_work_directory_keeps_recent_responses_only(self) -> None:
         import os

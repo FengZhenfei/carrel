@@ -1,4 +1,4 @@
 interface:
   display_name: "Carrel-Search"
-  short_description: "Search local knowledge bases, fetch context and images as needed, and answer with traceable evidence"
-  default_prompt: "Use $carrel-search to search the knowledge base, follow up on related evidence when necessary, and attach locatable sources."
+  short_description: "Search local knowledge bases, fetch context and images as needed, and answer with the files relied on and follow-ups along the graph"
+  default_prompt: "Use $carrel-search to search the knowledge base, answer from the evidence, list the reference files and offer follow-ups."

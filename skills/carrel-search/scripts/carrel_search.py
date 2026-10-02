@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Small read-only client for the Carrel search service. Python 3.9+, standard library only.
 
-Every JSON command prints a compact view of the response and keeps the complete response in a file under the work
-directory. Later commands point at one entry of an earlier response with --ref "<call id>:<label>" (S3, F2, E5,
-H1.2, N4 ...) instead of retyping ids or writing request files; `show` prints an entry in full."""
+Every JSON command prints a compact view of the response (ids, scores and debug fields left out, document text kept)
+and keeps the complete response in a file under the work directory. A view that does not fit one output is paged:
+`show <call id> --page 2` prints the next page. Later commands point at one entry of an earlier response with
+--ref "<call id>:<label>" (S3, F2, E5, H1.2, N4 ...) instead of retyping ids or writing request files; `show` prints
+an entry in full."""
 from __future__ import annotations
 
 import argparse
@@ -25,14 +27,16 @@ import uuid
 KEEP_SECONDS = 86400              # responses and pictures in the work directory older than a day are removed
 REF_RE = re.compile(r"^([0-9a-f]{6}):([SFPERHN])(\d+)(?:\.(\d+))?$")
 STORED_RE = re.compile(r"^[0-9a-f]{6}(-[A-Za-z0-9.\-]+)?\.(json|png|jpg|jpeg|webp|gif|bmp|img)$")
-# A compact view stays below what agent harnesses show inline: Claude Code moves a tool output above 30,000 bytes
-# into a file and shows a 2 KB preview, which costs the agent another step. Sources that do not fit are listed by
-# their opening words; `show` prints them in full.
-VIEW_BYTES = 26000
-FULL_SOURCES_MIN = 4              # the best hits are printed in full whatever the budget
+# One printed output stays below what agent harnesses show inline: Claude Code moves a tool output above 30,000 bytes
+# into a file and shows a 2 KB preview, which costs the agent further steps. Nothing is dropped to get there: what does
+# not fit goes to the next page (`show <call id> --page 2`).
+PAGE_BYTES = 28000
+PAGE_RESERVE = 400                # room kept on a page for the lines that say which page it is
+PAGE_BREAK = "\f"                 # a view puts it where the next page must start
+TOP_SOURCES = 4                   # the best hits: when one of them does not fit the first page, the next page must be read
+CONTEXT_STEP = 60                 # chunks /context is asked for per request; a longer range is read in several
+CONTEXT_MAX = 300                 # chunks one context command reads at most
 OPENING_CHARS = 60
-PAGE_SUMMARY_CHARS = 140
-SERIES_CHARS = 300
 GRAPH_LIST_MAX = 12               # entities / relations matching the question that the view lists
 INDEX_LINE_RE = re.compile(r"^(ENTITIES|KEYWORDS):", re.I)      # index fodder of picture chunks, dropped from the view
 
@@ -42,7 +46,8 @@ TXT = {
     "kb": "knowledge base: {names}",
     "ref_hint": "Point at an entry as {id}:{label} after --ref: context (read the original), image / crop (see the picture), neighbors (walk the graph), facts (facts under it); show {id}:{label} prints its full text or every field",
     "full": "complete response: {path}",
-    "next": "▶ If you mean to look further: first write the user two or three sentences, as reply text, with the conclusion that is already certain and its citations, then send the next commands; the final answer is still written in full.",
+    "next": "▶ Answer directly from the result above, in this order: the answer, the reference files, numbered follow-ups. No walking along the graph this turn; pick the follow-ups from the graph leads, each one hop from one entity.",
+    "next_hop": "▶ Answer only the follow-up the user picked and go no further; then list the reference files as before and offer new numbered follow-ups.",
     "state": "evidence: {state}",
     "hits": "{hits} hits",
     "neighbors_n": "{n} neighbouring chunks",
@@ -53,11 +58,24 @@ TXT = {
     "sec_sources": "━━ Sources ━━",
     "sec_specs": "━━ Facts ━━",
     "sec_pages": "━━ Pages (compiled second-hand summaries; leads only) ━━",
-    "sec_graph": "━━ Graph leads (model-extracted; use them to decide where to go, read the original before concluding) ━━",
-    "sec_docs": "documents: {items}",
+    "sec_graph": "━━ Graph leads (model-extracted, not conclusions; for composing follow-ups: when the user picks one, walk one hop from its entry) ━━",
+    "sec_files": "━━ Reference files (list the ones the answer uses, each path as printed here; the entries after ← come from that file) ━━",
     "neighbor_of": "neighbouring chunk of {label}",
-    "neighbor_refs": "neighbouring chunks (context; show when needed): {items}",
-    "opening_only": "only the opening is shown; full text: show {refs}",
+    "neighbor_at": "neighbouring chunk of {label}",
+    "neighbor_refs": "neighbouring chunks (context; full text on the next page): {items}",
+    "opening_only": "This page ran out of room: {labels} shown by the opening words only; their full text, and that of the neighbouring chunks not printed, is on the next page (show {id} --page 2), to be read when useful",
+    "opening_top": "This page ran out of room: {labels} shown by the opening words only, some of the best sources among them. Their full text is on the next page; read it before answering: show {id} --page 2",
+    "rest_only": "This page ran out of room: the full text of the neighbouring chunks not printed is on the next page (show {id} --page 2), to be read when useful",
+    "sec_rest": "━━ Full text of the other sources ━━",
+    "sec_rest_must": "━━ Full text of the sources (continued from the previous page; to be read) ━━",
+    "continued": "(continued from the previous page)",
+    "maybe_more": "⚠ The length of this document is not known and one command reads at most {n} chunks; there may be more: read on with context --ref {ref} --before 0 --after {m}",
+    "position": "chunk {k} of {n}",
+    "same_header": "HEADER: same as {label}",
+    "page_head": "call {id} · {op} · page {page} of {total}",
+    "page_more": "(page {page} of {total}; more follows, read on: show {what} --page {next})",
+    "page_more_optional": "(page {page} of {total}; the next page holds the full text of the other sources, to be read when useful: show {what} --page {next})",
+    "page_last": "(page {total} of {total}, the end)",
     "page_text": "has body text, show {ref}",
     "not_accepted": "below the relevance threshold; a lead only",
     "unranked": "relevance not confirmed",
@@ -69,6 +87,7 @@ TXT = {
     "picture_conflicts": "{n} conflicts between the text in the picture and estimated readings; trust the text in the picture",
     "picture_view": "see the picture: image --ref {ref}",
     "same_cite": "same citation as {label}",
+    "same_file": "same file as {label}",
     "conflict": "conflict",
     "stale": "sources no longer active",
     "series": "series: {text}",
@@ -80,7 +99,7 @@ TXT = {
     "facts_n": "{n} facts",
     "docs_n": "{n} documents",
     "entities": "Entities:",
-    "relationships": "Relations:",
+    "relationships": "Relations (— joins two ends whose direction is not given: do not read subject and object from the order; an R entry cannot follow --ref, walk on from the entity entry of one of its ends):",
     "center": "{title} ({type}) · {total} relations in all, {count} here (by weight) · {facts} facts under it",
     "kinds": "relations by kind: {items} (one kind only: --type <predicate>)",
     "matches": "other entities with this name: {items}",
@@ -97,7 +116,9 @@ TXT = {
     "properties": "properties: {items}",
     "subject": "subject {title} ({type})",
     "property": "property \"{query}\" matched by {matched}, {concepts} concepts",
-    "context": "document {doc} · {n} chunks · {tokens} tokens",
+    "context": "document {doc} · chunks {a}–{b} of {total} · {tokens} tokens",
+    "context_plain": "document {doc} · {n} chunks · {tokens} tokens",
+    "chunk_at": "chunk {k}",
     "no_rows": "nothing matches",
     "catalog_kb": "{kb} {name} · {docs} documents · {chunks} chunks · {graph}",
     "graph_yes": "has a graph",
@@ -165,15 +186,23 @@ def work_dir(cfg):
 
 
 def cite_for(name, rel_path, where):
-    """The ready-to-paste citation of one document: "<KB folder>/<rel_path>", a path that starts at the knowledge
-    base's top-level folder whatever directory the files were synced from, followed by where in the file (the
-    service's short locator: page / slide / sheet rows, or the deepest heading)."""
-    return (str(name) + "/" if name else "") + str(rel_path) + (" " + where if where else "")
+    """Where an entry comes from, as plain text for reading: "<KB folder>/<rel_path>" from the knowledge base's
+    top-level folder, then where in the file (the service's short locator: page / slide / sheet rows, or the deepest
+    heading)."""
+    return (str(name) + "/" if name else "") + str(rel_path) + (TXT["dot"] + where if where else "")
+
+
+def file_for(name, rel_path):
+    """The line a file takes in the answer's reference list: "<KB folder>/<rel_path>", a path that starts at the
+    knowledge base's top-level folder whatever directory the files were synced from. No locator: the list names
+    files, not places in them."""
+    return (str(name) + "/" if name else "") + str(rel_path)
 
 
 def add_cites(result):
-    """Attach `cite` to every object that names a document (rel_path) and `docs_cite` next to every `docs` list, so
-    the agent pastes citations instead of assembling paths."""
+    """Attach `cite` (where it comes from, plain text) and `file` (its line for the reference list) to every object
+    that names a document (rel_path), and `docs_cite` / `docs_file` next to every `docs` list, so the agent copies
+    reference lines instead of assembling paths."""
     if not isinstance(result, dict):
         return
     names = dict(result.get("kb_names") or {})
@@ -202,10 +231,13 @@ def add_cites(result):
             return
         kb = str(obj.get("kb_id") or kb or "")
         if isinstance(obj.get("rel_path"), str) and obj["rel_path"]:
-            obj["cite"] = cite_for(names.get(kb), obj["rel_path"], where_of(obj))
+            obj["cite_doc"], obj["cite_at"] = cite_for(names.get(kb), obj["rel_path"], ""), where_of(obj)
+            obj["cite"] = cite_for(names.get(kb), obj["rel_path"], obj["cite_at"])
+            obj["file"] = file_for(names.get(kb), obj["rel_path"])
         docs = obj.get("docs")
         if isinstance(docs, list) and docs and all(isinstance(d, str) for d in docs):
             obj["docs_cite"] = [cite_for(names.get(kb), d, "") for d in docs]
+            obj["docs_file"] = [file_for(names.get(kb), d) for d in docs]
         for value in obj.values():
             if isinstance(value, (dict, list)):
                 walk(value, kb)
@@ -258,6 +290,14 @@ def resolve(work, ref):
     return envelope, letter, entry, child
 
 
+def within(named, kb, what):
+    """A reference may not lead outside the knowledge bases the caller named: the conflict is reported instead of
+    widening the scope or quietly looking the entry up somewhere else."""
+    if named and kb not in named:
+        raise ValueError(what + " is in " + kb + ", outside the knowledge base named for this call (" + ", ".join(named)
+                         + "); drop --kb to follow the reference, or name " + kb)
+
+
 def entity_of(envelope, letter, entry, child):
     """The knowledge base and entity id a reference stands for when walking the graph from it."""
     result = envelope.get("result") or {}
@@ -266,6 +306,10 @@ def entity_of(envelope, letter, entry, child):
         eid = ((child or entry).get("other") or {}).get("id")
     elif letter in ("E", "H"):
         eid = entry.get("id")
+    elif letter == "R":
+        # A matched relation names its two ends by title only, and which end is meant is the caller's choice.
+        raise ValueError("a relation is not a starting point; walk from one of its ends, by that entity's E / H entry or by name: --kb "
+                         + str(kb) + ' --entity "' + str(entry.get("source")) + '" (or "' + str(entry.get("target")) + '")')
     else:
         raise ValueError("this entry is not an entity; use an E, H, H1.2 or N reference, or --entity with a name")
     if not kb or not eid:
@@ -311,16 +355,41 @@ def notes_of(items):
 
 
 class Cites:
-    """A citation is printed in full the first time; later entries with the same citation point at that entry."""
+    """A citation is printed in full the first time. A later entry with the same citation points at that entry; one
+    from the same file but another place in it names the place and points at the entry for the file."""
 
     def __init__(self):
-        self.first = {}
+        self.first, self.docs = {}, {}
 
-    def put(self, label, cite):
+    def put(self, label, cite, row=None):
         if not cite:
             return ""
         first = self.first.setdefault(cite, label)
-        return cite if first == label else TXT["same_cite"].format(label=first)
+        if first != label:
+            return TXT["same_cite"].format(label=first)
+        doc, at = (row or {}).get("cite_doc"), (row or {}).get("cite_at")
+        if doc:
+            known = self.docs.setdefault(doc, label)
+            if known != label and at:
+                return TXT["same_file"].format(label=known) + TXT["dot"] + str(at)
+        return cite
+
+
+class Files:
+    """The files the entries of a view come from, in order of first appearance, each with the labels of its entries:
+    printed at the end of the view as the lines the answer's reference list is copied from."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def add(self, label, file):
+        if file:
+            self.rows.setdefault(file, []).append(label)
+
+    def lines(self):
+        if not self.rows:
+            return []
+        return ["", TXT["sec_files"]] + [file + "  ← " + " ".join(labels) for file, labels in self.rows.items()]
 
 
 def kb_line(result):
@@ -340,6 +409,12 @@ def arrow(row):
     if not row.get("directed"):
         return "—" + str(row.get("type")) + "—"
     return ("→" if row.get("direction") == "out" else "←") + str(row.get("type"))
+
+
+def link(row):
+    """A relation matched by the question, source first. The arrow is drawn only when the service says the relation is
+    directed; one it marks undirected, or gives no direction for, is joined neutrally."""
+    return str(row.get("source")) + " —" + str(row.get("type")) + ("→ " if row.get("directed") is True else "— ") + str(row.get("target"))
 
 
 def fact_body(row):
@@ -387,11 +462,26 @@ def nbytes(lines):
     return sum(len(str(x).encode("utf-8")) + 1 for x in lines)
 
 
-def source_text(s):
-    return "\n".join(line for line in str(s.get("text") or "").strip().splitlines() if not INDEX_LINE_RE.match(line))
+def source_text(s, headers=None, label=None):
+    """The text of a source as a view prints it. Table chunks of one sheet repeat the same header line: given `headers`
+    (header line → label of the first entry printed with it), a repeated one is replaced by a pointer to that entry."""
+    lines = [line for line in str(s.get("text") or "").strip().splitlines() if not INDEX_LINE_RE.match(line)]
+    if headers is not None:
+        for i, line in enumerate(lines):
+            if line.startswith("HEADER:") and len(line) > 30:
+                first = headers.setdefault(line, label)
+                if first != label:
+                    lines[i] = TXT["same_header"].format(label=first)
+    return "\n".join(lines)
 
 
-def source_notes(s, ref, parent=None):
+def forget(headers, label):
+    """An entry that is not printed in full after all gives up the header lines registered under its label."""
+    for line in [line for line, first in headers.items() if first == label]:
+        del headers[line]
+
+
+def source_notes(s, ref, parent=None, position=False):
     notes = []
     if parent is not None:
         notes.append(TXT["neighbor_of"].format(label=parent))
@@ -413,10 +503,16 @@ def source_notes(s, ref, parent=None):
         if visual.get("value_conflicts"):
             notes.append(TXT["picture_conflicts"].format(n=visual["value_conflicts"]))
         notes.append(TXT["picture_view"].format(ref=ref))
+    if position and s.get("chunk_total") and s.get("chunk_index") is not None:
+        # where the chunk sits in its document and how long the document is (a stitched hit covers a range)
+        k, st = str(int(s["chunk_index"]) + 1), s.get("stitched") or {}
+        if st.get("chunk_from") is not None and st.get("chunk_to") is not None and st["chunk_to"] != st["chunk_from"]:
+            k = str(int(st["chunk_from"]) + 1) + "–" + str(int(st["chunk_to"]) + 1)
+        notes.append(TXT["position"].format(k=k, n=s["chunk_total"]))
     return notes
 
 
-def view_search(envelope, limit=VIEW_BYTES):
+def view_search(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     cid = envelope["call_id"]
     summary = r.get("retrieval_summary") or {}
@@ -438,20 +534,20 @@ def view_search(envelope, limit=VIEW_BYTES):
     # Sources come first in the view and their citations are the ones later entries point back at, so they are
     # registered before the other sections are built; which of them are printed in full is decided last, from what
     # the other sections leave of the budget.
-    source_cites = {s.get("n"): cites.put("S" + str(s.get("n")), s.get("cite")) for s in hits}
+    source_cites = {s.get("n"): cites.put("S" + str(s.get("n")), s.get("cite"), s) for s in hits}
     tail = []
-    aggs = r.get("doc_aggs") or []
-    if aggs:
-        tail.append(TXT["sec_docs"].format(items=TXT["semi"].join(
-            str(a.get("doc") or a.get("rel_path")) + par(" ".join("S" + str(n) for n in a.get("source_ns") or [])) for a in aggs)))
+    files = Files()
+    for s in hits:
+        files.add("S" + str(s.get("n")), s.get("file"))
     specs = r.get("specs") or []
     if specs:
         tail += ["", TXT["sec_specs"]]
         for row in specs:
             label = "F" + str(row.get("n"))
-            tail.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"))))
+            tail.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"), row)))
+            files.add(label, row.get("file"))
             if row.get("series_text"):
-                tail.append("     " + TXT["series"].format(text=flat(row["series_text"], SERIES_CHARS)))
+                tail.append("     " + TXT["series"].format(text=flat(row["series_text"])))
     pages = r.get("pages") or []
     if any(row.get("kind") != "source" or row.get("text") for row in pages):
         tail += ["", TXT["sec_pages"]]
@@ -463,7 +559,7 @@ def view_search(envelope, limit=VIEW_BYTES):
             cite = cites.put(label, docs[0]) if docs else ""
             more = " " + TXT["more_docs"].format(n=len(docs)) if len(docs) > 1 else ""
             bits = [row.get("kind"), row.get("title"), TXT["sources_active"].format(x=row["sources_active"]) if row.get("sources_active") else ""]
-            line = "[" + label + "] " + TXT["dot"].join(str(b) for b in bits if b) + TXT["colon"] + flat(row.get("summary"), PAGE_SUMMARY_CHARS)
+            line = "[" + label + "] " + TXT["dot"].join(str(b) for b in bits if b) + TXT["colon"] + flat(row.get("summary"))
             if row.get("text"):
                 line += par(TXT["page_text"].format(ref=cid + ":" + label))
             tail.append(cited(line, cite + more if cite else ""))
@@ -494,50 +590,105 @@ def view_search(envelope, limit=VIEW_BYTES):
         tail.append(TXT["entities"] + " " + TXT["dot"].join(lines))
     seen, lines = set(), []
     for x in relations:
-        text = str(x.get("source")) + " —" + str(x.get("type")) + "→ " + str(x.get("target"))
+        text = link(x)
         if text not in seen and len(lines) < GRAPH_LIST_MAX:
             seen.add(text)
             lines.append("[R" + str(x.get("n")) + "] " + text)
     if lines:
         tail.append(TXT["relationships"] + " " + TXT["dot"].join(lines))
+    tail += files.lines()
     if hits and not summary.get("no_relevant_content"):
-        tail += ["", TXT["next"]]       # said where the agent decides its next step: it is what gets the conclusion to the user early
+        tail += ["", TXT["next"]]       # said last, where the agent decides what to do with what it has just read
 
-    body = []
+    # Sources. The page is first costed with every hit cut to its opening and every neighbour chunk only named; the
+    # room left after that goes to full texts: the hits in rank order (the best ones whatever the room), then the
+    # neighbour chunks of the hits printed in full. What stays cut is printed in full on the next page.
+    body, rest = [], []
     if src:
-        body += ["", TXT["sec_sources"]]
-        left = limit - nbytes(out) - nbytes(tail) - nbytes(body) - 400
-        opened = []
+        title = ["", TXT["sec_sources"]]
+        near = {}
+        for nb in src:
+            if nb.get("role") != "hit":
+                near.setdefault(nb.get("of"), []).append(nb)
+
+        def named(rows):
+            return "     " + TXT["neighbor_refs"].format(items=TXT["list"].join("S" + str(nb.get("n")) + par(nb.get("place")) for nb in rows))
+
+        firsts, cut = {}, {}
+        for s in hits:
+            label = "S" + str(s.get("n"))
+            firsts[s.get("n")] = "[" + label + "] " + source_cites[s.get("n")] + notes_of(source_notes(s, cid + ":" + label, position=True))
+            cut[s.get("n")] = [firsts[s.get("n")], "     " + flat(source_text(s), OPENING_CHARS)]
+        note = TXT["opening_only"].format(id=cid, labels=TXT["list"].join("S" + str(s.get("n")) for s in hits))
+        left = (limit - PAGE_RESERVE - 200 - nbytes(out) - nbytes(tail) - nbytes(title) - nbytes([note])
+                - sum(nbytes(cut[s.get("n")]) for s in hits) - sum(nbytes([named(rows)]) for rows in near.values()))
+        headers, blocks, later, opened = {}, {}, {}, []
         for i, s in enumerate(hits):
             label = "S" + str(s.get("n"))
-            first = "[" + label + "] " + source_cites[s.get("n")] + notes_of(source_notes(s, cid + ":" + label))
-            near = [nb for nb in src if nb.get("role") != "hit" and nb.get("of") == s.get("n")]
-            block = [first, source_text(s)]
-            if near:
-                block.append("     " + TXT["neighbor_refs"].format(items=TXT["list"].join("S" + str(nb.get("n")) + par(nb.get("place")) for nb in near)))
-            if i >= FULL_SOURCES_MIN and nbytes(block) > left:
-                block = [first, "     " + flat(source_text(s), OPENING_CHARS)]
-                opened.append(cid + ":" + label)
-            left -= nbytes(block)
-            body += block
-        if opened:
-            body.append(TXT["opening_only"].format(refs=" ".join(opened)))
-    return out + body + tail
+            full = [firsts[s.get("n")], source_text(s, headers, label)]
+            extra = nbytes(full) - nbytes(cut[s.get("n")])
+            if extra <= left:
+                left -= extra
+                blocks[s.get("n")] = full
+            else:
+                forget(headers, label)
+                blocks[s.get("n")] = cut[s.get("n")]
+                later[s.get("n")] = [firsts[s.get("n")], source_text(s)]
+                opened.append(label)
+        for s in hits:
+            parent, unprinted = "S" + str(s.get("n")), []
+            for nb in near.get(s.get("n")) or []:
+                label = "S" + str(nb.get("n"))
+                first = ("[" + label + "] " + TXT["dot"].join(str(x) for x in (TXT["neighbor_at"].format(label=parent), nb.get("place")) if x)
+                         + notes_of(source_notes(nb, cid + ":" + label)))
+                block = [first, source_text(nb, headers, label)]
+                if parent not in opened and nbytes(block) <= left:
+                    left -= nbytes(block)
+                    blocks[s.get("n")] += block
+                else:
+                    forget(headers, label)
+                    later.setdefault(s.get("n"), []).extend([first, source_text(nb)])
+                    unprinted.append(nb)
+            if unprinted:
+                blocks[s.get("n")].append(named(unprinted))
+        body = title + [line for s in hits for line in blocks[s.get("n")]]
+        rest = [line for s in hits for line in later.get(s.get("n")) or []]
+        if rest:
+            # One of the best hits cut to its opening: the answer needs the next page. Otherwise it is supplementary.
+            must = any("S" + str(s.get("n")) in opened for s in hits[:TOP_SOURCES])
+            key = "opening_top" if must else "opening_only" if opened else "rest_only"
+            body.append(TXT[key].format(id=cid, labels=TXT["list"].join(opened)))
+            rest = [PAGE_BREAK, TXT["sec_rest_must" if must else "sec_rest"]] + rest
+    return out + body + tail + rest
 
 
-def view_context(envelope):
+def view_context(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     src = r.get("sources") or []
-    out = [head(envelope, TXT["context"].format(doc=(src[0].get("doc") if src else r.get("doc_id")), n=len(src), tokens=r.get("tokens_total")))]
-    cites = Cites()
+    first = src[0] if src else {}
+    doc = first.get("rel_path") or first.get("doc") or r.get("doc_id")
+    at = [int(s["chunk_index"]) for s in src if s.get("chunk_index") is not None]
+    if at and first.get("chunk_total"):
+        what = TXT["context"].format(doc=doc, a=min(at) + 1, b=max(at) + 1, total=first["chunk_total"], tokens=r.get("tokens_total"))
+    else:
+        what = TXT["context_plain"].format(doc=doc, n=len(src), tokens=r.get("tokens_total"))
+    out = [head(envelope, what)]
+    # All chunks are of one document: the first line names it, each chunk carries only its place in it.
+    headers = {}
     for s in src:
         label = "S" + str(s.get("n"))
-        out.append("[" + label + "] " + cites.put(label, s.get("cite")) + notes_of(source_notes(s, envelope["call_id"] + ":" + label)))
-        out.append(source_text(s))
-    return out
+        where = s.get("place") or (TXT["chunk_at"].format(k=int(s["chunk_index"]) + 1) if s.get("chunk_index") is not None else "")
+        out.append("[" + label + "] " + str(where) + notes_of(source_notes(s, envelope["call_id"] + ":" + label)))
+        out.append(source_text(s, headers, label))
+    if r.get("maybe_more") and src:
+        out.append(TXT["maybe_more"].format(n=len(src), m=CONTEXT_MAX - 1, ref=envelope["call_id"] + ":S" + str(src[-1].get("n"))))
+    files = Files()
+    if src:
+        files.add("S1" if len(src) == 1 else "S1–S" + str(len(src)), first.get("file"))
+    return out + files.lines()
 
 
-def view_neighbors(envelope):
+def view_neighbors(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     cid = envelope["call_id"]
     if not r.get("found"):
@@ -551,7 +702,7 @@ def view_neighbors(envelope):
         out.append(also_named(r["matches"]))
     if r.get("neighbors"):
         out.append(TXT["ref_hint"].format(id=cid, label="N3"))
-    cites, excerpts = Cites(), {}
+    cites, excerpts, files = Cites(), {}, Files()
     for x in r.get("neighbors") or []:
         label = "N" + str(x.get("n"))
         other = x.get("other") or {}
@@ -573,8 +724,9 @@ def view_neighbors(envelope):
             first = excerpts.setdefault((ev["excerpt"], ev.get("cite")), label)
             if first != label:
                 body = TXT["same_excerpt"].format(label=first)
-        out.append("     " + cited(body + (TXT["lp"] + TXT["semi"].join(marks) + TXT["rp"] if marks else ""), cites.put(label, ev.get("cite"))))
-    return out
+        out.append("     " + cited(body + (TXT["lp"] + TXT["semi"].join(marks) + TXT["rp"] if marks else ""), cites.put(label, ev.get("cite"), ev)))
+        files.add(label, ev.get("file"))
+    return out + files.lines() + (["", TXT["next_hop"]] if r.get("neighbors") else [])
 
 
 def page_bits(r, count):
@@ -585,24 +737,25 @@ def page_bits(r, count):
     return bits
 
 
-def view_entities(envelope):
+def view_entities(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     rows = r.get("entities") or []
     out = [head(envelope, *page_bits(r, len(rows)))]
     if r.get("types"):
         out.append(TXT["types"].format(items=TXT["dot"].join(str(t.get("type")) + " " + str(t.get("count")) + par(t.get("parent_type")) for t in r["types"])))
     out.append(TXT["ref_hint"].format(id=envelope["call_id"], label="E3") if rows else TXT["no_rows"])
-    cites = Cites()
+    cites, files = Cites(), Files()
     for e in rows:
         label = "E" + str(e.get("n"))
         docs = e.get("docs_cite") or []
         out.append(cited("[" + label + "] " + str(e.get("title")) + par(e.get("type"), TXT["relations_n"].format(n=e.get("degree")),
                                                                         TXT["docs_n"].format(n=e.get("doc_count"))),
                          cites.put(label, docs[0]) if docs else ""))
-    return out
+        files.add(label, next(iter(e.get("docs_file") or []), None))
+    return out + files.lines()
 
 
-def view_facts(envelope):
+def view_facts(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     if not r.get("found", True):
         return candidates(envelope)
@@ -620,16 +773,17 @@ def view_facts(envelope):
     if r.get("properties"):
         out.append(TXT["properties"].format(items=TXT["dot"].join(str(p.get("concept")) + " " + str(p.get("count")) for p in r["properties"])))
     out.append(TXT["ref_hint"].format(id=envelope["call_id"], label="F3") if rows else TXT["no_rows"])
-    cites = Cites()
+    cites, files = Cites(), Files()
     for row in rows:
         label = "F" + str(row.get("n"))
-        out.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"))))
+        out.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"), row)))
+        files.add(label, row.get("file"))
         if row.get("series_text"):
-            out.append("     " + TXT["series"].format(text=flat(row["series_text"], PAGE_SUMMARY_CHARS)))
-    return out
+            out.append("     " + TXT["series"].format(text=flat(row["series_text"])))
+    return out + files.lines() + (["", TXT["next_hop"]] if rows and r.get("subject") else [])
 
 
-def view_catalog(envelope):
+def view_catalog(envelope, limit=PAGE_BYTES):
     out = [head(envelope)]
     for kb in (envelope["result"].get("kbs") or []):
         out.append(TXT["catalog_kb"].format(kb=kb.get("kb_id"), name=kb.get("name"), docs=kb.get("docs"), chunks=kb.get("chunks"),
@@ -644,11 +798,105 @@ VIEWS = {"search": view_search, "context": view_context, "neighbors": view_neigh
          "catalog": view_catalog}
 
 
-def compact(envelope, path):
+BLOCK_RE = re.compile(r"^(\[(?:[0-9a-f]{6}:)?[A-Z]\d+(?:\.\d+)?\] |▶ )")
+
+
+def split_block(block, room, first):
+    """An entry longer than a page, cut into pieces that fit: the first into `first` bytes (what is left of the
+    current page), the others into `room`. It is cut at line ends, and inside a line only when the line alone is
+    longer than a page. Every piece after the first opens with the entry's label and a note that it continues."""
+    lines = "\n".join(block).split("\n")
+    opening = next((m.group(1) for m in map(BLOCK_RE.match, lines) if m), "")
+    more = (opening if opening.startswith("[") else "") + TXT["continued"]
+    room -= nbytes([more])
+    pieces, cur, used, cap = [], [], 0, first
+    for line in lines:
+        raw = line.encode("utf-8")
+        while used + len(raw) + 1 > cap:
+            if len(raw) + 1 > room and cap - used > 200:
+                cut = raw[:cap - used - 1].decode("utf-8", errors="ignore")     # never in the middle of a character
+                cur.append(cut)
+                raw = raw[len(cut.encode("utf-8")):]
+            pieces.append(cur)
+            cur, used, cap = [more], 0, room
+        cur.append(raw.decode("utf-8"))
+        used += len(raw) + 1
+    return pieces + [cur]
+
+
+def pages_of(lines, limit):
+    """Split a view into pages below `limit` bytes. An entry starts at a line that opens with its label and is kept
+    whole unless it is longer than a page by itself; a blank line or a section title stays with what follows it;
+    PAGE_BREAK starts a new page."""
+    blocks, cur, titles = [], [], True
+    for line in lines:
+        text = str(line)
+        if text == PAGE_BREAK:
+            blocks += [cur, None] if cur else [None]
+            cur, titles = [], True
+            continue
+        title = text == "" or text.startswith("━━ ")
+        if cur and not titles and (title or BLOCK_RE.match(text)):
+            blocks.append(cur)
+            cur, titles = [], True
+        cur.append(text)
+        titles = titles and title
+    if cur:
+        blocks.append(cur)
+    room = limit - PAGE_RESERVE
+    pages, page, used = [], [], 0
+    for block in blocks:
+        pieces = [block]
+        if block is not None and nbytes(block) > room:
+            # an entry too long for any page starts on this one when a fair part of it is still free
+            pieces = split_block(block, room, room - used if page and room - used >= 3000 else room)
+        for piece in pieces:
+            size = nbytes(piece) if piece is not None else 0
+            if page and (piece is None or used + size > room):
+                pages.append(page)
+                page, used = [], 0
+            if piece is not None:
+                page, used = page + piece, used + size
+    return pages + [page] if page or not pages else pages
+
+
+def one_page(pages, page, what, head=None):
+    """Page `page` of a paged view with the lines that say where it stands: a first line on the later pages, and at
+    the end what the next page is — more of the same, to be read on, or only the full texts a search left out."""
+    total = len(pages)
+    if not 1 <= page <= total:
+        raise ValueError("show " + what + " has " + str(total) + (" pages" if total > 1 else " page"))
+    out = list(pages[page - 1])
+    while out and out[0] == "":
+        out.pop(0)
+    if page > 1 and head:
+        out = [head.format(page=page, total=total), ""] + out
+    if page < total:
+        optional = next((i for i, lines in enumerate(pages, 1) if next((x for x in lines if x != ""), None) == TXT["sec_rest"]), None)
+        key = "page_more_optional" if optional is not None and page + 1 >= optional else "page_more"
+        out += ["", TXT[key].format(page=page, total=total, what=what, next=page + 1)]
+    elif total > 1:
+        out += ["", TXT["page_last"].format(total=total)]
+    return out
+
+
+def page_limit(cfg):
+    """Bytes one printed output may take: PAGE_BYTES unless the configuration says otherwise (a harness whose inline
+    limit was raised can take larger pages)."""
+    value = int(os.environ.get("CARREL_SEARCH_PAGE_BYTES") or cfg.get("page_bytes") or PAGE_BYTES)
+    if not 4000 <= value <= 400000:
+        raise ValueError("page_bytes must be between 4000 and 400000")
+    return value
+
+
+def compact(envelope, path, limit=PAGE_BYTES, page=1):
     view = VIEWS.get(envelope["operation"])
     if view is None:
         return json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False)
-    return "\n".join(view(envelope) + ["", TXT["full"].format(path=path)])
+    cid = envelope["call_id"]
+    head = TXT["page_head"].format(id=cid, op=envelope["operation"], page="{page}", total="{total}")
+    out = one_page(pages_of(view(envelope, limit), limit), page, cid, head)
+    return "\n".join(out + ["", TXT["full"].format(path=path)])
 
 
 # ── requests ──
@@ -666,13 +914,15 @@ def payload(args, work=None):
             hints["block_types"] = args.block_type
         if args.rel_path:
             hints["rel_paths"] = args.rel_path
+        named = list(data.get("kbs") or [])         # named by the caller (--kb or the request file): never widened
         for item in args.in_doc or []:
             kb, row = chunk_of(*resolve(work, item)[:3])
             if not row.get("doc_id"):
                 raise ValueError("the referenced entry carries no document id: " + item)
+            within(named, kb, "--in-doc " + item)
             hints.setdefault("doc_ids", []).append(row["doc_id"])
-            if kb not in data.setdefault("kbs", []):
-                data["kbs"].append(kb)
+            if not named and kb not in data.setdefault("kbs", []):
+                data["kbs"].append(kb)      # no knowledge base named: the documents pointed at decide
         if hints:
             data["hints"] = hints
         if args.top_k is not None:
@@ -697,7 +947,16 @@ def payload(args, work=None):
             stitched = row.get("stitched") or {}
             if stitched.get("chunk_from") is not None and stitched.get("chunk_to") is not None:
                 first, last = int(stitched["chunk_from"]), int(stitched["chunk_to"])
-            data.update({"kb_id": kb, "doc_id": row["doc_id"], "chunk_from": max(0, first - args.before), "chunk_to": last + args.after})
+            lo, hi = max(0, first - args.before), last + args.after
+            if args.whole:
+                # the whole document; a row that does not say how long it is gets read until the chunks run out
+                total = int(row.get("chunk_total") or 0)
+                if total > CONTEXT_MAX:
+                    raise ValueError(too_long(total))
+                lo, hi = 0, (total or CONTEXT_MAX) - 1
+            if hi - lo + 1 > CONTEXT_MAX:
+                raise ValueError("one context command reads up to " + str(CONTEXT_MAX) + " chunks")
+            data.update({"kb_id": kb, "doc_id": row["doc_id"], "chunk_from": lo, "chunk_to": hi})
             if row.get("content_version"):
                 data["content_version"] = row["content_version"]
         if not data.get("kb_id") or not data.get("doc_id"):
@@ -715,6 +974,7 @@ def payload(args, work=None):
     if args.command == "neighbors":
         if ref is not None:
             data["kb_id"], data["entity_id"] = entity_of(*ref)
+            within([args.kb] if args.kb else [], data["kb_id"], "--ref " + args.ref)
         if args.kb:
             data["kb_id"] = args.kb
         if args.entity:
@@ -732,6 +992,7 @@ def payload(args, work=None):
     if args.command in ("entities", "facts"):
         if args.command == "facts" and ref is not None:
             data["kb_id"], data["subject_id"] = entity_of(*ref)
+            within([args.kb] if args.kb else [], data["kb_id"], "--ref " + args.ref)
         if args.kb:
             data["kb_id"] = args.kb
         for key in ("limit", "offset"):
@@ -769,6 +1030,45 @@ def request(url, token, timeout, method, route, data=None):
         return response.read(), response.headers
 
 
+def too_long(total):
+    return ("this document has " + str(total) + " chunks, --whole reads up to " + str(CONTEXT_MAX)
+            + "; read a part of it with --before / --after, or search inside it with search --in-doc")
+
+
+def read_context(url, token, timeout, data, whole=False):
+    """/context serves a limited number of chunks per request: a longer range is read in consecutive requests and
+    merged into one response, its sources numbered through. A whole-document read that started from a row without
+    the document's length learns it from the first chunks: a document over the limit is refused then, not returned
+    in part; when the length never shows, the response is marked as possibly incomplete."""
+    lo, hi = data.get("chunk_from"), data.get("chunk_to")
+    if not isinstance(lo, int) or not isinstance(hi, int) or (hi - lo < CONTEXT_STEP and not whole):
+        return json.loads(request(url, token, timeout, "POST", "/context", data)[0])
+    merged, total, start, ended = None, 0, lo, False
+    while start <= hi:
+        part = dict(data, chunk_from=start, chunk_to=min(start + CONTEXT_STEP - 1, hi))
+        result = json.loads(request(url, token, timeout, "POST", "/context", part)[0])
+        rows = result.get("sources") or []
+        if merged is None:
+            merged = result
+            total = next((int(row["chunk_total"]) for row in rows if isinstance(row, dict) and row.get("chunk_total")), 0)
+            if whole and total:
+                if total > CONTEXT_MAX:
+                    raise ValueError(too_long(total))
+                hi = total - 1
+        else:
+            merged["sources"] = (merged.get("sources") or []) + rows
+            merged["tokens_total"] = (merged.get("tokens_total") or 0) + (result.get("tokens_total") or 0)
+        if len(rows) < part["chunk_to"] - part["chunk_from"] + 1:
+            ended = True                # the document ends here
+            break
+        start += CONTEXT_STEP
+    if whole and not total and not ended:
+        merged["maybe_more"] = True
+    for i, row in enumerate(merged.get("sources") or [], 1):
+        row["n"] = i
+    return merged
+
+
 def save_new(path, content):
     destination = Path(path).expanduser().absolute()
     # Exclusive creation: a mistyped output path must not replace user data.
@@ -797,6 +1097,7 @@ def parser():
         if name == "show":
             cmd.add_argument("refs", nargs="+", help="A call id (prints its compact view again) or references such as 3fa2c1:S3")
             cmd.add_argument("--json", action="store_true", help="Print every field of a source or page as JSON")
+            cmd.add_argument("--page", type=int, help="With a call id: the page of its compact view to print (default 1)")
             continue
         cmd.add_argument("--output", help="Also save to this new file (pictures: save here instead of the work directory)")
         cmd.add_argument("--json", action="store_true", help="Print the complete response instead of the compact view")
@@ -807,6 +1108,7 @@ def parser():
         if name == "context":
             cmd.add_argument("--before", type=int, default=1, help="Chunks to read before the referenced one (default 1)")
             cmd.add_argument("--after", type=int, default=1, help="Chunks to read after the referenced one (default 1)")
+            cmd.add_argument("--whole", action="store_true", help="Read the whole document the referenced entry is in")
         if name == "crop":
             cmd.add_argument("--bbox", help="x0,y0,x1,y1 as 0-1 ratios or 0-1000 per mille")
             cmd.add_argument("--pad", type=int)
@@ -846,24 +1148,31 @@ def parser():
     return p
 
 
-def show(work, refs, raw=False):
+def show(work, refs, raw=False, page=None, limit=PAGE_BYTES):
+    calls = [ref for ref in refs if re.fullmatch(r"[0-9a-f]{6}", ref)]
+    if page is not None and calls and len(refs) > 1:
+        raise ValueError("--page goes with one call id (show 3fa2c1 --page 2) or with entry references only")
+    lines = []
     for ref in refs:
-        if re.fullmatch(r"[0-9a-f]{6}", ref):
-            print(compact(stored(work, ref), work / (ref + ".json")))
+        if ref in calls:
+            print(compact(stored(work, ref), work / (ref + ".json"), limit, page or 1))
             continue
         envelope, letter, entry, child = resolve(work, ref)
         if letter == "S" and not raw:
             parent = "S" + str(entry.get("of")) if entry.get("role") != "hit" and entry.get("of") else None
-            print("[" + ref + "] " + str(entry.get("cite") or "") + notes_of(source_notes(entry, ref, parent)))
-            print(str(entry.get("text") or "").strip())
+            lines.append("[" + ref + "] " + str(entry.get("cite") or "") + notes_of(source_notes(entry, ref, parent)))
+            lines.append(str(entry.get("text") or "").strip())
         elif letter == "P" and not raw:
             docs = entry.get("docs_cite") or []
-            print(cited("[" + ref + "] " + TXT["dot"].join(str(b) for b in (entry.get("kind"), entry.get("title")) if b) + TXT["colon"]
-                        + flat(entry.get("summary")), TXT["semi"].join(docs)))
-            print(str(entry.get("text") or "").strip())
+            lines.append(cited("[" + ref + "] " + TXT["dot"].join(str(b) for b in (entry.get("kind"), entry.get("title")) if b) + TXT["colon"]
+                               + flat(entry.get("summary")), TXT["semi"].join(docs)))
+            lines.append(str(entry.get("text") or "").strip())
         else:
-            print(TXT["shown"].format(ref=ref))
-            print(json.dumps(child if child is not None else entry, ensure_ascii=False, indent=1, allow_nan=False))
+            lines.append(TXT["shown"].format(ref=ref))
+            lines.append(json.dumps(child if child is not None else entry, ensure_ascii=False, indent=1, allow_nan=False))
+    if lines:
+        # Entries shown together are paged like a view: the same references with --page print the next page.
+        print("\n".join(one_page(pages_of(lines, limit), page or 1, " ".join(ref for ref in refs if ref not in calls))))
     return 0
 
 
@@ -874,8 +1183,9 @@ def main(argv=None):
     try:
         cfg = config(args)
         work = work_dir(cfg)
+        limit = page_limit(cfg)
         if args.command == "show":
-            return show(work, args.refs, args.json)
+            return show(work, args.refs, args.json, args.page, limit)
         call_id = new_call(work)
         if args.output and Path(args.output).expanduser().exists():
             raise FileExistsError("output already exists; choose a new filename")
@@ -886,6 +1196,7 @@ def main(argv=None):
             kb, point = args.kb, args.point_id
             if args.ref:
                 kb, row = chunk_of(*resolve(work, args.ref)[:3])
+                within([args.kb] if args.kb else [], kb, "--ref " + args.ref)
                 point, tag = row["point_id"], args.ref.replace(":", "-")
             if not kb or not point:
                 raise ValueError("image requires --ref, or --kb with --point-id")
@@ -900,8 +1211,13 @@ def main(argv=None):
                 tag = args.ref.replace(":", "-") + "-crop"
         else:
             route, method, data = "/" + args.command, "GET", None
-        raw, headers = request(url, token, timeout, method, route, data)
         envelope = {"call_id": call_id, "operation": args.command}
+        if args.command == "context":
+            raw, headers = None, None
+            result = read_context(url, token, timeout, data, bool(args.whole and args.ref))
+        else:
+            raw, headers = request(url, token, timeout, method, route, data)
+            result = None if binary else json.loads(raw)
         if binary:
             mime = headers.get_content_type()
             if not mime.startswith("image/"):
@@ -922,14 +1238,14 @@ def main(argv=None):
                 print(TXT["saved"].format(path=res["path"], mime=mime, w=res["width"], h=res["height"], source=res["source"]))
             return 0
         envelope["request"] = {k: v for k, v in (data or {}).items() if k != "image_b64"}
-        envelope["result"] = json.loads(raw)
+        envelope["result"] = result
         add_cites(envelope["result"])
         number_rows(envelope["result"])
         encoded = (json.dumps(envelope, ensure_ascii=False, indent=1, allow_nan=False) + "\n").encode("utf-8")
         path = save_new(work / (call_id + ".json"), encoded)
         if args.output:
             save_new(args.output, encoded)
-        print(json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False) if args.json else compact(envelope, path))
+        print(json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False) if args.json else compact(envelope, path, limit))
         return 0
     except (OSError, ValueError, TypeError, KeyError, urllib.error.URLError) as exc:
         if isinstance(exc, urllib.error.HTTPError):

@@ -4,14 +4,14 @@
 
 The search service retrieves evidence from indexed documents and graphs.
 The calling agent uses that evidence to answer, requests more context when
-needed, and cites its sources.
+needed, and names the files it relied on.
 
 ## Connect an agent
 
 The bundled [carrel-search skill](../skills/carrel-search/SKILL.md) includes a
 Python standard-library client and instructions for searching, checking
-evidence, following relationships, and citing sources. Install the skill using
-your agent's supported skill mechanism.
+evidence, answering, listing the reference files, and offering follow-ups along
+the graph. Install the skill using your agent's supported skill mechanism.
 
 The client defaults to `http://127.0.0.1:9810`. For another host, set
 `CARREL_SEARCH_BASE_URL` and `CARREL_SEARCH_TOKEN` in the client environment.
@@ -27,22 +27,32 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 ```
 
 Each command prints a compact view of the response: retrieval status, the text
-of the sources with ready-made citations, facts, page summaries, and graph
-leads. The complete response is kept in a work directory, and every entry has
-a label, so a later command points at it with `--ref <call id>:<label>`
-instead of retyping IDs: `context --ref 3fa2c1:S3` reads the original around
-a source, `neighbors --ref 3fa2c1:H1` walks the graph from a subject, and
+of the sources with the file and place each comes from, facts, page summaries,
+graph leads, and the reference files. IDs, scores, and debug fields are left
+out; document text is not cut. A view that does not fit one tool output is
+paged, and `show <call id> --page 2` prints the next page. The complete
+response is kept in a work directory, and every entry has a label, so a later
+command points at it with `--ref <call id>:<label>` instead of retyping IDs:
+`context --ref 3fa2c1:S3` reads the original around a source,
+`context --ref 3fa2c1:S3 --whole` reads its whole document,
+`neighbors --ref 3fa2c1:H1` walks the graph from a subject, and
 `show 3fa2c1:F2` prints an entry in full. `--json` prints the complete
 response instead.
 
+The skill answers from one search: the answer, then the files it rests on as
+plain-text paths from each knowledge base's top-level folder, then a few
+numbered follow-ups drawn from the graph leads. When the user replies with a
+number, the agent walks one hop along the graph from that lead and answers
+again. Looking further is the user's choice, so the first answer does not wait
+for a multi-hop exploration.
+
 How long an answer takes depends mostly on the agent's reasoning effort, not on
 the service: retrieval returns within seconds and the rest is the agent
-reading and thinking. A middle-to-high level is usually enough for a cited
-answer that follows the graph; the highest levels walk further and cross-check
-more, and take several times longer. Claude Code lets a skill pin its own
-level with an `effort:` line in the frontmatter of `SKILL.md` (for example
-`effort: high`), which applies to the turn that invokes the skill; in other
-agents, choose the level for the session.
+reading and thinking, and the highest levels take several times longer than a
+middle-to-high one. Claude Code lets a skill pin its own level with an
+`effort:` line in the frontmatter of `SKILL.md` (for example `effort: high`),
+which applies to the turn that invokes the skill; in other agents, choose the
+level for the session.
 
 Store tokens in the client environment or a separate token file. The service
 uses `KB_SEARCH_TOKEN`; client configuration uses the `CARREL_` variables above.
