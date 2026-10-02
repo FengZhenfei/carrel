@@ -26,6 +26,15 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
   --question "What are the delivery and acceptance requirements?"
 ```
 
+Each command prints a compact view of the response: retrieval status, the text
+of the sources with ready-made citations, facts, page summaries, and graph
+leads. The complete response is kept in a work directory, and every entry has
+a label, so a later command points at it with `--ref <call id>:<label>`
+instead of retyping IDs: `context --ref 3fa2c1:S3` reads the original around
+a source, `neighbors --ref 3fa2c1:H1` walks the graph from a subject, and
+`show 3fa2c1:F2` prints an entry in full. `--json` prints the complete
+response instead.
+
 Store tokens in the client environment or a separate token file. The service
 uses `KB_SEARCH_TOKEN`; client configuration uses the `CARREL_` variables above.
 With no server token, protected endpoints accept loopback callers only.
@@ -43,11 +52,11 @@ in the service's own environment take precedence over the file.
 |---|---|
 | `GET /health` | Service health, authentication mode, and knowledge-base metadata |
 | `GET /catalog` | Knowledge-base names, domains, size, file samples, and graph availability; `?refresh=1` refreshes the catalog |
-| `POST /search` | Retrieve sources and available entities, relationships, facts, and compiled pages |
+| `POST /search` | Retrieve sources and available entities, relationships, facts, compiled pages, and the one-hop neighbourhood of the subjects |
 | `POST /context` | Fetch a document's chunks by index range |
 | `GET /image/{kb_id}/{point_id}` | Fetch an image associated with a retrieved chunk |
 | `POST /crop` | Crop a selected region of that image |
-| `POST /graph/neighbors` | Fetch evidence-backed relationships around an entity |
+| `POST /graph/neighbors` | Fetch evidence-backed relationships around an entity, each with an excerpt of the original text |
 | `POST /graph/entities` | List entities by type, upper class, or name, with a total and paging |
 | `POST /graph/facts` | List the structured facts of a subject, or of a property across subjects, with a total and paging |
 
@@ -146,8 +155,42 @@ checking the source evidence at each step.
   number under the same filter, and `has_more` whether some were left out.
 - The endpoint returns a single bounded neighborhood. Narrow with `types`
   or adjust `limit` when more focused results are needed.
+- `predicates` lists how many relationships of each kind the entity has,
+  independent of `limit` and `types`: it shows which other kinds can be
+  requested by predicate. Each far end carries `degree`, its own relationship
+  count, and the entity carries `facts`, the number of facts under it.
+- Each relationship carries an excerpt of the original text: the first
+  evidence chunk has `excerpt` (at most 200 characters, the sentences that
+  name the far end) and `excerpt_match` (`both` when both ends are named in
+  the chunk, `other` when only the far end is, `center` or `none` when the far
+  end was not located). The excerpt is located by name, without a model. A
+  text chunk that names the far end is preferred over a picture chunk; an
+  excerpt taken from a picture chunk is marked `visual`, because that text is
+  the vision model's description.
 - Relationship descriptions summarize linked evidence. Their evidence positions
   can be passed to `/context` to retrieve the original passages.
+
+### Subject neighbourhoods in search results
+
+`/search` returns `neighborhoods`: for the entities the question is about, a
+preview of where the graph leads, so an agent can decide whether to call
+`/graph/neighbors` without first looking each subject up.
+
+- Subjects are first the entities the question names: a title or alias that
+  appears whole in the question, ignoring case and spaces. A name of two or
+  three characters without letters or digits counts only when the entity is
+  also among the graph route's matches. The remaining slots are filled with
+  the graph route's best matches. `KB_SEARCH_NEIGHBORHOODS` sets the total
+  (4 by default, `0` disables the block).
+- Each subject carries `named`, `relations` (its relationship total), `facts`,
+  `predicates` (counts per kind), and `neighbors`: its eight strongest
+  relationships with predicate, direction, and the far end, one line per far
+  end.
+- The block carries leads only, without evidence. It is omitted for scoped
+  queries (hard `hints` filters), and a failure to build it is recorded in
+  `retrieval_summary.degraded` without affecting the search.
+- The names of all entities of a knowledge base are kept in the search process
+  per graph version and read once after a restart or a new graph version.
 
 ### Enumerate entities and facts
 
@@ -193,7 +236,8 @@ followed by `place`: the short locator that sources and evidence chunks carry
 |---|---|
 | `sources` | Original passages, provenance, acceptance flags, and available visual descriptions |
 | `entities`, `relationships` | Graph candidates and connections; verify relevant links against sources |
-| `specs` | Structured facts with units, conditions, time, source references, and conflict indicators |
+| `neighborhoods` | The strongest relationships of the entities the question names; leads for walking the graph |
+| `specs` | Structured facts with units, conditions, time, source references, and conflict indicators; `evidence` lists the chunks a fact rests on, with positions for `/context`, the one whose text holds the value first (`located`) when that can be told |
 | `pages` | Compiled subject, timeline, or source views; `compiled=true` distinguishes derived content |
 | `doc_aggs` | Documents represented in this result set |
 | `retrieval_summary` | Routing, selection, evidence status, and degradation diagnostics |
@@ -234,6 +278,8 @@ channels and source positions for citation. Entries include:
 | `<kb>:graph`, `<kb>:visual`, `rerank: TimeoutError` | The stage failed, timed out, or had no budget left; reranking falls back to fusion order |
 | `budget: widen skipped` | Too little budget remained to widen to the other knowledge bases |
 | `budget: context skipped`, `context: …` | Neighboring chunks or table heads were not fetched |
+| `budget: neighborhoods skipped`, `neighborhoods: …` | The subject neighbourhoods were not built |
+| `budget: spec evidence skipped`, `<kb>:spec_evidence: …` | Facts carry no source chunks, or only chunk ids for that knowledge base |
 | `<kb>:backfill: …` | Candidate text could not be fetched; candidates without text were dropped |
 | `widen: rerank: …` | Reranking after widening failed; the first round's below-the-floor verdict is kept |
 

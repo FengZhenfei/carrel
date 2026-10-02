@@ -126,6 +126,10 @@ class SearchSettings:
     boilerplate_factor: float     # boilerplate chunks (table of contents / revision history / copyright page) have their final ranking score multiplied by it (Q18: down-weighted, not removed)
     page_text_tokens: int         # total budget for compiled page text in the context (Q12: only timeline pages and subject pages with series rows)
     spec_hint_limit: int          # maximum number of fact hints (Q11)
+    neighborhoods: int            # how many subjects' one-hop neighbourhoods /search carries (entities the question names first, filled up
+                                  # with graph route seeds); 0 = none. Measured on 2026-10-02: a few subjects with 8 relations each, one per
+                                  # line, come to 500-600 characters; every extra round of deliberation costs an agent half a minute to five
+                                  # minutes while one query takes about a second, so the leads for the first hop come with the first search
 
 
 def load_search_settings(env: Mapping[str, str] | None = None) -> SearchSettings:
@@ -178,4 +182,5 @@ def load_search_settings(env: Mapping[str, str] | None = None) -> SearchSettings
         boilerplate_factor=_float(env, "KB_SEARCH_BOILERPLATE_FACTOR", 0.5),
         page_text_tokens=_int(env, "KB_SEARCH_PAGE_TEXT_TOKENS", 1200),
         spec_hint_limit=_int(env, "KB_SEARCH_SPEC_HINT_LIMIT", 8),
+        neighborhoods=_int(env, "KB_SEARCH_NEIGHBORHOODS", 4),
     )

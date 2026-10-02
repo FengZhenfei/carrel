@@ -13,7 +13,7 @@ import os
 import pathlib
 
 from kb_search import catalog as catalog_mod
-from kb_search import channels, evalset, images, service
+from kb_search import channels, evalset, graphwalk, images, service
 from kb_search.config import SearchSettings, load_search_settings
 from kb_search.evidence import assemble_sources, doc_aggs, page_rows, select_hits, spec_rows, stitch_short_hit
 from kb_search.fusion import interleave, rrf_merge
@@ -155,7 +155,7 @@ class ConfigTests(unittest.TestCase):
         defaults = load_search_settings(Recording())
         self.assertEqual(set(example), read)                                     # the example lacks no key and has none the code does not know
         self.assertEqual(load_search_settings(example), defaults)                # copying the example verbatim gives the calibrated values
-        self.assertEqual((defaults.rerank_threshold, defaults.graph_hops), (0.1, 1))
+        self.assertEqual((defaults.rerank_threshold, defaults.graph_hops, defaults.neighborhoods), (0.1, 1, 4))
 
     def test_search_keys_follow_the_env_file_without_a_restart(self) -> None:
         import tempfile
@@ -1038,7 +1038,7 @@ class OrchestrationTests(unittest.TestCase):
 
     def _run(self, *, rerank_fn=None, kbs=None, settings_over=None, question="我的尿酸多少", graph_entities=None, extra_vec=None, extra_bm25=None,
              image=None, visual_fn=None, vec_delay=None, graph_specs=None, hints=None, graph_delay=None, broken=(),
-             visual_query_fn=None, entries=None, graph_relations=None, graph_pages=None):
+             visual_query_fn=None, entries=None, graph_relations=None, graph_pages=None, hoods=None):
         docs = {"p1": _payload("p1", "d1", 2, "尿酸 433 umol/L,参考范围 208-428。" * 12),
                 "p2": _payload("p2", "d1", 3, "甘油三酯 1.7 mmol/L。" * 20),
                 "p3": _payload("p3", "d2", 0, "封装类型 361-ball FCBGA。" * 15, visual_ref="parse/x.jpg", visual_summary="图", visual_value_conflicts=[{"a": 1}], visual_confidence="high"),
@@ -1108,6 +1108,12 @@ class OrchestrationTests(unittest.TestCase):
                 raise RuntimeError("qdrant timed out")
             return {i: docs[i] for i in ids if i in docs}
 
+        def fake_points(q, c, ids, *, keys=None, timeout=None):
+            calls.setdefault("points", []).append(sorted(ids))
+            if "points" in broken:
+                raise RuntimeError("qdrant timed out")
+            return {i: docs[i] for i in ids if i in docs}
+
         def fake_vec(q, c, v, limit, timeout=None, query_filter=None):
             calls["vec_filter"] = query_filter
             if "vec" in broken:
@@ -1118,6 +1124,13 @@ class OrchestrationTests(unittest.TestCase):
             if c == "kb_001":
                 return [{"point_id": "p1", "score": 0.8, "payload": docs["p1"]}, {"point_id": "p3", "score": 0.6, "payload": docs["p3"]}] + list(extra_vec or [])
             return [{"point_id": "p9", "score": 0.3, "payload": docs["p9"]}]
+
+        def fake_hoods(settings, sources, graph_versions, question, seeds, *, limit, driver=None, timeout=None):
+            calls["hoods"] = {"kbs": list(sources), "question": question, "seeds": [e.get("title") for e in seeds], "graph_versions": graph_versions,
+                              "limit": limit, "timeout": timeout}
+            if callable(hoods):
+                return hoods()
+            return list(hoods or [])
 
         def fake_bm25(url, question, c, limit, identifiers=None, timeout=None, filters=None):
             calls["bm25_filters"] = filters
@@ -1140,9 +1153,56 @@ class OrchestrationTests(unittest.TestCase):
                 mock.patch.object(channels, "table_head", return_value=None), \
                 mock.patch.object(channels, "fetch_payloads", side_effect=fake_fetch), \
                 mock.patch.object(channels, "neighbor_payloads", side_effect=fake_neighbors), \
+                mock.patch.object(channels, "shared_driver", return_value=object()), \
+                mock.patch.object(graphwalk, "neighborhoods", side_effect=fake_hoods), \
+                mock.patch.object(graphwalk, "point_payloads", side_effect=fake_points), \
                 mock.patch.object(Reranker, "score", fake_rerank):
             out = service.search(question, kbs=kbs, explain=True, image_bytes=image, hints=hints)
         return out, calls
+
+    def test_search_facts_carry_the_chunks_they_rest_on(self) -> None:
+        """Facts of /search carry their source chunks: locators enough for /context, the chunk that holds the value first
+        when that can be told; a failed lookup is only a degraded note and the facts are returned all the same."""
+        specs = [{"id": "s1", "subject": "李", "property": "尿酸", "value": "433", "score": 0.9, "point_ids": ["p1"]},
+                 {"id": "s2", "subject": "系统", "property": "结构", "value": "架构图", "score": 0.8, "point_ids": ["p1", "p8"]}]
+        out, calls = self._run(graph_specs=specs)
+        by = {sp["id"]: sp for sp in out["specs"]}
+        self.assertEqual([(e["point_id"], e["doc_id"], e["chunk_index"], e["active"]) for e in by["s1"]["evidence"]], [("p1", "d1", 2, True)])
+        self.assertNotIn("located", by["s1"]["evidence"][0])                          # a single chunk: nothing to tell apart
+        self.assertEqual([(e["point_id"], e.get("located")) for e in by["s2"]["evidence"]], [("p8", True), ("p1", None)])   # the value is in p8 only
+        self.assertEqual((by["s2"]["evidence"][0]["doc_id"], by["s2"]["evidence"][0]["chunk_index"]), ("d8", 0))
+        self.assertEqual(calls["points"], [["p8"]])                                   # a chunk already among the sources (p1) is not fetched again
+        self.assertIn("spec_evidence_ms", out["retrieval_summary"]["timings_ms"])
+        broken, _ = self._run(graph_specs=specs, broken=("points",))
+        self.assertIn("kb_001:spec_evidence: RuntimeError", broken["retrieval_summary"]["degraded"])
+        by = {sp["id"]: sp for sp in broken["specs"]}
+        self.assertEqual(by["s1"]["evidence"][0]["chunk_index"], 2)                   # chunks among the sources are unaffected
+        self.assertEqual([(e["point_id"], e.get("active")) for e in by["s2"]["evidence"]], [("p1", True), ("p8", None)])   # not fetched: unknown, not marked inactive
+
+    def test_search_carries_the_neighbourhood_of_named_subjects(self) -> None:
+        """A search carries the one-hop neighbourhood of its subjects: the caller reads it and decides whether to call the
+        neighbours endpoint and walk on. These are leads that come along: switching them off, a scoped query or a failure
+        to fetch them leaves the search itself untouched."""
+        block = {"kb_id": "kb_001", "id": "e1", "title": "尿酸", "type": "biomarker", "named": True, "relations": 3, "facts": 2,
+                 "predicates": [{"type": "measured_in", "count": 3}],
+                 "neighbors": [{"relation_id": "r1", "type": "measured_in", "direction": "out", "directed": True, "weight": 2.0,
+                                "other": {"id": "e2", "title": "血液", "type": "specimen", "degree": 9}}]}
+        out, calls = self._run(hoods=[block])
+        self.assertEqual(out["neighborhoods"], [{"n": 1, **block}])
+        self.assertEqual((calls["hoods"]["kbs"], calls["hoods"]["seeds"], calls["hoods"]["graph_versions"], calls["hoods"]["limit"]),
+                         (["kb_001"], ["尿酸"], {"kb_001": "001-v"}, 4))                             # only knowledge bases with a graph; the graph route's entity rows are the seeds that fill up
+        self.assertLessEqual(calls["hoods"]["timeout"], service.NEIGHBORHOOD_TIMEOUT)               # a slow graph database does not hold the request up
+        self.assertIn("neighborhood_ms", out["retrieval_summary"]["timings_ms"]); self.assertEqual(out["retrieval_summary"]["degraded"], [])
+        off, calls_off = self._run(hoods=[block], settings_over={"neighborhoods": 0})
+        self.assertEqual(off["neighborhoods"], []); self.assertNotIn("hoods", calls_off)
+        scoped, calls_scoped = self._run(hoods=[block], kbs=["kb_001"], hints={"doc_ids": ["d1"]})
+        self.assertEqual(scoped["neighborhoods"], []); self.assertNotIn("hoods", calls_scoped)      # scoped queries do not carry them: relations have no document information
+
+        def boom():
+            raise RuntimeError("neo4j timed out")
+        broken, _ = self._run(hoods=boom)
+        self.assertEqual(broken["neighborhoods"], []); self.assertIn("neighborhoods: RuntimeError", broken["retrieval_summary"]["degraded"])
+        self.assertTrue([r for r in broken["sources"] if r["role"] == "hit"])                       # a failure only records a degradation, the evidence is returned as usual
 
     def test_hints_restrict_documents_and_prefer_block_types(self) -> None:
         out, calls = self._run(kbs=["kb_001"], hints={"doc_ids": ["d2"], "block_types": ["image"], "subject": "李"}, settings_over={"top_k": 5})
@@ -1419,6 +1479,9 @@ class OrchestrationTests(unittest.TestCase):
                 mock.patch.object(channels, "table_head", return_value=None), \
                 mock.patch.object(channels, "fetch_payloads", side_effect=lambda q, c, ids, **kw: {i: docs[i] for i in ids if i in docs}), \
                 mock.patch.object(channels, "neighbor_payloads", return_value=[]), \
+                mock.patch.object(channels, "shared_driver", return_value=object()), \
+                mock.patch.object(graphwalk, "neighborhoods", return_value=[]), \
+                mock.patch.object(graphwalk, "point_payloads", return_value={}), \
                 mock.patch.object(Reranker, "score", lambda self, query, documents: [0.8] * len(documents)):
             out = service.search("尿酸多少", kbs=["kb_001"])
         return out, calls
@@ -1438,6 +1501,204 @@ class OrchestrationTests(unittest.TestCase):
         out, _ = self._run(broken=("vec",))
         self.assertTrue(out["sources"])
         self.assertIn("kb_001:text", out["retrieval_summary"]["degraded"])
+
+class GraphWalkTests(unittest.TestCase):
+    """The parts of the graph lookups that need no backend: excerpts of the original text, entities named in the
+    question, the subject neighbourhoods /search carries."""
+
+    ENTITIES = [
+        {"id": "e1", "title": "ZK200", "type": "product", "aliases": ["ZK 200 Pro"], "degree": 50},
+        {"id": "e2", "title": "Northwind Gateway", "type": "product", "aliases": ["Gateway"], "degree": 30},
+        {"id": "e3", "title": "Northwind", "type": "vendor", "aliases": [], "degree": 99},
+        {"id": "e4", "title": "网关", "type": "module", "aliases": [], "degree": 7},
+        {"id": "e5", "title": "网关", "type": "module", "aliases": [], "degree": 70},
+        {"id": "e6", "title": "AI", "type": "capability", "aliases": [], "degree": 5},
+        {"id": "e7", "title": "延迟", "type": "property", "aliases": ["时延"], "degree": 12},
+        {"id": "e8", "title": "热备份", "type": "feature", "aliases": None, "degree": 3},
+        {"id": "e9", "title": "Gateway", "type": "module", "aliases": [], "degree": 2},
+    ]
+    TOP = [{"relation_id": "r1", "type": "part_of", "outgoing": False, "directed": True, "weight": 5.0,
+            "other_id": "e10", "other_title": "控制模块", "other_type": "module", "other_degree": 4},
+           {"relation_id": "r3", "type": "requires", "outgoing": True, "directed": True, "weight": 4.0,
+            "other_id": "e10", "other_title": "控制模块", "other_type": "module", "other_degree": 4},
+           {"relation_id": "r2", "type": "supports", "outgoing": True, "directed": False, "weight": 2.5,
+            "other_id": "e5", "other_title": "网关", "other_type": "module", "other_degree": 70}]
+    RELATIONS = {"e1": {"total": 3, "kinds": ["part_of", "supports", "part_of"], "top": TOP},
+                 "e4": {"total": 1, "kinds": ["part_of"], "top": TOP[:1]}}
+    FACTS = {"e1": 12}
+
+    def setUp(self) -> None:
+        graphwalk._names.clear()
+
+    def _driver(self, log):
+        entities, relations, facts = self.ENTITIES, self.RELATIONS, self.FACTS
+
+        class Result:
+            def __init__(self, rows): self.rows = rows
+            def data(self): return self.rows
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, cypher, **kw):
+                log.append((cypher, kw))
+                if "e.aliases AS aliases" in cypher:
+                    return Result(entities)
+                if "collect(r.type) AS kinds" in cypher:
+                    return Result([{"eid": i, **relations[i]} for i in kw["ids"] if i in relations])
+                if "HAS_SPEC" in cypher:
+                    return Result([{"eid": i, "facts": facts.get(i, 0)} for i in kw["ids"]])
+                raise AssertionError(cypher)
+
+        class Driver:
+            def session(self): return Session()
+            def close(self): raise AssertionError("the shared driver must not be closed")
+
+        return Driver()
+
+    def test_facts_point_at_the_chunk_that_holds_the_value(self) -> None:
+        """A fact comes from an extraction unit that may span several chunks: when the value's wording appears in exactly
+        one of them that chunk goes first and is marked located, the property name is tried when the value does not
+        settle it, and nothing is marked otherwise; inactive and missing chunks go last and are never located."""
+        sources = [{"n": 1, "point_id": "p1", "doc_id": "d1", "rel_path": "dir/a.pdf", "doc": "a.pdf", "chunk_index": 4, "content_version": "v1",
+                    "page_idx": 2, "position": "a.pdf · page 3", "place": "page 3", "text": "ZK200 概述:支持双机热备,切换很快。"}]
+        stored = {"p2": {"is_active": True, "doc_id": "d1", "rel_path": "dir/a.pdf", "filename": "a.pdf", "chunk_index": 5, "content_version": "v1",
+                         "page_idx": 3, "text": "切换时间 2 s,待机功耗 3 W。ZK200 概述见上页。"},
+                  "p3": {"is_active": False, "doc_id": "d1", "rel_path": "dir/a.pdf", "filename": "a.pdf", "chunk_index": 6, "content_version": "v0",
+                         "page_idx": 4, "text": "切换时间 2 s"},
+                  "p5": {"is_active": True, "doc_id": "d7", "rel_path": "dir/b.pdf", "filename": "b.pdf", "chunk_index": 0, "content_version": "v1",
+                         "page_idx": 0, "text": "重量 5 kg。"}}
+        log = []
+
+        class Q:
+            def __init__(self, down=()): self.down = down
+            def retrieve(self, collection_name, ids, with_payload, with_vectors, **kw):
+                log.append((collection_name, sorted(ids), "text" in with_payload, kw))
+                if collection_name in self.down:
+                    raise RuntimeError("qdrant timed out")
+                return [SimpleNamespace(id=i, payload=stored[i]) for i in ids if i in stored]
+
+        specs = [{"kb_id": "kb_001", "id": "a", "property": "切换时间", "value": "2 s", "point_ids": ["p1", "p2"]},        # the value is in p2 only
+                 {"kb_id": "kb_001", "id": "b", "property": "待机功耗", "value": "三瓦", "point_ids": ["p1", "p2"]},       # a paraphrased value: the property name is in p2 only
+                 {"kb_id": "kb_001", "id": "c", "property": "名称", "value": "ZK200", "point_ids": ["p1", "p2"]},          # the value in both, the property name in neither: undecided
+                 {"kb_id": "kb_001", "id": "d", "property": "切换时间", "value": "2 s", "point_ids": ["p3", "p9", "p2", "p1"]},   # inactive and missing ones go last; p1, beyond the per-fact limit, is not taken
+                 {"kb_id": "kb_001", "id": "e", "property": "概述", "value": "热备", "point_ids": ["p1"]},
+                 {"kb_id": "kb_002", "id": "f", "property": "重量", "value": "5", "point_ids": ["p5", "p6"]},             # another knowledge base reads its own collection
+                 {"kb_id": "kb_001", "id": "g", "property": "x", "value": "1", "point_ids": []}]
+        self.assertEqual(graphwalk.locate_facts(Q(), {"kb_001": "c1", "kb_002": "c2"}, specs, sources, timeout=2.4), [])
+        by = {sp["id"]: sp for sp in specs}
+        shape = lambda sid: [(e["point_id"], e["active"], e.get("located")) for e in by[sid]["evidence"]]
+        self.assertEqual(shape("a"), [("p2", True, True), ("p1", True, None)])
+        self.assertEqual((by["a"]["evidence"][0]["doc_id"], by["a"]["evidence"][0]["chunk_index"], by["a"]["evidence"][0]["content_version"]), ("d1", 5, "v1"))
+        self.assertTrue(by["a"]["evidence"][0]["place"]); self.assertEqual(by["a"]["evidence"][1]["place"], "page 3")
+        self.assertEqual(shape("b"), [("p2", True, True), ("p1", True, None)])
+        self.assertEqual(shape("c"), [("p1", True, None), ("p2", True, None)])
+        self.assertEqual(shape("d"), [("p2", True, None), ("p3", False, None), ("p9", False, None)])        # one live chunk left: nothing to tell apart, but it goes first
+        self.assertEqual(shape("e"), [("p1", True, None)])
+        self.assertEqual(shape("f"), [("p5", True, None), ("p6", False, None)])
+        self.assertNotIn("evidence", by["g"])
+        self.assertEqual(log, [("c1", ["p2", "p3", "p9"], True, {"timeout": 3}), ("c2", ["p5", "p6"], True, {"timeout": 3})])   # p1, already among the sources, is not fetched; the timeout is rounded up to whole seconds
+        # one knowledge base cannot be read: its chunks keep only their ids (unknown, not marked inactive), the others are unaffected
+        again = [dict(sp, evidence=None) for sp in specs if sp["id"] in ("a", "f")]
+        self.assertEqual(graphwalk.locate_facts(Q(down=("c2",)), {"kb_001": "c1", "kb_002": "c2"}, again, sources), ["kb_002:spec_evidence: RuntimeError"])
+        self.assertEqual([e.get("located") for e in again[0]["evidence"]], [True, None])
+        self.assertEqual(again[1]["evidence"], [{"point_id": "p5"}, {"point_id": "p6"}])
+
+    def test_excerpt_takes_the_sentences_that_name_the_other_end(self) -> None:
+        sentence = "ZK200 通过 Northwind 网关接入,延迟低于 5 ms。"
+        text = "前言。" * 40 + sentence + "后记。" * 100
+        body, match = graphwalk.excerpt_of(text, ["Northwind 网关", "NW-GW"], ["ZK200"])
+        self.assertEqual(match, "both")
+        self.assertTrue(body.startswith(sentence)); self.assertTrue(body.endswith("后记。")); self.assertNotIn("…", body)   # from the start of a sentence to the end of one
+        self.assertLessEqual(len(body), graphwalk.EXCERPT_CHARS)
+        self.assertEqual(graphwalk.excerpt_of("Northwind 网关支持双机热备。", ["Northwind 网关"], ["ZK200"]), ("Northwind 网关支持双机热备。", "other"))
+        self.assertEqual(graphwalk.excerpt_of("ZK200 的外壳\n是铝合金。", ["Northwind 网关"], ["ZK200"]), ("ZK200 的外壳 是铝合金。", "center"))   # a line break becomes a space
+        # no sentence boundary on either side: the cut sides get an ellipsis
+        body, match = graphwalk.excerpt_of("甲" * 300 + "Northwind 网关" + "乙" * 300, ["Northwind 网关"], [])
+        self.assertEqual(match, "other"); self.assertTrue(body.startswith("…甲") and body.endswith("乙…")); self.assertIn("Northwind 网关", body)
+        self.assertEqual(graphwalk.excerpt_of("丙" * 500, ["Northwind 网关"], ["ZK200"]), ("丙" * graphwalk.EXCERPT_CHARS + "…", "none"))   # neither found: the head of the chunk
+        # a name of letters / digits does not match inside a longer word; for a name written with spaces the spelling without them counts
+        self.assertEqual(graphwalk.excerpt_of("FAIL 指示灯亮起表示故障。AI 模块负责推理。", ["AI"], []), ("AI 模块负责推理。", "other"))
+        self.assertEqual(graphwalk.excerpt_of("ZK200 支持热插拔。", ["ZK 200"], [])[1], "other")
+        # with both ends present, the occurrence of the far end closest to the centre entity is taken
+        far = "网关的说明。" + "无关。" * 60 + "ZK200 内置网关,支持冗余。"
+        self.assertEqual(graphwalk.excerpt_of(far, ["网关"], ["ZK200"]), ("ZK200 内置网关,支持冗余。", "both"))
+
+    def test_excerpt_prefers_document_text_over_picture_descriptions(self) -> None:
+        payloads = {"a": {"is_active": True, "rel_path": "x.pdf", "text": "FACTS: ZK200 与 Northwind 网关的连接示意图。", "visual_ref": "parse/a.jpg", "block_type": "image"},
+                    "b": {"is_active": True, "rel_path": "x.pdf", "text": "Northwind 网关支持双机热备。", "block_type": "text"},
+                    "c": {"is_active": True, "rel_path": "x.pdf", "text": "ZK200 的外壳是铝合金。", "block_type": "text"},
+                    "d": {"is_active": False, "rel_path": "old.pdf", "text": "ZK200 通过 Northwind 网关接入。", "block_type": "text"}}
+
+        class Q:
+            def retrieve(self, collection_name, ids, with_payload, with_vectors):
+                return [SimpleNamespace(id=i, payload=payloads[i]) for i in ids if i in payloads]
+
+        def pick(*points):
+            rows = [{"relation_id": "r1", "_names": ["Northwind 网关"], "evidence": [{"point_id": p} for p in points]}]
+            graphwalk.backfill_evidence(Q(), "kb_005", rows, anchors=["ZK200"])
+            first = rows[0]["evidence"][0]
+            return first["point_id"], first.get("excerpt_match"), first.get("visual", False)
+
+        # a text chunk that names the far end (even without the centre entity) comes before a picture description that names both;
+        # a picture chunk is used, and marked visual, when it is the only one naming the far end
+        self.assertEqual(pick("a", "c", "b"), ("b", "other", False))
+        self.assertEqual(pick("c", "a"), ("a", "both", True))
+        self.assertEqual(pick("c"), ("c", "center", False))
+        self.assertEqual(pick("d", "c"), ("c", "center", False))                    # deactivated evidence is not excerpted
+        rows = [{"relation_id": "r1", "_names": ["Northwind 网关"], "evidence": [{"point_id": "b"}]}]
+        graphwalk.backfill_evidence(Q(), "kb_005", rows)                           # no excerpt wanted (the facts route): the text is not fetched
+        self.assertNotIn("excerpt", rows[0]["evidence"][0])
+
+    def test_entities_named_in_the_question(self) -> None:
+        log: list = []
+        with self._driver(log).session() as session:
+            index = graphwalk.name_index(session, "kb_005", "v1")
+        named = graphwalk.named_entities("zk200 和 northwind gateway 的网关延迟对比,FAIL 时怎么热备份", index)
+        # case and spaces are ignored; names covered by a longer one (Northwind, Gateway) do not count; AI does not match inside FAIL;
+        # of same-named entities the one with more relations is taken (e5); names with letters or digits, or of four characters and
+        # more, come first, three-character ones next, two-character words without letters last
+        self.assertEqual([(e["id"], e["_rank"]) for e in named], [("e1", 2), ("e2", 2), ("e8", 1), ("e5", 0), ("e7", 0)])
+        # aliases count; of several sharing the name the one with the most relations is taken (e2 shares it as an alias, e9 as its
+        # title), the same entity a lookup by name on the neighbours endpoint lands on
+        self.assertEqual([e["id"] for e in graphwalk.named_entities("Gateway 怎么配", index)], ["e2"])
+        self.assertEqual([e["id"] for e in graphwalk.named_entities("ZK 200 的时延", index)], ["e1", "e7"])           # an extra space in the question, and an alias
+        self.assertEqual(graphwalk.named_entities("今天天气怎么样", index), [])
+        self.assertEqual(graphwalk.named_entities("", index), [])
+
+    def test_neighbourhoods_take_named_entities_first_then_seeds(self) -> None:
+        log: list = []
+        sources = {"kb_005": SimpleNamespace(kb_id="kb_005", collection="kb_005")}
+        seed = lambda eid, title, score: {"kb_id": "kb_005", "id": eid, "title": title, "score": score}
+        seeds = [seed("e3", "Northwind", 0.9), seed("e1", "ZK200", 0.8), seed("zz", "not in the graph", 0.7)]
+        run = lambda question, seeds, gv="v1", limit=3: graphwalk.neighborhoods(SimpleNamespace(), sources, {"kb_005": gv}, question, seeds, limit=limit,
+                                                                                driver=self._driver(log))
+        out = run("zk200 和 northwind gateway 对比", seeds)
+        # the two the question names come first (Northwind, the best-scoring graph route seed, does not get ahead of them); a seed
+        # used to fill up that is connected to nothing takes no slot
+        self.assertEqual([(b["kb_id"], b["id"], b["named"], b["relations"], b["facts"]) for b in out],
+                         [("kb_005", "e1", True, 3, 12), ("kb_005", "e2", True, 0, 0)])
+        self.assertEqual(out[0]["predicates"], [{"type": "part_of", "count": 2}, {"type": "supports", "count": 1}])
+        # a far end is listed once, by its strongest relation (the control module also has a requires), so one far end cannot fill the list
+        self.assertEqual([(n["type"], n["direction"], n["directed"], n["other"]["title"], n["other"]["degree"]) for n in out[0]["neighbors"]],
+                         [("part_of", "in", True, "控制模块", 4), ("supports", "out", False, "网关", 70)])
+        self.assertNotIn("evidence", out[0]["neighbors"][0])                                             # leads only; evidence and excerpts come from the neighbours endpoint
+        rel = next(kw for c, kw in log if "collect(r.type) AS kinds" in c)
+        self.assertEqual((rel["ids"], rel["gv"]), (["e1", "e2", "e3"], "v1"))
+        # a two- or three-character name without letters or digits only counts when the entity is also a graph route seed:
+        # 网关 is among the seeds (of the same-named ones e5 has more relations), 延迟 is not
+        self.assertEqual([(b["id"], b["named"]) for b in run("网关的延迟", [seed("e5", "网关", 0.6)])], [("e5", True)])
+        self.assertEqual(run("网关的延迟", []), [])
+        # seeds that fill up: of those sharing a name within one knowledge base only the first is taken
+        self.assertEqual([(b["id"], b["named"], b["relations"]) for b in run("今天天气怎么样", [seed("e4", "网关", 0.6), seed("e5", "网关", 0.5)])],
+                         [("e4", False, 1)])
+        self.assertEqual([b["id"] for b in run("zk200 和 northwind gateway 的热备份", seeds, limit=1)], ["e1"])   # the total across knowledge bases is capped
+        # the names stay in the process: the same graph version is not read again, a new one is
+        loads = lambda: sum(1 for c, _ in log if "e.aliases AS aliases" in c)
+        self.assertEqual(loads(), 1)
+        run("热备份", [], gv="v2")
+        self.assertEqual(loads(), 2)
+
 
 class ApiTests(unittest.TestCase):
     def test_bearer_token_is_required_when_configured(self) -> None:
@@ -1542,15 +1803,19 @@ class ApiTests(unittest.TestCase):
             def __exit__(self, *a): return False
             def run(self, cypher, **kw):
                 self.calls.append((cypher, kw))
-                if "count(r) AS total" in cypher:
-                    return FakeResult([{"total": 7}])
+                if "count(r) AS n" in cypher:
+                    return FakeResult([{"type": "has_stage", "n": 5}, {"type": "part_of", "n": 2}])
                 if "RELATED_TO" in cypher:
                     return FakeResult([{"relation_id": "r1", "type": "has_stage", "outgoing": True, "directed": True, "weight": 3.0, "npmi": 0.4, "cooccur": 2,
-                                        "description": "FDE 有阶段二", "type_violation": False, "other_id": "e2", "other_title": "阶段二", "other_type": "stage", "other_scope": None, "other_pagerank": 0.1}])
+                                        "description": "FDE 有阶段二", "type_violation": False, "other_id": "e2", "other_title": "阶段二", "other_type": "stage", "other_scope": None, "other_pagerank": 0.1,
+                                        "other_degree": 3, "other_aliases": ["Stage Two"]}])
                 if "EVIDENCES" in cypher:
-                    return FakeResult([{"rid": "r1", "point_id": "p7", "chunk_uid": "u7", "rel_path": "x/fde.pdf", "doc_id": None, "chunk_index": None, "content_version": None, "page_idx": None}])
+                    return FakeResult([{"rid": "r1", "point_id": p, "chunk_uid": "u" + p[1:], "rel_path": "x/fde.pdf", "doc_id": None, "chunk_index": None, "content_version": None, "page_idx": None}
+                                       for p in ("p6", "p7")])
                 if "MENTIONED_IN" in cypher:
                     return FakeResult([{"rel_path": "x/fde.pdf"}])
+                if "HAS_SPEC" in cypher:
+                    return FakeResult([{"n": 4}])
                 if "id: $id" in cypher:
                     return FakeResult([])
                 return FakeResult([{"id": "e1", "title": "FDE", "type": "role", "parent_type": None, "scope": None, "description": "前向部署工程师", "pagerank": 0.5, "degree": 9, "aliases": ["Forward Deployed Engineer"]}])
@@ -1563,15 +1828,32 @@ class ApiTests(unittest.TestCase):
         src = SimpleNamespace(kb_id="kb_003", collection="kb_003", source_root="reports")
         class FakeQ:
             def retrieve(self, collection_name, ids, with_payload, with_vectors):
-                return [SimpleNamespace(id="p7", payload={"is_active": True, "doc_id": "d7", "chunk_index": 3, "content_version": "v1", "page_idx": 4, "rel_path": "x/fde.pdf", "filename": "fde.pdf",
-                                                          "section_path": ["2. Roles"]})]
+                self.keys = list(with_payload)
+                base = {"is_active": True, "doc_id": "d7", "content_version": "v1", "page_idx": 4, "rel_path": "x/fde.pdf", "filename": "fde.pdf", "section_path": ["2. Roles"],
+                        "block_type": "text"}
+                return [SimpleNamespace(id="p6", payload={**base, "chunk_index": 2, "text": "FDE 是前向部署工程师。"}),
+                        SimpleNamespace(id="p7", payload={**base, "chunk_index": 3, "text": "TITLE: 2. Roles\nFDE 的工作分三个阶段。阶段二由 FDE 驻场交付,周期约三个月。阶段三转入运维。"})]
 
         with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", return_value=FakeDriver()), \
                 mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="003-v"):
-            out = graphwalk.neighbors(SimpleNamespace(), src, entity="fde", entity_id=None, limit=5, types=None, direction="both", q=FakeQ())
+            fq = FakeQ()
+            out = graphwalk.neighbors(SimpleNamespace(), src, entity="fde", entity_id=None, limit=5, types=None, direction="both", q=fq)
+            only = graphwalk.neighbors(SimpleNamespace(), src, entity="fde", entity_id=None, limit=5, types=["part_of"], direction="both", q=fq)
         self.assertTrue(out["found"]); self.assertEqual(out["entity"]["title"], "FDE"); self.assertEqual(out["entity"]["docs"], ["x/fde.pdf"])
         nb = out["neighbors"][0]
         self.assertEqual((nb["type"], nb["direction"], nb["other"]["title"]), ("has_stage", "out", "阶段二"))            # predicate, direction, far end
+        # every relation carries an excerpt of the original text: the evidence chunk that names the far end is picked (p7, moved to
+        # the front) and cut from the start of a sentence; the chunk that does not name it (p6) carries none
+        self.assertEqual([ev["point_id"] for ev in nb["evidence"]], ["p7", "p6"])
+        self.assertEqual((nb["evidence"][0]["excerpt"], nb["evidence"][0]["excerpt_match"], nb["evidence"][0]["block_type"]),
+                         ("阶段二由 FDE 驻场交付,周期约三个月。阶段三转入运维。", "both", "text"))
+        self.assertNotIn("excerpt", nb["evidence"][1]); self.assertNotIn("visual", nb["evidence"][0]); self.assertNotIn("_names", nb)
+        self.assertIn("text", fq.keys)                                                                    # the text is fetched for the excerpt only
+        # relation counts per predicate are not bounded by limit; the far end's own relation count and the number of facts under the
+        # centre entity come along, and the caller decides by them where to walk
+        self.assertEqual(out["predicates"], [{"type": "has_stage", "count": 5}, {"type": "part_of", "count": 2}])
+        self.assertEqual((nb["other"]["degree"], out["entity"]["facts"]), (3, 4))
+        self.assertEqual((only["total"], only["has_more"]), (2, True))                                    # with a predicate filter the total counts that kind only
         self.assertEqual((nb["evidence"][0]["doc_id"], nb["evidence"][0]["chunk_index"], nb["evidence"][0]["active"]), ("d7", 3, True))   # the evidence chunk can be fed to /context directly
         self.assertEqual((nb["evidence"][0]["position"], nb["evidence"][0]["place"]), ("page 4 · 2. Roles", "page 4"))   # the position string and the short locator for citations, written like the sources of /search
         self.assertEqual((out["count"], out["total"], out["has_more"], out["kb_name"]), (1, 7, True, "reports"))   # the total is not bounded by limit: an incomplete answer shows
@@ -1849,6 +2131,219 @@ class SkillClientTests(unittest.TestCase):
         c.add_cites(old_service)
         self.assertEqual(old_service["sources"][0]["cite"], "datasheets/a.pdf")          # a service without `place`: the path alone, nothing guessed from the position
         self.assertNotIn("](", result["sources"][0]["cite"])                # plain text, not a link: files may sit in the mirror directly
+
+    SEARCH = {"call_id": "aaaaaa", "operation": "search", "result": {
+        "question": "compare ZK200 and Northwind Gateway", "kbs": ["kb_005"], "kb_names": {"kb_005": "products"},
+        "sources": [
+            {"n": 1, "role": "hit", "accepted": True, "kb_id": "kb_005", "point_id": "p1", "doc_id": "d1", "content_version": "v1", "chunk_index": 7,
+             "doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "place": "page 6", "text": "ZK200 supports hot standby.",
+             "stitched": {"chunk_from": 6, "chunk_to": 7}},
+            {"n": 2, "role": "hit", "accepted": False, "kb_id": "kb_005", "point_id": "p2", "doc_id": "d2", "content_version": "v3", "chunk_index": 0,
+             "doc": "board.pdf", "rel_path": "vendor/board.pdf", "place": "page 1", "text": "FACTS: a wiring diagram.\nENTITIES: ZK200, Northwind\nKEYWORDS: wiring",
+             "visual": {"confidence": "high", "value_conflicts": 2}},
+            {"n": 3, "role": "neighbor", "of": 1, "accepted": None, "kb_id": "kb_005", "point_id": "p3", "doc_id": "d1", "content_version": "v1",
+             "chunk_index": 8, "doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "place": "page 6", "text": "The standby unit takes over in 2 s."}]
+        + [{"n": n, "role": "hit", "accepted": True, "kb_id": "kb_005", "point_id": "p%d" % n, "doc_id": "d3", "content_version": "v1", "chunk_index": n,
+            "doc": "notes.md", "rel_path": "vendor/notes.md", "place": "Setup", "text": ("Step %d of the setup. " % n) * 12} for n in (4, 5, 6)],
+        "doc_aggs": [{"doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "source_ns": [1]}, {"doc": "board.pdf", "rel_path": "vendor/board.pdf", "source_ns": [2]}],
+        "specs": [{"n": 1, "kb_id": "kb_005", "hint": "ZK200 · failover time = 2 s", "rel_path": "vendor/manual.pdf", "sources": [1], "conflict": True},
+                  {"n": 2, "kb_id": "kb_005", "text": "ZK200 · weight: 3 kg", "rel_path": "vendor/sheet.pdf", "sources": [], "verified": False,
+                   "series_text": "3 kg (2024), 2.8 kg (2025)"},
+                  {"n": 3, "kb_id": "kb_005", "subject": "ZK200", "property": "standby power", "value": "3", "unit": "W", "conditions_text": "mode: idle",
+                   "when": "2025-03", "text": "ZK200 · standby power: 3 W | mode: idle | when: 2025-03", "rel_path": "vendor/manual.pdf", "sources": [],
+                   "evidence": [{"point_id": "p12", "doc_id": "d1", "content_version": "v1", "chunk_index": 12, "rel_path": "vendor/manual.pdf", "place": "page 9",
+                                 "active": True, "located": True},
+                                {"point_id": "p11", "doc_id": "d1", "content_version": "v1", "chunk_index": 11, "rel_path": "vendor/manual.pdf", "place": "page 8",
+                                 "active": True}]}],
+        "pages": [{"n": 1, "kb_id": "kb_005", "kind": "subject", "title": "ZK200", "summary": "A gateway controller.", "sources_active": "2/2",
+                   "docs": ["vendor/manual.pdf", "vendor/sheet.pdf"], "text": "# ZK200\nReleased in 2024."},
+                  {"n": 2, "kb_id": "kb_005", "kind": "source", "title": "manual.pdf", "summary": "manual.pdf · ZK200, Northwind", "docs": ["vendor/manual.pdf"]}],
+        "neighborhoods": [{"n": 1, "kb_id": "kb_005", "id": "e1", "title": "ZK200", "type": "product", "named": True, "relations": 30, "facts": 12,
+                           "predicates": [{"type": "part_of", "count": 20}, {"type": "supports", "count": 10}],
+                           "neighbors": [{"relation_id": "r1", "type": "part_of", "direction": "in", "directed": True, "other": {"id": "e7", "title": "Control module", "degree": 4}},
+                                         {"relation_id": "r2", "type": "related_to", "direction": "out", "directed": False, "other": {"id": "e2", "title": "Northwind Gateway", "degree": 9}}]}],
+        "entities": [{"n": 1, "kb_id": "kb_005", "id": "e1", "title": "ZK200", "type": "product"},
+                     {"n": 2, "kb_id": "kb_005", "id": "e9", "title": "ZK200", "type": "product"}],
+        "relationships": [{"n": 1, "kb_id": "kb_005", "source": "ZK200", "type": "supports", "target": "hot standby"},
+                          {"n": 2, "kb_id": "kb_005", "source": "ZK200", "type": "supports", "target": "hot standby"}],
+        "retrieval_summary": {"evidence_state": "accepted", "degraded": ["kb_005:graph"], "routing": {"weak": True}}}}
+    NEIGHBORS = {"call_id": "bbbbbb", "operation": "neighbors", "result": {
+        "kb_id": "kb_005", "kb_name": "products", "found": True, "entity": {"id": "e1", "title": "ZK200", "type": "product", "facts": 12},
+        "total": 30, "count": 3, "predicates": [{"type": "part_of", "count": 20}],
+        "matches": [{"id": "e9", "title": "ZK200", "type": "module", "degree": 2}],
+        "neighbors": [
+            {"type": "part_of", "direction": "in", "directed": True, "type_violation": True, "other": {"id": "e7", "title": "Control module", "type": "module", "degree": 4},
+             "evidence": [{"point_id": "p8", "doc_id": "d1", "content_version": "v1", "chunk_index": 3, "rel_path": "vendor/manual.pdf", "place": "page 2",
+                           "active": True, "excerpt": "The control module is part of ZK200.", "excerpt_match": "both"}]},
+            {"type": "supports", "direction": "out", "directed": True, "other": {"id": "e2", "title": "Northwind Gateway", "type": "product", "degree": 9},
+             "evidence": [{"point_id": "p9", "doc_id": "d1", "content_version": "v1", "chunk_index": 5, "rel_path": "vendor/manual.pdf", "place": "page 2",
+                           "active": True, "excerpt": "A block diagram.", "excerpt_match": "center", "visual": True}]},
+            {"type": "requires", "direction": "out", "directed": True, "other": {"id": "e3", "title": "Power unit", "type": "module", "degree": 1},
+             "evidence": [{"point_id": "p9", "doc_id": "d1", "content_version": "v1", "chunk_index": 5, "rel_path": "vendor/manual.pdf", "place": "page 2",
+                           "active": True, "excerpt": "A block diagram.", "excerpt_match": "center", "visual": True}]}]}}
+    ENTITIES = {"call_id": "cccccc", "operation": "entities", "result": {
+        "kb_id": "kb_005", "kb_name": "products", "total": 1, "offset": 0, "types": [{"type": "product", "parent_type": "entity", "count": 3}],
+        "entities": [{"id": "e1", "title": "ZK200", "type": "product", "degree": 30, "doc_count": 2, "docs": ["vendor/manual.pdf"]}]}}
+    NO_FACTS = {"call_id": "dddddd", "operation": "facts", "result": {"kb_id": "kb_005", "kb_name": "products", "found": True, "total": 0, "offset": 0, "facts": []}}
+    CONTEXT = {"call_id": "eeeeee", "operation": "context", "result": {
+        "kb_id": "kb_005", "kb_name": "products", "doc_id": "d2", "tokens_total": 10,
+        "sources": [{"n": 1, "role": "context", "kb_id": "kb_005", "point_id": "p2", "doc_id": "d2", "doc": "board.pdf", "rel_path": "vendor/board.pdf",
+                     "place": "page 1", "text": "FACTS: a wiring diagram.\nKEYWORDS: wiring", "visual": {"confidence": "high"}}]}}
+
+    def _stored(self, c, work, *envelopes):
+        import copy
+
+        for envelope in envelopes:
+            envelope = copy.deepcopy(envelope)
+            c.add_cites(envelope["result"])
+            c.number_rows(envelope["result"])
+            (work / (envelope["call_id"] + ".json")).write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+        return [c.stored(work, e["call_id"]) for e in envelopes]
+
+    def test_compact_view_keeps_what_the_agent_reads_and_points_at(self) -> None:
+        """A command prints a compact view instead of the complete response: the text of the sources with ready citations,
+        facts, page summaries and graph leads, every entry under a label later commands can point at."""
+        import contextlib
+        import tempfile
+        from pathlib import Path
+
+        c = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            search, neighbors = self._stored(c, work, self.SEARCH, self.NEIGHBORS)
+            view = c.compact(search, work / "aaaaaa.json").splitlines()
+            near = c.compact(neighbors, work / "bbbbbb.json").splitlines()
+            tight = c.view_search(search, limit=1500)
+            shown = io.StringIO()
+            with contextlib.redirect_stdout(shown):
+                c.show(work, ["aaaaaa:S3", "aaaaaa:P1", "aaaaaa:H1.2"])
+        self.assertEqual(view[0], "call aaaaaa · search · knowledge base: products (kb_005) · evidence: accepted · 5 hits + 1 neighbouring chunks")
+        self.assertIn("gaps in this retrieval: kb_005:graph", view); self.assertIn("routing: weak vector evidence (weak)", view)
+        at = view.index
+        # a hit is printed with its text; its neighbouring chunks are named, not printed; a citation is printed once and pointed at afterwards
+        self.assertEqual(view[at("[S1] products/vendor/manual.pdf page 6   (stitched with adjacent chunks)"):][:3],
+                         ["[S1] products/vendor/manual.pdf page 6   (stitched with adjacent chunks)", "ZK200 supports hot standby.",
+                          "     neighbouring chunks (context; show when needed): S3 (page 6)"])
+        picture = ("[S2] products/vendor/board.pdf page 1   (below the relevance threshold; a lead only; picture · confidence high; "
+                   "2 conflicts between the text in the picture and estimated readings; trust the text in the picture; see the picture: image --ref aaaaaa:S2)")
+        self.assertEqual(view[at(picture):][:2], [picture, "FACTS: a wiring diagram."])                # the index lines of a picture chunk are left out
+        self.assertNotIn("The standby unit takes over in 2 s.", view)
+        self.assertEqual(view[at("[S5] same citation as S4"):][1], ("Step 5 of the setup. " * 12).strip())
+        self.assertIn("documents: manual.pdf (S1); board.pdf (S2)", view)
+        self.assertIn("[F1] ZK200 · failover time = 2 s [conflict] — same citation as S1", view)
+        self.assertEqual(view[at("[F2] ZK200 · weight: 3 kg [sources no longer active] — products/vendor/sheet.pdf"):][1], "     series: 3 kg (2024), 2.8 kg (2025)")
+        # a fact the service gave no hint reads the same way, and is cited at the chunk its value was found in
+        self.assertIn("[F3] ZK200 · standby power = 3 W @ mode: idle · 2025-03 — products/vendor/manual.pdf page 9", view)
+        self.assertFalse([line for line in view if line.startswith("[P2]")])                           # a source page without body text is left out
+        self.assertIn("[P1] subject · ZK200 · sources active 2/2: A gateway controller. (has body text, show aaaaaa:P1) — products/vendor/manual.pdf (one of 2 documents)", view)
+        self.assertIn("[H1] ZK200 (product) · named in the question · 30 relations · 12 facts · part_of 20, supports 10", view)
+        self.assertIn("     H1.1 ←part_of Control module (4); H1.2 —related_to— Northwind Gateway (9)", view)
+        # entities and relations that read the same are listed once
+        self.assertIn("Entities: [E1] ZK200 (product)", view); self.assertIn("Relations: [R1] ZK200 —supports→ hot standby", view)
+        self.assertEqual(view[-1], "complete response: " + str(work / "aaaaaa.json"))
+        # the reminder to tell the user the conclusion before looking further stands where the agent decides its next step
+        self.assertTrue(view[-3].startswith("▶ If you mean to look further: first write the user two or three sentences, as reply text"))
+        nothing = dict(search, result=dict(search["result"], retrieval_summary={"evidence_state": "diagnostic", "no_relevant_content": True}))
+        self.assertFalse([line for line in c.view_search(nothing) if line.startswith("▶")])            # nothing to conclude from: no reminder
+        # the view stays within its budget: the best hits are printed in full whatever it is, later ones by their opening words
+        self.assertIn(("Step 5 of the setup. " * 12).strip(), tight)
+        self.assertEqual(tight[tight.index("[S6] same citation as S4"):][:2], ["[S6] same citation as S4", "     " + ("Step 6 of the setup. " * 12)[:59] + "…"])
+        self.assertIn("only the opening is shown; full text: show aaaaaa:S6", tight)
+        self.assertLess(c.nbytes(view), c.VIEW_BYTES)
+        # show prints what the view left out: a neighbouring chunk and a page's body as text, anything else with every field
+        out = shown.getvalue().splitlines()
+        self.assertEqual(out[:2], ["[aaaaaa:S3] products/vendor/manual.pdf page 6   (neighbouring chunk of S1)", "The standby unit takes over in 2 s."])
+        self.assertEqual(out[2:5], ["[aaaaaa:P1] subject · ZK200: A gateway controller. — products/vendor/manual.pdf; products/vendor/sheet.pdf", "# ZK200", "Released in 2024."])
+        self.assertEqual(json.loads("\n".join(out[6:]))["other"]["id"], "e2")
+        self.assertEqual(near[0], "call bbbbbb · neighbors · knowledge base: products (kb_005) · ZK200 (product) · 30 relations in all, 3 here (by weight) · 12 facts under it")
+        self.assertIn("relations by kind: part_of 20 (one kind only: --type <predicate>)", near)
+        self.assertIn("other entities with this name: ZK200 (module · 2 relations · id=e9)", near)
+        self.assertEqual(near[near.index("[N1] ←part_of Control module (module · 4 relations)   (the end types do not fit this kind of relation; judge it by the excerpt)"):][1],
+                         '     "The control module is part of ZK200." — products/vendor/manual.pdf page 2')
+        self.assertEqual(near[near.index("[N2] →supports Northwind Gateway (product · 9 relations)"):][1],
+                         '     "A block diagram." (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N2 when needed) — same citation as N1')
+        # an excerpt shared by several relations is printed once
+        self.assertEqual(near[near.index("[N3] →requires Power unit (module · 1 relations)"):][1],
+                         "     same excerpt as N2 (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N3 when needed) — same citation as N1")
+
+    def test_listings_and_read_back_use_the_same_labels_and_remarks(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        c = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            entities, none, context = self._stored(c, work, self.ENTITIES, self.NO_FACTS, self.CONTEXT)
+            listed, empty, read = c.view_entities(entities), c.view_facts(none), c.view_context(context)
+        self.assertIn("entities per type (--type takes the type name; the upper class in brackets goes with --parent-type): product 3 (entity)", listed)
+        self.assertEqual(listed[-1], "[E1] ZK200 (product · 30 relations · 2 documents) — products/vendor/manual.pdf")
+        self.assertEqual(empty[1:], ["nothing matches"])                                              # no rows: no hint on how to point at one
+        # a picture chunk read back says so and how to fetch the picture; its index lines are left out
+        self.assertEqual(read[1:], ["[S1] products/vendor/board.pdf page 1   (picture · confidence high; see the picture: image --ref eeeeee:S1)", "FACTS: a wiring diagram."])
+
+    def test_later_commands_point_at_entries_of_stored_responses(self) -> None:
+        """--ref "<call id>:<label>" stands for an entry of an earlier response, so the agent neither retypes ids nor writes
+        request files: read the original around a chunk, walk the graph from an entity, list the facts under it, search
+        inside a document."""
+        import tempfile
+        from pathlib import Path
+
+        c = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            self._stored(c, work, self.SEARCH, self.NEIGHBORS)
+            build = lambda *argv: c.payload(c.parser().parse_args(list(argv)), work)
+            # the original around a source: a stitched hit is read over its whole range, one chunk either side by default
+            self.assertEqual(build("context", "--ref", "aaaaaa:S1"), {"kb_id": "kb_005", "doc_id": "d1", "chunk_from": 5, "chunk_to": 8, "content_version": "v1"})
+            self.assertEqual(build("context", "--ref", "aaaaaa:S2", "--before", "3", "--after", "0"),
+                             {"kb_id": "kb_005", "doc_id": "d2", "chunk_from": 0, "chunk_to": 0, "content_version": "v3"})
+            self.assertEqual(build("context", "--ref", "bbbbbb:N2")["chunk_from"], 4)                    # a relation: its first evidence chunk
+            self.assertEqual(build("context", "--ref", "aaaaaa:F1")["doc_id"], "d1")                     # a fact of /search without evidence: the first source it points at
+            self.assertEqual(build("context", "--ref", "aaaaaa:F3"),                                      # with evidence: the chunk that holds its value
+                             {"kb_id": "kb_005", "doc_id": "d1", "chunk_from": 11, "chunk_to": 13, "content_version": "v1"})
+            # walking on: a listed entity, a subject of the neighbourhood block, one of its far ends, the far end of a relation
+            self.assertEqual(build("neighbors", "--ref", "aaaaaa:E1"), {"kb_id": "kb_005", "entity_id": "e1"})
+            self.assertEqual(build("neighbors", "--ref", "aaaaaa:H1.2", "--type", "supports", "--limit", "5"),
+                             {"kb_id": "kb_005", "entity_id": "e2", "limit": 5, "types": ["supports"]})
+            self.assertEqual(build("neighbors", "--ref", "bbbbbb:N1"), {"kb_id": "kb_005", "entity_id": "e7"})
+            self.assertEqual(build("facts", "--ref", "aaaaaa:H1", "--property", "weight"), {"kb_id": "kb_005", "subject_id": "e1", "property": "weight"})
+            self.assertEqual(build("crop", "--ref", "aaaaaa:S2", "--bbox", "0.1,0.2,0.5,0.6"), {"kb_id": "kb_005", "point_id": "p2", "bbox": [0.1, 0.2, 0.5, 0.6]})
+            self.assertEqual(build("search", "--question", "failover time", "--in-doc", "aaaaaa:S1", "--block-type", "table"),
+                             {"question": "failover time", "kbs": ["kb_005"], "hints": {"block_types": ["table"], "doc_ids": ["d1"]}})
+            self.assertEqual(c.chunk_of(*c.resolve(work, "aaaaaa:S2")[:3])[1]["point_id"], "p2")       # the chunk whose picture `image --ref` fetches
+            for bad in ("aaaaaa:S9", "aaaaaa:H1.5", "aaaaaa:X1", "cccccc:S1", "S1"):
+                with self.assertRaises(ValueError):
+                    c.resolve(work, bad)
+            with self.assertRaises(ValueError):
+                build("neighbors", "--ref", "aaaaaa:S1")                                                # a source is not an entity
+            with self.assertRaises(ValueError):
+                build("context", "--ref", "aaaaaa:E1")                                                  # an entity is not a chunk
+            with self.assertRaises(ValueError):
+                build("context", "--ref", "aaaaaa:F2")                                                  # a fact that names no chunk of the response
+
+    def test_work_directory_keeps_recent_responses_only(self) -> None:
+        import os
+        import re
+        import tempfile
+        import time
+        from pathlib import Path
+
+        c = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            old, new, picture, foreign = work / "aaaaaa.json", work / "bbbbbb.json", work / "cccccc-aaaaaa-S2.png", work / "notes.json"
+            for f in (old, new, picture, foreign):
+                f.write_text("{}", encoding="utf-8")
+            stale = time.time() - c.KEEP_SECONDS - 60
+            for f in (old, picture, foreign):
+                os.utime(f, (stale, stale))
+            self.assertEqual(c.work_dir({"work_dir": str(work)}), work)
+            self.assertEqual(sorted(f.name for f in work.iterdir()), ["bbbbbb.json", "notes.json"])     # only what this client stored is removed
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{6}", c.new_call(work)))
+        rows = {"offset": 50, "entities": [{"id": "e1"}, {"id": "e2"}], "neighbors": [{"type": "part_of"}]}
+        c.number_rows(rows)
+        self.assertEqual(([e["n"] for e in rows["entities"]], rows["neighbors"][0]["n"]), ([51, 52], 1))   # listed entities are numbered across pages
 
     def test_listing_commands_build_their_requests(self) -> None:
         c = self._client()

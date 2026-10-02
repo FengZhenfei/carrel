@@ -17,6 +17,8 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
   --question "资料中对交付和验收有哪些要求？"
 ```
 
+每条命令输出一份精简结果：检索状态、来源正文和现成的出处、事实、页面摘要、图谱线索。完整响应保存在工作目录里，每一条都有编号，后续命令用 `--ref <调用编号>:<条目编号>` 指向它，不必重抄 ID：`context --ref 3fa2c1:S3` 回读某条来源前后的原文，`neighbors --ref 3fa2c1:H1` 从某个主体沿图谱走一跳，`show 3fa2c1:F2` 打印某一条的全部字段。加 `--json` 则输出完整响应。
+
 令牌保存在客户端环境变量或独立令牌文件中。服务端使用 `KB_SEARCH_TOKEN`，客户端使用上述 `CARREL_` 变量。服务端没有设置令牌时，受保护接口只接受本机调用；`/health` 无需认证。
 
 运行中的服务每分钟重读一次 `config/knowledge-base.env` 里的 `KB_SEARCH_*`，改了令牌或参数一分钟内生效，无需重启，换下的旧令牌随即失效。监听地址和端口仍需重启才生效；在服务自身环境中显式设置的键优先于文件。
@@ -27,11 +29,11 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 |---|---|
 | `GET /health` | 服务健康、认证模式和知识库元数据 |
 | `GET /catalog` | 知识库名称、领域、规模、文件样本及图谱状态；`?refresh=1` 刷新目录 |
-| `POST /search` | 返回原文，以及可用的实体、关系、事实和编译页面 |
+| `POST /search` | 返回原文，以及可用的实体、关系、事实、编译页面和主体的一跳邻域 |
 | `POST /context` | 按切块序号范围补取文档内容 |
 | `GET /image/{kb_id}/{point_id}` | 获取检索切块对应的图片 |
 | `POST /crop` | 裁剪该图片中的指定区域 |
-| `POST /graph/neighbors` | 查询实体周围带证据的关系 |
+| `POST /graph/neighbors` | 查询实体周围带证据的关系，每条关系带一段原文摘录 |
 | `POST /graph/entities` | 按类型、上层类或名称列出实体，带总数和翻页 |
 | `POST /graph/facts` | 列出某个主体的结构化事实，或某个属性在各主体上的事实，带总数和翻页 |
 
@@ -90,7 +92,18 @@ curl -sS http://127.0.0.1:9810/search \
 - 有向关系的 `in`、`out` 表示关系方向；无向关系可用 `direction=both` 查询两个存储方向。
 - 默认返回 20 条，最多 100 条，按权重排序；`count` 记录本次返回的关系数，`total` 是同样筛选条件下的总数，`has_more` 表示是否还有未返回的。
 - 接口一次返回有数量上限的邻域，可通过 `types` 缩小范围或调整 `limit`。
+- `predicates` 列出这个实体各类关系的条数，不受 `limit` 和 `types` 影响，据此可知还有哪些种类可以按谓语去取。每个对端带 `degree`（它自己的关系数），实体带 `facts`（名下的事实条数）。
+- 每条关系带一段原文摘录：排在最前的证据切块带 `excerpt`（200 字以内，取原文里提到对端的那几句）和 `excerpt_match`（`both` 表示两端的名字都在这一片里，`other` 表示只找到对端，`center` 或 `none` 表示没有定位到对端）。摘录按名字在原文里定位，不调用模型。提到对端的文字切块优先于图片切块；取自图片切块的摘录标 `visual`，因为那段文字是视觉模型的描述。
 - 关系描述汇总关联证据，其来源位置可用于 `/context` 原文查询。
+
+### 检索结果里的主体邻域
+
+`/search` 返回 `neighborhoods`：问题所问的实体在图谱里通向哪里的预览，智能体据此决定是否调用 `/graph/neighbors`，不必先逐个查一遍。
+
+- 主体首先是问题里点名的实体：标题或别名整段出现在问题里，不分大小写、不计空格。不含字母数字的两三个字的名字，只有当这个实体同时是图路的命中时才算。剩下的名额用图路匹配度最高的实体补足。`KB_SEARCH_NEIGHBORHOODS` 设置总数（默认 4，设为 `0` 关闭）。
+- 每个主体带 `named`、`relations`（关系总数）、`facts`、`predicates`（各类关系的条数）和 `neighbors`：权重最高的 8 条关系，含谓语、方向和对端，同一个对端只列一条。
+- 这一块只是线索，不带证据。带硬过滤 `hints` 的限定查询不返回它；构建失败时只在 `retrieval_summary.degraded` 里记录，不影响检索。
+- 一个知识库全部实体的名字按图谱版本保留在检索进程里，重启或图谱换版后读取一次。
 
 ### 列举实体和事实
 
@@ -114,7 +127,8 @@ curl -sS http://127.0.0.1:9810/search \
 |---|---|
 | `sources` | 原文、来源位置、接受标记及可用的视觉描述 |
 | `entities`、`relationships` | 图谱候选与关联，关键关系需回查来源 |
-| `specs` | 带单位、条件、时间、来源与冲突标记的结构化事实 |
+| `neighborhoods` | 问题点名的实体权重最高的几条关系，是沿图谱追查的线索 |
+| `specs` | 带单位、条件、时间、来源与冲突标记的结构化事实；`evidence` 是事实出自的切块，带可用于 `/context` 的位置，能分辨时正文里写着该值的那一块排在最前（`located`） |
 | `pages` | 编译的主体页、时间线页或来源页，`compiled=true` 表示派生内容 |
 | `doc_aggs` | 本次结果涉及的文档 |
 | `retrieval_summary` | 路由、选择、证据状态和降级诊断 |
@@ -135,6 +149,8 @@ curl -sS http://127.0.0.1:9810/search \
 | `<kb>:graph`、`<kb>:visual`、`rerank: TimeoutError` | 该阶段失败、超时或没有剩余预算；重排退回融合顺序 |
 | `budget: widen skipped` | 剩余预算不足，没有放宽到其他知识库 |
 | `budget: context skipped`、`context: …` | 没有补取邻近切块或表头 |
+| `budget: neighborhoods skipped`、`neighborhoods: …` | 没有生成主体邻域 |
+| `budget: spec evidence skipped`、`<kb>:spec_evidence: …` | 事实没有带来源切块，或该知识库的切块只有 ID |
 | `<kb>:backfill: …` | 候选原文取不回来，没有原文的候选被丢弃 |
 | `widen: rerank: …` | 放宽后的重排失败，保留首轮「全部低于下限」的结论 |
 

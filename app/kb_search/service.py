@@ -45,8 +45,10 @@ RELATION_FIELDS = ("id", "source", "type", "target", "score", "hop", "via", "des
 SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "verified", "series_text", "conflict", "conflict_note",
                "subject", "property", "symbol", "concept", "value", "min", "typ", "max", "unit", "unit_canonical", "flag", "ref_min", "ref_max",
                "when", "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
-               "confidence", "comparable", "text", "note", "score", "rel_path", "section", "point_ids")
+               "confidence", "comparable", "text", "note", "score", "rel_path", "section", "point_ids", "evidence")
 PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "verified", "sources_active", "docs", "series", "point_ids")
+NEIGHBORHOOD_FIELDS = ("id", "title", "type", "named", "relations", "facts", "predicates", "neighbors")
+NEIGHBORHOOD_TIMEOUT = 5.0          # subject neighbourhoods are leads that come along: wait at most this long for a slow graph database, never hold the request up
 # Generic words pointing across documents (Q08): when the question asks "both / each / respectively /
 # all / compare" and the candidates come from only a few documents, quotas are split by document
 CROSS_DOC_RE = re.compile(r"(两份|两个文档|各自|各有|各是|分别|都有|都是|对比|比较|区别|差异|异同|共同|哪几份|每份|每个文档)")
@@ -779,11 +781,51 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             row["sources_active"] = f"{active}/{len(pids)}"
             row["verified"] = active > 0
     specs = spec_rows(specs, source_ns=source_ns, limit_hints=ss.spec_hint_limit, point_active=point_active)
+    from . import graphwalk
+
+    # The chunks each fact rests on (locators, place string, which chunk holds the value): the caller cites down to
+    # the place and reads the original back through them; a failed lookup is only a degraded note, the facts are
+    # returned all the same
+    if specs:
+        t = time.time()
+        timeout = _left(ss.channel_timeout, until)
+        if timeout <= 0:
+            degraded.append("budget: spec evidence skipped")
+        else:
+            try:
+                degraded.extend(graphwalk.locate_facts(q, {kb: settings.sources[kb].collection for kb in chosen}, specs, sources, timeout=timeout))
+            except Exception as exc:
+                degraded.append(f"spec_evidence: {type(exc).__name__}")
+        timings["spec_evidence_ms"] = int((time.time() - t) * 1000)
     subjects = list(buckets["keys"]) if buckets and buckets.get("mode") == "subject" else []
     pages = page_rows(pages, subjects=subjects, text_budget_tokens=ss.page_text_tokens, point_active=point_active)[:6]
     if evidence_state != "accepted":
         for row in specs + pages:
             row["state"] = evidence_state
+    # The one-hop neighbourhood of the subjects: for the entities the question names (filled up with graph route seeds),
+    # a few of their strongest relations each; the caller reads it and decides whether to call the neighbours endpoint.
+    # Scoped queries do not carry it (relations have no document information, the same reason the relation table is
+    # omitted above); a failure only records a degradation
+    neighborhoods: list[dict[str, Any]] = []
+    graph_kbs = [kb for kb in chosen if graph_versions.get(kb)]
+    if ss.neighborhoods > 0 and graph_kbs and not doc_hint:
+        t = time.time()
+        timeout = _left(min(ss.channel_timeout, NEIGHBORHOOD_TIMEOUT), until)
+        if timeout <= 0:
+            degraded.append("budget: neighborhoods skipped")
+        else:
+            try:
+                job = _pool(ss).submit(graphwalk.neighborhoods, settings, {kb: settings.sources[kb] for kb in graph_kbs},
+                                       {kb: str(graph_versions[kb]) for kb in graph_kbs}, question, entities, limit=ss.neighborhoods,
+                                       driver=channels.shared_driver(settings), timeout=timeout)
+                ok, val = _collect({"*": job}, time.time() + timeout)["*"]
+            except Exception as exc:
+                ok, val = False, exc
+            if ok:
+                neighborhoods = val
+            else:
+                degraded.append(f"neighborhoods: {type(val).__name__}")
+        timings["neighborhood_ms"] = int((time.time() - t) * 1000)
     rerank_max = max((float(c.get("score_rerank") or 0.0) for c in cands), default=0.0) if reranked else None
     summary = {
         "kbs": chosen, "routing": routing, "identifiers": identifiers, "image_query": image_query,
@@ -810,6 +852,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         "sources": sources, "doc_aggs": doc_aggs(sources),
         "entities": numbered(entities[:24], ENTITY_FIELDS + ("kb_id",)),
         "relationships": numbered(relations[:24], RELATION_FIELDS + ("kb_id",)),
+        "neighborhoods": numbered(neighborhoods, NEIGHBORHOOD_FIELDS + ("kb_id",)),
         "specs": numbered(specs, SPEC_FIELDS + ("state", "kb_id")),
         "pages": numbered(pages, PAGE_FIELDS + ("state", "kb_id")),
         "retrieval_summary": summary,

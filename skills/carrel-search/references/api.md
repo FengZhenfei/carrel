@@ -1,6 +1,6 @@
 # API and configuration
 
-This file describes the calling conventions of the Carrel search service (`app/kb_search`); the server code is the authority on the API.
+This file describes the calling conventions of the Carrel search service (`app/kb_search`) and of the bundled client; the server code is the authority on the API.
 
 ## Connection
 
@@ -12,156 +12,103 @@ Environment variables can be used directly: `CARREL_SEARCH_BASE_URL` sets the ad
 
 An optional JSON config is shown in [config.example.json](config.example.json). Point to it with `--config /absolute/path/config.json` or set `CARREL_SEARCH_CONFIG`; when neither is given, `~/.config/carrel-search/config.json` is tried. The example contains no real token. The config may add `token_file`, pointing to a file that holds the token separately; environment variables take precedence. The script never generates a config or reads keys on the server.
 
+`work_dir` in the config (or `CARREL_SEARCH_WORK_DIR`) is where complete responses and fetched pictures are kept; without it the client uses `carrel-search/` under the system temporary directory, created for the current user only. Files older than a day are removed on the next call.
+
 Check the connection with `python3 "$SKILL_DIR/scripts/carrel_search.py" health` (optionally with `--base-url`). Authentication still uses the separately stored token.
 
 The command-level `--base-url` takes precedence over the environment and the config; `--timeout` overrides the config, defaulting to 60 seconds with no automatic retries. Global arguments go before the subcommand. 401/403 means the authentication must be fixed and a connection error means reachability must be checked; 503 means the service could not reach its own retrieval back ends (or its state database was busy) and the request can be retried later. None of these should be read as the knowledge base having no content.
 
-The service bounds each search by its request budget (`KB_SEARCH_REQUEST_BUDGET`, 45 seconds by default), below the client's default timeout; keep `--timeout` above the budget. When time runs short the service still answers, skipping the later stages (widening, reranking, neighbouring context) and listing them in `retrieval_summary.degraded`.
+The service bounds each search by its request budget (`KB_SEARCH_REQUEST_BUDGET`, 45 seconds by default), below the client's default timeout; keep `--timeout` above the budget. When time runs short the service still answers, skipping the later stages (widening, reranking, neighbouring context, subject neighbourhoods) and listing them under "gaps in this retrieval".
 
-Below, `$SKILL_DIR` is the actual skill directory and `$WORK_DIR` the existing working directory of the current task. These variables must be set by the caller; IDs/versions in JSON requests come from actual API responses and are never copied from placeholders.
+Below, `$SKILL_DIR` is the actual skill directory.
 
-## Commands and requests
+## Commands
 
-| Command | HTTP | Purpose |
+| Command | HTTP | Purpose and arguments |
 |---|---|---|
-| `health` | GET `/health` | Status of the service and its listed dependencies; does not prove every branch is healthy |
-| `catalog` | GET `/catalog` | Current KB names, IDs and capabilities; not required before every query |
-| `search` | POST `/search` | First retrieval, or a new sub-question |
-| `context` | POST `/context` | Read back a range of original text from a given version of the same document |
-| `image` | GET `/image/{kb_id}/{point_id}` | Original image bytes; save first, then view |
-| `crop` | POST `/crop` | Deterministic crop of an already confirmed original image |
-| `neighbors` | POST `/graph/neighbors` | One-hop relations of an entity in the current graph: predicate, direction, weight, far-end entity, evidence chunks; the agent decides the next hop itself |
-| `entities` | POST `/graph/entities` | Entities by type / upper class / name, with a total and paging; only when the question asks for a complete set |
-| `facts` | POST `/graph/facts` | Qualified facts by subject / property, with a total and paging; rows shaped like `specs` |
+| `health` | GET `/health` | Status of the service and its listed dependencies, no token needed; does not prove every branch is healthy |
+| `catalog` | GET `/catalog` | Current knowledge base names, IDs, domains, subject types, entity types, document samples and whether each has a graph; not required before every query |
+| `search` | POST `/search` | Retrieval. `--question` (required, at most 2000 characters), `--kb` (repeatable; without it the service routes), `--top-k 1..50`, `--block-type` (repeatable, a soft preference), `--in-doc <ref>` (repeatable; search only inside the document of that source), `--rel-path` (repeatable; a path inside the knowledge base, a hard filter), `--image file` (search by picture), `--no-context` (no neighbouring chunks), `--explain` |
+| `context` | POST `/context` | Read back a range of original text from the same version of a document. `--ref <ref>` (S, F or N) with `--before` / `--after` (1 chunk each by default; a stitched hit is read over its whole range) |
+| `image` | GET `/image/{kb_id}/{point_id}` | The original picture, saved to the work directory; the path is printed. `--ref <ref>` |
+| `crop` | POST `/crop` | Deterministic crop of the original picture. `--ref <ref> --bbox x0,y0,x1,y1`, optionally `--pad 0..200` |
+| `neighbors` | POST `/graph/neighbors` | One-hop relations of an entity. `--ref <ref>`, or `--kb` with `--entity name` / `--entity-id`; `--type` (repeatable, only these predicates), `--direction both/out/in`, `--limit 1..100` (20 by default) |
+| `entities` | POST `/graph/entities` | Entities by type / upper class / name. `--kb`, `--type` (repeatable), `--parent-type`, `--name`, `--limit 1..200` (50 by default), `--offset` |
+| `facts` | POST `/graph/facts` | Qualified facts by subject / property. `--ref <ref>`, or `--kb` with `--subject` / `--subject-id`; `--property`, `--match auto/exact/contains`, `--limit`, `--offset`; at least one of subject and property |
+| `show` | — | `show <call id>:<label>` (several at once are fine): the full text of a source or page, every field (JSON) of any other entry, and of sources and pages too with `--json`; `show <call id>` prints the compact view of that call again |
+
+Every command also takes `--json` (print the complete response instead of the compact view) and `--output new-file` (save another copy; for pictures, save there instead). `--request file` still passes a JSON request body directly and is rarely needed.
+
+## Compact view and labels
+
+Each JSON command prints a compact view. Its first line reads `call <call id> · <command> · knowledge base · status…` and its last line gives the location of the complete response. The complete response (the service's original response plus the citations and numbers the client adds) is kept, with nothing dropped, in `<call id>.json` in the work directory; it normally need not be read, and `show` prints what the view leaves out.
+
+The compact view of `search` is kept within what an agent's tool shows in one piece: the best hits are always printed in full, later ones by their opening words when space runs short, with their labels listed at the end; the chunks before and after a hit are listed by label and place only; the entity and keyword lines that picture chunks carry for indexing are not printed; source pages that hold only a file name and entity names are not printed; entities and relations that read the same are listed once, twelve of each at most. `show` prints any of these in full.
+
+Labels:
+
+| Prefix | What it is | Appears in |
+|---|---|---|
+| `S` | A source chunk | `search`, `context` |
+| `F` | A fact | `search`, `facts` |
+| `P` | A compiled page | `search` |
+| `E` | An entity | `search`, `entities` |
+| `R` | A relation matching the question | `search` |
+| `H` | The one-hop neighbourhood of a subject; `H1.2` is the second relation of the first subject | `search` |
+| `N` | A relation returned by a neighbourhood lookup | `neighbors` |
+
+What `--ref` takes: `context` / `image` / `crop` need a chunk, so `S` stands for itself and `N` and `F` for their first evidence chunk (for a fact, the chunk holding its value comes first when that can be told); `neighbors` / `facts` need an entity, so `E` and `H` stand for themselves and `H1.2` and `N` for the far end of the relation. Pointing at the wrong kind is reported as an error. Labels are independent per call, which is why a reference carries the call id.
+
+A citation is printed in full the first time it appears in a view; later entries with the same citation say "same citation as S3", meaning the citation printed on that entry.
+
+Left out of the compact view: IDs, scores, metadata of unselected candidates, the model-written descriptions of entities and relations, and the structured extraction fields of pictures. All of them are in the complete response.
+
+## Endpoint details
 
 ### Search
 
-```bash
-python3 "$SKILL_DIR/scripts/carrel_search.py" search --question "<the user's actual question>"
-python3 "$SKILL_DIR/scripts/carrel_search.py" search --request "$WORK_DIR/request.json" --output "$WORK_DIR/result.json"
-```
+The response (visible with `--json` or `show`) has the top-level keys `question/kbs/kb_names/retrieval_summary/sources/specs/pages/entities/relationships/neighborhoods/doc_aggs`.
 
-Request sketch; omit the fields that are not actually needed:
+- `sources[]`: `role=hit` is a hit and carries `accepted` (true only when its rerank score passed the threshold); `role=neighbor` is a chunk next to a hit, and `of` says which hit it belongs to. Each carries `n/kb_id/doc_id/rel_path/chunk_index/content_version/point_id/block_type/place/text/token_count`; picture chunks add `visual` (description, text in the picture, extracted facts, confidence, number of conflicts) and stitched ones `stitched` (`chunk_from/chunk_to/pieces[]`).
+- `specs[]`: qualified facts. The compact view prints each as "subject · property = value unit @ conditions · time"; the time is `when` / `valid_from`, which is the document's date for a fact whose material states no time of its own. Also `series_text`, `conflict`, `verified/sources_active`, `kinds`, `comparable`, `unit_canonical`, `ref_min/ref_max` and `flag`. `evidence[]` are the chunks the fact comes from (3 at most, with `doc_id/chunk_index/content_version/place/active`): a fact comes from an extraction unit that may span several chunks, and when the value's wording appears in exactly one of them that chunk comes first with `located=true` and the citation takes its place; otherwise the citation stops at the document.
+- `pages[]`: compiled pages, `kind` being `subject` / `timeline` / `source`; `summary` is the overview, and timeline pages and subject pages with series add `text`.
+- `entities[]` / `relationships[]`: graph items matching the question (at most 24 each); `description` is a model summary. `entities[].id` shares its namespace with the `entity_id` of the graph endpoints.
+- `neighborhoods[]`: the one-hop neighbourhood of the subjects, 4 at most by default. Entities the question names come first (a title or alias appearing whole in the question, case and spaces ignored; a name of two or three characters without letters or digits counts only when the entity is also a graph route match), then the graph route's best matches fill up. Each carries `id/title/type/named/relations (total)/facts (count)/predicates (counts per kind)/neighbors`; `neighbors[]` are its eight strongest relations (`type/direction/directed/weight/other{id,title,type,degree}`), one line per far end. These are leads without evidence. A search scoped to documents (`--in-doc`, `--rel-path`) does not carry the block.
+- `retrieval_summary`: `evidence_state` (`accepted` / `diagnostic` / `unranked`), `no_relevant_content`, `degraded`, `routing` (`chosen/weak/widened`), `buckets` and `selection.quota_filled`, `timings_ms`.
 
-```json
-{
-  "question": "<the user's actual question>",
-  "kbs": ["<kb id from the catalog>"],
-  "top_k": 12,
-  "context": true,
-  "explain": false,
-  "hints": {
-    "doc_ids": ["<confirmed document id>"],
-    "rel_paths": ["<full rel_path as returned by the API>"],
-    "content_version": "<content_version from the original response>",
-    "block_types": ["table"]
-  }
-}
-```
+`--in-doc` and `--rel-path` are hard filters; `--block-type` is a soft preference. Subjects and dates are not supported filters: write a time range into the question (it is a boost, not a filter, so the dates in the results still need checking).
 
-`question` is required; without `kbs` the service picks the knowledge bases. `top_k` is 1–50 and defaults to the service setting. `context` is a boolean for whether neighbouring chunks are fetched, not a conversation history. `explain` only adds retrieval explanations and generates no answer.
+Image queries use `search --question "<the actual image retrieval question>" --image /absolute/path/query.png`; the script does the base64 encoding. The original image file is limited to 9,000,000 bytes. A file the service cannot read as an image is answered with 422 (send PNG or JPEG). When the image vector cannot be computed, "gaps in this retrieval" lists `visual_query` and the results come from the question text alone. Image-to-image results still need their textual constraints checked; vector similarity must not be assumed to satisfy every combined image-and-text condition.
 
-`hints.doc_ids/rel_paths/content_version` are hard filters and several fields intersect; do not guess full paths from file names. `block_types` is a soft preference. Check `hints_used/hints_ignored/hints_scope`; subject and date are not supported hard-filter keys.
+### Reading back the original
 
-For image queries use `search --question "the actual image query" --image /absolute/path/query.png`; the script handles the base64 encoding. The raw image file is capped at 9,000,000 bytes, matching the API's base64 limit. A file the service cannot read as an image is rejected with 422 (send PNG or JPEG). When the image vector cannot be computed, `retrieval_summary.degraded` contains a `visual_query` entry and the results come from the question text alone. Image-to-image results still need their textual constraints checked; do not assume that vector similarity already satisfies every combined image-and-text condition.
+`context --ref` takes the chunk's `doc_id/content_version` and index and reads from `chunk_index - before` to `chunk_index + after` (the service allows at most 60 chunks per call). The returned chunks have the row shape of search hits, without stitching or budget truncation; picture chunks are marked the same way and `image --ref` works on them. When the requested old version can no longer be fetched, search again; never mix old and new text.
 
-### Fetching context
+### Original picture and crop
 
-```bash
-python3 "$SKILL_DIR/scripts/carrel_search.py" context --request "$WORK_DIR/context.json" --output "$WORK_DIR/context-result.json"
-```
-
-```json
-{
-  "kb_id": "<from the hit>",
-  "doc_id": "<from the hit>",
-  "content_version": "<from the hit>",
-  "chunk_from": 5,
-  "chunk_to": 7
-}
-```
-
-The range is taken from the actual hit's chunk index plus the neighbouring chunks needed; a page number is not a chunk_index. Start and end are non-negative and ascending, and the service requires `chunk_to - chunk_from <= 60`; usually start with a smaller range. This endpoint does not apply the 6,000-token text budget of `/search`, so avoid fetching an overly large range at once. When an old version yields no material, search again; do not mix old and new text.
-
-### Original images and crops
-
-```bash
-python3 "$SKILL_DIR/scripts/carrel_search.py" image --kb "<kb id>" --point-id "<point_id of the image hit>" --output "$WORK_DIR/source-image.png"
-python3 "$SKILL_DIR/scripts/carrel_search.py" crop --request "$WORK_DIR/crop.json" --output "$WORK_DIR/detail.png"
-```
-
-```json
-{
-  "kb_id": "<from the image hit>",
-  "point_id": "<from the image hit>",
-  "bbox": [0.1, 0.2, 0.8, 0.9],
-  "pad": 16
-}
-```
-
-`point_id` is the UUID `point_id` of the image hit in `sources`, not its `chunk_uid`; any other value is rejected with 422. `bbox` is given as 0–1 fractions or 0–1000 per-mille of the original image, not pixels: values above 1000 are rejected and any value up to 1000 is read as per-mille, so pixel coordinates would silently select the wrong region; the pixel box actually cropped comes back as `crop_box`. `pad` is 0–200 pixels. Look at the original image first, then locate the region. The original is saved with the service's raw bytes and the extension does not change the encoding; the returned `mime_type` is authoritative. Crops are output as PNG. The client returns the absolute path, content hash, source, dimensions and crop box; it does not hand the image to the model merely as base64 text.
+`image --ref` fetches the original of a picture chunk: the bitmap embedded in the PDF first, then a high-resolution render of its position on the page, and only then the picture in the parser cache; the output gives the saved path, type, size and source. A crop is a part of the same original and has no more pixels. For a chunk that is not a picture the service answers 404. The `--bbox` of `crop` is a 0–1 fraction or 0–1000 per-mille range over the original picture, not pixels: values above 1000 are rejected, and anything up to 1000 is read as per-mille, so pixel coordinates crop somewhere else without an error. Look at the original picture before choosing the region. A crop is a PNG.
 
 ### Graph neighbourhood
 
-```bash
-python3 "$SKILL_DIR/scripts/carrel_search.py" neighbors --kb "<kb id>" --entity "<entity title or alias>" --limit 20
-python3 "$SKILL_DIR/scripts/carrel_search.py" neighbors --kb "<kb id>" --entity-id "<entity_id from the previous response>" --type has_stage --direction out
-```
+A name is matched against titles and aliases, ignoring case and spaces. Of several entities with the same name the one with the most relations is taken and the others are listed under "other entities with this name"; prefer `--ref` whenever a label is available. When nothing matches, a few vector-similar candidates (with IDs) are offered; check them and look one up again with `--entity-id`. A knowledge base without a current graph answers 404.
 
-JSON can also be passed with `--request`:
+The response has the top-level keys `kb_id/kb_name/graph_version/found/entity/matches/candidates/direction/types/count/total/has_more/predicates/neighbors`. `entity` carries `id/title/type/parent_type/aliases/scope/degree/pagerank/description/docs/facts`. Each entry of `neighbors[]`:
 
-```json
-{
-  "kb_id": "<kb id>",
-  "entity_id": "<entity_id from the previous response>",
-  "limit": 20,
-  "types": ["<predicate>"],
-  "direction": "both"
-}
-```
+- `type` (the predicate), `directed` and `direction`: only for a relation with `directed=true` does `out` mean the current entity is the subject and `in` that the far end is; `directed=false` is an undirected association that says nothing about subject, object or causality.
+- `weight/npmi/cooccur`, `description` (a model summary, not original text), `type_violation` (the end types do not fit this kind of relation: a check at extraction, not proof that the relation is wrong), `relation_id`.
+- `other`: the far-end entity's ID, title, type, scope and its own relation count `degree`.
+- `evidence[]`: at most 3 chunks with `point_id/doc_id/chunk_index/content_version/rel_path/place/active`. The first one carries `excerpt` (at most 200 characters, the sentences of the evidence that name the far end) and `excerpt_match`: `both` when both ends are named in the chunk, `other` when only the far end is, `center` / `none` when the far end was not located (the compact view says so). When several relations share an excerpt the compact view prints it under the first and writes "same excerpt as N5" under the others. The excerpt is located by name in the original text, without a model; a text chunk that names the far end is preferred over a picture chunk, and an excerpt taken from a picture chunk has `visual=true` (that text is the vision model's description). Evidence with `active=false` has been deactivated and is not current grounds.
 
-`entity_id` can be replaced by `entity` (title or alias); `types` may be omitted, and `direction` is one of `both/out/in`, defaulting to `both`. Names are matched exactly, case-insensitively, against titles or aliases.
-When several entities share a name, the service picks the one with the larger `degree` among the matching candidates as `entity` and lists the others in `matches`; the caller must still check type, scope and sources, and the connection count is no substitute for entity disambiguation.
-When nothing is found, `found=false` and `candidates` offers a few vector-similar entities (with IDs) to check and choose from; this is not a confirmed hit. A knowledge base without a current graph returns 404.
-
-Each entry in the response's `neighbors[]` contains:
-
-- `type` (the predicate), `directed` and `direction`: only for relations with `directed=true` does `out` mean the current entity is the subject and `in` that the far end is. `directed=false` is an undirected association whose `in/out` only reflects the storage direction in the graph database, not a semantic subject/object or causality. Query undirected relations with `both` so that no association is missed because of the storage direction.
-- `weight/npmi/cooccur`, `description` (a model summary, not original text), `type_violation` (a flag that an endpoint type is out of bounds).
-- `other`: the far-end entity's ID, title, type, scope and so on.
-- `evidence[]`: at most 3 chunks per relation, with `point_id/doc_id/chunk_index/content_version/rel_path/page_idx/position/place/active`. Take the top-level `kb_id` of the response, then build the range parameters of `/context` from the evidence's `doc_id/content_version` and `chunk_index`; do not pass the whole evidence object as the request. `active=false` means the evidence point has been deactivated and cannot serve as current grounds.
-
-**Coverage and truncation:** `limit` defaults to 20 with a range of 1–100; relations are returned in descending weight order. `count` is the number returned this time, `total` the number of relations under the same filter, and `has_more=true` means some were left out; there is no pagination parameter.
-In that case narrow with `types` according to the question or raise `limit`. Repeating the same request does not yield a next page.
-`entity.docs` lists at most 12 document paths as source leads, not a complete document list. The graph also filters out some relations, so neighbourhood results cannot prove "all results" in the material; completeness must be checked against the original directory or ledger.
-Multi-hop traversal is done by the caller step by step according to the question, checking the relation and the original evidence at every step; the time per hop varies with the entity and the running load.
+`predicates` is the number of relations of each kind (predicate) the entity has, independent of `limit` and `--type`; `total` is the number of relations under the same filter. There is no paging parameter: narrow with `--type` or raise `--limit`, since repeating the same request does not return a next page. `entity.docs` lists at most 12 document paths and is not a complete list. The graph also filters some relations, so a neighbourhood cannot prove that it holds "everything" in the documents.
 
 ### Listing entities and facts
 
-Use these only when the question asks for a complete set (every entity of a kind, every parameter of one subject, one property across subjects); ordinary questions need `/search` only.
+Use these only when the question asks for a complete set. The `entities` response carries `total/offset/limit/count/has_more`, and the first page (`offset=0`) adds `types`: the number of entities per type in this knowledge base (the line at the top of the compact view, with the upper class in brackets). Each entity carries `id/title/type/parent_type/scope/degree/pagerank/aliases`, a `description` cut to 200 characters, `docs` (the 3 documents that mention it most) and `doc_count`, in descending `pagerank` order; entities that only appear on boilerplate pages and reference-number entities are not listed.
 
-```bash
-python3 "$SKILL_DIR/scripts/carrel_search.py" entities --kb "<kb id>" --output "$WORK_DIR/entities-1.json"
-python3 "$SKILL_DIR/scripts/carrel_search.py" entities --kb "<kb id>" --type "<an entity type>" --limit 50 --offset 50 --output "$WORK_DIR/entities-2.json"
-python3 "$SKILL_DIR/scripts/carrel_search.py" facts --kb "<kb id>" --subject "<subject title or alias>" --property "<property name or symbol>" --output "$WORK_DIR/facts-1.json"
-```
+`facts`: `--match auto` tries an exact match first and containment when nothing matched. Of same-named subjects the one with the most relations is chosen and the others are listed; when the name does not match, candidates are offered. `facts[]` has the fields of the facts of `search` plus `evidence[]` (at most 3 chunks); `series_text` only covers the facts returned on this page. With a subject only, the first page adds `properties`: the properties under that subject with counts, 50 at most. When "gaps in this retrieval" lists `spec_payload_missing`, the affected rows only have basic fields (the graph is switching versions); query again later.
 
-Conditions of `entities`: `--type` (repeatable, case-insensitive), `--parent-type` (the upper classes `entity/part/property/process/standard/document`, repeatable), `--name` (text contained in the title or an alias), `--limit` (50 by default, at most 200), `--offset`. The response is `kb_id/kb_name/graph_version/filters/total/offset/limit/count/has_more/entities`; the first page (`offset=0`) also has `types`, the number of entities per type in this knowledge base. Each entry of `entities[]` carries `id/title/type/parent_type/scope/degree/pagerank/aliases`, a `description` cut to 200 characters, `docs` (the 3 documents that mention it most; the client adds `docs_cite`) and `doc_count` (how many documents mention it), in descending `pagerank` order; entities found only on boilerplate pages and reference numbers are not listed.
+The text of a fact row is a statement the pipeline composed from extracted fields, not the document's own words; read the evidence back with `context --ref` when the original is needed. Both endpoints list what the graph registered (the result of model extraction), not everything in the documents; a knowledge base without a current graph answers 404.
 
-Conditions of `facts`: `--subject` or `--subject-id`, `--property` (property name / symbol / concept name), `--match` (`auto` tries exact first and containment only when nothing matched, `exact`, `contains`), `--limit`, `--offset`; at least one of subject and property is required, otherwise 422. The response is `kb_id/kb_name/graph_version/found/subject/matches/candidates/property/total/offset/limit/count/has_more/facts`:
+## Errors
 
-- `subject` is the chosen subject entity; with several of the same name the best connected one is taken and the rest are in `matches`, so prefer `--subject-id` when an ID is at hand. Names ignore case and spaces; when nothing matches, `found=false` and `candidates` offers a few entities similar by vector.
-- `property` is `{query, matched, concepts}`: `matched` is the mode that applied (`exact` / `contains`, `null` when neither matched), and every spelling under the matched concepts comes back.
-- `facts[]` has the fields of `specs` in `/search` (`hint`, values and units, conditions, time, `series_text`, `conflict`, `verified/sources_active`) without `sources` numbers and `score`; each row also carries `evidence[]` (at most 3 chunks, the same fields as the evidence of the neighbourhood endpoint), and `n` continues from `offset`. `series_text` covers only the facts of this page.
-- With a subject only, the first page also has `properties`: the properties (concepts) of this subject with counts, at most 50.
-- When `degraded` contains `spec_payload_missing`, those rows hold basic fields only (the graph is switching versions); query again shortly.
-
-Both endpoints list what the graph registered (the result of model extraction), not the full material; a knowledge base without a current graph answers 404.
-
-## Reading responses
-
-JSON commands: `{"call_id":"<id of this call>","operation":"search","result":{<the service's original response>}}`. With `--output` the complete JSON is saved to a new file and the terminal shows only `response_file`; the file must then be read, and a file pointer must not be treated as evidence already read. For image commands, `result.path` points to the actual file, which needs an image tool to view.
-
-Descriptive names such as `Sources` correspond to the actual lower-case JSON keys `sources/entities/relationships/specs/pages`. Keep `retrieval_summary`, the complete sources and the truncation state; the client does not rerank, does not delete evidence a second time and does not widen the knowledge base selection on its own. The client adds two citation fields to the result: `cite` on every object that names a document, written as `<knowledge base folder>/<rel_path>` followed by the service's short locator `place` (page, slide or sheet rows; the deepest heading for documents without pages), and the document-level `docs_cite` next to every `docs` list. The path starts at the knowledge base's top-level folder, so it reads the same wherever the files were synced from. `call_id` only distinguishes multiple responses and is not a server-side document identity.
-
-On failure, a JSON error goes to stderr with a non-zero exit code; empty results are never returned silently. All output files are written without overwriting, and the output directory must already exist.
+On failure one line of JSON is written to stderr and the exit code is non-zero; an empty result is never returned silently. A mistyped label, a reference of the wrong kind, or a call whose stored response has been removed is reported as an error without sending a request.
