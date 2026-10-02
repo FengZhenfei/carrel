@@ -35,6 +35,15 @@ a source, `neighbors --ref 3fa2c1:H1` walks the graph from a subject, and
 `show 3fa2c1:F2` prints an entry in full. `--json` prints the complete
 response instead.
 
+How long an answer takes depends mostly on the agent's reasoning effort, not on
+the service: retrieval returns within seconds and the rest is the agent
+reading and thinking. A middle-to-high level is usually enough for a cited
+answer that follows the graph; the highest levels walk further and cross-check
+more, and take several times longer. Claude Code lets a skill pin its own
+level with an `effort:` line in the frontmatter of `SKILL.md` (for example
+`effort: high`), which applies to the turn that invokes the skill; in other
+agents, choose the level for the session.
+
 Store tokens in the client environment or a separate token file. The service
 uses `KB_SEARCH_TOKEN`; client configuration uses the `CARREL_` variables above.
 With no server token, protected endpoints accept loopback callers only.
