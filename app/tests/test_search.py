@@ -1700,6 +1700,37 @@ class GraphWalkTests(unittest.TestCase):
         self.assertEqual(loads(), 2)
 
 
+MIRROR = "/srv/kb/mirror"       # an absolute server path in the fixtures: it must not appear anywhere in a response
+
+
+def _state_db(path: str, *, files=(), chunks=(), failures=(), migrate: bool = True) -> None:
+    """A real state database in a temporary directory, built with the pipeline's own schema (migrate=False is an
+    older database without the chunk_diag_json column), with a few rows inserted."""
+    from kb_pipeline import db
+
+    if migrate:
+        db.init_db(path)
+    else:
+        with db.connect(path) as con:
+            con.executescript(db.SCHEMA)
+    with db.connect(path) as con:
+        for f in files:
+            rel = f["rel_path"]
+            row = {"kb_id": "kb_005", "collection": f.get("kb_id", "kb_005"), "source_root": "products", "source_type": "local",
+                   "source_path": "products/" + rel, "filename": pathlib.PurePosixPath(rel).name,
+                   "dir": "" if "/" not in rel else rel.rsplit("/", 1)[0], "physical_path": f"{MIRROR}/products/{rel}",
+                   "mime_type": "application/pdf", "size": 10, "mtime": 1_700_000_000, "content_version": "v1", "metadata_fingerprint": "m",
+                   "first_seen_at": 1, "last_seen_at": 1, "status": "seen", **f}
+            row["file_id"] = f"{row['kb_id']}:{row['file_key']}"
+            con.execute(f"INSERT INTO files ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+        for i, (file_id, version, status, collection) in enumerate(chunks):
+            con.execute("INSERT INTO chunks(chunk_uid, file_id, content_version, chunk_index, point_id, collection, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 1)", (f"u{i}", file_id, version, i, f"p{i}", collection, status))
+        for i, (file_id, stage, message, created, resolved) in enumerate(failures):
+            con.execute("INSERT INTO failures(failure_id, file_id, job_id, stage, error_type, error_message, created_at, resolved_at) "
+                        "VALUES (?, ?, NULL, ?, 'ParseError', ?, ?, ?)", (f"fl{i}", file_id, stage, message, created, resolved))
+
+
 class ApiTests(unittest.TestCase):
     def test_bearer_token_is_required_when_configured(self) -> None:
         from fastapi.testclient import TestClient
@@ -2080,6 +2111,431 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([r["n"] for r in rows], [1, 2, 3]); self.assertEqual(stats["neighbors"], 0)
         aggs = doc_aggs(rows)
         self.assertEqual([(a["doc"], a["hits"]) for a in aggs], [("d1.pdf", 2), ("d2.pdf", 1)])
+
+    def test_docs_lists_every_document_from_the_state_db(self) -> None:
+        """/docs: every document registered in the state database, sorted by path, with a total and paging; the chunk
+        count covers only active chunks of the current version, with the chunking check and the latest unresolved
+        failure; the directory is compared as a "dir/" prefix, the name case-insensitively; the response carries no
+        absolute server path."""
+        import tempfile
+
+        from fastapi.testclient import TestClient
+
+        from kb_search.main import create_app
+
+        diag = {"ok": False, "reasons": [{"key": "fragmented", "message": "too many fragments"}],
+                "stats": {"chunks": 3, "tokens_total": 900, "tokens_mean": 300.0, "blocks": 7, "headings": 2, "section_depths": {"0": 3},
+                          "by_block_type": {"text": {"chunks": 2, "tokens": 600}, "table": {"chunks": 1, "tokens": 300}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.db")
+            _state_db(path, files=[
+                {"file_key": 1, "rel_path": "acme/a.pdf", "indexed_version": "v1", "indexed_parser_profile": "pdf-v12", "status": "indexed",
+                 "chunk_diag_json": json.dumps(diag)},
+                {"file_key": 2, "rel_path": "acme/pricing/b.xlsx", "mime_type": "application/vnd.ms-excel", "content_version": "v2"},
+                {"file_key": 3, "rel_path": "acme2/c.pdf", "indexed_version": "v1", "status": "indexed", "chunk_diag_json": "{not json"},
+                {"file_key": 4, "rel_path": "Other/D.PDF", "indexed_version": "v1", "status": "deleted"},
+                {"file_key": 9, "rel_path": "acme/other-kb.pdf", "kb_id": "kb_006", "indexed_version": "v1", "status": "indexed"},
+            ], chunks=[
+                ("kb_005:1", "v1", "active", "kb_005"), ("kb_005:1", "v1", "active", "kb_005"), ("kb_005:1", "v1", "active", "kb_005"),
+                ("kb_005:1", "v0", "inactive", "kb_005"), ("kb_005:1", "v0", "active", "kb_005"),      # chunks of an old version do not count, even when their status was not flipped
+                ("kb_005:2", "v1", "active", "kb_005"),                                               # the current version is v2: this chunk is old
+                ("kb_005:3", "v1", "active", "kb_005"), ("kb_005:4", "v1", "deleted", "kb_005"), ("kb_006:9", "v1", "active", "kb_006"),
+            ], failures=[
+                ("kb_005:2", "parse", "an older one", 100, None), ("kb_005:2", "parse", "x" * 500, 200, None),
+                ("kb_005:2", "fts_sync", "resolved", 300, 301), ("kb_005:3", "parse", "resolved", 50, 60),
+            ])
+            settings = SimpleNamespace(state_db=path, sources={"kb_005": SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")})
+            auth = {"Authorization": "Bearer secret"}
+            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), None)):
+                client = TestClient(create_app())
+                r = client.post("/docs", json={"kb_id": "kb_005"}, headers=auth)
+                self.assertEqual(r.status_code, 200)
+                out = r.json()
+                self.assertNotIn(MIRROR, r.text); self.assertNotIn("physical_path", r.text); self.assertNotIn("source_path", r.text)
+                self.assertEqual((out["kb_id"], out["kb_name"], out["total"], out["count"], out["has_more"]), ("kb_005", "products", 3, 3, False))
+                self.assertEqual(out["totals"], {"files": 3, "indexed": 2, "not_indexed": 1, "chunks": 4})
+                a, b, c = out["docs"]
+                self.assertEqual([d["rel_path"] for d in out["docs"]], ["acme/a.pdf", "acme/pricing/b.xlsx", "acme2/c.pdf"])   # deleted ones are not listed
+                self.assertEqual((a["n"], a["doc_id"], a["filename"], a["dir"], a["doc_type"], a["chunk_total"], a["indexed"], a["parser_profile"]),
+                                 (1, "kb_005:1", "a.pdf", "acme", "pdf", 3, True, "pdf-v12"))
+                self.assertEqual(a["diag"], {"ok": False, "reasons": ["fragmented"], "blocks": 7, "headings": 2, "tokens_total": 900,
+                                             "block_types": {"table": 1, "text": 2}})
+                self.assertNotIn("last_error", a)
+                self.assertEqual((b["doc_type"], b["chunk_total"], b["indexed"], b["content_version"], b["status"]), ("xlsx", 0, False, "v2", "seen"))
+                self.assertEqual((b["last_error"]["stage"], b["last_error"]["error_type"], b["last_error"]["at"], len(b["last_error"]["message"])),
+                                 ("parse", "ParseError", 200, 300))                                  # the latest unresolved one, its message cut to 300 characters
+                self.assertNotIn("diag", b); self.assertNotIn("diag", c); self.assertNotIn("last_error", c)   # an unreadable check is left out
+                for key in ("mime_type", "size", "mtime", "first_seen_at"):
+                    self.assertIn(key, a)
+                # the directory is compared as a "dir/" prefix (surrounding / removed); the name ignores case; paging leaves totals alone
+                sub = client.post("/docs", json={"kb_id": "kb_005", "dir": "/acme/"}, headers=auth).json()
+                self.assertEqual([d["rel_path"] for d in sub["docs"]], ["acme/a.pdf", "acme/pricing/b.xlsx"])
+                self.assertEqual(sub["totals"], {"files": 2, "indexed": 1, "not_indexed": 1, "chunks": 3})
+                self.assertEqual(client.post("/docs", json={"kb_id": "kb_005", "dir": ""}, headers=auth).json()["total"], 3)
+                self.assertEqual([d["rel_path"] for d in client.post("/docs", json={"kb_id": "kb_005", "dir": "acme/pricing"}, headers=auth).json()["docs"]],
+                                 ["acme/pricing/b.xlsx"])
+                gone = client.post("/docs", json={"kb_id": "kb_005", "name": "d.pdf", "include_deleted": True}, headers=auth).json()
+                self.assertEqual([(d["rel_path"], d["status"], d["chunk_total"], d["indexed"]) for d in gone["docs"]], [("Other/D.PDF", "deleted", 0, False)])
+                self.assertEqual(client.post("/docs", json={"kb_id": "kb_005", "name": "d.pdf"}, headers=auth).json()["total"], 0)
+                page = client.post("/docs", json={"kb_id": "kb_005", "limit": 1, "offset": 1}, headers=auth).json()
+                self.assertEqual(([d["n"] for d in page["docs"]], page["total"], page["count"], page["has_more"], page["totals"]["files"]), ([2], 3, 1, True, 3))
+                # parameter validation, unknown knowledge base, auth
+                for bad in ({"limit": 0}, {"limit": 2001}, {"offset": -1}, {"dir": "x" * 501}, {"name": "x" * 201}):
+                    self.assertEqual(client.post("/docs", json={"kb_id": "kb_005", **bad}, headers=auth).status_code, 422, bad)
+                self.assertEqual(client.post("/docs", json={"kb_id": "kb_006"}, headers=auth).status_code, 404)
+                self.assertEqual(client.post("/docs", json={"kb_id": "kb_005"}).status_code, 401)
+                self.assertEqual(client.get("/docs").status_code, 200)                                    # the built-in API documentation page (GET) still works
+            # an older database without the chunk_diag_json column: still listed, only without the chunking check
+            old = os.path.join(tmp, "old.db")
+            _state_db(old, files=[{"file_key": 1, "rel_path": "a.pdf", "indexed_version": "v1"}], chunks=[("kb_005:1", "v1", "active", "kb_005")],
+                      migrate=False)
+            from kb_search import library
+
+            legacy = library.list_docs(SimpleNamespace(state_db=old), settings.sources["kb_005"])
+            self.assertEqual([(d["rel_path"], d["chunk_total"], d["indexed"], "diag" in d) for d in legacy["docs"]], [("a.pdf", 1, True, False)])
+
+    def test_docs_error_message_carries_no_absolute_path(self) -> None:
+        """The worker writes a failure message as "exception text + the whole traceback": the traceback holds absolute
+        paths of code files and the exception text the physical_path under the mirror, both within the first 300
+        characters. Before it leaves, the traceback is cut off, the mirror prefix becomes the path inside the knowledge
+        base and any other absolute path keeps only its file name."""
+        import re
+        import tempfile
+        import traceback
+
+        from kb_search import library
+
+        def worker_style(path: str) -> str:
+            try:
+                open(path)
+            except OSError as exc:
+                return f"{exc}\n{traceback.format_exc()}"
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "state.db")
+            _state_db(db_path, files=[
+                {"file_key": 1, "rel_path": "acme/a.pdf"},
+                # physical_path does not line up with rel_path (older data from before a rename): the mirror root removes the prefix
+                {"file_key": 2, "rel_path": "new-dir/b.pdf", "physical_path": f"{MIRROR}/products/old-dir/b.pdf"},
+                {"file_key": 3, "rel_path": "c.pdf"},
+            ], failures=[
+                ("kb_005:1", "worker", worker_style(f"{MIRROR}/products/acme/a.pdf"), 1, None),
+                ("kb_005:2", "worker", worker_style(f"{MIRROR}/products/old-dir/b.pdf"), 1, None),
+                ("kb_005:3", "worker", "cannot read /opt/deploy/app/kb_pipeline/parse.py line 3; rate 5 kb/s, ratio 1/2", 1, None),
+            ])
+            source = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
+            out = library.list_docs(SimpleNamespace(state_db=db_path, mirror_root=MIRROR), source)
+            msgs = {d["rel_path"]: d["last_error"]["message"] for d in out["docs"]}
+            for msg in msgs.values():
+                self.assertNotIn(MIRROR, msg)
+                self.assertNotIn("Traceback", msg)
+                self.assertIsNone(re.search(r"(?<![\w.])/[^\s'\"/]+/", msg), msg)          # no multi-segment path starting with /
+            self.assertEqual(msgs["acme/a.pdf"], "[Errno 2] No such file or directory: 'acme/a.pdf'")
+            self.assertEqual(msgs["new-dir/b.pdf"], "[Errno 2] No such file or directory: 'products/old-dir/b.pdf'")
+            self.assertEqual(msgs["c.pdf"], "cannot read parse.py line 3; rate 5 kb/s, ratio 1/2")       # slashes of relative spellings stay
+            # without a configured mirror root (only each file's own physical_path and the fallback): still nothing leaks
+            bare = library.list_docs(SimpleNamespace(state_db=db_path), source)
+            self.assertNotIn(MIRROR, json.dumps(bare))
+            self.assertEqual({d["rel_path"]: d["last_error"]["message"] for d in bare["docs"]}["acme/a.pdf"],
+                             "[Errno 2] No such file or directory: 'acme/a.pdf'")
+
+    def test_grep_counts_literal_phrases(self) -> None:
+        """/grep: one query per phrase (combined into one msearch), match_phrase per field, scope as filters, only the
+        current versions counted; hits sorted by path and chunk index, each hit checked for a literal occurrence and cut
+        to a snippet around the phrase, never the whole text; a missing index counts as zero hits with a degraded entry,
+        a backend error is a 503."""
+        import tempfile
+
+        from fastapi.testclient import TestClient
+
+        from kb_search import library
+        from kb_search.main import create_app
+
+        long_body = "甲" * 100 + "WidgetX9" + "乙" * 100
+        hits = [
+            {"_id": "p1", "matched_queries": ["body"], "_source": {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunk_index": 2, "block_type": "text",
+                                                                    "page_idx": 3, "content_version": "v1", "body": long_body}},
+            {"_id": "p2", "matched_queries": ["body"], "_source": {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunk_index": 5, "block_type": "text",
+                                                                    "body": "Preface. widget x9 overview."}},                   # differs only in case: not literal
+            {"_id": "p3", "matched_queries": ["visual", "body"], "_source": {
+                "doc_id": "kb_005:3", "rel_path": "c.xlsx", "chunk_index": 0, "block_type": "table", "sheet_name": "pricing", "row_start": 2, "row_end": 9,
+                "body": "Widget suite and X9 service", "visual": "Figure: Ｗｉｄｇｅｔ　Ｘ９ price list"}},          # literal in visual after full-width and whitespace normalisation
+        ]
+        buckets = [{"key": k, "doc_count": n, "path": {"hits": {"hits": [{"_source": {"rel_path": p}}]}}}
+                   for k, n, p in (("kb_005:2", 1, "b.pdf"), ("kb_005:1", 2, "a.pdf"), ("kb_005:3", 2, "0.xlsx"))]
+        responses = [{"hits": {"total": {"value": 5}, "hits": hits}, "aggregations": {"by_doc": {"buckets": buckets, "sum_other_doc_count": 0}}},
+                     {"hits": {"total": {"value": 0}, "hits": []}, "aggregations": {"by_doc": {"buckets": []}}}]
+
+        class FakeOS:
+            def __init__(self, exists=True, fail=None):
+                self.bodies, self.timeouts = [], []
+                self.indices = SimpleNamespace(exists=self._exists)
+                self._present, self._fail = exists, fail
+            def _exists(self, index, request_timeout=None):
+                if self._fail:
+                    raise self._fail
+                self.timeouts.append(request_timeout)
+                return self._present
+            def msearch(self, body, request_timeout=None):
+                self.bodies.append(body); self.timeouts.append(request_timeout)
+                return {"responses": responses[:len(body) // 2]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.db")
+            _state_db(path, chunks=[("kb_005:1", "v1", "active", "kb_005"), ("kb_005:3", "v2", "active", "kb_005"), ("kb_005:1", "v0", "inactive", "kb_005"),
+                                    ("kb_006:1", "v9", "active", "kb_006")])
+            settings = SimpleNamespace(state_db=path, opensearch_url="http://os", sources={"kb_005": SimpleNamespace(kb_id="kb_005", collection="kb_005",
+                                                                                                                     source_root="products")})
+            auth = {"Authorization": "Bearer secret"}
+            ss = _settings(token="secret", channel_timeout=4.0)
+            fake = FakeOS()
+            with mock.patch.object(service, "runtime", return_value=(settings, ss, None)), mock.patch.object(channels, "os_client", return_value=fake):
+                client = TestClient(create_app())
+                r = client.post("/grep", json={"kb_id": "kb_005", "phrases": [" Widget X9 ", "no-such-term"], "fields": ["title", "body", "visual"],
+                                               "doc_ids": ["kb_005:1", "kb_005:3"], "rel_paths": ["a.pdf"], "limit": 3}, headers=auth)
+                self.assertEqual(r.status_code, 200)
+                out = r.json()
+                self.assertNotIn("乙" * 61, r.text)                                                      # never the whole text
+                # query body: one section per phrase, scope and current versions as filters, one match_phrase per field,
+                # sorted by path and chunk index, aggregated by document
+                body = fake.bodies[0]
+                self.assertEqual((len(body), body[0], body[2]), (4, {"index": "kb_005"}, {"index": "kb_005"}))
+                query = body[1]
+                self.assertEqual(query["query"]["bool"]["filter"], [{"terms": {"content_version": ["v1", "v2"]}}, {"terms": {"doc_id": ["kb_005:1", "kb_005:3"]}},
+                                                                    {"terms": {"rel_path": ["a.pdf"]}}])
+                self.assertEqual(query["query"]["bool"]["should"], [{"match_phrase": {f: {"query": "Widget X9", "_name": f}}} for f in ("body", "title", "visual")])
+                self.assertEqual((query["query"]["bool"]["minimum_should_match"], query["size"], query["track_total_hits"]), (1, 3, True))
+                self.assertEqual(query["sort"], [{"rel_path": {"order": "asc"}}, {"chunk_index": {"order": "asc", "missing": "_last"}}])
+                self.assertEqual(query["aggs"]["by_doc"]["terms"], {"field": "doc_id", "size": 1000})
+                self.assertEqual(query["aggs"]["by_doc"]["aggs"]["path"]["top_hits"], {"size": 1, "_source": ["rel_path"]})
+                self.assertEqual(set(fake.timeouts), {4.0})                                                # every call carries the time limit
+                self.assertEqual((out["kb_name"], out["fields"], out["scope"]), ("products", ["body", "title", "visual"], {"rel_paths": 1, "doc_ids": 2}))
+                first, second = out["results"]
+                self.assertEqual((first["phrase"], first["total_chunks"], first["literal_checked"], first["literal_true"]), ("Widget X9", 5, 3, 2))
+                self.assertEqual(first["docs"], [{"doc_id": "kb_005:3", "rel_path": "0.xlsx", "chunks": 2}, {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunks": 2},
+                                                 {"doc_id": "kb_005:2", "rel_path": "b.pdf", "chunks": 1}])     # chunks descending, then path ascending
+                h1, h2, h3 = first["hits"]
+                self.assertEqual(h1, {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunk_index": 2, "block_type": "text", "page_idx": 3, "point_id": "p1",
+                                      "field": "body", "snippet": "…" + "甲" * 60 + "WidgetX9" + "乙" * 60 + "…", "literal": True})
+                self.assertEqual((h2["field"], h2["literal"], h2["snippet"]), ("body", False, "Preface. widget x9 overview."))
+                self.assertNotIn("page_idx", h2)
+                self.assertEqual((h3["field"], h3["literal"], h3["sheet_name"], h3["row_start"], h3["row_end"]), ("visual", True, "pricing", 2, 9))
+                self.assertNotIn("body", h1); self.assertNotIn("content_version", h1)
+                self.assertEqual((second["total_chunks"], second["docs"], second["hits"], second["literal_checked"]), (0, [], [], 0))
+                self.assertIn("literal is checked only for the hits returned", out["note"]); self.assertNotIn("degraded", out)
+                # all three fields by default; limit=0 returns counts only
+                client.post("/grep", json={"kb_id": "kb_005", "phrases": ["pricing"], "limit": 0}, headers=auth)
+                self.assertEqual((len(fake.bodies[-1][1]["query"]["bool"]["should"]), fake.bodies[-1][1]["size"]), (3, 0))
+                self.assertEqual(fake.bodies[-1][1]["query"]["bool"]["filter"], [{"terms": {"content_version": ["v1", "v2"]}}])
+                # parameter validation, unknown knowledge base, auth
+                for bad in ({"phrases": []}, {"phrases": ["a"] * 9}, {"phrases": ["  "]}, {"phrases": ["x" * 201]}, {"phrases": ["a"], "fields": ["path"]},
+                            {"phrases": ["a"], "fields": []}, {"phrases": ["a"], "limit": 201}, {"phrases": ["a"], "rel_paths": ["x"] * 501},
+                            {"phrases": ["a"], "doc_ids": ["x"] * 501}):
+                    self.assertEqual(client.post("/grep", json={"kb_id": "kb_005", **bad}, headers=auth).status_code, 422, bad)
+                self.assertEqual(client.post("/grep", json={"kb_id": "kb_404", "phrases": ["a"]}, headers=auth).status_code, 404)
+                self.assertEqual(client.post("/grep", json={"kb_id": "kb_005", "phrases": ["a"]}).status_code, 401)
+            # missing index: zero hits plus one degraded entry, no query sent
+            missing = FakeOS(exists=False)
+            out = library.grep(settings, settings.sources["kb_005"], ["pricing"], client=missing)
+            self.assertEqual((out["results"][0]["total_chunks"], out["results"][0]["hits"], missing.bodies), (0, [], []))
+            self.assertEqual(out["degraded"], ["kb_005: keyword index kb_005 does not exist"])
+            # the keyword index is unreachable: 503, not "nothing found"
+            with mock.patch.object(service, "runtime", return_value=(settings, ss, None)), \
+                    mock.patch.object(channels, "os_client", return_value=FakeOS(fail=ConnectionError("refused"))):
+                r = TestClient(create_app()).post("/grep", json={"kb_id": "kb_005", "phrases": ["a"]}, headers=auth)
+                self.assertEqual(r.status_code, 503); self.assertIn("opensearch", r.json()["detail"])
+        # snippets and the literal check: NFKC-normalised and whitespace dropped before comparing
+        self.assertEqual(library.snippet("Spec: Ａ Ｃ Ｍ Ｅ 365 edition", "ACME 365"), ("Spec: Ａ Ｃ Ｍ Ｅ 365 edition", True))
+        self.assertEqual(library.snippet("nothing here" + "丙" * 200, "ACME")[1], False)
+        self.assertEqual(library.snippet("nothing here" + "丙" * 200, "ACME")[0], "nothing here" + "丙" * 48 + "…")   # not found: the start of the field
+
+    def test_graph_pages_list_and_read_compiled_pages(self) -> None:
+        """/graph/pages: the whole page collection is scrolled in batches, then filtered, sorted and paged in process;
+        entity keys become entity ids and documents become paths, the per-kind counts ignore the filters;
+        with_text=false gives only the character count."""
+        import tempfile
+
+        from fastapi.testclient import TestClient
+
+        from kb_pipeline.graph.vectors import entity_id
+        from kb_pipeline.vector.qdrant import graph_collection_alias
+        from kb_search.main import create_app
+
+        gv = "002-v"
+        alpha_text = "Spec A1. " * 10
+        page = lambda pid, kind, title, keys, docs, text="", **kw: {"gr_id": pid, "kind": kind, "type": kind, "title": title, "text": text,
+                                                                    "description": f"Overview of {title}", "entity_keys": keys, "concept_keys": kw.get("concepts", []),
+                                                                    "doc_ids": docs, "graph_version": gv, "path": f"{kind}/{pid}.md", **({"series": kw["series"]} if "series" in kw else {})}
+        payloads = [page("pg-alpha", "subject", "Alpha Widget", ["k-alpha"], ["kb_002:1", "kb_002:9"], alpha_text, series=["rated power 40 W (2024-03)"],
+                         concepts=["c-power"]),
+                    page("pg-index", "index", "Index · kb_002", [], []),
+                    page("pg-power", "timeline", "Rated power timeline", ["k-alpha"], ["kb_002:1"], "2024-03 40 W"),
+                    page("pg-beta", "subject", "Beta Gadget", ["k-beta"], ["kb_002:2"], "Beta Gadget."),
+                    page("pg-src", "source", "2024-03.pdf", ["k-alpha", "k-beta"], ["kb_002:1"], "source page")]
+
+        class FakeQ:
+            def __init__(self, fail=None): self.calls, self.fail = [], fail
+            def scroll(self, collection_name, limit, offset, with_payload, with_vectors, **kw):
+                self.calls.append((collection_name, offset, with_payload, with_vectors))
+                if self.fail:
+                    raise self.fail
+                if offset is None:
+                    return [SimpleNamespace(id=f"x{i}", payload=p) for i, p in enumerate(payloads[:3])], "next"
+                return [SimpleNamespace(id=f"y{i}", payload=p) for i, p in enumerate(payloads[3:])], None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.db")
+            _state_db(path, files=[{"kb_id": "kb_002", "file_key": 1, "rel_path": "reports/2024-03.pdf"},
+                                   {"kb_id": "kb_002", "file_key": 2, "rel_path": "reports/2025.pdf"},
+                                   {"kb_id": "kb_002", "file_key": 3, "rel_path": "reports/2025.pdf", "status": "deleted", "last_seen_at": 9}])
+            src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="datasheets")
+            settings = SimpleNamespace(state_db=path, sources={"kb_002": src})
+            auth = {"Authorization": "Bearer secret"}
+            q = FakeQ()
+            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), q)):
+                client = TestClient(create_app())
+                post = lambda **body: client.post("/graph/pages", json={"kb_id": "kb_002", **body}, headers=auth)
+                out = post().json()
+                self.assertEqual(q.calls, [(graph_collection_alias("kb_002", "page"), None, True, False), (graph_collection_alias("kb_002", "page"), "next", True, False)])
+                self.assertEqual((out["kb_name"], out["graph_version"], out["total"], out["count"], out["has_more"]), ("datasheets", gv, 5, 5, False))
+                self.assertEqual(out["kinds"], {"subject": 2, "timeline": 1, "source": 1, "index": 1})
+                self.assertEqual([p["id"] for p in out["pages"]], ["pg-alpha", "pg-beta", "pg-power", "pg-src", "pg-index"])      # by kind, then by title
+                alpha = out["pages"][0]
+                self.assertEqual((alpha["n"], alpha["kind"], alpha["title"], alpha["summary"], alpha["path"]),
+                                 (1, "subject", "Alpha Widget", "Overview of Alpha Widget", "subject/pg-alpha.md"))
+                self.assertEqual((alpha["text"], alpha["text_chars"], alpha["series"], alpha["concept_keys"]),
+                                 (alpha_text, 90, ["rated power 40 W (2024-03)"], ["c-power"]))
+                self.assertEqual(alpha["entity_ids"], [entity_id("k-alpha")])
+                self.assertEqual((alpha["doc_ids"], alpha["docs"]), (["kb_002:1", "kb_002:9"], ["reports/2024-03.pdf", None]))   # a path that cannot be resolved stays empty
+                self.assertEqual(out["pages"][4]["series"], [])
+                # filters: kind + paging; the per-kind counts are not affected
+                subj = post(kind="subject", limit=1, offset=1).json()
+                self.assertEqual(([(p["n"], p["id"]) for p in subj["pages"]], subj["total"], subj["has_more"], subj["kinds"]["timeline"]), ([(2, "pg-beta")], 2, False, 1))
+                self.assertEqual([p["id"] for p in post(title=" rated power time ").json()["pages"]], ["pg-power"])            # whitespace and case ignored
+                self.assertEqual([p["id"] for p in post(entity_id=entity_id("k-beta")).json()["pages"]], ["pg-beta", "pg-src"])
+                self.assertEqual([p["id"] for p in post(doc_id="kb_002:2").json()["pages"]], ["pg-beta"])
+                self.assertEqual([p["id"] for p in post(rel_path="reports/2024-03.pdf").json()["pages"]], ["pg-alpha", "pg-power", "pg-src"])
+                self.assertEqual([p["id"] for p in post(rel_path="reports/2025.pdf").json()["pages"]], ["pg-beta"])        # one path deleted and put back: the live one wins
+                self.assertEqual([p["id"] for p in post(id="pg-index").json()["pages"]], ["pg-index"])
+                bare = post(with_text=False, limit=2).json()
+                self.assertTrue(all("text" not in p and p["text_chars"] >= 0 for p in bare["pages"]))
+                self.assertEqual((bare["count"], bare["has_more"], bare["pages"][0]["text_chars"]), (2, True, 90))
+                # parameter validation, unknown knowledge base, unknown document, auth
+                for bad in ({"kind": "chapter"}, {"limit": 0}, {"limit": 101}, {"offset": -1}, {"title": "x" * 201}):
+                    self.assertEqual(post(**bad).status_code, 422, bad)
+                self.assertEqual(post(rel_path="reports/missing.pdf").status_code, 404)
+                self.assertEqual(post(doc_id="kb_002:1", rel_path="reports/2025.pdf").status_code, 422)       # both given but naming different documents
+                self.assertEqual(client.post("/graph/pages", json={"kb_id": "kb_404"}, headers=auth).status_code, 404)
+                self.assertEqual(client.post("/graph/pages", json={"kb_id": "kb_002"}).status_code, 401)
+            # no page collection: 404; the main store unreachable: 503
+            gone = type("UnexpectedResponse", (Exception,), {"status_code": 404})("Not found: Collection doesn't exist")
+            for err, code in ((gone, 404), (ConnectionError("refused"), 503)):
+                with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), FakeQ(fail=err))):
+                    self.assertEqual(TestClient(create_app()).post("/graph/pages", json={"kb_id": "kb_002"}, headers=auth).status_code, code)
+
+    def test_graph_facts_by_document_and_conflict_group(self) -> None:
+        """The three new /graph/facts conditions: by document (doc_id or rel_path) and conflict groups only, intersected
+        with subject / property. Every row carries subject_id / doc_id / concept_key; conflict groups sort together; with
+        a document the first page lists that document's properties."""
+        import tempfile
+
+        from fastapi.testclient import TestClient
+
+        from kb_search.main import create_app
+
+        log: list = []
+        gv = "002-v"
+
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, cypher, **kw):
+                text = str(getattr(cypher, "text", cypher))
+                log.append((text, kw))
+                rows: list = []
+                if "replace(toLower(e.title), ' ', '') = $name" in text:
+                    rows = [{"id": "e-main", "title": "Alpha Widget", "type": "product", "parent_type": "entity", "scope": None, "description": "",
+                             "pagerank": 0.2, "degree": 30, "aliases": []}]
+                elif "RETURN DISTINCT f.concept_key AS key" in text:
+                    rows = [{"key": "c-power"}]
+                elif "count(f) AS total" in text:
+                    rows = [{"total": 2}]
+                elif "AS row" in text:
+                    rows = [{"row": {"id": "f1", "subject": "Alpha Widget", "property": "rated power", "concept_key": "c-power", "value": "40",
+                                     "conflict_group": "g1", "doc_id": "kb_002:1"}, "subject_id": "e-main"},
+                            {"row": {"id": "f2", "subject": "Alpha Widget", "property": "P_rated", "concept_key": "c-power", "value": "45",
+                                     "conflict_group": "g1", "doc_id": "kb_002:1"}, "subject_id": None}]
+                elif "count(f) AS n" in text:
+                    rows = [{"concept": "rated power", "concept_key": "c-power", "n": 2}]
+                return SimpleNamespace(data=lambda: rows)
+
+        driver = SimpleNamespace(session=lambda: Session(), close=mock.Mock())
+        src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="datasheets")
+        run = lambda **kw: graphwalk.list_facts(SimpleNamespace(), src, fields=service.FACT_FIELDS, q=None, driver=driver, **kw)
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv):
+            out = run(doc_id="kb_002:1", conflict_only=True)
+            total_q = next((t, kw) for t, kw in log if "count(f) AS total" in t)
+            self.assertIn("MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE true AND f.doc_id = $doc AND f.conflict_group IS NOT NULL", total_q[0])
+            self.assertEqual(total_q[1]["doc"], "kb_002:1")
+            listing = next(t for t, kw in log if "AS row" in t)
+            self.assertIn("OPTIONAL MATCH (s:Entity {kb_id: $kb, graph_version: $gv})-[:HAS_SPEC]->(f)", listing)     # which entity each fact hangs under
+            self.assertIn("min(s.id) AS subject_id", listing)
+            self.assertIn("ORDER BY coalesce(f.conflict_group, ''), coalesce(f.subject, ''),", listing)              # one conflict group sorts together
+            self.assertIn("SKIP $offset LIMIT $limit", listing)
+            props = next(t for t, kw in log if "count(f) AS n" in t)
+            self.assertIn("WHERE f.doc_id = $doc RETURN", props); self.assertNotIn("conflict_group", props)          # the property summary is scoped by the document
+            self.assertEqual(out["filters"], {"doc_id": "kb_002:1", "conflict_only": True})
+            self.assertEqual(out["properties"], [{"concept": "rated power", "concept_key": "c-power", "count": 2}])
+            f1, f2 = out["facts"]
+            self.assertEqual((f1["subject_id"], f1["doc_id"], f1["concept_key"], f1["conflict_group"], f1["conflict"]), ("e-main", "kb_002:1", "c-power", "g1", True))
+            self.assertNotIn("subject_id", f2); self.assertEqual(f2["doc_id"], "kb_002:1")
+            # property + document: the exact / containment probe also runs inside the document; a second page of a document listing has no property summary
+            log.clear()
+            out2 = run(prop="P_rated", doc_id="kb_002:1", offset=2)
+            probe = next(t for t, kw in log if "RETURN DISTINCT f.concept_key" in t)
+            self.assertIn(" AND f.doc_id = $doc RETURN DISTINCT", probe)
+            self.assertNotIn("properties", out2); self.assertEqual(out2["filters"], {"doc_id": "kb_002:1"})
+            # subject + conflict: taken along the subject's fact edges, subject_id is that subject; without a document filters has no doc_id
+            log.clear()
+            out3 = run(subject="Alpha Widget", conflict_only=True)
+            listing = next(t for t, kw in log if "AS row" in t)
+            self.assertIn("e.id AS subject_id ORDER BY coalesce(f.conflict_group, ''), coalesce(f.concept, f.property, '')", listing)
+            self.assertNotIn("OPTIONAL MATCH", listing)
+            self.assertIn("WHERE true RETURN coalesce(f.concept", next(t for t, kw in log if "count(f) AS n" in t))       # with only a subject the summary is as before
+            self.assertEqual(out3["filters"], {"conflict_only": True})
+            # none of the new conditions: behaviour as before, no filters, no conflict-group ordering
+            log.clear()
+            out4 = run(subject="Alpha Widget")
+            self.assertNotIn("filters", out4)
+            self.assertNotIn("conflict_group, ''", next(t for t, kw in log if "AS row" in t))
+        # the fact projection of /search is unchanged; the facts endpoint adds three columns
+        self.assertNotIn("subject_id", service.SPEC_FIELDS); self.assertNotIn("doc_id", service.SPEC_FIELDS); self.assertNotIn("concept_key", service.SPEC_FIELDS)
+        self.assertEqual(service.FACT_FIELDS[-3:], ("subject_id", "doc_id", "concept_key"))
+        self.assertEqual(service.FACT_FIELDS[:-3], tuple(f for f in service.SPEC_FIELDS if f not in ("sources", "score")))
+        # endpoint: the relaxed 422 rule; rel_path is turned into a doc_id through the state database
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.db")
+            _state_db(path, files=[{"kb_id": "kb_002", "file_key": 1, "rel_path": "reports/2024-03.pdf"}])
+            settings = SimpleNamespace(state_db=path, sources={"kb_002": src})
+            auth = {"Authorization": "Bearer secret"}
+            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), None)), \
+                    mock.patch.object(graphwalk, "list_facts", return_value={"total": 1}) as lf, \
+                    mock.patch.object(channels, "shared_driver", return_value=driver):
+                client = TestClient(create_app())
+                post = lambda **body: client.post("/graph/facts", json={"kb_id": "kb_002", **body}, headers=auth)
+                self.assertEqual(post(conflict_only=True).status_code, 200)
+                self.assertEqual((lf.call_args.kwargs["conflict_only"], lf.call_args.kwargs["doc_id"]), (True, None))
+                self.assertEqual(post(rel_path="reports/2024-03.pdf").status_code, 200)
+                self.assertEqual(lf.call_args.kwargs["doc_id"], "kb_002:1")
+                self.assertEqual(post(doc_id="kb_002:7").status_code, 200)
+                self.assertEqual(lf.call_args.kwargs["doc_id"], "kb_002:7")
+                for bad in ({}, {"conflict_only": False}, {"doc_id": "  "}, {"property": " "}, {"rel_path": "/"}, {"rel_path": " // "}):
+                    self.assertEqual(post(**bad).status_code, 422, bad)                                  # at least one of subject, property, document and conflict
+                self.assertEqual(post(rel_path="reports/missing.pdf").status_code, 404)
+                self.assertEqual(post(doc_id="kb_002:2", rel_path="reports/2024-03.pdf").status_code, 422)
+                self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_404", "conflict_only": True}, headers=auth).status_code, 404)
+                self.assertEqual(client.post("/graph/facts", json={"kb_id": "kb_002", "conflict_only": True}).status_code, 401)
 
 
 class SkillClientTests(unittest.TestCase):

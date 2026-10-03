@@ -39,7 +39,10 @@ Skill 检索一次就作答：先是答案，然后列出所依据的文件（�
 | `POST /crop` | 裁剪该图片中的指定区域 |
 | `POST /graph/neighbors` | 查询实体周围带证据的关系，每条关系带一段原文摘录 |
 | `POST /graph/entities` | 按类型、上层类或名称列出实体，带总数和翻页 |
-| `POST /graph/facts` | 列出某个主体的结构化事实，或某个属性在各主体上的事实，带总数和翻页 |
+| `POST /graph/facts` | 列出某个主体的结构化事实、某个属性在各主体上的事实、某份文档里的事实，或只列带跨文档冲突组的事实，带总数和翻页 |
+| `POST /graph/pages` | 按类别、标题、实体或文档列出编译页面（主体页、时间线页、来源页、索引页），可带全文 |
+| `POST /docs` | 列出一个知识库的全部文档，带类型、入库状态、切块数和最近一次未解决的失败 |
+| `POST /grep` | 统计若干短语出现在多少切块、哪些文档里，附前几条命中和逐字核对 |
 
 控制台在端口 9800 使用独立的 `/api` 管理接口，智能体通常连接端口 9810 的检索服务。
 
@@ -115,13 +118,43 @@ curl -sS http://127.0.0.1:9810/search \
 
 `POST /graph/entities` 接受 `kb_id`，以及可选的 `types`、`parent_types`（上层类 `entity`、`part`、`property`、`process`、`standard`、`document`）、`name`（标题或别名中包含的文字）、`limit`（默认 50，最多 200）和 `offset`。实体按重要程度排序，每个实体带 `docs`（提及它最多的文档）和 `doc_count`。第一页同时返回 `types`，即该知识库各类型的实体数量。
 
-`POST /graph/facts` 接受 `kb_id`、主体名称 `subject` 或 `subject_id`、可选的 `property`（属性名、符号或概念名）、`match`（`auto`、`exact` 或 `contains`）、`limit` 和 `offset`。主体与属性至少提供一个。返回行的结构与 `/search` 的 `specs` 相同，并带 `evidence` 列表，其中的位置可用于 `/context`。
+`POST /graph/facts` 接受 `kb_id`、主体名称 `subject` 或 `subject_id`、可选的 `property`（属性名、符号或概念名）、`match`（`auto`、`exact` 或 `contains`）、以 `doc_id` 或 `rel_path` 指定的文档、`conflict_only`、`limit` 和 `offset`。主体、属性、文档、`conflict_only` 至少提供一个，多个条件取交集。返回行的结构与 `/search` 的 `specs` 相同，并带 `evidence` 列表，其中的位置可用于 `/context`；每行有值时另带 `subject_id`（事实所属的实体）、`doc_id`（事实出自的文档）和 `concept_key`，取不到值的字段直接省略（不挂在任何实体下的事实没有 `subject_id`，没有记录来源文档的事实没有 `doc_id`）。
 
 - 属性命中后，同一规范概念下的各种写法一并返回。`match=auto` 先精确匹配，没有结果时才按包含匹配；`property.matched` 说明实际采用的方式。
-- 只提供主体时，第一页同时返回 `properties`，即该主体拥有的属性及数量。
+- 提供主体或文档时，第一页同时返回 `properties`，即这个范围里的属性及数量。
+- 按 `rel_path` 指定的文档经状态库换成 `doc_id`；同一路径先后有过几个文件时，取没有删除的那个。路径不存在返回 HTTP 404，`doc_id` 与 `rel_path` 指向不同文档返回 HTTP 422。指定文档时，属性匹配也只在这份文档里进行。
+- `conflict_only=true` 只保留带跨文档冲突组的事实，同一组的事实排在一起。文档与冲突条件会回显在 `filters` 里。
 - `total`、`offset` 和 `has_more` 描述完整结果；用更大的 `offset` 请求下一页。
 - 实体名称不区分大小写、不计空格。名称没有匹配时 `found=false`，`candidates` 列出相近实体，可按 ID 选择。
-- 两个接口列出的是图谱在抽取时登记的内容，不能证明文档里没有其他内容。
+- 这些接口列出的是图谱在抽取时登记的内容，不能证明文档里没有其他内容。
+
+### 编译页面
+
+`POST /graph/pages` 用于整页读取编译页面，不必等检索恰好命中。它接受 `kb_id`，以及可选的 `kind`（`subject`、`timeline`、`source` 或 `index`）、`title`（标题中包含的文字，不区分大小写、不计空格）、`id`（页面 ID）、`entity_id`、以 `doc_id` 或 `rel_path` 指定的文档、`with_text`（默认 true）、`limit`（默认 20，最多 100）和 `offset`。
+
+- 响应带 `kb_name`、`graph_version`、`kinds`、`pages`，以及与 `/graph/entities` 相同的翻页字段 `total`、`offset`、`limit`、`count` 和 `has_more`。
+- 页面先按上述类别顺序、再按标题排序。`kinds` 是整个知识库各类页面的数量，不受筛选条件影响。
+- 每个页面带 `n`（在完整结果中的序号）、`id`、`kind`、`title`、`summary`、`text`（`with_text=false` 时省略，`text_chars` 始终给出它的长度）、`series`、`docs`（文档路径，已无法对应的位置为 `null`）及对应的 `doc_ids`、`entity_ids`（可直接用于 `/graph/neighbors` 和 `/graph/facts`）、`concept_keys` 和 `path`（页面在编译视图里的文件路径，例如 `index.md` 或 `subjects/` 下的某个路径）。
+- 页面正文存储时截到 8000 字以内，每个页面最多记录 32 份文档、32 个实体，因此按文档或实体筛选可能漏掉涉及更多文档或实体的页面。
+- 知识库没有页面集合时返回 HTTP 404；向量库无法访问时返回 HTTP 503。
+
+### 文档清单与短语计数
+
+问题需要完整的文档清单，或某个短语出现的次数，而不是最相关的几段原文时，使用这两个接口。
+
+`POST /docs` 接受 `kb_id`，以及可选的 `dir`（该目录及其子目录下的文档）、`name`（`rel_path` 中包含的文字，不区分大小写）、`include_deleted`、`limit`（默认 500，最多 2000）和 `offset`。文档清单读自状态库，按 `rel_path` 排序。响应带 `kb_name`、`totals`、`docs`，以及翻页字段 `total`、`offset`、`limit`、`count` 和 `has_more`。每份文档带 `n`（在完整结果中的序号）、`doc_id`、`rel_path`、`filename`、`dir`、`doc_type`、`mime_type`、`size`、`mtime`、`content_version`、`status`、`indexed`、`chunk_total`、`parser_profile` 和 `first_seen_at`，有记录时另带 `diag`（切块验收的摘要）和 `last_error`（最近一次未解决的失败）。
+
+- `chunk_total` 只计现行内容版本的活跃切块，与检索能看到的一致；解析版本就是现行版本并且切出了切块时，`indexed` 为 true。`totals` 汇总符合筛选条件的全部文档，不受翻页影响，含 `files`、`indexed`、`not_indexed` 和 `chunks` 四项。
+- 失败消息截到 300 字以内，去掉堆栈和服务器路径。响应里只有知识库内的相对路径。
+- `POST /docs` 与交互式接口文档页（`GET /docs`）同一路径、不同方法，互不影响。
+
+`POST /grep` 接受 `kb_id`、`phrases`（1–8 个，去掉首尾空白后每个 1–200 字）、用于限定范围的可选 `rel_paths` 和 `doc_ids`（各最多 500 个）、`fields`（`body`、`title`、`visual` 中的若干个，默认三个都查）和 `limit`（每个短语返回的命中数，默认 30，最多 200；`0` 只返回计数）。
+
+- 响应带 `kb_name`、`fields`（实际查的字段）、`scope`（`rel_paths` 与 `doc_ids` 各限定了多少个）、`note`（计数的读法）和 `results`，每个短语一项。
+- 每个短语返回 `total_chunks`、`docs`（命中的每份文档及其切块数，切块多的在前）和按路径、切块序号排序的 `hits`。每条命中带位置、命中的字段 `field`，以及短语前后的一小段片段，不返回整段原文。
+- 计数采用关键词索引分析器的短语匹配。中日韩文字按二元组建索引，匹配可能比字面短语宽松，因此每条返回的命中另做一次逐字核对（经 Unicode NFKC 归一并去掉空白后比较）：每条命中带 `literal`，每个短语带 `literal_checked` 和 `literal_true`。总数没有逐条核对。
+- 只计现行内容版本的切块。关键词索引同步还没跟上的文档，计数可能与现状有出入。`docs_truncated` 表示命中的文档超过 1000 份。
+- 关键词索引尚未建立时按 0 命中处理并在 `degraded` 里记录；无法访问时返回 HTTP 503。
 
 响应中带知识库的目录名（`/search` 为 `kb_names`，其余为 `kb_name`）。引用文档时写作 `<目录名>/<rel_path>`，后接 `place`：来源和证据切块自带的短定位（页码、幻灯片或工作表行；不分页的文档为最深一级标题）。
 

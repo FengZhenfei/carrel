@@ -77,7 +77,10 @@ in the service's own environment take precedence over the file.
 | `POST /crop` | Crop a selected region of that image |
 | `POST /graph/neighbors` | Fetch evidence-backed relationships around an entity, each with an excerpt of the original text |
 | `POST /graph/entities` | List entities by type, upper class, or name, with a total and paging |
-| `POST /graph/facts` | List the structured facts of a subject, or of a property across subjects, with a total and paging |
+| `POST /graph/facts` | List the structured facts of a subject, of a property across subjects, or of a document, or only those in cross-document conflict groups, with a total and paging |
+| `POST /graph/pages` | List compiled pages (subject, timeline, source, and index pages) by kind, title, entity, or document, with their full text |
+| `POST /docs` | List every document of a knowledge base with its type, index state, chunk count, and latest unresolved failure |
+| `POST /grep` | Count the chunks and documents in which literal phrases appear, with the first hits and a literal check |
 
 The console has a separate `/api` namespace on port 9800 for administration.
 Agents normally use the search service on port 9810.
@@ -227,22 +230,116 @@ type in this knowledge base.
 
 `POST /graph/facts` accepts `kb_id`, a `subject` title or `subject_id`, an
 optional `property` (property name, symbol, or concept name), `match`
-(`auto`, `exact`, or `contains`), `limit`, and `offset`. At least one of
-subject and property is required. Rows have the shape of `specs` in
-`/search` and carry an `evidence` list whose positions can be passed to
-`/context`.
+(`auto`, `exact`, or `contains`), a document as `doc_id` or `rel_path`,
+`conflict_only`, `limit`, and `offset`. At least one of subject, property,
+document, and `conflict_only` is required, and the conditions intersect. Rows
+have the shape of `specs` in `/search` and carry an `evidence` list whose
+positions can be passed to `/context`. When known, each row also carries
+`subject_id` (the entity the fact belongs to), `doc_id` (the document it came
+from), and `concept_key`; a field without a value is left out (a fact that
+hangs under no entity has no `subject_id`, one with no recorded document has no
+`doc_id`).
 
 - A matched property brings every spelling of the same normalized concept
   with it. `match=auto` tries an exact match first and containment only when
   nothing matched; `property.matched` reports which one applied.
-- With a subject only, the first page also returns `properties`: the
-  properties this subject has, with counts.
+- With a subject or a document, the first page also returns `properties`: the
+  properties in that scope, with counts.
+- A document named by `rel_path` is resolved to its `doc_id` through the state
+  database; when one path has held several files, the one not deleted wins. An
+  unknown path answers HTTP 404, and a `doc_id` and `rel_path` that name
+  different documents answer HTTP 422. With a document, the property match
+  also runs inside that document.
+- `conflict_only=true` keeps only facts in a cross-document conflict group and
+  sorts the facts of each group next to each other. Document and conflict
+  filters are echoed in `filters`.
 - `total`, `offset`, and `has_more` describe the whole result; request the
   next page with a larger `offset`.
 - Entity names ignore case and spaces. When a name does not match,
   `found=false` and `candidates` lists similar entities to choose from by ID.
-- Both endpoints list what the graph registered during extraction. They do not
+- These endpoints list what the graph registered during extraction. They do not
   prove that the documents contain nothing else.
+
+### Compiled pages
+
+`POST /graph/pages` reads compiled pages whole instead of waiting for a search
+to hit them. It accepts `kb_id` and optional `kind` (`subject`, `timeline`,
+`source`, or `index`), `title` (text contained in the title, ignoring case and
+spaces), `id` (a page ID), `entity_id`, a document as `doc_id` or `rel_path`,
+`with_text` (true by default), `limit` (20 by default, at most 100), and
+`offset`.
+
+- The response carries `kb_name`, `graph_version`, `kinds`, `pages`, and the
+  paging fields `total`, `offset`, `limit`, `count`, and `has_more`, as in
+  `/graph/entities`.
+- Pages are sorted by kind in the order above, then by title. `kinds` counts
+  the pages of each kind in the whole knowledge base, independent of the
+  filters.
+- Each page carries `n` (its position in the whole result), `id`, `kind`,
+  `title`, `summary`, `text` (left out with `with_text=false`; `text_chars`
+  always gives its length), `series`, `docs` (paths, `null` where a document
+  can no longer be resolved) with the matching `doc_ids`, `entity_ids` (usable
+  with `/graph/neighbors` and `/graph/facts`), `concept_keys`, and `path` (the
+  page's file path in the compiled view, such as `index.md` or a path under
+  `subjects/`).
+- Page text is stored cut to 8,000 characters, and a page records at most 32
+  documents and 32 entities, so filtering by document or entity can miss pages
+  that involve more.
+- A knowledge base without a page collection answers HTTP 404; an unreachable
+  vector store answers HTTP 503.
+
+### Documents and phrase counts
+
+Use these two endpoints when a question needs the complete list of documents
+or how often a phrase occurs, rather than the most relevant passages.
+
+`POST /docs` accepts `kb_id` and optional `dir` (documents under this
+directory, subdirectories included), `name` (text contained in `rel_path`,
+ignoring case), `include_deleted`, `limit` (500 by default, at most 2000), and
+`offset`. Documents are read from the state database and sorted by
+`rel_path`. The response carries `kb_name`, `totals`, `docs`, and the paging
+fields `total`, `offset`, `limit`, `count`, and `has_more`. Each document
+carries `n` (its position in the whole result), `doc_id`, `rel_path`,
+`filename`, `dir`, `doc_type`, `mime_type`, `size`, `mtime`,
+`content_version`, `status`, `indexed`, `chunk_total`, `parser_profile`, and
+`first_seen_at`, plus `diag` (a summary of the chunking check) and
+`last_error` (the latest unresolved failure) when present.
+
+- `chunk_total` counts only active chunks of the current content version, the
+  ones search can see; `indexed` is true when the parsed version is the
+  current one and produced chunks. `totals` summarises every document that
+  matches the filters, independent of paging: `files`, `indexed`,
+  `not_indexed`, and `chunks`.
+- Failure messages are cut to 300 characters, without the stack trace and
+  with server paths removed. Responses carry only paths relative to the
+  knowledge base.
+- `POST /docs` shares its path with the interactive API page (`GET /docs`);
+  the two methods do not interfere.
+
+`POST /grep` accepts `kb_id`, `phrases` (1–8, each 1–200 characters after
+trimming), optional `rel_paths` and `doc_ids` (up to 500 each) to restrict the
+scope, `fields` (any of `body`, `title`, and `visual`; all three by default),
+and `limit` (hits returned per phrase, 30 by default, at most 200; `0` returns
+counts only).
+
+- The response carries `kb_name`, `fields` (the fields searched), `scope` (how
+  many `rel_paths` and `doc_ids` restrict it), `note` (how to read the
+  counts), and `results`, one entry per phrase.
+- For each phrase the result gives `total_chunks`, `docs` (each matching
+  document with its chunk count, most chunks first), and `hits` sorted by path
+  and chunk index. A hit carries its position, the `field` it was found in,
+  and a short snippet around the phrase rather than the whole chunk.
+- Counts are phrase matches of the keyword index's analyzer. CJK text is
+  indexed as character bigrams, so a match can be looser than the literal
+  phrase. Each returned hit is therefore checked for a literal occurrence
+  after Unicode (NFKC) normalisation and whitespace removal: `literal` per hit,
+  `literal_checked` and `literal_true` per phrase. Totals are not checked one
+  by one.
+- Only chunks of current content versions are counted. For a document whose
+  keyword-index sync has not caught up yet, counts can differ from the current
+  state. `docs_truncated` marks a phrase found in more than 1,000 documents.
+- A keyword index that does not exist yet counts as zero hits with a
+  `degraded` entry; an unreachable one answers HTTP 503.
 
 Responses carry the knowledge base's folder name (`kb_names` in `/search`,
 `kb_name` elsewhere). A document is cited as `<folder name>/<rel_path>`,

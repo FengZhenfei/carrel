@@ -5,10 +5,10 @@ import hmac
 import io
 import json
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import service
 
@@ -70,10 +70,52 @@ class FactsRequest(BaseModel):
     kb_id: str
     subject: str | None = Field(default=None, max_length=200)      # the subject's title or alias (case-insensitive)
     subject_id: str | None = Field(default=None, max_length=200)   # or the entity id directly
-    prop: str | None = Field(default=None, max_length=200, alias="property")   # property name / symbol / canonical concept name; at least one of subject and property
+    prop: str | None = Field(default=None, max_length=200, alias="property")   # property name / symbol / canonical concept name
     match: str = Field(default="auto", pattern="^(auto|exact|contains)$")      # auto: exact first, containment only when nothing matched
+    doc_id: str | None = Field(default=None, max_length=200)       # only the facts drawn from this document
+    rel_path: str | None = Field(default=None, max_length=1000)    # or the document by its path inside the knowledge base
+    conflict_only: bool = False                                    # only facts in a cross-document conflict group; at least one of subject, property, document and this
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class PagesRequest(BaseModel):
+    kb_id: str
+    kind: str | None = Field(default=None, pattern="^(subject|timeline|source|index)$")
+    title: str | None = Field(default=None, max_length=200)        # the title contains this text (case-insensitive, whitespace ignored)
+    id: str | None = Field(default=None, max_length=200)           # page id
+    entity_id: str | None = Field(default=None, max_length=200)    # pages involving this entity
+    doc_id: str | None = Field(default=None, max_length=200)       # pages involving this document
+    rel_path: str | None = Field(default=None, max_length=1000)
+    with_text: bool = True
+    limit: int = Field(default=20, ge=1, le=100)
+    offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class DocsRequest(BaseModel):
+    kb_id: str
+    dir: str | None = Field(default=None, max_length=500)          # only documents under this directory (subdirectories included), compared as a "dir/" prefix
+    name: str | None = Field(default=None, max_length=200)         # rel_path contains this text (case-insensitive)
+    include_deleted: bool = False
+    limit: int = Field(default=500, ge=1, le=2000)
+    offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class GrepRequest(BaseModel):
+    kb_id: str
+    phrases: list[str] = Field(min_length=1, max_length=8)
+    rel_paths: list[str] | None = Field(default=None, max_length=500)
+    doc_ids: list[str] | None = Field(default=None, max_length=500)
+    fields: list[Literal["body", "title", "visual"]] | None = Field(default=None, min_length=1)
+    limit: int = Field(default=30, ge=0, le=200)                   # hits returned per phrase; 0 returns counts only
+
+    @field_validator("phrases")
+    @classmethod
+    def _phrases(cls, value: list[str]) -> list[str]:
+        out = [str(p).strip() for p in value]
+        if any(not 1 <= len(p) <= 200 for p in out):
+            raise ValueError("each phrase must be 1-200 characters after trimming")
+        return out
 
 
 class CropRequest(BaseModel):
@@ -188,5 +230,24 @@ def graph_entities(req: EntitiesRequest) -> dict[str, Any]:
 @router.post("/graph/facts", dependencies=[Depends(require_token)])
 def graph_facts(req: FactsRequest) -> dict[str, Any]:
     return _wrap(service.graph_facts, req.kb_id, subject=req.subject, subject_id=req.subject_id, prop=req.prop, match=req.match,
-                 limit=req.limit, offset=req.offset)
+                 doc_id=req.doc_id, rel_path=req.rel_path, conflict_only=req.conflict_only, limit=req.limit, offset=req.offset)
+
+
+@router.post("/graph/pages", dependencies=[Depends(require_token)])
+def graph_pages(req: PagesRequest) -> dict[str, Any]:
+    return _wrap(service.graph_pages, req.kb_id, kind=req.kind, title=req.title, page_id=req.id, entity_id=req.entity_id, doc_id=req.doc_id,
+                 rel_path=req.rel_path, with_text=req.with_text, limit=req.limit, offset=req.offset)
+
+
+# POST /docs shares its path with FastAPI's own API documentation page (GET /docs) under a different method; the
+# two do not interfere
+@router.post("/docs", dependencies=[Depends(require_token)])
+def docs(req: DocsRequest) -> dict[str, Any]:
+    return _wrap(service.docs, req.kb_id, dir=req.dir, name=req.name, include_deleted=req.include_deleted, limit=req.limit, offset=req.offset)
+
+
+@router.post("/grep", dependencies=[Depends(require_token)])
+def grep(req: GrepRequest) -> dict[str, Any]:
+    return _wrap(service.grep, req.kb_id, req.phrases, fields=list(req.fields) if req.fields else None, rel_paths=req.rel_paths,
+                 doc_ids=req.doc_ids, limit=req.limit)
 

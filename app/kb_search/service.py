@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -929,21 +930,85 @@ def graph_entities(kb_id: str, *, types: list[str] | None = None, parent_types: 
                                    offset=offset, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
-FACT_FIELDS = tuple(f for f in SPEC_FIELDS if f not in ("sources", "score"))      # sources travel as each row's evidence, and there is no retrieval score here
+# sources travel as each row's evidence, and there is no retrieval score here; each row also carries the entity it
+# hangs under, the document it came from and its concept key (needed when taking facts by document or comparing a
+# conflict group)
+FACT_FIELDS = tuple(f for f in SPEC_FIELDS if f not in ("sources", "score")) + ("subject_id", "doc_id", "concept_key")
 
 
 def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | None = None, prop: str | None = None,
-                match: str = "auto", limit: int = 50, offset: int = 0) -> dict[str, Any]:
-    """Qualified facts by subject / property: rows shaped like the specs of /search, with a total and paging;
-    at least one of subject and property is required."""
-    from . import graphwalk
+                match: str = "auto", doc_id: str | None = None, rel_path: str | None = None, conflict_only: bool = False,
+                limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Qualified facts by subject / property / document / conflict: rows shaped like the specs of /search, with a
+    total and paging; at least one of subject, property, document and conflict_only is required (with none of
+    them it would be every fact of the knowledge base, which a listing with clearer paging should serve).
+    rel_path is turned into a doc_id through the state database (graph facts record only doc_id)."""
+    from . import graphwalk, library
 
     settings, ss, q = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
-    if not (subject or subject_id or str(prop or "").strip()):
-        raise ValueError("subject, subject_id or property is required")
+    doc_id = str(doc_id or "").strip() or None
+    # rel_path is normalised the same way as resolve_doc (surrounding whitespace and / removed) before the check: a
+    # bare "/" would otherwise become empty and add no condition at all, listing the whole knowledge base
+    rel_path = str(rel_path or "").strip().strip("/") or None
+    if not (subject or subject_id or str(prop or "").strip() or doc_id or rel_path or conflict_only):
+        raise ValueError("subject, subject_id, property, doc_id, rel_path or conflict_only is required")
+    doc_id = library.resolve_doc(settings, kb_id, doc_id=doc_id, rel_path=rel_path)
     return graphwalk.list_facts(settings, settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
-                                limit=limit, offset=offset, fields=FACT_FIELDS, q=q, driver=channels.shared_driver(settings),
-                                timeout=ss.channel_timeout)
+                                doc_id=doc_id, conflict_only=conflict_only, limit=limit, offset=offset, fields=FACT_FIELDS, q=q,
+                                driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
+
+def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None, page_id: str | None = None, entity_id: str | None = None,
+                doc_id: str | None = None, rel_path: str | None = None, with_text: bool = True, limit: int = 20,
+                offset: int = 0) -> dict[str, Any]:
+    """The list and full text of compiled pages, filtered by kind / title / page id / entity / document; no page
+    collection (no graph) is reported as 404, an unreachable main store as 503."""
+    from . import graphwalk, library
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    doc_id = library.resolve_doc(settings, kb_id, doc_id=str(doc_id or "").strip() or None, rel_path=rel_path)
+    paths = library.doc_paths(settings, kb_id)
+    try:
+        return graphwalk.list_pages(settings, settings.sources[kb_id], kind=kind, title=title, page_id=page_id, entity_id=entity_id,
+                                    doc_id=doc_id, with_text=with_text, limit=limit, offset=offset, paths=paths, q=q)
+    except (KeyError, ValueError):
+        raise
+    except Exception as exc:
+        raise RetrievalUnavailable(f"qdrant: {_err(exc)}") from exc
+
+
+def docs(kb_id: str, *, dir: str | None = None, name: str | None = None, include_deleted: bool = False, limit: int = 500,
+         offset: int = 0) -> dict[str, Any]:
+    """Every document of a knowledge base (the files registered in the state database): path, type, parse state,
+    chunk count and the latest unresolved failure, with a total and paging."""
+    from . import library
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    return library.list_docs(settings, settings.sources[kb_id], dir=dir, name=name, include_deleted=include_deleted, limit=limit,
+                             offset=offset)
+
+
+def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
+         doc_ids: list[str] | None = None, limit: int = 30) -> dict[str, Any]:
+    """Literal phrase counts: in how many chunks and which documents each phrase appears, with the first few hits
+    and a literal check; an unreachable keyword index is reported as 503."""
+    from . import library
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    if not [p for p in phrases if str(p).strip()]:
+        raise ValueError("phrases must not be empty")
+    try:
+        return library.grep(settings, settings.sources[kb_id], phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, limit=limit,
+                            client=channels.os_client(settings.opensearch_url), timeout=ss.channel_timeout)
+    except (KeyError, ValueError, sqlite3.Error):
+        raise                   # state-database errors are not the keyword index's; they go to the common error handling as they are (a lock is reported as 503)
+    except Exception as exc:
+        raise RetrievalUnavailable(f"opensearch: {_err(exc)}") from exc

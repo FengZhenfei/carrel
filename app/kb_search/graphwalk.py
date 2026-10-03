@@ -1,13 +1,15 @@
 """Structured graph lookups: the agent walks the graph and lists things step by step itself (multi-hop
 reasoning lives on the agent side; blindly expanding three to five hops showed no gain at all in evaluation).
-All three endpoints only read the current graph version and generate nothing:
+All four endpoints only read the current graph version and generate nothing:
 - neighbours: given an entity (name or id), its one-hop relations: predicate, direction, weight, the entity
   at the other end and evidence chunks (ready for /context); every relation carries an excerpt of the original
   text that names the far end, and the entity's relation counts per predicate come along; the name is first
   matched exactly by title / alias, and if nothing matches a few candidates are offered by vector for the agent
   to choose from;
 - entities: entities by type / upper class / name, with a total and paging ("all of them" questions);
-- facts: qualified facts by subject / property, with a total and paging, rows shaped like the specs of /search.
+- facts: qualified facts by subject / property / document / conflict, with a total and paging, rows shaped
+  like the specs of /search;
+- pages: compiled pages by kind / title / entity / document, optionally with their full text.
 /search additionally carries the one-hop neighbourhood of its subjects (neighborhoods): for each entity the question
 names, a few of its strongest relations, so the agent can decide where to walk next.
 What is listed is what the graph registered (the result of model extraction), not a complete inventory of the
@@ -61,9 +63,12 @@ FACT_MATCH = {
     "contains": "(" + " OR ".join(f"toLower(coalesce({k}, '')) CONTAINS $p" for k in _FACT_TEXT_KEYS) + ")",
 }
 # The basic graph-database fields a fact falls back to when its payload cannot be fetched from the fact
-# collection (the alias is switching versions)
+# collection (the alias is switching versions); doc_id is also used to give every row its source document (the
+# payload projection does not carry it)
 _FACT_BASIC = ("id", "subject", "property", "symbol", "concept", "concept_key", "value", "min", "typ", "max", "unit", "unit_canonical",
-               "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section")
+               "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section", "doc_id")
+PAGE_KINDS = ("subject", "timeline", "source", "index")
+PAGE_SCROLL = 256
 
 
 def kb_name(source: Any) -> str | None:
@@ -714,20 +719,27 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
 
 
 def list_facts(settings: Settings, source: KBSource, *, subject: str | None = None, subject_id: str | None = None,
-               prop: str | None = None, match: str = "auto", limit: int = 50, offset: int = 0,
-               fields: tuple[str, ...] | None = None, q: Any = None, driver: Any = None, timeout: float | None = None) -> dict[str, Any]:
-    """List the qualified facts of the current graph version by subject / property, with a total and paging
-    ("every parameter of this subject", "this property across subjects").
+               prop: str | None = None, match: str = "auto", doc_id: str | None = None, conflict_only: bool = False,
+               limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, driver: Any = None,
+               timeout: float | None = None) -> dict[str, Any]:
+    """List the qualified facts of the current graph version by subject / property / document, with a total and
+    paging ("every parameter of this subject", "this property across subjects", "the facts registered from this
+    document", "the values that disagree across documents").
     The subject is found by id or name (title / alias) and its facts are taken along the HAS_SPEC edges; with
     several entities of the same name the one with the most relations is used and the rest are listed in
     matches. The property is matched against the property name / symbol / canonical concept name: match=auto
     tries exact first and falls back to containment only when nothing matched; every spelling under the matched
     concept keys comes back with it (the ones concept normalisation folded into one, such as "TC" and "total
     cholesterol result").
+    doc_id keeps only the facts drawn from that document; conflict_only keeps only the facts in a cross-document
+    conflict group, with each group's facts next to each other. The conditions are intersected; the exact-then-
+    containment property probe also runs inside the document / conflict scope, so that a spelling found only in
+    other documents does not leave this document with nothing.
     Fact rows are taken from the payloads of the fact collection, the same projection as the specs of /search,
     so hint strings, series, conflicts and source verification follow the same rules; every row also carries
-    the locators of its evidence chunks (ready for /context). With only a subject, the first page also lists the
-    properties this subject has."""
+    the locators of its evidence chunks (ready for /context), the entity it hangs under (subject_id) and the
+    document it came from (doc_id). With a subject or a document, the first page also lists the properties in
+    that scope."""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
     from kb_pipeline.graph.recall import TimedSession, spec_result_row
     from kb_pipeline.graph.vectors import point_id_for
@@ -766,10 +778,17 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             params: dict[str, Any] = {"kb": source.kb_id, "gv": gv, "p": needle, "keys": []}
             if center is not None:
                 params["sid"] = str(center["id"])
+            # The document and conflict conditions go into the property probe, the count and the listing; the property
+            # summary is scoped by the document only (it answers "which properties does this scope have")
+            in_doc = "f.doc_id = $doc" if doc_id else ""
+            if doc_id:
+                params["doc"] = str(doc_id)
+            narrow = " AND ".join(c for c in (in_doc, "f.conflict_group IS NOT NULL" if conflict_only else "") if c)
+            also = f" AND {narrow}" if narrow else ""
             where, matched, keys = "true", None, []
             if needle:
                 for mode in (("exact", "contains") if match == "auto" else (match,)):
-                    found_keys = session.run(f"{scope} WHERE {FACT_MATCH[mode]} RETURN DISTINCT f.concept_key AS key LIMIT $top",
+                    found_keys = session.run(f"{scope} WHERE {FACT_MATCH[mode]}{also} RETURN DISTINCT f.concept_key AS key LIMIT $top",
                                              top=CONCEPT_KEYS_MAX, **params).data()
                     if found_keys:
                         matched, keys = mode, [str(r["key"]) for r in found_keys if r.get("key")]
@@ -778,17 +797,30 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                 # every spelling under the matched concept keys, plus the facts the text matches directly (facts of
                 # older graphs without concept keys can only be reached by the latter)
                 where = f"(f.concept_key IN $keys OR {FACT_MATCH[matched]})" if matched else "false"
+            where += also
             total = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
             order = "coalesce(f.concept, f.property, ''), coalesce(f.valid_from, ''), coalesce(f.series_index, 0), f.id"
             if center is None:
                 order = "coalesce(f.subject, ''), " + order
-            picked = [dict(r.get("row") or {}) for r in session.run(
-                f"{scope} WHERE {where} RETURN f {{" + ", ".join(f".{k}" for k in _FACT_BASIC) + f"}} AS row "
-                f"ORDER BY {order} SKIP $offset LIMIT $limit", offset=offset, limit=limit, **params).data()] if total else []
+            if conflict_only:
+                order = "coalesce(f.conflict_group, ''), " + order          # the facts of one conflict group side by side
+            row_map = "f {" + ", ".join(f".{k}" for k in _FACT_BASIC) + "}"
+            if center is not None:
+                listing = f"{scope} WHERE {where} RETURN {row_map} AS row, e.id AS subject_id ORDER BY {order} SKIP $offset LIMIT $limit"
+            else:
+                # Sort and page first, then find the subjects: one lookup for each of this page's few dozen facts. A fact
+                # can hang under several subjects; the smallest id is taken so the result is stable. Aggregation drops
+                # the row order, so the rows are sorted again by the same order before returning
+                listing = (f"{scope} WHERE {where} WITH f ORDER BY {order} SKIP $offset LIMIT $limit "
+                           "OPTIONAL MATCH (s:Entity {kb_id: $kb, graph_version: $gv})-[:HAS_SPEC]->(f) "
+                           f"WITH f, min(s.id) AS subject_id RETURN {row_map} AS row, subject_id ORDER BY {order}")
+            records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
+            picked = [dict(r.get("row") or {}) for r in records]
+            subject_ids = [r.get("subject_id") for r in records]
             properties = None
-            if center is not None and offset == 0:
+            if (center is not None or doc_id) and offset == 0:
                 properties = session.run(
-                    f"{scope} RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
+                    f"{scope} WHERE {in_doc or 'true'} RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
                     "ORDER BY n DESC, concept LIMIT $top", top=PROPERTY_SUMMARY_LIMIT, **params).data()
     finally:
         if own_driver:
@@ -810,6 +842,11 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             degraded.append(f"spec_payload: {type(exc).__name__}")
     raw = [spec_result_row(payloads[fid]) if fid in payloads else {**{k: r.get(k) for k in _FACT_BASIC}, "point_ids": []}
            for fid, r in zip(fact_ids, picked)]
+    for row, r, sid in zip(raw, picked, subject_ids):
+        # the payload projection (shared with /search) carries neither: the source document comes from the graph
+        # database, with the payload's as a fallback
+        row["doc_id"] = r.get("doc_id") or (payloads.get(str(r["id"])) or {}).get("doc_id")
+        row["subject_id"] = sid
     missing = sum(1 for fid in fact_ids if fid not in payloads)
     if missing and not degraded:
         # the alias of the fact collection points at another version (the few seconds of a publish switch): only
@@ -839,6 +876,80 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
     if properties is not None:
         out["properties"] = [{"concept": r.get("concept"), "concept_key": r.get("concept_key"), "count": int(r.get("n") or 0)}
                              for r in properties]
+    if doc_id or conflict_only:
+        out["filters"] = {k: v for k, v in (("doc_id", doc_id), ("conflict_only", True if conflict_only else None)) if v}
     if degraded:
         out["degraded"] = degraded
     return out
+
+
+def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None, title: str | None = None, page_id: str | None = None,
+               entity_id: str | None = None, doc_id: str | None = None, with_text: bool = True, limit: int = 20, offset: int = 0,
+               paths: dict[str, str] | None = None, q: Any = None) -> dict[str, Any]:
+    """The list and full text of the compiled pages (subject / timeline / source / index pages): a caller that wants
+    to read a whole page need not hope a search happens to hit it.
+    The page collection is small (a few hundred points per knowledge base), so the whole collection is scrolled
+    once and filtered, sorted and paged in process, which is simpler than a payload index for every filter; it
+    goes through the alias, so what is read is the current version. A missing collection (the knowledge base has
+    no graph, or no pages were generated) -> KeyError.
+    entity_keys become entity ids (the same algorithm as the ids in the entity collection and the graph
+    database), so the caller can take them straight to the neighbours / facts endpoints; doc_ids become paths
+    through paths (doc_id -> rel_path from the state database), and a position that cannot be resolved stays
+    empty while its doc_id is kept. kinds counts the whole collection by kind and is not affected by the filters.
+    Page text is already cut to at most 8,000 characters when written."""
+    from kb_pipeline.graph.vectors import entity_id as entity_id_for
+    from kb_pipeline.vector.qdrant import client as qdrant_client, graph_collection_alias
+
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    if q is None:
+        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    alias = graph_collection_alias(source.collection, "page")
+    pages: list[dict[str, Any]] = []
+    cursor = None
+    try:
+        while True:
+            points, cursor = q.scroll(collection_name=alias, limit=PAGE_SCROLL, offset=cursor, with_payload=True, with_vectors=False)
+            pages.extend(dict(p.payload or {}) for p in points)
+            if cursor is None or not points:
+                break
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 404:          # no such collection: no graph, or this graph version generated no pages
+            raise KeyError(f"{source.kb_id} has no compiled pages") from exc
+        raise
+    kinds = {k: 0 for k in PAGE_KINDS}
+    for p in pages:
+        if p.get("kind") in kinds:
+            kinds[p["kind"]] += 1
+    paths = paths or {}
+    title_key = _squash(title)
+    rows = []
+    for p in pages:
+        eids = [entity_id_for(k) for k in p.get("entity_keys") or []]
+        docs = [str(d) for d in p.get("doc_ids") or []]
+        if kind and p.get("kind") != kind:
+            continue
+        if title_key and title_key not in _squash(p.get("title")):
+            continue
+        if page_id and str(p.get("gr_id")) != str(page_id):
+            continue
+        if entity_id and str(entity_id) not in eids:
+            continue
+        if doc_id and str(doc_id) not in docs:
+            continue
+        rows.append((p, eids, docs))
+    order = {k: i for i, k in enumerate(PAGE_KINDS)}
+    rows.sort(key=lambda r: (order.get(str(r[0].get("kind")), len(order)), str(r[0].get("title") or ""), str(r[0].get("gr_id") or "")))
+    out_pages = []
+    for i, (p, eids, docs) in enumerate(rows[offset:offset + limit]):
+        text = str(p.get("text") or "")
+        row: dict[str, Any] = {"n": offset + i + 1, "id": p.get("gr_id"), "kind": p.get("kind"), "title": p.get("title"),
+                               "summary": p.get("description")}
+        if with_text:
+            row["text"] = text
+        row.update({"text_chars": len(text), "series": list(p.get("series") or []), "docs": [paths.get(d) for d in docs], "doc_ids": docs,
+                    "entity_ids": eids, "concept_keys": list(p.get("concept_keys") or []), "path": p.get("path")})
+        out_pages.append(row)
+    gv = next((str(p["graph_version"]) for p in pages if p.get("graph_version")), None)
+    return {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv, "total": len(rows), "offset": offset, "limit": limit,
+            "count": len(out_pages), "has_more": offset + len(out_pages) < len(rows), "kinds": kinds, "pages": out_pages}
