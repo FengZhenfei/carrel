@@ -102,6 +102,14 @@ start takes about the sum of the load times.
 A container still waiting shows `health: starting`; if the first server never
 comes up, the ones behind it keep waiting, so look at that one first.
 
+The embedding, reranker and vl-embedding servers run with
+`VLLM_BATCH_INVARIANT=1`: vLLM then computes the same vectors and scores for
+the same input however requests are batched and whether the prefix cache hits,
+so a search returns the same ranking every time. Without it, identical requests
+got slightly different scores and the chunks near the cut-off swapped places.
+Image embedding is somewhat slower in this mode; `VLLM_BATCH_INVARIANT=0` in
+`.env` turns it off. The vlm server and the parser keep the default.
+
 ## Data locations
 
 All bind mounts are relative to this directory, so they land in the checkout:

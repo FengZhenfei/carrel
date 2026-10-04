@@ -1150,6 +1150,19 @@ class DeploymentFileTests(unittest.TestCase):
         for name, block in services.items():
             self.assertTrue("logging: *default-logging" in block or "<<: *vllm-common" in block, name)
 
+    def test_search_model_servers_are_batch_invariant(self) -> None:
+        """The three model servers a search calls (embedding, reranker, vl-embedding) run in batch-invariant
+        mode, so the same query ranks the same way every time; the generative ones (vlm, the parser) do not."""
+        compose = _repo_file("deployment/compose/docker-compose.yml")
+        head, body = compose.split("\nservices:\n", 1)
+        anchor = head.split("x-vllm-deterministic: &vllm-deterministic", 1)[1].split("\nx-", 1)[0]
+        self.assertIn("<<: *vllm-environment", anchor)
+        self.assertIn('VLLM_BATCH_INVARIANT: "${VLLM_BATCH_INVARIANT:-1}"', anchor)
+        blocks = re.split(r"(?m)^  ([\w.-]+):\n", body.split("\nnetworks:\n", 1)[0])
+        services = dict(zip(blocks[1::2], blocks[2::2]))
+        self.assertEqual({name for name, block in services.items() if "*vllm-deterministic" in block},
+                         {"embedding", "reranker", "vl-embedding"})
+
 
 class DependencyDeclarationTests(unittest.TestCase):
     """Every third-party package the code imports must be declared in pyproject, and every declared one must be
