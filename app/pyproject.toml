@@ -1,6 +1,6 @@
 [project]
 name = "carrel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Carrel: Ontology-Augmented Generation for AI agents. Local knowledge-base ingestion pipeline, console and search service."
 license = "MIT"
 requires-python = ">=3.12"
