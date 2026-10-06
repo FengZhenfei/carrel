@@ -34,8 +34,9 @@ class StopSemanticsTests(unittest.TestCase):
         """A graph build interrupted by a signal is recorded as cancelled. Recording it as failed would turn
         the panel red and let "last failed" mask "stopped by the user, cache intact, can be resumed"."""
         source = _repo_file("app/kb_pipeline/graph/build.py")
+        # A run that received a stop signal counts too (a client library may have wrapped the signal)
         self.assertIn(
-            'terminal_status = "cancelled" if isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) else "failed"',
+            'terminal_status = ("cancelled" if isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) or interrupted.is_set()',
             source)
         self.assertIn("status=terminal_status,", source)
 
@@ -2194,6 +2195,7 @@ class HardDeleteLifecycleTests(unittest.TestCase):
             with db.connect(stub.state_db) as con:
                 db.record_graph_check(con, source.kb_id, {"kind": "none"})
                 db.set_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id, {"origin": "manual", "started_at": 1})
+                db.set_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id, {"graph_build_id": "g", "count": 1})
                 con.commit()
             seen: dict[str, Any] = {}
             real = maintenance._hard_delete_kb
@@ -2215,6 +2217,7 @@ class HardDeleteLifecycleTests(unittest.TestCase):
             with db.connect(stub.state_db) as con:
                 self.assertIsNone(db.latest_graph_check(con, source.kb_id))      # ids are never reused, so these two would stay forever
                 self.assertIsNone(db.get_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id))
+                self.assertIsNone(db.get_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id))   # the resume count
             # A failed delete releases the lock too
             stub2, source2 = self._kb(tmp, "库E")
             with self._stores(neo4j=RuntimeError("boom")):

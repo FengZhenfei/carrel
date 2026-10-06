@@ -1492,3 +1492,59 @@ class GraphGcSafetyNetTests(unittest.TestCase):
             self.assertEqual(seen["protect"], {"v-paused"})
             self.assertEqual(seen["discard"], {"v-fail1"})
             self.assertEqual(seen["keep_latest"], 1)
+
+    def test_graph_gc_reclaims_dead_running_builds_first(self) -> None:
+        """Nightly GC does not wait for the console: builds whose process is dead but which still say running are
+        marked failed first. The newest one is kept for a resume (protect); one superseded by a newer build becomes a
+        half-built version (discard) and no longer takes a retention slot; a dry run leaves the records alone. GC holds
+        the build lock, so the lock branch is taken: a build started before the current boot is recorded as ending
+        with the shutdown (the scheduled check resumes it), otherwise as dying in this boot."""
+        import socket
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from kb_pipeline import db, maintenance
+        from kb_pipeline.graph import build as build_mod
+
+        for dry_run, booted in ((False, None), (False, 1000), (True, None)):
+            with self.subTest(dry_run=dry_run, booted=booted), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / "state" / "s.db"; db.init_db(state)
+                with db.connect(state) as con:
+                    for bid, status, started in (("good", "done", 100), ("dead-old", "running", 200),
+                                                 ("dead-new", "running", 300)):
+                        con.execute(
+                            "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, "
+                            "status, started_at, build_kind, worker_host, worker_pid, heartbeat_at) "
+                            "VALUES(?, 'kb_1', 'kb_1', 'kb_1', ?, ?, ?, 'full', ?, 99999999, ?)",
+                            (bid, "v-" + bid, status, started, socket.gethostname(), started))
+                source = SimpleNamespace(kb_id="kb_1", collection="kb_1", graph_enabled=True)
+                settings = SimpleNamespace(runtime_dir=Path(tmp), state_db=state, sources={"kb_1": source},
+                                           graph_gc_keep_versions=1, qdrant_url="http://127.0.0.1:1", qdrant_api_key=None)
+                seen: dict = {}
+
+                def fake_gc(settings, source, **kwargs):
+                    seen.update(kwargs)
+                    return {"result": {}, "steps": [], "errors": {}}
+
+                with mock.patch.object(build_mod, "gc_graph_versions", fake_gc), \
+                        mock.patch.object(db, "boot_time", return_value=booted), \
+                        mock.patch("kb_pipeline.vector.qdrant.client", lambda *a, **k: object()), \
+                        mock.patch("kb_pipeline.vector.qdrant.graph_alias_targets",
+                                   lambda q, collection: {"entity": "graph_1_entity__v-good"}), \
+                        mock.patch("kb_pipeline.vector.qdrant.parse_graph_collection_name",
+                                   lambda name: {"graph_version": "v-good"}):
+                    out = maintenance.graph_gc(settings, dry_run=dry_run)
+                with db.connect(state) as con:
+                    status = dict(con.execute("SELECT graph_build_id, status FROM graph_builds").fetchall())
+                    error = con.execute("SELECT error FROM graph_builds WHERE graph_build_id = 'dead-new'").fetchone()[0]
+                if dry_run:
+                    self.assertEqual((status["dead-old"], status["dead-new"]), ("running", "running"))
+                    self.assertNotIn("reconciled", out)
+                    continue
+                self.assertEqual(sorted(out["reconciled"]), ["dead-new", "dead-old"])
+                self.assertEqual((status["dead-old"], status["dead-new"], status["good"]), ("failed", "failed", "done"))
+                self.assertTrue(str(error).startswith(db.GRAPH_RECLAIMED_REBOOT if booted else db.GRAPH_RECLAIMED_DEAD), error)
+                self.assertEqual(seen["protect"], {"v-dead-new"})
+                self.assertEqual(seen["discard"], {"v-dead-old"})

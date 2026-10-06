@@ -401,6 +401,29 @@ def begin_graph_build(
     return build_id
 
 
+# How the reaper's error text begins. A build that started before the current boot ended with the last
+# shutdown or power loss (the scheduled check resumes it, see interrupted_full_build); one that died during this
+# boot (kill -9, OOM) and one whose heartbeat went stale on another host are not resumed.
+# "Started before this boot" alone does not prove the process lived until the shutdown: deaths during this boot are
+# reclaimed as DEAD by the scan that runs every minute (cli._reclaim_stale_graph_builds); one that died less than a
+# minute before a reboot is still recorded as REBOOT, and the attempt limit bounds it.
+GRAPH_RECLAIMED_REBOOT = "Graph build process ended with the last shutdown or power loss"
+GRAPH_RECLAIMED_DEAD = "Graph build process no longer exists"
+GRAPH_RECLAIMED_STALE = "Graph build heartbeat timed out"
+
+
+def boot_time() -> int | None:
+    """When the current boot started (btime in /proc/stat); None when it cannot be read (not Linux)."""
+    try:
+        with open("/proc/stat", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds: int = 3600,
                                  lock_path: str | Path | None = None) -> list[str]:
     """Re-mark graph build records that are still 'running' although their process is dead as failed.
@@ -417,7 +440,10 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
     lock, or the holder is not the pid recorded on the row, the row is a dead record. Checking only whether the
     pid still exists would leave a dead record 'running' for good once another process reuses the pid. Without
     lock_path the lock directory next to the state database is used (the default layout); only when there is no
-    lock file there (the state database was moved, a test stub) does it fall back to judging by pid."""
+    lock file there (the state database was moved, a test stub) does it fall back to judging by pid. Once a row is
+    judged dead, one that started before the current boot gets the GRAPH_RECLAIMED_REBOOT reason (it ended with the
+    last shutdown or power loss) and the scheduled check resumes it; one that died during this boot gets
+    GRAPH_RECLAIMED_DEAD and is not resumed."""
     from .graph.lock import LOCK_DIR_NAME, LOCK_FILE_NAME, build_lock_held, build_lock_holder
 
     hostname = socket.gethostname()
@@ -436,6 +462,7 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
         db_file = str(con.execute("PRAGMA database_list").fetchone()[2] or "")
         lock_path = Path(db_file).parent / LOCK_DIR_NAME if db_file else None
     lock_known = lock_path is not None and (Path(lock_path) / LOCK_FILE_NAME).exists()
+    booted = boot_time()
     # 0 = nobody holds the lock; None = someone holds it but has not recorded a pid yet (just acquired): alive
     holder: int | None = 0
     if lock_known and build_lock_held(Path(lock_path)):
@@ -448,7 +475,7 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
             if lock_known:
                 if holder is None or holder == pid:
                     continue
-                reason = (f"Graph build process no longer exists (pid={pid}, it does not hold the build lock); "
+                reason = (f"{GRAPH_RECLAIMED_DEAD} (pid={pid}, it does not hold the build lock); "
                           "marked failed by the reaper")
             else:
                 alive = True
@@ -458,11 +485,15 @@ def reconcile_stale_graph_builds(con: sqlite3.Connection, *, stale_after_seconds
                     alive = False
                 if alive:
                     continue
-                reason = f"Graph build process no longer exists (pid={pid}); marked failed by the reaper"
+                reason = f"{GRAPH_RECLAIMED_DEAD} (pid={pid}); marked failed by the reaper"
+            if booted is not None and int(row["started_at"] or 0) < booted:
+                # Judged dead and started before the current boot: it went with the last shutdown or power loss
+                # (SIGKILLed when the shutdown timed out, or the power went)
+                reason = f"{GRAPH_RECLAIMED_REBOOT} (pid={pid}); marked failed by the reaper"
         else:
             if now - last_seen < max(60, stale_after_seconds):
                 continue
-            reason = f"Graph build heartbeat timed out ({now - last_seen}s); marked failed"
+            reason = f"{GRAPH_RECLAIMED_STALE} ({now - last_seen}s); marked failed"
         con.execute(
             "UPDATE graph_builds SET status='failed', finished_at=?, error=? "
             "WHERE graph_build_id=? AND status='running'",
@@ -892,7 +923,7 @@ def unsuccessful_graph_versions(con: sqlite3.Connection, kb_id: str, *, supersed
 
 def resumable_graph_versions(con: sqlite3.Connection, kb_id: str) -> set[str]:
     """The version kept for a resume: when the newest build record of the base (by start time) is cancelled or
-    failed, or still marked running after its process died, its version id. "Continue build" only resumes that
+    failed, or still marked running after its process died, its version id. "Resume build" only resumes that
     newest record (kb_server.service.trigger_graph_build); no entry point resumes an older half-finished
     version. The scheduled GC neither deletes it nor lets it take a slot among the "latest N versions": once it
     took a slot, KEEP=1 deleted the resume artifacts the same night and KEEP=2 pushed out the previous good
@@ -904,6 +935,95 @@ def resumable_graph_versions(con: sqlite3.Connection, kb_id: str) -> set[str]:
         return set()
     version = str(row["graph_version"] or "")
     return {version} if version else set()
+
+
+# How many times the scheduled check has resumed a build on its own (app_config, key followed by kb_id; cleared
+# together with the build records when the graph or the knowledge base is deleted)
+GRAPH_AUTO_RESUME_PREFIX = "graph_auto_resume:"
+
+
+def _stopped_by_shutdown(status: str, error: str, manifest: dict[str, Any]) -> bool:
+    """Did the record's terminal state come from a machine shutdown, reboot or power loss. A cancelled record (the
+    process got a signal and wrote it itself) is judged by stopped_by.shutdown, written on the spot in the manifest
+    (systemd reported stopping when the signal arrived, see build._shutdown_probe); a failed record (SIGKILL or power
+    loss, judged later by the reaper) by the start of its reason (it started before the current boot). Ctrl-C, a
+    manual kill, systemctl stop, hitting the wall-clock limit, OOM, and pausing or switching off in the console do not
+    count -- the error text cannot tell them apart, and a checkpoint that re-raises a swallowed signal does not even
+    carry the signal number."""
+    if status == "cancelled":
+        stopped = manifest.get("stopped_by")
+        return isinstance(stopped, dict) and stopped.get("shutdown") is True
+    if status == "failed":
+        return error.startswith(GRAPH_RECLAIMED_REBOOT)
+    return False
+
+
+def interrupted_full_build(con: sqlite3.Connection, kb_id: str) -> dict[str, Any] | None:
+    """Should the scheduled check resume this knowledge base's interrupted full build under the same version. Only
+    the records are looked at; pause / switch-off / models / configuration fingerprint are for the caller.
+
+    All of these must hold: the knowledge base's latest record stopped at cancelled / failed; it is a full build whose
+    intent, recorded at start, is "whole corpus, publish" (sample builds and builds that do not switch aliases are not
+    resumed, nor are old records without an intent); no other version has been built since (a rollback refreshes the
+    target version's finish time to now, so after a rollback the interrupted newer version is no longer resumed); the
+    terminal state came from a machine shutdown (_stopped_by_shutdown) -- or this run was itself resumed by the
+    scheduled check and then failed with a real error (dependencies not up yet after boot), which still counts, bounded
+    by the attempt limit.
+
+    Returns {"row": the record, "attempts": how many earlier automatic resumes actually started, "ours": whether this
+    run was started by the scheduled check}; None when it should not be resumed."""
+    row = con.execute(
+        "SELECT * FROM graph_builds WHERE kb_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1", (kb_id,)).fetchone()
+    if row is None:
+        return None
+    status = str(row["status"] or "")
+    if status not in ("cancelled", "failed") or str(row["build_kind"] or "full") != "full":
+        return None
+    try:
+        manifest = json.loads(row["manifest_json"] or "{}")
+    except ValueError:
+        manifest = {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    intent = manifest.get("intent")
+    if not isinstance(intent, dict) or not intent.get("publish") or not intent.get("full_corpus"):
+        return None
+    build_id = str(row["graph_build_id"])
+    started_at = int(row["started_at"] or 0)
+    later = con.execute(
+        "SELECT 1 FROM graph_builds WHERE kb_id = ? AND status = 'done' AND COALESCE(finished_at, started_at) > ? LIMIT 1",
+        (kb_id, started_at)).fetchone()
+    if later is not None:
+        return None
+    mark = get_app_config(con, GRAPH_AUTO_RESUME_PREFIX + kb_id) or {}
+    mark = mark if isinstance(mark, dict) and str(mark.get("graph_build_id") or "") == build_id else {}
+    attempts = int(mark.get("count") or 0) if mark else 0
+    ours = False
+    if mark:
+        if int(mark.get("started_at") or -1) == started_at:
+            # The previous round never got going (it failed before writing the record): it does not count, and the
+            # record is still the earlier run, so the previous round's judgement of it carries over
+            attempts = max(0, attempts - 1)
+            ours = bool(mark.get("ours"))
+        elif int(mark.get("pid") or -1) == int(row["worker_pid"] or 0):
+            ours = True                          # this run is the one the previous round resumed
+        else:
+            attempts = 0                         # someone resumed it in between ("Resume build"): start over
+    error = str(row["error"] or "")
+    own_failure = ours and status == "failed" and not error.startswith(
+        (GRAPH_RECLAIMED_DEAD, GRAPH_RECLAIMED_STALE))
+    if not _stopped_by_shutdown(status, error, manifest) and not own_failure:
+        return None
+    return {"row": row, "attempts": attempts, "ours": ours}
+
+
+def mark_graph_auto_resume(con: sqlite3.Connection, kb_id: str, row: sqlite3.Row, attempts: int, *,
+                           ours: bool = False) -> None:
+    """Count one attempt before resuming (count first, then run: being stopped again midway still counts). started_at
+    and pid let the next round tell "never got going / resumed by me / resumed by someone else" apart; ours is this
+    round's judgement of the record, carried over when the run never got going."""
+    set_app_config(con, GRAPH_AUTO_RESUME_PREFIX + kb_id, {
+        "graph_build_id": str(row["graph_build_id"]), "count": int(attempts),
+        "started_at": int(row["started_at"] or 0), "pid": os.getpid(), "ours": bool(ours), "at": now_ts()})
 
 
 def graph_extraction_flag_counts(con: sqlite3.Connection, kb_id: str, fingerprint: str, *, flags: Iterable[str] = ("truncated", "partial"),

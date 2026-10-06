@@ -764,6 +764,7 @@ const EN_ZH_PATTERNS = [
   [/^The graph build runs on another host \((.+?)\) and cannot be terminated from here$/, "建图进程在另一台主机($1)上,无法从这里终止"],
   [/^The graph build process did not confirm stopping \((.+?)\); the record stays running$/, "建图进程没有确认停止($1),记录保持 running"],
   [/^Graph build process no longer exists \(pid=(\d+)\); marked failed by the reaper$/, "建图进程已不存在(pid=$1),记录由回收流程判为失败"],
+  [/^Graph build process ended with the last shutdown or power loss \(pid=(\d+)\); marked failed by the reaper$/, "建图进程随上次关机或断电结束(pid=$1),记录由回收流程判为失败"],
   [/^Graph build process no longer exists \(pid=(\d+), it does not hold the build lock\); marked failed by the reaper$/, "建图进程已不存在(pid=$1,建图锁不在它手里),记录由回收流程判为失败"],
   [/^Graph build heartbeat timed out \((\d+)s\); marked failed$/, "建图记录心跳超时($1s),判为失败"],
   [/^Built-in model “(.+?)” cannot be deleted$/, "内置模型「$1」不可删除"],

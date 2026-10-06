@@ -2974,6 +2974,496 @@ class BuildGateTests(unittest.TestCase):
                 self.assertEqual(db.latest_graph_check(con, source.kb_id)["reason"], "kb_closed")
 
 
+class GraphAutoResumeTests(unittest.TestCase):
+    """A full build stopped by a machine shutdown, reboot or power loss is resumed by the scheduled check under the
+    same version; builds a person stopped (pause, switch-off, Ctrl-C, kill, systemctl stop), OOM, sample builds,
+    versions after a rollback and builds whose configuration fingerprint changed are not; the attempts are capped,
+    and a round that yields or never gets going does not count."""
+
+    VERSION = BuildGateTests.VERSION
+    SIGTERM = "GraphBuildInterrupted('Graph build interrupted by signal 15')"
+    PUBLISH = {"publish": True, "full_corpus": True}
+    SHUTDOWN = {"signals": [15], "system_state": {"user": "stopping", "system": "stopping"}, "shutdown": True}
+    _kb = BuildGateTests._kb
+    _set = staticmethod(BuildGateTests._set)
+    _row = staticmethod(BuildGateTests._row)
+
+    def _put(self, settings, source, *, status="cancelled", error=SIGTERM, intent=PUBLISH, stopped_by=SHUTDOWN,
+             kind="full", fingerprint=None, build_id="b1", version=None, pid=99999999, started=None,
+             finished=None) -> None:
+        from kb_pipeline.graph import build as build_mod
+
+        started = int(time.time()) - 600 if started is None else int(started)
+        if finished is None and status != "running":
+            finished = started + 60
+        manifest = {k: v for k, v in (("intent", intent), ("stopped_by", stopped_by)) if v is not None}
+        fp = build_mod.graph_cache_fingerprint(settings, source) if fingerprint is None else fingerprint
+        with db.connect(settings.state_db) as con:
+            con.execute(
+                "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                "started_at, finished_at, worker_host, worker_pid, heartbeat_at, cache_fingerprint, build_kind, "
+                "manifest_json, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (build_id, source.kb_id, source.kb_id, source.collection, version or self.VERSION, status, started,
+                 finished, socket.gethostname(), pid, started, fp, kind, json.dumps(manifest), error))
+
+    @staticmethod
+    def _found(settings, kb_id: str):
+        with db.connect(settings.state_db) as con:
+            return db.interrupted_full_build(con, kb_id)
+
+    @staticmethod
+    def _mark(settings, kb_id: str, **value) -> None:
+        with db.connect(settings.state_db) as con:
+            db.set_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + kb_id, {"graph_build_id": "b1", **value})
+
+    def _check(self, settings, source, *, execute=True, dry_run=False, build=None, append=None, blocked=None):
+        """One check-rebuild round: the policy is not due; building, appending and yielding are stubbed. Returns
+        (exit code, list of decisions)."""
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+
+        from kb_pipeline import cli
+
+        loaded = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
+                                 runtime_dir=settings.runtime_dir, sources={source.kb_id: source})
+        args = argparse.Namespace(graph_command="check-rebuild", execute=execute, dry_run=dry_run, force_full=False,
+                                  env_file=None, source=None, collection=None, all=False)
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_settings", return_value=loaded), \
+                mock.patch.object(cli, "evaluate_rebuild", side_effect=lambda s, *, source_key, source: {
+                    "source": source_key, "kb_id": source.kb_id, "graph_enabled": True, "due": False}), \
+                mock.patch.object(cli, "evaluate_append",
+                                  side_effect=append or (lambda s, **kw: {"due": False, "reason": "source_unchanged"})), \
+                mock.patch.object(cli, "_rebuild_blocked", return_value=blocked), \
+                mock.patch.object(cli, "build_graph", side_effect=build or AssertionError("must not build")), \
+                contextlib.redirect_stdout(out):
+            code = cli.cmd_graph(args)
+        text = out.getvalue()
+        return code, json.loads(text[text.index("[\n"):])
+
+    def test_only_publishing_full_builds_stopped_by_a_shutdown_are_taken(self) -> None:
+        manual = {"signals": [15], "system_state": {"user": "running", "system": "running"}, "shutdown": False}
+        cases = [
+            ({}, True),
+            ({"error": "LLMInterrupted('stop requested')"}, True),
+            ({"error": "GraphBuildInterrupted('Graph build interrupted by a stop signal')"}, True),  # re-raised during a shutdown
+            ({"status": "failed", "stopped_by": None,
+              "error": f"{db.GRAPH_RECLAIMED_REBOOT} (pid=5); marked failed by the reaper"}, True),  # SIGKILL at shutdown, power loss
+            ({"stopped_by": manual}, False),             # kill, systemctl stop, wall-clock limit, console pause / switch-off
+            ({"stopped_by": {**manual, "signals": [2]},
+              "error": "GraphBuildInterrupted('Graph build interrupted by a stop signal')"}, False),   # Ctrl-C swallowed, re-raised
+            ({"stopped_by": None, "error": "LLMInterrupted('stop requested')"}, False),   # no signal (circuit break etc.)
+            ({"error": "GraphBuildCalledOff('Graph build is paused; this build does not start')", "stopped_by": None}, False),
+            ({"status": "failed", "stopped_by": None,
+              "error": f"{db.GRAPH_RECLAIMED_DEAD} (pid=5, it does not hold the build lock); marked failed by the reaper"},
+             False),                                     # kill -9, OOM during this boot
+            ({"status": "failed", "stopped_by": None, "error": f"{db.GRAPH_RECLAIMED_STALE} (7200s); marked failed"}, False),
+            ({"status": "failed", "stopped_by": None, "error": "LLMMalformedResponse('bad json')"}, False),
+            ({"status": "running", "error": None, "stopped_by": None}, False),
+            ({"status": "done", "error": None, "stopped_by": None}, False),
+            ({"kind": "append"}, False),
+            ({"intent": None}, False),                                          # old record without an intent
+            ({"intent": {"publish": False, "full_corpus": True}}, False),       # does not switch aliases
+            ({"intent": {"publish": False, "full_corpus": False}}, False),      # sample build
+        ]
+        for kw, expected in cases:
+            with self.subTest(kw=kw), tempfile.TemporaryDirectory() as tmp:
+                _build_mod, settings, source = self._kb(tmp)
+                self._put(settings, source, **kw)
+                found = self._found(settings, source.kb_id)
+                self.assertEqual(found is not None, expected)
+                if found is not None:
+                    self.assertEqual((found["row"]["graph_build_id"], found["attempts"], found["ours"]), ("b1", 0, False))
+
+    def test_a_rollback_retires_the_interrupted_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source, build_id="old", version="v-old", status="done", error=None, stopped_by=None,
+                      started=100, finished=200)
+            self._put(settings, source, started=1000)
+            self.assertIsNotNone(self._found(settings, source.kb_id))
+            with db.connect(settings.state_db) as con:       # rolling back to the old version refreshes its finish time
+                con.execute("UPDATE graph_builds SET finished_at = 2000 WHERE graph_build_id = 'old'")
+            self.assertIsNone(self._found(settings, source.kb_id))
+
+    def test_attempts_count_only_the_runs_that_began(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source, started=1000, pid=4242)
+            self._mark(settings, source.kb_id, count=1, started_at=1000, pid=os.getpid())   # previous round never got going
+            self.assertEqual(self._found(settings, source.kb_id)["attempts"], 0)
+            self._mark(settings, source.kb_id, count=1, started_at=900, pid=4242)            # this run is the one resumed
+            found = self._found(settings, source.kb_id)
+            self.assertEqual((found["attempts"], found["ours"]), (1, True))
+            self._mark(settings, source.kb_id, count=2, started_at=900, pid=7)               # someone resumed it by hand
+            self.assertEqual(self._found(settings, source.kb_id)["attempts"], 0)
+            with db.connect(settings.state_db) as con:
+                db.set_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id,
+                                  {"graph_build_id": "other", "count": 2, "started_at": 900, "pid": 4242})
+            self.assertEqual(self._found(settings, source.kb_id)["attempts"], 0)
+
+    def test_a_run_resumed_by_the_check_may_fail_for_real_and_still_be_retried(self) -> None:
+        """Dependencies not up yet after boot: the resumed run fails with a connection error, and the next round
+        resumes again (the limit bounds it); a round that never gets going does not change that. A resumed run a
+        person stopped, or one that hit OOM, is not resumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source, status="failed", error="RuntimeError('connection refused')", stopped_by=None,
+                      started=1000, pid=4242)
+            self.assertIsNone(self._found(settings, source.kb_id))                 # not resumed by us: a real error
+            self._mark(settings, source.kb_id, count=1, started_at=900, pid=4242)
+            self.assertEqual(self._found(settings, source.kb_id)["attempts"], 1)
+            self._mark(settings, source.kb_id, count=2, started_at=1000, pid=os.getpid(), ours=True)   # never got going
+            self.assertEqual(self._found(settings, source.kb_id)["attempts"], 1)
+            self._mark(settings, source.kb_id, count=2, started_at=1000, pid=os.getpid(), ours=False)
+            self.assertIsNone(self._found(settings, source.kb_id))
+            for status, error, stopped_by in (
+                    ("failed", f"{db.GRAPH_RECLAIMED_DEAD} (pid=4242); marked failed by the reaper", None),   # OOM
+                    ("failed", f"{db.GRAPH_RECLAIMED_STALE} (7200s); marked failed", None),
+                    ("cancelled", self.SIGTERM, {"signals": [15], "shutdown": False}),           # a person stopped it
+                    ("cancelled", "GraphBuildCalledOff('Graph build is paused; this version is not published')", None)):
+                with db.connect(settings.state_db) as con:
+                    con.execute("UPDATE graph_builds SET status = ?, error = ?, manifest_json = ?",
+                                (status, error, json.dumps({"intent": self.PUBLISH, **({"stopped_by": stopped_by}
+                                                                                        if stopped_by else {})})))
+                self._mark(settings, source.kb_id, count=1, started_at=900, pid=4242)
+                self.assertIsNone(self._found(settings, source.kb_id), error)
+
+    def test_reclaiming_tells_a_shutdown_from_a_kill_in_this_boot(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph.lock import GraphBuildLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source, status="running", error=None, stopped_by=None, started=1000, build_id="dead")
+            self._put(settings, source, status="running", error=None, stopped_by=None, started=1000, build_id="alive",
+                      version="v-alive", pid=os.getpid())
+            for booted, prefix in ((2000, db.GRAPH_RECLAIMED_REBOOT), (500, db.GRAPH_RECLAIMED_DEAD),
+                                   (None, db.GRAPH_RECLAIMED_DEAD)):
+                with self.subTest(booted=booted), db.connect(settings.state_db) as con:
+                    con.execute("UPDATE graph_builds SET status = 'running', error = NULL")
+                    with mock.patch.object(db, "boot_time", return_value=booted):
+                        self.assertEqual(db.reconcile_stale_graph_builds(con), ["dead"])   # liveness first
+                    error = con.execute("SELECT error FROM graph_builds WHERE graph_build_id = 'dead'").fetchone()[0]
+                    self.assertTrue(str(error).startswith(prefix), error)
+            # In production the lock file is always there, so the lock branch is the one taken: this process holds
+            # the lock and 'alive' records this process
+            lock = GraphBuildLock(settings)
+            lock.acquire()
+            try:
+                for booted, prefix in ((2000, db.GRAPH_RECLAIMED_REBOOT), (500, db.GRAPH_RECLAIMED_DEAD)):
+                    with self.subTest(lock=True, booted=booted), db.connect(settings.state_db) as con:
+                        con.execute("UPDATE graph_builds SET status = 'running', error = NULL")
+                        with mock.patch.object(db, "boot_time", return_value=booted):
+                            self.assertEqual(db.reconcile_stale_graph_builds(con), ["dead"])
+                        error = con.execute("SELECT error FROM graph_builds WHERE graph_build_id = 'dead'").fetchone()[0]
+                        self.assertTrue(str(error).startswith(prefix), error)
+            finally:
+                lock.release()
+
+    def test_boot_time_is_read_from_proc_stat(self) -> None:
+        from unittest import mock
+
+        for text, expected in (("cpu 1 2\nbtime 1700000000\nprocesses 9\n", 1700000000), ("cpu 1 2\n", None),
+                               ("btime abc\n", None)):
+            with self.subTest(text=text), mock.patch("kb_pipeline.db.open", mock.mock_open(read_data=text), create=True):
+                self.assertEqual(db.boot_time(), expected)
+        with mock.patch("kb_pipeline.db.open", side_effect=OSError("no proc"), create=True):
+            self.assertIsNone(db.boot_time())
+        if sys.platform.startswith("linux"):
+            booted = db.boot_time()
+            self.assertIsInstance(booted, int)
+            self.assertTrue(0 < booted <= time.time())
+        else:
+            self.assertIsNone(db.boot_time())        # no /proc: everything reclaimed counts as dying in this boot
+
+    def test_check_rebuild_reclaims_a_build_killed_by_a_shutdown_and_resumes_it_up_to_the_limit(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline import cli
+        from kb_pipeline.graph.build import GraphBuildInterrupted
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            started = int(time.time()) - 600
+            self._put(settings, source, status="running", error=None, stopped_by=None, started=started)  # SIGKILL at shutdown
+            calls: list = []
+            appended: list = []
+
+            def build(s, **kw):                     # same version resumed, then caught by a shutdown again
+                row = self._row(settings, source.kb_id)
+                calls.append({**kw, "status": row["status"], "error": row["error"]})
+                with db.connect(settings.state_db) as con:
+                    con.execute("UPDATE graph_builds SET status = 'cancelled', started_at = started_at + ?, worker_pid = ?, "
+                                "error = ?, manifest_json = ?", (len(calls), os.getpid(), self.SIGTERM,
+                                                                 json.dumps({"intent": self.PUBLISH, "stopped_by": self.SHUTDOWN})))
+                raise GraphBuildInterrupted("Graph build interrupted by signal 15")
+
+            def append(s, **kw):
+                appended.append(kw)
+                return {"due": False, "reason": "source_unchanged"}
+
+            with mock.patch.object(db, "boot_time", return_value=started + 1):
+                for _ in range(cli.GRAPH_AUTO_RESUME_LIMIT):
+                    code, _results = self._check(settings, source, build=build, append=append)
+                    self.assertEqual(code, 1)           # the resumed run was stopped: the round records an error and ends
+                code, results = self._check(settings, source, build=build, append=append)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), cli.GRAPH_AUTO_RESUME_LIMIT)
+            first = calls[0]
+            self.assertEqual((first["graph_version"], first["allow_existing_graph_version"]), (self.VERSION, True))
+            self.assertNotIn("incremental", first)
+            self.assertTrue(first.get("activate_aliases", True))           # it resumes a publishing full build
+            self.assertFalse(first.get("dry_run", False))
+            self.assertIsNone(first.get("doc_ids"))
+            self.assertEqual(first["status"], "failed")                    # reclaimed at the start of the round first
+            self.assertTrue(str(first["error"]).startswith(db.GRAPH_RECLAIMED_REBOOT))
+            self.assertEqual(results[0]["resume_declined"]["reason"], "attempts_exhausted")
+            self.assertEqual(len(appended), 1)                              # only then the append is looked at as before
+            code, results = self._check(settings, source, execute=False)    # the read-only check agrees
+            self.assertEqual(results[0]["resume_declined"]["reason"], "attempts_exhausted")
+            self.assertNotIn("would_resume", results[0])
+
+    def test_a_build_killed_in_this_boot_is_not_resumed(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            started = int(time.time()) - 600
+            self._put(settings, source, status="running", error=None, stopped_by=None, started=started)  # kill -9, OOM
+            appended: list = []
+            with mock.patch.object(db, "boot_time", return_value=started - 3600):
+                code, results = self._check(settings, source, append=lambda s, **kw: appended.append(kw) or {"due": False})
+            self.assertEqual(code, 0)
+            self.assertTrue(str(self._row(settings, source.kb_id)["error"]).startswith(db.GRAPH_RECLAIMED_DEAD))
+            self.assertEqual(len(appended), 1)
+            self.assertNotEqual(results[0].get("reason"), "resume_interrupted")
+
+    def test_a_resume_that_never_began_costs_nothing_and_success_clears_the_count(self) -> None:
+        calls: list = []
+
+        def neo4j_down(s, **kw):                    # fails before writing the record: the record is untouched
+            calls.append(kw)
+            raise RuntimeError("Neo4j unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source)
+            for _ in range(3):
+                code, _results = self._check(settings, source, build=neo4j_down)
+                self.assertEqual(code, 1)
+            self.assertEqual(len(calls), 3)                                  # no attempt wasted
+            with db.connect(settings.state_db) as con:
+                self.assertEqual(db.get_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id)["count"], 1)
+            code, results = self._check(settings, source, build=lambda s, **kw: {"ok": True})
+            self.assertEqual((code, results[0]["reason"], results[0]["build"]), (0, "resume_interrupted", {"ok": True}))
+            with db.connect(settings.state_db) as con:
+                self.assertIsNone(db.get_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id))
+                self.assertEqual(db.latest_graph_check(con, source.kb_id)["resumed_graph_version"], self.VERSION)
+
+    def test_a_resumed_run_that_failed_for_real_keeps_its_claim_through_a_round_that_never_began(self) -> None:
+        """Dependencies not up after boot: the resumed run fails with a connection error, the next round fails
+        before writing the record (Neo4j not ready yet), and the round after still resumes it as "resumed by us" --
+        the mark carries this round's judgement along; the limit still applies."""
+        calls: list[str] = []
+
+        def begin_and_fail(s, **kw):                # rewrites the record the way the real begin does, then fails
+            calls.append("begin")
+            with db.connect(settings.state_db) as con:
+                con.execute("UPDATE graph_builds SET started_at = started_at + ?, worker_pid = ?, status = 'failed', "
+                            "error = ?, manifest_json = ?", (10 * len(calls), os.getpid(), "RuntimeError('connection refused')",
+                                                             json.dumps({"intent": self.PUBLISH})))
+            raise RuntimeError("connection refused")
+
+        def never_began(s, **kw):
+            calls.append("neo4j")
+            raise RuntimeError("Neo4j unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source)
+            for stub in (begin_and_fail, never_began, begin_and_fail):
+                code, _results = self._check(settings, source, build=stub)
+                self.assertEqual(code, 1)
+            code, results = self._check(settings, source)
+            self.assertEqual(calls, ["begin", "neo4j", "begin"])
+            self.assertEqual((code, results[0]["resume_declined"]["reason"]), (0, "attempts_exhausted"))
+
+    def test_check_rebuild_leaves_paused_disabled_and_reconfigured_builds_alone(self) -> None:
+        for case in ("paused", "disabled", "config_changed"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                _build_mod, settings, source = self._kb(tmp)
+                self._put(settings, source, fingerprint="old-config" if case == "config_changed" else None)
+                if case == "paused":
+                    self._set(settings, source.kb_id, {"graph_paused": True})
+                elif case == "disabled":
+                    self._set(settings, source.kb_id, {"graph_enabled": False})
+                code, results = self._check(settings, source)
+                self.assertEqual(code, 0)
+                self.assertNotEqual(results[0].get("reason"), "resume_interrupted")
+                if case == "config_changed":
+                    self.assertEqual(results[0]["resume_declined"]["reason"], "config_changed")
+
+    def test_yielding_does_not_spend_an_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source)
+            code, results = self._check(settings, source, blocked={"reason": "kb parsing", "retry": True},
+                                        append=lambda s, **kw: self.fail("a yielding round must not look at the append"))
+            self.assertEqual(code, 75)
+            self.assertEqual((results[0]["reason"], results[0]["resumed_graph_version"]), ("resume_interrupted", self.VERSION))
+            with db.connect(settings.state_db) as con:
+                self.assertIsNone(db.get_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id))
+                self.assertEqual(db.latest_graph_check(con, source.kb_id)["skipped_reason"], "kb parsing")
+
+    def test_read_only_and_dry_runs_change_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_mod, settings, source = self._kb(tmp)
+            self._put(settings, source)
+            code, results = self._check(settings, source, execute=False)
+            self.assertEqual(code, 0)
+            self.assertEqual(results[0]["would_resume"], {"graph_version": self.VERSION, "attempts": 0})
+            code, results = self._check(settings, source, dry_run=True)       # dry run: no resume (the stub would error)
+            self.assertEqual(code, 0)
+            self.assertNotIn("resumed_graph_version", results[0])
+            with db.connect(settings.state_db) as con:
+                self.assertIsNone(db.get_app_config(con, db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id))
+        for execute, dry_run in ((False, False), (True, True)):
+            with self.subTest(execute=execute, dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                _build_mod, settings, source = self._kb(tmp)
+                self._put(settings, source, status="running", error=None, stopped_by=None)
+                self._check(settings, source, execute=execute, dry_run=dry_run)
+                self.assertEqual(self._row(settings, source.kb_id)["status"], "running")   # neither reclaims
+
+    def test_a_build_records_its_intent_and_whether_a_shutdown_stopped_it(self) -> None:
+        import signal
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+
+        q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
+        for shutdown in (True, False):
+            with self.subTest(shutdown=shutdown), tempfile.TemporaryDirectory() as tmp:
+                build_mod, settings, source = self._kb(tmp)
+                seen: dict = {}
+
+                def stopped(settings_, source_, **kw):     # SIGTERM while revising labels (a shutdown, or a kill)
+                    seen["manifest"] = json.loads(self._row(settings, source.kb_id)["manifest_json"])
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(5)                          # the signal handler raises here
+
+                probe = {"system_state": {"system": "stopping" if shutdown else "running"}, "shutdown": shutdown}
+                with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                        mock.patch.object(build_mod, "_shutdown_probe", return_value=probe), \
+                        mock.patch.object(schema_flow, "ensure_schema_before_build", stopped):
+                    with self.assertRaises(build_mod.GraphBuildInterrupted):
+                        build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+                self.assertEqual(seen["manifest"]["intent"], self.PUBLISH)    # written at start: survives a SIGKILL
+                row = self._row(settings, source.kb_id)
+                manifest = json.loads(row["manifest_json"])
+                self.assertEqual((row["status"], manifest["intent"]), ("cancelled", self.PUBLISH))
+                self.assertEqual(manifest["stopped_by"], {"signals": [signal.SIGTERM], **probe})
+                self.assertEqual(self._found(settings, source.kb_id) is not None, shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            build_mod, settings, source = self._kb(tmp)
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                    mock.patch.object(build_mod, "_shutdown_probe", side_effect=AssertionError("no signal, no probe")), \
+                    mock.patch.object(schema_flow, "ensure_schema_before_build",
+                                      side_effect=build_mod.GraphBuildInterrupted("Graph build interrupted by signal 15")):
+                with self.assertRaises(build_mod.GraphBuildInterrupted):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+            self.assertNotIn("stopped_by", json.loads(self._row(settings, source.kb_id)["manifest_json"]))
+            with mock.patch.object(build_mod, "qdrant_client", return_value=q):
+                with self.assertRaises(Exception):
+                    build_mod.build_graph(settings, source_key=source.kb_id, source=source, doc_ids=["d1"],
+                                          activate_aliases=False, run_gc=False)
+            row = self._row(settings, source.kb_id)                        # sample build: no publish, not the corpus
+            self.assertEqual(json.loads(row["manifest_json"])["intent"], {"publish": False, "full_corpus": False})
+
+    def test_a_signal_swallowed_on_the_way_is_still_recorded(self) -> None:
+        """A signal mostly lands in an HTTP call, where the client's retries swallow it and a checkpoint re-raises it
+        (without the signal number), or a client library wraps it into another exception: which signal arrived and
+        whether the machine was shutting down are recorded all the same, and the run ends as interrupted."""
+        import signal
+        from unittest import mock
+
+        from kb_pipeline.graph import schema_flow
+        from kb_pipeline.graph.llm import LLMInterrupted
+
+        q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
+        cases = [
+            (signal.SIGTERM, True, None, "Graph build interrupted by a stop signal", True),
+            (signal.SIGINT, False, None, "Graph build interrupted by a stop signal", False),
+            (signal.SIGTERM, True, LLMInterrupted("stop requested"), "LLMInterrupted", True),
+            (signal.SIGTERM, False, RuntimeError("ResponseHandlingException(GraphBuildInterrupted())"), "RuntimeError", False),
+        ]
+        for sig, shutdown, after, error_part, resumable in cases:
+            with self.subTest(sig=sig, after=after), tempfile.TemporaryDirectory() as tmp:
+                build_mod, settings, source = self._kb(tmp)
+
+                def swallowed(settings_, source_, **kw):
+                    self.assertIsNot(signal.getsignal(sig), signal.SIG_DFL)   # a handler is installed: pytest survives
+                    try:
+                        os.kill(os.getpid(), sig)
+                        time.sleep(5)
+                    except Exception:
+                        pass                                  # swallowed the way a client's retry would
+                    if after is not None:
+                        raise after
+                    return source_, None
+
+                probe = {"system_state": {"system": "stopping" if shutdown else "running"}, "shutdown": shutdown}
+                with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                        mock.patch.object(build_mod, "_shutdown_probe", return_value=probe), \
+                        mock.patch.object(schema_flow, "ensure_schema_before_build", swallowed):
+                    with self.assertRaises(Exception):
+                        build_mod.build_graph(settings, source_key=source.kb_id, source=source)
+                row = self._row(settings, source.kb_id)
+                manifest = json.loads(row["manifest_json"])
+                self.assertEqual(row["status"], "cancelled")
+                self.assertIn(error_part, str(row["error"]))
+                self.assertEqual(manifest["stopped_by"], {"signals": [int(sig)], **probe})
+                self.assertEqual(self._found(settings, source.kb_id) is not None, resumable)
+                self._mark(settings, source.kb_id, count=1, started_at=0, pid=int(row["worker_pid"]))   # even if resumed by us
+                self.assertEqual(self._found(settings, source.kb_id) is not None, resumable)
+
+    def test_the_shutdown_probe_trusts_only_pid1(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline.graph import build as build_mod
+
+        def run(states):
+            def fake(cmd, **kw):                     # is-system-running exits 0 only when running and prints the state
+                state = states["user" if "--user" in cmd else "system"]
+                if isinstance(state, BaseException):
+                    raise state
+                code = 0 if state == "running" else 1
+                if kw.get("check") and code:
+                    raise subprocess.CalledProcessError(code, cmd, output=state)
+                return SimpleNamespace(stdout=state + "\n" if state else "", returncode=code)
+            return fake
+
+        for states, shutdown in (({"user": "running", "system": "stopping"}, True),
+                                 ({"user": "stopping", "system": "stopping"}, True),
+                                 ({"user": "stopping", "system": "running"}, False),     # only the user manager went down
+                                 ({"user": "stopping", "system": "starting"}, False),
+                                 ({"user": "running", "system": "starting"}, False),
+                                 ({"user": "running", "system": "degraded"}, False)):
+            with self.subTest(states=states), mock.patch.object(build_mod.subprocess, "run", run(states)):
+                probe = build_mod._shutdown_probe()
+                self.assertEqual((probe["shutdown"], probe["system_state"]), (shutdown, states))
+        with mock.patch.object(build_mod.subprocess, "run", run({"user": "running", "system": ""})):
+            self.assertEqual(build_mod._shutdown_probe()["system_state"]["system"], "exit 1")
+        with mock.patch.object(build_mod.subprocess, "run",
+                               run({"user": FileNotFoundError("systemctl"), "system": subprocess.TimeoutExpired("x", 3)})):
+            # no systemd (another Linux setup, macOS) or no answer: not a shutdown, so nothing is resumed on its own
+            self.assertEqual(build_mod._shutdown_probe(),
+                             {"system_state": {"user": "FileNotFoundError", "system": "TimeoutExpired"}, "shutdown": False})
+
+
 class GraphRetireTests(unittest.TestCase):
     """Once a KB has been emptied (the directory remains, every file deleted) there is no corpus, so no append or
     rebuild ever happens, and the current graph would keep its aliases and keep turning up in searches. The graph

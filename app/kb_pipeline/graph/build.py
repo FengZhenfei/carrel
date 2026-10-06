@@ -29,6 +29,7 @@ import os
 import secrets
 import shutil
 import signal
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -362,7 +363,7 @@ def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
     """Compress the configuration items whose change invalidates the whole extraction cache into one fingerprint:
     the per-step models, the type table, the predicate table, parent types, language, unit size, gleaning rounds
     and the prompt texts. The console compares it with the one recorded when the build started and, on mismatch,
-    turns "Continue build" back into "Build now / rebuild". The corpus dimension is tracked separately by
+    turns "Resume build" back into "Build / rebuild now". The corpus dimension is tracked separately by
     graph_builds.source_content_hash."""
     from .facts import FACTS_MAX_PER_UNIT
 
@@ -726,12 +727,18 @@ def build_graph(
           f"kind={'append' if incremental else 'full'} dry_run={dry_run}", flush=True)
     paths = graph_paths(settings, source, graph_version)
     build_id = "dry-run"
-    result: dict[str, Any] = {}
+    # The intent at start goes into the manifest: of the builds a machine shutdown interrupts, the scheduled check
+    # resumes only "whole corpus, publish" ones (sample builds and builds that do not switch aliases are not resumed,
+    # see db.interrupted_full_build). On an error the result is written into the manifest as it is, so it carries the
+    # intent from the very start
+    intent = {"publish": bool(activate_aliases), "full_corpus": doc_ids is None}
+    result: dict[str, Any] = {"intent": intent}
     input_manifest: dict[str, Any] | None = None
     build_chunks: list[dict[str, str]] = []
     stop_event = threading.Event()
     interrupted = threading.Event()
-    restore_signals = _install_build_signal_handlers(stop_event, interrupted)
+    received_signals: list[int] = []
+    restore_signals = _install_build_signal_handlers(stop_event, interrupted, received_signals)
 
     def check_stop() -> None:
         # the main thread is mostly blocked in HTTP calls (embedding, writing vectors), where the retries of that
@@ -795,6 +802,7 @@ def build_graph(
                     cache_fingerprint=graph_cache_fingerprint(settings, source),
                     build_kind="append" if incremental else "full",
                 )
+                db.update_graph_build_manifest(con, build_id, {"intent": intent})   # nobody writes it after a SIGKILL
                 # in the same transaction as the fingerprint rewrite: once the record carries this run's fingerprint,
                 # the phase marks left on it must be the ones checked against it
                 if previous is not None:
@@ -849,7 +857,7 @@ def build_graph(
                             if schema_auto else None),
             "source_collection": source.collection, "graph_version": graph_version,
             "graph_build_id": build_id, "resumed_phases": sorted(phases_done),
-            "build_kind": "append" if incremental else "full",
+            "build_kind": "append" if incremental else "full", "intent": intent,
             "base_version": str(base_row["graph_version"]) if base_row is not None else None,
             "paths": {"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir), "cache_file": str(paths.cache_file)},
             "models": {step: spec.name for step, spec in specs.items()},
@@ -1524,7 +1532,16 @@ def build_graph(
             result["error"] = repr(exc)
         # A signal interruption is not a failure: record cancelled, the panel shows "stopped", and the cache and
         # extracted units stay for the next resume.
-        terminal_status = "cancelled" if isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) else "failed"
+        # A run that received a stop signal ends as interrupted whatever it raised: the signal may have been wrapped
+        # into another exception on its way (client libraries wrap any exception), same rule as _run_phase
+        terminal_status = ("cancelled" if isinstance(exc, (GraphBuildInterrupted, LLMInterrupted)) or interrupted.is_set()
+                           else "failed")
+        if terminal_status == "cancelled" and received_signals and not isinstance(exc, GraphBuildCalledOff):
+            # Whether the machine was shutting down when the signal arrived is recorded on the spot: the scheduled
+            # check resumes only builds a shutdown stopped (db.interrupted_full_build). The error text cannot tell
+            # afterwards -- a person's stop and a shutdown write the same, and a checkpoint re-raising a swallowed
+            # signal does not even carry the signal number
+            result["stopped_by"] = {"signals": sorted(set(received_signals)), **_shutdown_probe()}
         if not dry_run and build_id != "dry-run":
             with db.connect(settings.state_db) as con:
                 record_build_outcome(
@@ -1728,14 +1745,38 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     return {"result": result, "steps": steps, "errors": errors}
 
 
+def _shutdown_probe() -> dict[str, Any]:
+    """Is the machine shutting down: only the system manager (PID1) reporting stopping counts. PID1 reports stopping as
+    soon as the shutdown transaction is queued, before anything is stopped, and the system bus stops after the user
+    manager, so the build can still ask it when SIGTERM arrives. The user manager also reports stopping when it alone
+    goes down (restart / stop user@, loginctl terminate-user, systemctl --user exit), which is a person stopping
+    things, so its state is only recorded for reference. When nothing can be asked (no systemd, a timeout) the answer
+    is "not shutting down" -- better not to resume on its own. is-system-running exits 0 only when running and prints
+    the other states all the same, so only the output is read, not the exit code."""
+    states: dict[str, str] = {}
+    for scope, cmd in (("user", ["systemctl", "--user", "is-system-running"]),
+                       ("system", ["systemctl", "is-system-running"])):
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            states[scope] = (done.stdout or "").strip() or f"exit {done.returncode}"
+        except Exception as exc:
+            states[scope] = type(exc).__name__
+    return {"system_state": states, "shutdown": states.get("system") == "stopping"}
+
+
 def _install_build_signal_handlers(stop_event: threading.Event | None = None,
-                                   interrupted: threading.Event | None = None):
+                                   interrupted: threading.Event | None = None,
+                                   received: list[int] | None = None):
     """Turn SIGTERM/SIGINT into an exception handled by build_graph's failure path; also set the stop event so
     worker threads waiting on the LLM exit as soon as possible. Returns a function that restores the original
     handlers.
     interrupted is set only here (stop is also set by a circuit break or a thread-pool error): when the raised
-    exception is swallowed on its way, the checkpoints recognise the stop signal by it."""
+    exception is swallowed on its way, the checkpoints recognise the stop signal by it.
+    received records which signals arrived: an exception swallowed on its way and re-raised by a checkpoint does
+    not carry the signal number."""
     def handler(signum, _frame):
+        if received is not None:
+            received.append(int(signum))
         if interrupted is not None:
             interrupted.set()
         if stop_event is not None:

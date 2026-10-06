@@ -9,6 +9,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -269,6 +270,17 @@ def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: boo
         return {"skipped": True, "reason": "graph build running", "yielded_to": "graph_build",
                 "dry_run": dry_run, "keep_latest": keep}
     try:
+        if not dry_run:
+            # Builds that were killed (reboot, OOM) but still say running are marked failed first, without waiting for
+            # someone to open the console: a running version is neither a "half-built version" nor gives way, so it
+            # takes a retention slot. The lock is ours, so no live build is misjudged; the lock path is given
+            # explicitly instead of being derived from where the state database lives
+            try:
+                with db.connect(settings.state_db) as con:
+                    out["reconciled"] = db.reconcile_stale_graph_builds(con, lock_path=lock.path)
+            except Exception as exc:
+                out["reconcile_error"] = repr(exc)
+                print(f"[graph-gc] reconcile stale graph builds failed: {exc!r}", file=sys.stderr, flush=True)
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
         for key, source in sorted(settings.sources.items(), key=lambda kv: kv[1].kb_id):
             if not getattr(source, "graph_enabled", False):
@@ -548,6 +560,9 @@ def _drop_graph_data(settings: Settings, con, *, kb_id: str, collection: str, er
                 "(SELECT graph_build_id FROM graph_builds WHERE kb_id=?)", (kb_id,))
         cur = con.execute("DELETE FROM graph_builds WHERE kb_id=?", (kb_id,))
         entry["graph_builds_deleted"] = int(cur.rowcount or 0)
+        # The automatic resume count goes with the build records (the key holds only the kb_id; ids are never reused,
+        # so it would stay forever otherwise)
+        con.execute("DELETE FROM app_config WHERE key = ?", (db.GRAPH_AUTO_RESUME_PREFIX + kb_id,))
         entry["graph_extractions_deleted"] = db.delete_graph_extractions(con, kb_id)
         entry["graph_facts_deleted"] = db.delete_graph_facts(con, kb_id)
     except Exception as exc:

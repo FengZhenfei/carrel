@@ -327,6 +327,44 @@ class ScanBoundaryTests(unittest.TestCase):
             min_file_age_seconds=30, sources={},
         )
 
+    def test_the_scan_reclaims_a_graph_build_that_died_in_this_boot(self) -> None:
+        """The scan that runs every minute also reclaims dead graph builds: one killed (kill -9 / OOM) during this
+        boot is recorded as "no longer exists" right away and keeps that reason after a later reboot, so the
+        scheduled check does not take it for one a shutdown stopped and does not resume it."""
+        import argparse
+        import socket
+        from unittest import mock
+
+        from kb_pipeline import cli, discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "mirror"; root.mkdir(); (root / "库A").mkdir()
+            state = Path(tmp) / "s.db"; db.init_db(state)
+            started = int(time.time()) - 600
+            with db.connect(state) as con:
+                src, _ = discovery.enroll(con, root, "库A")
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, "
+                    "started_at, worker_host, worker_pid, heartbeat_at, build_kind, manifest_json) "
+                    "VALUES('g', ?, ?, ?, 'v1', 'running', ?, ?, 99999999, ?, 'full', ?)",
+                    (src.kb_id, src.kb_id, src.collection, started, socket.gethostname(), started,
+                     json.dumps({"intent": {"publish": True, "full_corpus": True}})))
+            settings = self._settings(root, state)
+            settings.sources = discovery.enrolled_sources(state, root)
+            args = argparse.Namespace(env_file=None, source=None, limit=None, verbose=False, dry_run=False, rehash=False,
+                                      requeue_failed=False, no_detect_deletes=False, force_kb_teardown=False,
+                                      exit_code_on_recent=False)
+            with mock.patch.object(cli, "load_settings", return_value=settings), \
+                    mock.patch.object(db, "boot_time", return_value=started - 3600):
+                self.assertEqual(cli.cmd_scan(args), 0)
+            with db.connect(state) as con:
+                row = con.execute("SELECT status, error FROM graph_builds WHERE graph_build_id = 'g'").fetchone()
+                self.assertEqual(row["status"], "failed")
+                self.assertTrue(str(row["error"]).startswith(db.GRAPH_RECLAIMED_DEAD), row["error"])
+                with mock.patch.object(db, "boot_time", return_value=started + 1):       # a reboot afterwards
+                    self.assertEqual(db.reconcile_stale_graph_builds(con), [])
+                self.assertIsNone(db.interrupted_full_build(con, src.kb_id))
+
     def test_mirror_root_missing_refuses_to_touch_anything(self) -> None:
         """A missing mirror root is indistinguishable from "all KBs vanished at once": the whole round of lifecycle
         processing must be refused, otherwise one failed mount marks every knowledge base deactivated and fills the

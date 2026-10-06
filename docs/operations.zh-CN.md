@@ -74,6 +74,12 @@ journalctl --user -u carrel-web --since -5min
 
 控制台和检索 API 作为常驻服务运行，内存紧张时批处理单元先于它们被终止（`OOMScoreAdjust` 分别为 200 和 100）。定时器按相对间隔执行，不使用日历时刻。入库、建图或同步繁忙时，维护任务可以延后；连续多次延后会以退出码 75 显示失败状态，策略见 `scripts/lib/kb-maint-defer.sh` 和 [systemd 文档](../deployment/systemd/README.md#busy-yield)。
 
+整机关机、重启或断电停下的整库建图，由定时的图谱检查（`check-rebuild --execute`）接着处理。这一轮本来不需要整库重建时，会按同一版本续跑：跑完的阶段跳过，抽取结果走缓存，最多续两次。首次建图还没成功过，或者重建策略已经到期时，这一轮会另起新版本从头跑，阶段不跳过，图谱设置没变的话抽取结果仍走缓存。
+
+建图收到停止信号时会当场记下 systemd 是否正在关机；被直接杀掉的，按「开跑早于本次开机」认出；机器一直开着期间死掉的建图，扫描会在一分钟内记为已不存在，不会被续。人停的（控制台暂停或关闭、Ctrl-C、`kill`、`systemctl stop`）、OOM、带 `--no-activate-aliases` 跑的建图、升级到这一版之前就已开始的建图、被回退顶替的版本，以及之后改过图谱设置（模型、标签、谓词、语言、单元大小、嵌入模型，或升级带来的提示词变化）的建图，都留给控制台处理：缓存还能续用时按钮是「继续建图」，否则是「立即/重新建图」，会另起新版本。没有安排定时图谱检查的主机不会自动续跑；不在 Linux 上时，停止也不会被认作关机。
+
+不带 `--execute` 的 `kb graph check-rebuild` 会用 `would_resume`（版本和已续次数）报出下一轮会尝试续跑的建图，次数用完的报成 `resume_declined`（`attempts_exhausted`）。它不检查模型和配置指纹，所以真正执行的那一轮仍可能拒绝（`config_changed`）或跳过（`build_skipped`）。要让某个库的定时建图不再跑，可以在建图进行中点「暂停建图」，或者关掉「开启知识图谱」并保存；停掉 `carrel-graph-rebuild.service` 只会结束当前这一轮，下一轮仍由定时器照常触发。
+
 默认维护只处理项目资产。清理用户级 uv/pip 缓存或 Docker 缓存需显式设置 `KB_HOST_HOUSEKEEPING=1`。
 
 每夜备份只留不可再生的内容：状态库（各库配置、模型注册表、抽取与事实缓存）、管线 env、compose 的 `.env` 以及 `runtime/eval` 下的题集，原样复制到 `backups/state/<时间戳>/`，只保留最近 `KB_BACKUP_KEEP`（7）份。向量、索引、图谱和解析缓存都能从镜像重建。恢复时先停定时器和两个服务，从最新一份放回两个 env 与 `runtime/state/kb-pipeline.db`，用 `docker compose up -d` 起容器，再起服务和定时器；状态库里的缓存还在的话，整库重建不会再调用远端模型。

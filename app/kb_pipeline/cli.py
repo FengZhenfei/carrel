@@ -15,7 +15,8 @@ from . import db
 from . import discovery, search_fts
 from .config import load_settings
 from .graph.build import (GraphBuildCalledOff, GraphBuildInterrupted, adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild,
-                          graph_retirable, kb_still_active, llm_ready, retire_graph, rollback_graph_version)
+                          graph_cache_fingerprint, graph_retirable, kb_still_active, llm_ready, retire_graph,
+                          rollback_graph_version)
 from .graph.llm import LLMInterrupted
 from .graph.lock import build_lock_held, build_lock_path, clear_lock_leftovers
 from .graph.neo4j_import import delete_neo4j_graph_version, import_graph_to_neo4j, neo4j_status
@@ -125,9 +126,29 @@ def cmd_init_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reclaim_stale_graph_builds(settings) -> list[str]:
+    """Mark graph build records whose process is dead but which still say running as failed, without waiting for
+    someone to open the console. Called by the scan that runs every minute and at the start of each scheduled check:
+    a build that died during this boot (kill -9, OOM) is recorded as "no longer exists" within a minute, and only one
+    that went with a shutdown or power loss is left for after the boot, recorded as "ended with the last shutdown or
+    power loss" -- the only kind the scheduled check resumes. The lock path is given explicitly instead of being
+    derived from where the state database lives. Errors are only logged."""
+    try:
+        with db.connect(settings.state_db) as con:
+            recovered = db.reconcile_stale_graph_builds(con, lock_path=build_lock_path(settings))
+    except Exception as exc:
+        print(f"[graph] reconcile stale graph builds failed: {exc!r}", file=sys.stderr, flush=True)
+        return []
+    if recovered:
+        print(f"[graph] recovered stale graph builds: {','.join(recovered)}", flush=True)
+    return recovered
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
     db.init_db(settings.state_db)
+    if not getattr(args, "dry_run", False):
+        _reclaim_stale_graph_builds(settings)
     stats = ScanStats()
     if args.source and args.source not in settings.sources:
         raise ValueError(f"unknown source {args.source!r}; available: {', '.join(settings.sources)}")
@@ -814,6 +835,65 @@ def _rebuild_blocked(settings, source) -> dict | None:
     return None
 
 
+# How many times the scheduled check resumes a build a machine shutdown stopped: an OOM kill shortly before a reboot
+# can still look like one, and without a limit it would be resumed every two hours
+GRAPH_AUTO_RESUME_LIMIT = 2
+
+
+def _interrupted_build(settings, source) -> dict | None:
+    """Does this knowledge base have a full build the scheduled check should resume (see db.interrupted_full_build);
+    paused or switched-off graphs are not looked at."""
+    if not getattr(source, "graph_enabled", False) or getattr(source, "graph_paused", False):
+        return None
+    with db.connect(settings.state_db) as con:
+        return db.interrupted_full_build(con, source.kb_id)
+
+
+def _resume_interrupted(settings, key, source, decision) -> bool:
+    """Resume, under the same version, a full build stopped by a machine shutdown, reboot or power loss: finished
+    phases are skipped, extraction and responses come from the cache.
+
+    The console's "Resume build" needs someone to press it; without that, when there is nothing new in the knowledge
+    base and the policy is not due, the version stays "stopped / failed" for good. Builds a person stopped (console
+    pause / switch-off, Ctrl-C, kill, systemctl stop), OOM, sample builds, old records after a rollback and builds whose
+    configuration fingerprint has changed (resuming them means calling the models over the whole corpus again, which
+    is for a person to decide) are not resumed; the rules are in db.interrupted_full_build. Returns True when this
+    round is handled here (resumed, or due to resume but yielded / models not set), so the caller does not look at the
+    incremental append; False to go on as before."""
+    if decision.get("reason") in ("disabled", "paused_by_operator"):
+        return False
+    found = _interrupted_build(settings, source)
+    if found is None:
+        return False
+    row, attempts = found["row"], int(found["attempts"])
+    version = str(row["graph_version"])
+    if attempts >= GRAPH_AUTO_RESUME_LIMIT:
+        decision["resume_declined"] = {"graph_version": version, "reason": "attempts_exhausted", "attempts": attempts}
+        return False
+    not_ready = llm_ready(settings, source)
+    if not not_ready and str(row["cache_fingerprint"] or "") != graph_cache_fingerprint(settings, source):
+        decision["resume_declined"] = {"graph_version": version, "reason": "config_changed"}
+        return False
+    decision.update(due=True, reason="resume_interrupted", resumed_graph_version=version)
+    if not_ready:
+        decision["build_skipped"] = {"reason": "llm_not_configured", "detail": not_ready}
+        return True
+    blocked = _rebuild_blocked(settings, source)
+    if blocked:
+        decision["build_skipped"] = blocked          # yielding does not count; the next round comes back to it
+        return True
+    with db.connect(settings.state_db) as con:
+        db.mark_graph_auto_resume(con, source.kb_id, row, attempts + 1, ours=bool(found.get("ours")))
+    print(f"[graph] {key}: resuming interrupted build version={version} "
+          f"(auto attempt {attempts + 1}/{GRAPH_AUTO_RESUME_LIMIT}, last error: {str(row['error'] or '')[:120]})",
+          file=sys.stderr, flush=True)
+    decision["build"] = build_graph(settings, source_key=key, source=source, graph_version=version,
+                                    allow_existing_graph_version=True)
+    with db.connect(settings.state_db) as con:
+        con.execute("DELETE FROM app_config WHERE key = ?", (db.GRAPH_AUTO_RESUME_PREFIX + source.kb_id,))
+    return True
+
+
 def _fresh_source(settings, source):
     """Re-read this KB's configuration from the registry by kb_id when its turn comes. A round of checks runs
     serially: a KB earlier in the round may build for hours while the later ones still hold the copy read when
@@ -927,6 +1007,10 @@ def cmd_graph(args: argparse.Namespace) -> int:
         force_full = bool(getattr(args, "force_full", False))
         if force_full and (not args.execute or len(selected) != 1):
             raise ValueError("--force-full requires --execute and exactly one --source")
+        if args.execute and not args.dry_run:
+            # The resume decision below needs the terminal states after reclaiming; a round is serial, so once at the
+            # start is enough
+            _reclaim_stale_graph_builds(settings)
         for key, source in selected:
             try:
                 source = _fresh_source(settings, source)
@@ -981,6 +1065,17 @@ def cmd_graph(args: argparse.Namespace) -> int:
 
                 if closed:
                     pass
+                elif not args.execute:
+                    # Read-only check: report whether a round with --execute would resume an interrupted full build
+                    # (models and fingerprint are not looked at)
+                    found = None if decision.get("due") or decision.get("reason") in (
+                        "no_active_content", "disabled", "paused_by_operator") else _interrupted_build(settings, source)
+                    if found is not None:
+                        info = {"graph_version": str(found["row"]["graph_version"]), "attempts": int(found["attempts"])}
+                        if info["attempts"] >= GRAPH_AUTO_RESUME_LIMIT:
+                            decision["resume_declined"] = {**info, "reason": "attempts_exhausted"}
+                        else:
+                            decision["would_resume"] = info
                 elif args.execute and decision.get("due"):
                     # The first build (no successful version yet) does not re-extract: that label version is
                     # usually the one the user just extracted; without one, the build fills it in itself
@@ -994,6 +1089,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
                             decision["build_skipped"] = blocked
                         else:
                             decision["retired"] = retire_graph(settings, source_key=key, source=source)
+                elif not args.dry_run and _resume_interrupted(settings, key, source, decision):
+                    pass        # resumed a build a shutdown stopped (or it yielded): no append this round
                 elif args.execute:
                     append = evaluate_append(settings, source_key=key, source=source)
                     decision["append"] = append
@@ -1038,6 +1135,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
                             "kind": check_kind(decision), "due": bool(decision.get("due")),
                             "reason": decision.get("reason"), "append_reason": append_info.get("reason"),
                             "skipped_reason": skipped.get("reason"), "error": decision.get("error"),
+                            "resumed_graph_version": decision.get("resumed_graph_version"),
                         })
                 except Exception as record_exc:
                     print(f"[graph] record check failed for {key}: {record_exc!r}", file=sys.stderr, flush=True)

@@ -102,6 +102,38 @@ while ingestion, graph building, or synchronization is active. Repeated
 deferrals produce exit 75 and a visible failed-unit state; see
 `scripts/lib/kb-maint-defer.sh` and the [systemd guide](../deployment/systemd/README.md#busy-yield).
 
+A full graph build stopped by a machine shutdown, reboot or power loss is
+picked up again by the scheduled graph check (`check-rebuild --execute`). When
+that round is not due for a full rebuild anyway, it resumes the same version,
+skipping finished phases and reusing cached extraction, at most twice. While the
+first build has never finished, or when the rebuild policy is due, the round
+starts a new version instead: no phases are skipped, and cached extraction is
+still reused as long as the graph settings are unchanged.
+
+When a build receives a stop signal it records whether systemd was shutting
+down; a build killed outright is recognised by having started before the
+current boot, and the scan marks builds that die while the machine stays up as
+dead within a minute, so those are not resumed. Builds stopped by a person
+(console pause or switch-off, Ctrl-C, `kill`, `systemctl stop`), OOM kills,
+builds run with `kb graph build --no-activate-aliases`, builds started before
+upgrading to this version, versions superseded by a rollback, and builds whose
+graph settings have changed since (models, labels, predicates, language, unit
+size, the embedding model, or prompts changed by an upgrade) are left to the
+console: **Resume build** while the cache can still be reused, otherwise
+**Build / rebuild now**, which starts a new version. A host that does not
+schedule the graph check never resumes on its own, and outside Linux no stop is
+attributed to a shutdown.
+
+`kb graph check-rebuild` without `--execute` reports `would_resume` (version and
+attempts so far) for a build the next round would try to resume, or
+`resume_declined` with `attempts_exhausted` once the limit is reached. It does
+not look at models or the settings fingerprint, so the executing round may still
+decline the build (`config_changed`) or skip it (`build_skipped`). To keep a
+knowledge base's scheduled builds from running, use **Pause build** while it is
+building or turn **Enable knowledge graph** off and save; stopping
+`carrel-graph-rebuild.service` only ends the current round, and the timer starts
+the next one as usual.
+
 Maintenance covers project data by default. Set `KB_HOST_HOUSEKEEPING=1` to
 also clear user-level uv/pip caches and prune Docker caches.
 
