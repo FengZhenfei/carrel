@@ -52,6 +52,7 @@ TXT = {
     "hits": "{hits} hits",
     "neighbors_n": "{n} neighbouring chunks",
     "none": "⚠ nothing relevant was found, or only diagnostic candidates: not enough to support an answer; this does not mean the knowledge base holds nothing",
+    "rel_path_none": "--rel-path {paths} matched no document in the knowledge base: write the path inside the knowledge base, sub-folders included (the path on a source line without the knowledge base folder at its start); catalog lists bare file names, not paths. Unsure of the path: --in-doc <call id>:S<n>",
     "degraded": "gaps in this retrieval: {items}",
     "routing_weak": "routing: weak vector evidence (weak)",
     "routing_widened": "routing: widened to every knowledge base (widened)",
@@ -512,6 +513,20 @@ def source_notes(s, ref, parent=None, position=False):
     return notes
 
 
+def missed_paths(envelope, hits):
+    """The --rel-path values that matched no document. Filtered to a document that exists, the vector channel always
+    has some chunk to return (it has no score threshold), so no hit and no candidate from a vector channel that ran
+    means the paths were wrong (most often a bare file name without its folders). Without a question vector the
+    channel is skipped and nothing is concluded."""
+    rel = ((envelope.get("request") or {}).get("hints") or {}).get("rel_paths") or []
+    if not rel or hits:
+        return []
+    channels = (envelope["result"].get("retrieval_summary") or {}).get("channels") or {}
+    ran = [c["text"]["candidates"] for c in channels.values()
+           if isinstance(c, dict) and isinstance(c.get("text"), dict) and "candidates" in c["text"]]
+    return [str(p) for p in rel] if ran and not any(ran) else []
+
+
 def view_search(envelope, limit=PAGE_BYTES):
     r = envelope["result"]
     cid = envelope["call_id"]
@@ -522,6 +537,9 @@ def view_search(envelope, limit=PAGE_BYTES):
                 TXT["hits"].format(hits=len(hits)) + (" + " + TXT["neighbors_n"].format(n=len(src) - len(hits)) if len(src) > len(hits) else ""))]
     if summary.get("no_relevant_content"):
         out.append(TXT["none"])
+    missed = missed_paths(envelope, hits)
+    if missed:
+        out.append(TXT["rel_path_none"].format(paths=TXT["list"].join(missed)))
     if summary.get("degraded"):
         out.append(TXT["degraded"].format(items="; ".join(str(x) for x in summary["degraded"])))
     routing = summary.get("routing") or {}
@@ -1141,7 +1159,9 @@ def parser():
             cmd.add_argument("--explain", action="store_true")
             cmd.add_argument("--block-type", action="append", help="Prefer chunks of this kind (table, image, ...); a soft preference, repeatable")
             cmd.add_argument("--in-doc", action="append", metavar="REF", help="Search only inside the document of this entry (e.g. 3fa2c1:S3); repeatable")
-            cmd.add_argument("--rel-path", action="append", help="Search only this document path inside the knowledge base; repeatable")
+            cmd.add_argument("--rel-path", action="append",
+                             help="Search only this document: its path inside the knowledge base, sub-folders included (the path on "
+                                  "a source line without the knowledge base folder at its start; catalog lists bare file names); repeatable")
         if name == "image":
             cmd.add_argument("--kb")
             cmd.add_argument("--point-id")

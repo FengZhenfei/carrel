@@ -2735,6 +2735,30 @@ class SkillClientTests(unittest.TestCase):
         self.assertIn("products/vendor/manual.pdf  ← N1 N2 N3", near)
         self.assertTrue(near[-3].startswith("▶ Answer only the follow-up the user picked and go no further"))
 
+    def test_a_rel_path_that_matched_no_document_is_named(self) -> None:
+        """The service matches --rel-path exactly against the path inside the knowledge base, and a bare file name
+        copied from catalog finds nothing without an error. Filtered to a document that exists, the vector channel
+        always returns chunks, so the view names the paths when there is no hit and the vector channel that ran found
+        nothing; without a question vector the channel is skipped and nothing is concluded."""
+        c = self._client()
+
+        def search(channels, paths=("manual.pdf",), sources=()):
+            return {"call_id": "cccccc", "operation": "search", "request": {"question": "q", "hints": {"rel_paths": list(paths)}},
+                    "result": {"kbs": ["kb_005"], "kb_names": {"kb_005": "products"}, "sources": list(sources),
+                               "retrieval_summary": {"evidence_state": "diagnostic", "no_relevant_content": True, "channels": channels}}}
+
+        empty = {"kb_005": {"text": {"candidates": 0}, "bm25": {"candidates": 0}}}
+        view = c.view_search(search(empty, ("manual.pdf", "prices.xlsx")))
+        self.assertEqual(view[2], "--rel-path manual.pdf, prices.xlsx matched no document in the knowledge base: write the path inside the "
+                                  "knowledge base, sub-folders included (the path on a source line without the knowledge base folder at its "
+                                  "start); catalog lists bare file names, not paths. Unsure of the path: --in-doc <call id>:S<n>")
+        quiet = [search({"kb_005": {"text": {"candidates": 4}, "bm25": {"candidates": 0}}}),                    # the document exists
+                 search({"kb_005": {"text": {"skipped": "embedding unavailable"}, "bm25": {"candidates": 0}}}),  # no question vector
+                 search(empty, paths=()),
+                 search(empty, sources=[{"n": 1, "role": "hit", "kb_id": "kb_005", "rel_path": "vendor/manual.pdf", "text": "x"}])]
+        for envelope in quiet:
+            self.assertFalse([line for line in c.view_search(envelope) if line.startswith("--rel-path")])
+
     def test_listings_and_read_back_use_the_same_labels_and_remarks(self) -> None:
         import tempfile
         from pathlib import Path
