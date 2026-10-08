@@ -157,16 +157,17 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
                      stitch: tuple[int, int] | None = None, neighbor_span: int = 1,
                      overlap_threshold: float = 0.85) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """hits are already ranked and each carries a payload. Hits are first deduped by text and all
-    numbered first; short hits are then stitched with neighbours (Q16; the material excludes other hits
-    and boilerplate chunks); table continuation chunks bring their header chunk; neighbours come after,
-    ordered by distance, backfilled only within budget, and dropped when they overlap a hit. Returns
-    (sources, stats)."""
+    numbered first; short hits are then stitched with neighbours (Q16; the material excludes other hits,
+    chunks a higher-ranked hit already stitched in, and boilerplate chunks); table continuation chunks
+    bring their header chunk; neighbours come after, ordered by distance, backfilled only within budget,
+    and dropped when a stitched hit already shows them or they overlap a hit. Returns (sources, stats)."""
     rows: list[dict[str, Any]] = []
     for i, cand in enumerate(hits, 1):
         rows.append(source_row(i, cand, cand.get("payload") or {}))
     rows, dropped_hits = dedupe_overlaps(rows, threshold=overlap_threshold)
     stats = {"hits": len(rows), "hit_tokens": 0, "neighbors": 0, "table_heads": 0, "stitched": 0, "truncated_hits": 0, "dropped_overlaps": dropped_hits, "budget_tokens": budget_tokens}
     hit_ids = {str(r.get("point_id")) for r in rows}
+    taken = set(hit_ids)            # a chunk goes into one hit only: two short hits close together would otherwise both stitch it in
     neighbor_cache: dict[str, list[dict[str, Any]]] = {}
     if neighbors is not None and stitch:
         span = max(neighbor_span, 2)
@@ -174,9 +175,10 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
             if str(r.get("block_type") or "") in STITCHABLE_BLOCKS and len(str(r.get("text") or "")) < stitch[0]:
                 nbs = neighbors(r, span)
                 neighbor_cache[str(r["point_id"])] = nbs
-                material = [p for p in nbs if str(p.get("point_id")) not in hit_ids and not is_boilerplate(p)]
+                material = [p for p in nbs if str(p.get("point_id")) not in taken and not is_boilerplate(p)]
                 if stitch_short_hit(r, material, min_chars=stitch[0], max_chars=stitch[1]):
                     stats["stitched"] += 1
+                    taken.update(str(pc.get("point_id")) for pc in r["stitched"]["pieces"])
     # Hard budget boundary (Codex S07 / R3): every hit first reserves a minimum excerpt allowance (the
     # smaller of 80 tokens and budget / count), the rest is handed out in order; the total never exceeds
     # the budget, and a hit that overflows is cut to an excerpt with its position and marked
@@ -199,7 +201,9 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
         stats["truncated_hits"] = stats.get("truncated_hits", 0) + 1
     stats["hit_tokens"] = used
     extra: list[dict[str, Any]] = []
-    seen = set(hit_ids)
+    # a chunk whose text a stitched hit still shows is not offered again: the overlap check below would not always
+    # catch it, since joining two pieces can run their numbers together
+    seen = hit_ids | {str(pc.get("point_id")) for r in rows for pc in (r.get("stitched") or {}).get("pieces") or [] if pc.get("kept", True)}
     if table_head is not None:
         for r in rows:
             if str(r.get("block_type") or "") != "table":

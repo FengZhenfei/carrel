@@ -322,6 +322,32 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("前文。", s1["text"]); self.assertEqual(s1["stitched"]["chunk_from"], 0)
         self.assertEqual(next(r for r in rows if r["role"] == "table_head")["of"], next(r for r in rows if r["point_id"] == "t2")["n"])
 
+    def test_assemble_sources_prints_each_chunk_once(self) -> None:
+        """A chunk goes into the sources once. Two short hits close together reach for the same neighbour: the
+        higher-ranked one stitches it in and the other stitches further out. A chunk a hit stitched in is not
+        offered again as a neighbour either: the overlap check would not always drop it, since joining two
+        pieces can run their numbers together ("7" + "8" reads as 78)."""
+        names = "零一二三四五六七八"
+
+        def doc(**texts):
+            return {i: _payload(f"c{i}", "d1", i, texts.get(f"c{i}", f"{names[i]}段正文。" * 40)) for i in range(9)}
+
+        def hit(chunks, i):
+            return {"point_id": f"c{i}", "kb_id": "kb_001", "scores": {}, "recall_sources": ["text"], "payload": chunks[i]}
+
+        def assemble(chunks, ranked):
+            near = lambda r, span: [chunks[j] for j in range(int(r["chunk_index"]) - span, int(r["chunk_index"]) + span + 1)
+                                    if j != int(r["chunk_index"]) and j in chunks]
+            rows, _ = assemble_sources([hit(chunks, i) for i in ranked], budget_tokens=5000, neighbors=near, stitch=(350, 850), neighbor_span=1)
+            printed = [pc["point_id"] for r in rows for pc in (r.get("stitched") or {}).get("pieces") or [{"point_id": r["point_id"]}]]
+            self.assertEqual(len(printed), len(set(printed)), printed)
+            return {r["point_id"]: [pc["point_id"] for pc in r["stitched"]["pieces"]] if r.get("stitched") else r["role"] for r in rows}
+
+        two_short = doc(c3="短甲。", c5="短乙。")
+        self.assertEqual(assemble(two_short, [3, 5]), {"c3": ["c2", "c3", "c4"], "c5": ["c5", "c6", "c7"]})
+        joined = doc(c3="短甲 7", c4="8 号条款。" + "四段正文。" * 40)
+        self.assertEqual(assemble(joined, [3]), {"c3": ["c2", "c3", "c4"]})
+
 
 class ImagesTests(unittest.TestCase):
     def test_resolve_bbox_conventions_and_crop(self) -> None:
@@ -1231,9 +1257,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(hits[0]["recall_sources"], ["text", "bm25", "graph"]); self.assertEqual(hits[0]["entities"], ["尿酸"])
         self.assertEqual(hits[2]["recall_sources"], ["text", "visual"])                            # RRF of the visual and text channels
         self.assertEqual(hits[1]["scores"]["score_bm25"], 9.0); self.assertIn("甘油三酯 1.7 mmol/L。", hits[1]["text"])   # the id-only hit got its text backfilled
-        self.assertEqual(hits[1]["stitched"]["own_chars"], 320)                                             # the short chunk was stitched with its neighbours
-        self.assertTrue(len(hits[1]["text"]) > 320 or hits[1].get("text_truncated"))                        # test budget is 400 tokens: the excess is cut to an excerpt (S07)
-        self.assertEqual(s["sources"]["truncated_hits"], 2); self.assertTrue(hits[1]["stitched"]["pieces"][0]["point_id"])
+        # the short chunk was stitched with its neighbours; the next short hit in the same document finds them taken and
+        # stays as it is, so each neighbour is printed once
+        self.assertEqual([pc["point_id"] for pc in hits[0]["stitched"]["pieces"]], ["n1", "p1", "n3"]); self.assertEqual(hits[0]["stitched"]["own_chars"], 324)
+        self.assertNotIn("stitched", hits[1]); self.assertEqual(len(hits[1]["text"]), 320)
+        self.assertTrue(hits[2].get("text_truncated")); self.assertEqual(s["sources"]["truncated_hits"], 1)   # test budget is 400 tokens: the excess is cut to an excerpt (S07)
         self.assertEqual(hits[0]["position"], "page 2 · S")
         self.assertEqual([r["n"] for r in out["sources"]], list(range(1, len(out["sources"]) + 1)))
         nbs = [r for r in out["sources"] if r["role"] == "neighbor"]
