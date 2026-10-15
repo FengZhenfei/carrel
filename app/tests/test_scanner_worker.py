@@ -1016,6 +1016,219 @@ def _parse_harness(tmp: str):
         yield h
 
 
+def _rescan(h, run_id: str = "r2"):
+    """Scan once more (the KB holds only a.md): returns schedule_file's (change type, new job id)."""
+    from kb_pipeline import discovery
+    from kb_pipeline.localfs.scanner import list_source_files
+
+    [file] = list_source_files(discovery.enrolled_sources(h.settings.state_db, h.settings.mirror_root)[h.kb_id])
+    out = schedule_file(h.con, ingest_run_id=run_id, file=file, current_seen_file_keys=set(), current_checksum_counts={})
+    h.con.commit()
+    return out
+
+
+class ChangedSinceScanTests(unittest.TestCase):
+    """2026-10-15: the scan saw a 0-byte broken download, the retry read the 402 MB file dropped in again; the size
+    limit let it through on the 0 bytes the scan recorded, and ten minutes of parsing were thrown away right before
+    the write as stale. Now the parse job checks the disk before the parse and before the write: changed content is
+    not parsed / not written and the next scan queues it again with the new content; a mere modification time change
+    (a touch, a fresh sync) is confirmed by re-hashing, the row's modification time aligned and the work done; a file
+    gone before the write is written as before. The size limit is judged on the size on disk."""
+
+    def _job(self, h, job_id=None):
+        return h.con.execute("SELECT status, error FROM jobs WHERE job_id = ?", (job_id or h.job_id,)).fetchone()
+
+    def _indexed(self, h) -> tuple[int, bool]:
+        active = h.con.execute("SELECT COUNT(*) FROM chunks WHERE file_id = ? AND status = 'active'", (h.file_id,)).fetchone()[0]
+        row = db.get_file_by_id(h.con, h.file_id)
+        return int(active), str(row["indexed_version"] or "") == str(row["content_version"])
+
+    def _file(self, h) -> Path:
+        return Path(h.settings.mirror_root) / "库A" / "a.md"
+
+    def _touch(self, h, seconds: int = 100) -> int:
+        later = int(self._file(h).stat().st_mtime) + seconds
+        os.utime(self._file(h), (later, later))
+        return later
+
+    def _row_mtime(self, h) -> int:
+        return int(db.get_file_by_id(h.con, h.file_id)["mtime"])
+
+    def _events(self, h, job_id=None) -> list[str]:
+        return [r[0] for r in h.con.execute("SELECT text FROM job_events WHERE job_id = ?", (job_id or h.job_id,))]
+
+    def _index_then_requeue(self, h) -> str:
+        """Index normally first, then queue a parse job directly the way the console's "retry" does (no scan)."""
+        from kb_pipeline.pipeline import worker as worker_mod
+        from kb_pipeline.pipeline.scheduler import requeue_single_file
+
+        self.assertTrue(worker_mod.run_once(h.con, settings=h.settings).startswith("parse-done:"))
+        job_id = requeue_single_file(h.con, ingest_run_id="manual", file_row=db.get_file_by_id(h.con, h.file_id))
+        h.con.commit()
+        self.assertIsNotNone(job_id)
+        return job_id
+
+    def test_file_replaced_after_the_scan_is_not_parsed_and_the_next_scan_requeues_it(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            self._file(h).write_text("# 标题\n\n换成了另一份内容,长度也和原来不一样。", encoding="utf-8")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-changed-skipped:"), result)
+            self.assertEqual(h.calls, [])                                   # nothing parsed, the vector store untouched
+            self.assertEqual(self._job(h)["status"], "done")
+            self.assertEqual(self._indexed(h), (0, False))
+            self.assertTrue(any(e.startswith("The file content changed after the scan") and "not parsed this round" in e
+                                for e in self._events(h)))
+            change, job2 = _rescan(h)
+            self.assertEqual(change, "content_changed")
+            self.assertIsNotNone(job2)
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(self._indexed(h), (1, True))
+
+    def test_size_limit_is_judged_on_the_file_actually_on_disk(self) -> None:
+        """What happened on 10-15: small when scanned, swapped for a file over the limit before the retry. The size
+        the scan recorded must not let it through to the parser."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.settings.max_file_bytes = 200
+            big = "# 标题\n\n" + "很长的正文。" * 100
+            self._file(h).write_text(big, encoding="utf-8")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-changed-skipped:"), result)
+            self.assertNotIn("parse", h.calls)
+            _rescan(h)
+            worker_mod.run_once(h.con, settings=h.settings)
+            self.assertNotIn("parse", h.calls)
+            job = h.con.execute("SELECT status, error FROM jobs WHERE file_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                                (h.file_id,)).fetchone()
+            self.assertEqual(job["status"], "failed")
+            self.assertIn(f"{len(big.encode('utf-8'))} bytes > 200", job["error"])
+
+    def test_touched_but_unchanged_file_is_parsed_right_away(self) -> None:
+        """Only the modification time changed: the re-hash confirms the content, the parse goes ahead and the row's
+        modification time follows the disk."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            later = self._touch(h)
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(self._indexed(h), (1, True))
+            self.assertEqual(self._row_mtime(h), later)
+
+    def test_manual_reparse_of_a_touched_indexed_file_is_not_swallowed(self) -> None:
+        """An indexed file is touched; the scan calls it unchanged and queues nothing. A job queued directly by a
+        console retry or a whole-KB re-parse must not be skipped, or the file could never be re-parsed again (second
+        review, 2026-10-15). The scan aligns the row's modification time as well."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            job_id = self._index_then_requeue(h)
+            later = self._touch(h)
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(h.calls.count("upsert"), 2)
+            self.assertEqual(self._job(h, job_id)["status"], "done")
+            self.assertEqual(self._row_mtime(h), later)
+            again = self._touch(h)                      # touched once more, this time left to the scan
+            self.assertEqual(_rescan(h), ("unchanged", None))
+            self.assertEqual(self._row_mtime(h), again)
+
+    def test_file_replaced_during_the_parse_is_not_written(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.hooks["parse"] = lambda: self._file(h).write_text("# 标题\n\n解析途中被换掉的内容,长度不同。", encoding="utf-8")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-changed-skipped:"), result)
+            self.assertIn("parse", h.calls)
+            self.assertNotIn("upsert", h.calls)
+            self.assertEqual(self._indexed(h), (0, False))
+            self.assertTrue(any("the parse result was not stored" in e for e in self._events(h)))
+            self.assertEqual(_rescan(h)[0], "content_changed")
+
+    def test_touch_during_the_parse_does_not_lose_the_result(self) -> None:
+        """Touched during the parse: whether or not the scan caught up, unchanged content is written."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        for rescan in (False, True):
+            with self.subTest(rescan=rescan), tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+                h.hooks["parse"] = (lambda: (self._touch(h), _rescan(h, "r-mid"))) if rescan else (lambda: self._touch(h))
+                result = worker_mod.run_once(h.con, settings=h.settings)
+                self.assertTrue(result.startswith("parse-done:"), result)
+                self.assertEqual(self._indexed(h), (1, True))
+
+    def test_file_moved_during_a_reparse_is_still_written(self) -> None:
+        """Renamed / moved during a re-parse before the scan caught up: the old path is gone before the write, which
+        goes ahead as before; the move is left to the scan."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            self._index_then_requeue(h)
+            h.hooks["parse"] = lambda: self._file(h).rename(self._file(h).with_name("b.md"))
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-done:"), result)
+            self.assertEqual(h.calls.count("upsert"), 2)
+
+    def test_empty_document_path_checks_before_writing_too(self) -> None:
+        """The empty-document ending checks as well: swapped for other whitespace-only content (another size) during
+        the parse, it is not marked indexed under the old version."""
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            h.results["parse"] = []
+            h.hooks["parse"] = lambda: self._file(h).write_text("\n\n\n\n", encoding="utf-8")
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("parse-changed-skipped:"), result)
+            self.assertEqual(self._indexed(h), (0, False))
+
+    def test_link_out_of_the_kb_still_fails_on_the_boundary_check(self) -> None:
+        """Swapped for a link out of the enrolled directory: still the boundary error and a failure, not a silent skip
+        as "changed content", and nothing outside the directory is read first."""
+        from kb_pipeline.pipeline import parse_job, worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            outside = Path(tmp) / "outside.md"
+            outside.write_text("# 目录外\n\n另一份内容,长度也不一样。", encoding="utf-8")
+            self._file(h).unlink()
+            self._file(h).symlink_to(outside)
+            hashed = []
+            with patch.object(parse_job, "sha256_file", lambda p: hashed.append(p) or "x"):
+                result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("failed:"), result)
+            self.assertIn("outside the enrolled directory", self._job(h)["error"])
+            self.assertEqual(hashed, [])
+            self.assertEqual(h.calls, [])
+
+    def test_file_replaced_by_a_directory_fails_instead_of_skipping(self) -> None:
+        from kb_pipeline.pipeline import worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
+            self._file(h).unlink()
+            self._file(h).mkdir()
+            result = worker_mod.run_once(h.con, settings=h.settings)
+            self.assertTrue(result.startswith("failed:"), result)
+            self.assertIn("physical file not found", self._job(h)["error"])
+
+    def test_timeline_message_has_a_chinese_pattern(self) -> None:
+        """The Chinese console renders timeline events through EN_ZH_PATTERNS: both endings of the new event match."""
+        from kb_pipeline.pipeline import parse_job
+
+        block = _repo_file("app/kb_server/static/i18n.js").split("const EN_ZH_PATTERNS = [", 1)[1].split("\n];", 1)[0]
+        patterns = [re.compile(m.group(1)) for m in re.finditer(r"^\s*\[/((?:[^/\\\n]|\\.)+)/, ", block, re.M)]
+        texts = []
+        for when in ("start", "write"):
+            with patch.object(parse_job.db, "add_job_event", lambda con, job_id, kind, text: texts.append(text)):
+                parse_job._changed_skip(None, {"job_id": "j"}, {"source_path": "a.md"},
+                                        "0 bytes, mtime 1 at scan time, now 402226803 bytes, mtime 2", when=when)
+        self.assertEqual(len(texts), 2)
+        for text in texts:
+            self.assertTrue(any(p.search(text) for p in patterns), text)
+
+
 class ParseCommitPointTests(unittest.TestCase):
     """2026-09-29 audit: cancellation was wrong at both ends. A cancellation during image description was
     swallowed by the except Exception around the callback, so every image of the document still went to the

@@ -717,6 +717,7 @@ const EN_ZH_PATTERNS = [
   [/^Service not ready, trying again in (\d+)s \(not counted as a retry\): ([\s\S]*)$/, "服务未就绪,$1s 后再试(不计重试次数): $2"],
   [/^The visual embedding service rejected (\d+) images; they have no visual vector$/, "视觉嵌入拒收 $1 张图,这些图没有视觉向量"],
   [/^Stored (\d+) points \((\d+) visual vectors\), took (.+)$/, "入库 $1 点(跨模态向量 $2),耗时 $3"],
+  [/^The file content changed after the scan \((\d+) bytes, mtime (\d+) at scan time, now (\d+) bytes, mtime (\d+)\); (not parsed this round|the parse result was not stored); the next scan queues it again with the new content$/, (m, a, ma, b, mb, what) => `文件内容在扫描之后变了(扫描时 ${a} 字节、修改时间 ${ma},现在 ${b} 字节、修改时间 ${mb}),${what === "not parsed this round" ? "这一轮不解析" : "解析结果不写入"},下一轮扫描按新内容重新排队`],
   [/^VLM description failed for (\d+)\/(\d+) images; this parse was not stored so that no document is left without image descriptions$/, "VLM 描述失败 $1/$2 张,本次解析不入库以免留下没有图片描述的文档"],
   // A job's error string is the repr of the exception (NonRetryableParseError('...')); the outer layer is kept as it is
   [/^(\w+\(["'])?The embedding service rejected chunk (\d+)\/(\d+) \(block_id=(.+?), (\d+) tokens\): ([\s\S]*)$/, (m, wrap, i, n, block, tokens, rest) => `${wrap || ""}嵌入服务拒收第 ${i}/${n} 片(block_id=${block},${tokens} token):${rest}`],

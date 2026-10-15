@@ -1096,7 +1096,9 @@ class EmbeddingRejectionTests(unittest.TestCase):
             db.init_db(state)
             doc = root / "a.md"
             doc.write_text("正文", encoding="utf-8")
-            file = SourceFile(**{**_local_file("a.md").__dict__, "physical_path": str(doc)})
+            # Size and modification time as on disk: the parse job checks them before it starts (2026-10-15)
+            file = SourceFile(**{**_local_file("a.md").__dict__, "physical_path": str(doc),
+                                 "size": doc.stat().st_size, "mtime": int(doc.stat().st_mtime)})
             settings = SimpleNamespace(
                 state_db=state, parse_enabled=True, parse_job_lease_seconds=600, metadata_job_lease_seconds=600,
                 job_max_retries=5, job_retry_base_seconds=300, job_retry_max_seconds=3600, max_file_bytes=0,

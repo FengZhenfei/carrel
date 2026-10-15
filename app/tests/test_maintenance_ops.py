@@ -534,6 +534,157 @@ class ParseAssetsGcTests(unittest.TestCase):
             self.assertEqual(delete_expired_inactive_points(w.q, "no-such-collection", listed, cutoff), 0)
 
 
+class UnclaimedParseVersionTests(unittest.TestCase):
+    """The version dropped as stale right before the write never reached the vector store and is not on the chunk
+    ledger, so the pass that finds versions through inactive points cannot see it (2026-10-15: 43 MB left behind).
+    Unclaimed and past retention, it is reclaimed; the file's current version, the indexed version, versions with
+    ledger rows or points in the vector store, files with a queued job, dirs written within the window and open
+    knowledge bases without any files row are all left alone."""
+
+    @staticmethod
+    def _age(path: Path, days: float) -> None:
+        t = time.time() - days * 86400
+        for item in [path, *path.rglob("*")]:
+            os.utime(item, (t, t))
+
+    def test_discarded_version_is_reclaimed_once_past_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pptx", version="sha-new")
+            w.add_batch(fk, "sha-new", "p1", 3, status="active")
+            live = w.cache(fk, "sha-new")
+            discarded = w.cache(fk, "sha-empty")
+            fresh = w.cache(fk, "sha-other")
+            self._age(live, 30)
+            self._age(discarded, 10)
+            dry = w.run(dry_run=True)
+            self.assertEqual([u["cache_dir"]["path"] for u in dry["unclaimed_cache_versions"]], [str(discarded)])
+            self.assertTrue(discarded.exists())
+            out = w.run()
+            self.assertFalse(discarded.exists())
+            self.assertTrue(live.exists())                  # the current version stays however old it is
+            self.assertTrue(fresh.exists())                 # written within the window: may be being parsed
+            self.assertEqual(out["totals"]["cache_dirs"], 1)
+            self.assertEqual(out["unclaimed_cache_versions"][0]["file_id"], db.file_id_for(w.KB, fk))
+            self.assertEqual(w.run()["unclaimed_cache_versions"], [])
+
+    def test_indexed_version_and_versions_on_the_ledger_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-new", indexed="sha-old", status="seen")
+            w.add_batch(fk, "sha-old", "p1", 2, status="active")
+            w.add_batch(fk, "sha-mid", "p1", 2, status="inactive", inactive_days_ago=2)   # on the ledger: the first pass's
+            caches = [w.cache(fk, v) for v in ("sha-new", "sha-old", "sha-mid")]
+            for c in caches:
+                self._age(c, 30)
+            out = w.run()
+            self.assertEqual(out["unclaimed_cache_versions"], [])
+            self.assertTrue(all(c.exists() for c in caches))
+
+    def test_indexed_version_without_ledger_rows_is_kept(self) -> None:
+        """An empty document is indexed with no chunks, so no ledger rows; only "the indexed version" keeps it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.md", version="sha-new", indexed="sha-empty")
+            caches = [w.cache(fk, "sha-empty"), w.cache(fk, "sha-new")]
+            for c in caches:
+                self._age(c, 30)
+            self.assertEqual(w.run()["unclaimed_cache_versions"], [])
+            self.assertTrue(all(c.exists() for c in caches))
+
+    def test_file_with_a_pending_job_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-new")
+            old = w.cache(fk, "sha-old")
+            self._age(old, 30)
+            with db.connect(w.state) as con:
+                db.enqueue_job(con, ingest_run_id=None, file_id=db.file_id_for(w.KB, fk), kb_id=w.KB, collection=w.KB,
+                               file_key=fk, job_type="parse", dedupe_key="parse:x")
+            out = w.run()
+            self.assertEqual(out["unclaimed_cache_versions"], [])
+            self.assertTrue(old.exists())
+
+    def test_a_version_claimed_after_listing_is_not_deleted(self) -> None:
+        """The scan took the version back (or a worker claimed a job) after the list was taken: the check right before
+        the delete stops it."""
+        from unittest import mock
+
+        from kb_pipeline import maintenance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-new")
+            live = w.cache(fk, "sha-new")
+            listed = ([(live, db.file_id_for(w.KB, fk), w.KB)], [])     # as if nobody claimed it when listed
+            with mock.patch.object(maintenance, "_unclaimed_parse_versions", return_value=listed):
+                out = w.run()
+            self.assertTrue(live.exists())
+            self.assertEqual(out["unclaimed_cache_versions"], [])
+
+    def test_dry_run_does_not_count_a_deleted_files_tree_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-a", status="deleted", seen_days_ago=10)
+            for v in ("sha-a", "sha-x"):
+                self._age(w.cache(fk, v), 10)
+            dry = w.run(dry_run=True)
+            self.assertEqual(dry["totals"]["cache_dirs"], 1)            # the deleted-files pass counted the whole tree once
+            self.assertEqual(dry["unclaimed_cache_versions"], [])
+            out = w.run()
+            self.assertEqual((out["totals"]["cache_dirs"], out["unclaimed_cache_versions"]), (1, []))
+
+    def test_version_still_in_qdrant_is_left_to_the_first_pass(self) -> None:
+        """Points written, then cut off before the ledger rows: points in the vector store, no rows. Deleting the cache
+        would break the pictures of those search results."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-v2", indexed="sha-v0", status="seen")
+            w.add_batch(fk, "sha-v0", "p1", 2, status="active")
+            w.add_batch(fk, "sha-v", "p1", 2, status="active", rows=False)
+            cache = w.cache(fk, "sha-v")
+            self._age(cache, 10)
+            out = w.run()
+            self.assertTrue(cache.exists())
+            self.assertEqual(out["unclaimed_cache_versions"], [])
+            self.assertIn("points_in_qdrant", [s["reason"] for s in out["skipped_items"]])
+
+    def test_nothing_is_deleted_when_qdrant_cannot_be_asked(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline import maintenance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            fk = w.add_file("a.pdf", version="sha-new")
+            old = w.cache(fk, "sha-old")
+            self._age(old, 10)
+            with mock.patch.object(maintenance, "_qdrant_versions", return_value=None):
+                out = w.run()
+            self.assertTrue(old.exists())
+            self.assertIn("qdrant_unavailable", [s["reason"] for s in out["skipped_items"]])
+
+    def test_keep_cache_reset_is_respected_until_the_scan_rebuilds_rows(self) -> None:
+        """kb reset --keep-cache cleared the files / chunks rows and keeps the cache for the re-parse on purpose: with
+        not a single row in the knowledge base nothing is touched; once the scan has built the rows again, a file_key
+        that never gets a row back (a moved file's old key, for one) expires and is reclaimed as usual."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _GcWorld(tmp)
+            gone = w.add_file("old/a.pdf", version="sha-a")
+            cache = w.cache(gone, "sha-a")
+            self._age(cache, 30)
+            with db.connect(w.state) as con:
+                db.purge_kb_state(con, w.KB)
+                con.commit()
+            out = w.run()
+            self.assertTrue(cache.exists())
+            self.assertEqual([s["reason"] for s in out["skipped_items"]], ["kb_has_no_file_rows"])
+            w.add_file("new/a.pdf", version="sha-a")                     # the scan builds the row again under the new path
+            out = w.run()
+            self.assertFalse(cache.exists())
+            self.assertEqual(len(out["unclaimed_cache_versions"]), 1)
+
+
 class StateBackupTests(unittest.TestCase):
     """The nightly backup takes only what cannot be regenerated (state database, env files, evaluation sets),
     keeps the newest N copies with tightened permissions, and runs before the nightly round waits for Qdrant."""

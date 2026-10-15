@@ -928,7 +928,9 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
 
     qdrant_versions: list[dict[str, Any]] = []
     deleted_files: list[dict[str, Any]] = []
+    unclaimed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    covered: set[Path] = set()          # cache dirs the first two passes handled (or counted in a dry run); the last pass skips them
     totals = {
         "qdrant_points": 0,
         "qdrant_malformed_points": 0,
@@ -1008,6 +1010,7 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
                     continue
                 totals["qdrant_points"] += point_count
                 cache_dir = parse_root / kb_id / str(file_key) / _safe_version(content_version)
+                covered.add(cache_dir)
                 # Look at the files row once more before deleting the cache: the scan may have just taken the
                 # file back during the steps above
                 if in_use or kept_points or _version_in_use(db.get_file_by_id(con, file_id), content_version, cutoff_ts):
@@ -1077,6 +1080,7 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
                     }
                 )
                 continue
+            covered.add(parse_root / kb_id / str(row["file_key"]))
             cache_result = _remove_tree(
                 parse_root / kb_id / str(row["file_key"]),
                 dry_run=dry_run,
@@ -1099,6 +1103,27 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
             totals["cache_dirs"] += int(cache_result["removed"] or dry_run and cache_result["exists"])
             totals["cache_bytes"] += int(cache_result["bytes"])
 
+        # Parse cache version dirs nobody claims. The first pass finds versions through inactive points in the vector
+        # store, the second only handles deleted files; a version dropped as stale right before the write never
+        # reached the vector store and is seen by neither, so it stayed forever (2026-10-15: 43 MB from a 402 MB pptx).
+        sources = list((settings.sources or {}).values())
+        active_kbs = {str(src.kb_id) for src in sources}
+        collections = {str(src.kb_id): str(src.collection) for src in sources}
+        candidates, held = _unclaimed_parse_versions(con, q, parse_root, cutoff_ts, active_kbs=active_kbs,
+                                                     collections=collections, covered=covered)
+        skipped.extend(held)
+        for version_dir, file_id, collection in candidates:
+            # The list was taken in one go; look once more before deleting: the scan may just have taken the version
+            # back, or a worker may just have claimed a job
+            if _parse_version_claim(con, file_id, version_dir.name) is not None:
+                continue
+            in_qdrant = _qdrant_versions(q, collection, file_id)
+            if in_qdrant is None or version_dir.name in in_qdrant:
+                continue
+            cache_result = _remove_tree(version_dir, dry_run=dry_run)
+            unclaimed.append({"file_id": file_id, "cache_dir": cache_result})
+            totals["cache_dirs"] += int(cache_result["removed"] or dry_run and cache_result["exists"])
+            totals["cache_bytes"] += int(cache_result["bytes"])
 
     return {
         "skipped": False,
@@ -1108,6 +1133,7 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
         "totals": totals,
         "qdrant_versions": qdrant_versions,
         "deleted_files": deleted_files,
+        "unclaimed_cache_versions": unclaimed,
         "skipped_items": skipped,
         "errors": errors,
     }
@@ -1283,6 +1309,102 @@ def _version_in_use(file_row: sqlite3.Row | None, content_version: str, cutoff_t
     if str(file_row["status"]) != "deleted":
         return True
     return int(file_row["last_seen_at"] or 0) >= cutoff_ts
+
+
+def _parse_version_claim(con: sqlite3.Connection, file_id: str, version_name: str) -> str | None:
+    """Who still uses this parse cache version dir: the file has a queued or running job, it is the file's current
+    version or the indexed one being served, or the chunk ledger still has rows of this version. Returns the reason;
+    None when nobody does."""
+    if db.pending_jobs_for_file(con, file_id):
+        return "pending_jobs"
+    row = db.get_file_by_id(con, file_id)
+    if row is not None and version_name in {_safe_version(str(row[key] or "")) for key in ("content_version", "indexed_version")}:
+        return "live_version"
+    for (version,) in con.execute("SELECT DISTINCT content_version FROM chunks WHERE file_id = ?", (file_id,)):
+        if _safe_version(str(version)) == version_name:
+            return "ledger_rows"
+    return None
+
+
+def _unclaimed_parse_versions(con: sqlite3.Connection, q: Any, parse_root: Path, cutoff_ts: int, *, active_kbs: set[str],
+                              collections: dict[str, str], covered: set[Path]
+                              ) -> tuple[list[tuple[Path, str, str]], list[dict[str, Any]]]:
+    """Version dirs under parse/<kb>/<file_key>/<version> nobody claims (see _parse_version_claim), with no point of
+    that version in the vector store, and whose whole tree was last changed before the retention window; returns
+    (candidates [(dir, file_id, collection)], skip notes). Dirs the first two passes handled are skipped.
+    A version that still has points (written, then cut off before its ledger rows were committed) belongs to the
+    first pass: once inactive it goes with its cache; deleting the cache here would break its pictures.
+    An open knowledge base without a single files row is left alone entirely: kb reset --keep-cache has just cleared
+    the rows and keeps the cache on purpose, to be reused once the scan has built the rows again."""
+    out: list[tuple[Path, str, str]] = []
+    held: list[dict[str, Any]] = []
+    if not parse_root.is_dir():
+        return out, held
+    for kb_dir in sorted(p for p in parse_root.iterdir() if p.is_dir()):
+        kb_id = kb_dir.name
+        key_dirs = [p for p in sorted(kb_dir.iterdir()) if p.is_dir() and p not in covered]
+        if kb_id in active_kbs and con.execute("SELECT 1 FROM files WHERE kb_id = ? LIMIT 1", (kb_id,)).fetchone() is None:
+            if key_dirs:
+                held.append({"reason": "kb_has_no_file_rows", "kb_id": kb_id, "key_dirs": len(key_dirs)})
+            continue
+        for key_dir in key_dirs:
+            try:
+                file_key = int(key_dir.name)
+            except ValueError:
+                continue
+            file_id = db.file_id_for(kb_id, file_key)
+            row = db.get_file_by_id(con, file_id)
+            collection = str(row["collection"]) if row is not None else collections.get(kb_id, kb_id)
+            old = [d for d in sorted(key_dir.iterdir())
+                   if d.is_dir() and d not in covered and _parse_version_claim(con, file_id, d.name) is None
+                   and _newest_mtime(d) < cutoff_ts]
+            if not old:
+                continue
+            in_qdrant = _qdrant_versions(q, collection, file_id)
+            if in_qdrant is None:
+                held.append({"reason": "qdrant_unavailable", "file_id": file_id, "collection": collection})
+                continue
+            for version_dir in old:
+                if version_dir.name in in_qdrant:
+                    held.append({"reason": "points_in_qdrant", "file_id": file_id, "version_dir": str(version_dir)})
+                else:
+                    out.append((version_dir, file_id, collection))
+    return out, held
+
+
+def _qdrant_versions(q: Any, collection: str, doc_id: str) -> set[str] | None:
+    """The content versions of this file that still have points in the vector store (active or inactive, written the
+    _safe_version way so they compare with dir names); an empty set when the collection is gone (the knowledge base
+    was deleted), None when the store cannot be asked (the caller then deletes nothing)."""
+    from qdrant_client.http import models
+
+    from .vector.qdrant import collection_exists
+
+    try:
+        if not collection_exists(q, collection):
+            return set()
+        flt = models.Filter(must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))])
+        found: set[str] = set()
+        offset = None
+        while True:
+            points, offset = q.scroll(collection_name=collection, scroll_filter=flt, limit=1000, offset=offset,
+                                      with_payload=["content_version"], with_vectors=False)
+            found.update(_safe_version(str((p.payload or {}).get("content_version") or "")) for p in points)
+            if offset is None:
+                return found
+    except Exception:
+        return None
+
+
+def _newest_mtime(path: Path) -> float:
+    newest = path.stat().st_mtime
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+            except OSError:
+                continue
+    return newest
 
 
 def _purge_file_state(con: sqlite3.Connection, file_id: str, *, dry_run: bool) -> dict[str, int]:

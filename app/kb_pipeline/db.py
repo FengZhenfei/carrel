@@ -1178,6 +1178,15 @@ def touch_file_seen(con: sqlite3.Connection, file_id: str) -> None:
     con.execute("UPDATE files SET last_seen_at = ? WHERE file_id = ?", (now_ts(), file_id))
 
 
+def refresh_file_mtime(con: sqlite3.Connection, file_id: str, content_version: str, size: int, mtime: int) -> None:
+    """Same content, only the modification time changed (a touch, a fresh sync): align the files row's modification
+    time with the disk and leave the content version alone. Used by the scan when it calls a file unchanged and by
+    the parse job when its re-hash before the parse matches; does nothing when the version or size was changed
+    elsewhere meanwhile. Does not commit; the caller does."""
+    con.execute("UPDATE files SET mtime = ? WHERE file_id = ? AND content_version = ? AND size = ?",
+                (int(mtime), file_id, content_version, int(size)))
+
+
 def upsert_file(con: sqlite3.Connection, file: SourceFile, status: str = "seen") -> str:
     ts = now_ts()
     fid = file_id_for(file.kb_id, file.file_key)

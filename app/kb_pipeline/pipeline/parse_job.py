@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -28,7 +29,7 @@ from ..parsers.pptx_enhanced import parse_pptx_enhanced
 from ..parsers.router import TEXT_FILENAMES, TEXT_SUFFIXES, parse_native
 from ..parsers.table_check import table_ambiguity_summary
 from ..parsers.visual_blocks import vlm_failure_summary, went_through_vlm
-from ..utils import count_tokens, detect_lang, dir_ancestors_from_rel_path, infer_doc_type
+from ..utils import count_tokens, detect_lang, dir_ancestors_from_rel_path, infer_doc_type, sha256_file
 from ..vector.layout import TEXT_VECTOR, VISUAL_VECTOR
 from ..vector.qdrant import client as qdrant_client
 from ..vector.qdrant import collection_exists, ensure_collection
@@ -58,6 +59,72 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
         raise
 
 
+def _disk_state(path: Path) -> tuple[int, int] | None:
+    """The file's (size, modification time in seconds) on disk right now, measured as the scanner records them in
+    the files row; None when the file is gone or no longer a regular file (swapped for a directory, a device...)."""
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return int(st.st_size), int(st.st_mtime)
+
+
+def _disk_state_within(settings: Settings, source: Any, path: Path) -> tuple[int, int] | None:
+    """Before the write: check the enrolled boundary first (the file may have been swapped for a link out of the
+    directory during the parse); outside it counts as gone, and the file is not read."""
+    try:
+        verify_source_file(settings, source, path)
+    except NonRetryableParseError:
+        return None
+    return _disk_state(path)
+
+
+def _changed_since_scan(con: sqlite3.Connection, file_row: Any, path: Path, disk: tuple[int, int] | None) -> str | None:
+    """When the content changed after the scan, the size and content version on the files row describe another
+    file: parsing anyway files the new content under the old version, and the size limit is judged on the old size.
+    2026-10-15: a 0-byte broken download was scanned, the retry read the 402 MB file dropped in again, the limit let
+    it through on 0 bytes, and ten minutes of parsing were thrown away before the write as stale.
+    Same size and modification time as the row: unchanged. Only the modification time differs (a touch, a fresh
+    sync), the size is the same and the version is a content hash: hash the file now; same content, so align the
+    row's modification time and carry on -- the scan calls such a file unchanged and queues nothing, so a console
+    retry or a whole-KB re-parse must not be skipped for it. Only content that really changed returns a reason; the
+    scan then sees a different size or hash, always calls it content_changed and queues it again. A file that is
+    gone returns None and the caller goes on as before (not found before the parse; written as usual before the
+    write, the move or deletion left to the scan)."""
+    if disk is None:
+        return None
+    keys = file_row.keys()
+    size, mtime = int(file_row["size"] or 0), int(file_row["mtime"] or 0)
+    if disk == (size, mtime):
+        return None
+    version = str(file_row["content_version"] or "")
+    checksum = str(file_row["checksum"] or "") if "checksum" in keys else ""
+    if disk[0] == size and checksum and checksum == version:
+        try:
+            same = sha256_file(path) == version
+        except OSError:
+            same = False
+        if same:
+            db.refresh_file_mtime(con, str(file_row["file_id"]), version, size, disk[1])
+            con.commit()
+            return None
+    return f"{size} bytes, mtime {mtime} at scan time, now {disk[0]} bytes, mtime {disk[1]}"
+
+
+def _changed_skip(con: sqlite3.Connection, job: Any, file_row: Any, why: str, *, when: str) -> str:
+    """when is start (before the parse: nothing parsed) or write (after the parse, before the write: result dropped)."""
+    print(f"[parse] changed-skip job={job['job_id']} when={when} file={file_row['source_path']}: {why}", flush=True)
+    try:
+        db.add_job_event(con, str(job["job_id"]), "info", f"The file content changed after the scan ({why}); "
+                         + ("not parsed this round" if when == "start" else "the parse result was not stored")
+                         + "; the next scan queues it again with the new content")
+    except Exception:
+        pass
+    return f"parse-changed-skipped:{job['job_id']}"
+
+
 def _withdraw_cancel(con: sqlite3.Connection, job: sqlite3.Row) -> None:
     """The job failed after it had already written to the vector store: a cancellation arriving now is too late
     to take effect. Withdraw the cancel flag so the worker backs off and retries it as an ordinary failure and
@@ -80,21 +147,29 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
 
     started = time.time()
     path = Path(str(file_row["physical_path"]))
-    if not path.exists():
+    disk = _disk_state(path)
+    if disk is None:
         raise NonRetryableParseError(f"physical file not found: {path}")
 
+    # The boundary first, then the content against the disk: a file swapped for a link out of the enrolled
+    # directory still fails on the boundary check, and nothing outside it is read
+    source = _source_for_file(settings, str(file_row["kb_id"]))
+    verify_source_file(settings, source, path)
+    changed = _changed_since_scan(con, file_row, path, disk)
+    if changed:
+        return _changed_skip(con, job, file_row, changed, when="start")
+
     max_bytes = settings.max_file_bytes
-    if max_bytes and int(file_row["size"] or 0) > max_bytes:
+    if max_bytes and disk[0] > max_bytes:
         # A few-hundred-MB .json/.log/.csv dropped into a knowledge base by mistake makes the worker eat
         # several GB of memory, spend tens of minutes in tiktoken, or simply get killed by the OOM killer --
-        # and the latter turns into a crash loop.
+        # and the latter turns into a crash loop. Judged on the size on disk (just checked above: the
+        # content is the version the scan recorded).
         raise NonRetryableParseError(
-            f"File exceeds the single-file limit ({int(file_row['size'])} bytes > {max_bytes}) and was skipped; "
+            f"File exceeds the single-file limit ({disk[0]} bytes > {max_bytes}) and was skipped; "
             "raise KB_MAX_FILE_BYTES if it must be ingested"
         )
 
-    source = _source_for_file(settings, str(file_row["kb_id"]))
-    verify_source_file(settings, source, path)
     parser_profile = str(job["parser_profile"] or _profile_for_path(path))
     content_version = str(file_row["content_version"])
     cache_dir = parse_cache_dir(settings, str(file_row["kb_id"]), int(file_row["file_key"]), content_version)
@@ -166,7 +241,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
               f"{table_stats['unverified']} unverified (unverified values are excluded from trusted parameters)")
     if not blocks:
         if _is_intentionally_empty(path):
-            return _finish_empty_document(con, settings, job, file_row, content_version, parser_profile)
+            return _finish_empty_document(con, settings, job, file_row, content_version, parser_profile, source=source)
         raise NonRetryableParseError("parser returned no blocks")
 
     # When the VLM is down, each image's exception is swallowed per image and the document is still stored
@@ -201,7 +276,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     print(f"[parse] chunks={len(chunks)} file={file_row['source_path']}", flush=True)
     if not chunks:
         if _is_intentionally_empty(path):
-            return _finish_empty_document(con, settings, job, file_row, content_version, parser_profile)
+            return _finish_empty_document(con, settings, job, file_row, content_version, parser_profile, source=source)
         raise NonRetryableParseError("chunker returned no chunks")
     # Chunking acceptance check: advisory only, never blocking; the verdict is stored with the files row for
     # the console
@@ -281,6 +356,10 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
             flush=True,
         )
         return f"parse-deleted-skipped:{job['job_id']}"
+    write_path = Path(str(write_row["physical_path"]))
+    changed = _changed_since_scan(con, write_row, write_path, _disk_state_within(settings, source, write_path))
+    if changed:
+        return _changed_skip(con, job, write_row, changed, when="write")
     if str(write_row["source_path"]) != str(file_row["source_path"]):
         print(
             f"[parse] metadata refreshed before upsert old_path={file_row['source_path']} "
@@ -505,6 +584,8 @@ def _finish_empty_document(
     file_row: sqlite3.Row,
     content_version: str,
     parser_profile: str,
+    *,
+    source: Any,
 ) -> str:
     write_row = db.get_file_by_id(con, str(job["file_id"]))
     if write_row is None:
@@ -513,6 +594,10 @@ def _finish_empty_document(
         return f"parse-stale-skipped:{job['job_id']}"
     if str(write_row["status"]) == "deleted":
         return f"parse-deleted-skipped:{job['job_id']}"
+    write_path = Path(str(write_row["physical_path"]))
+    changed = _changed_since_scan(con, write_row, write_path, _disk_state_within(settings, source, write_path))
+    if changed:
+        return _changed_skip(con, job, write_row, changed, when="write")
 
     q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     collection = str(write_row["collection"])

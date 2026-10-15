@@ -3397,7 +3397,8 @@ class PdfTextLayerTests(unittest.TestCase):
                                        vlm_top_p=0.8, vlm_max_tokens=64, vlm_structured_output=True, image_max_pixels=1,
                                        mineru_timeout_seconds=5)
             source = SimpleNamespace(vlm_prompt=None, graph_language=None, block_merge_tokens=800, max_tokens=400, overlap_tokens=0)
-            row = {"physical_path": str(pdf), "size": 13, "kb_id": "kb_x", "file_key": 1, "content_version": "v", "source_path": "r/a.pdf"}
+            row = {"physical_path": str(pdf), "size": 13, "mtime": int(pdf.stat().st_mtime), "kb_id": "kb_x", "file_key": 1,
+                   "content_version": "v", "source_path": "r/a.pdf"}
             with patch.object(parse_job.db, "get_file_by_id", return_value=row), \
                     patch.object(parse_job, "_source_for_file", return_value=source), \
                     patch.object(parse_job, "verify_source_file"), \

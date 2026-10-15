@@ -89,8 +89,12 @@ def schedule_file(
         return change.change_type, None
 
     if change.change_type == "unchanged" and old is not None:
-        # No change at all: only record "seen this round", do not rewrite the whole row
+        # No change at all: only record "seen this round", do not rewrite the whole row. A file whose content is
+        # the same and only its modification time changed (a touch, a fresh sync) gets the row's modification time
+        # aligned on the way: otherwise every round hashes it again, and so does the parse job's check before a parse
         db.touch_file_seen(con, str(old["file_id"]))
+        if int(old["mtime"] or 0) != int(file.mtime):
+            db.refresh_file_mtime(con, str(old["file_id"]), str(old["content_version"]), int(file.size), int(file.mtime))
         return change.change_type, None
 
     db.upsert_file(con, file, status=_status_after_scan(old, file))
