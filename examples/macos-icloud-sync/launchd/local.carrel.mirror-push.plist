@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install.sh writes this to ~/Library/LaunchAgents with the example folder's path filled in. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.carrel.mirror-push</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__SYNC_HOME__/push-mirror.sh</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>__SYNC_HOME__/logs/push-mirror.launchd.log</string>
+  <key>StandardErrorPath</key><string>__SYNC_HOME__/logs/push-mirror.launchd.log</string>
+</dict>
+</plist>

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,10 @@ REPO = Path(__file__).resolve().parents[2]
 # Patterns that are personal wherever they appear; the machine-specific list
 # lives outside the repository (see test_no_personal_traces_in_tracked_files).
 GENERIC_PRIVATE_PATTERNS = ("privaterelay", "iCloud", "Mobile Documents", "/Users/", "/home/", ".ts.net", "192.168.", "aliyuncs.com")
+# The macOS sync example is about iCloud Drive, so the two iCloud patterns are expected in it and on the page that
+# describes the author's setup; every other pattern still applies to those files.
+ICLOUD_PATTERNS = ("iCloud", "Mobile Documents")
+ICLOUD_EXAMPLE_PATHS = ("examples/macos-icloud-sync/", "docs/example-setup.md", "docs/example-setup.zh-CN.md")
 
 
 def private_patterns() -> list[str]:
@@ -296,7 +301,8 @@ class DeploymentAssetTests(unittest.TestCase):
 
     def test_no_personal_traces_in_tracked_files(self) -> None:
         """The public tree must not carry cloud-sync paths, home directories, tailnet
-        names, LAN addresses or relay e-mail domains. Machine- and person-specific
+        names, LAN addresses or relay e-mail domains (the iCloud sync example may name
+        iCloud, see ICLOUD_EXAMPLE_PATHS). Machine- and person-specific
         strings (user names, host names, device codes) are deliberately NOT listed
         here: a list of them would itself be a leak. Put them one per line in the
         file named by CARREL_PRIVATE_PATTERNS (default
@@ -321,6 +327,8 @@ class DeploymentAssetTests(unittest.TestCase):
             except (OSError, UnicodeDecodeError):
                 continue
             for pat in patterns:
+                if pat in ICLOUD_PATTERNS and rel.startswith(ICLOUD_EXAMPLE_PATHS):
+                    continue
                 if pat in text:
                     line = next(i for i, l in enumerate(text.splitlines(), 1) if pat in l)
                     hits.append(f"{rel}:{line}: {pat if pat in GENERIC_PRIVATE_PATTERNS else '<private pattern>'}")
@@ -334,6 +342,48 @@ class DeploymentAssetTests(unittest.TestCase):
                 self.assertEqual(private_patterns(), ["alpha-host", "beta_user"])
             with mock.patch.dict(os.environ, {"CARREL_PRIVATE_PATTERNS": str(Path(tmp) / "missing.txt")}):
                 self.assertEqual(private_patterns(), [])
+
+
+class MacSyncExampleTests(unittest.TestCase):
+    """examples/macos-icloud-sync: the scripts parse, the launchd templates render to valid agents that run
+    scripts of the folder, and sync.env.example lists exactly the settings the scripts read."""
+
+    DIR = REPO / "examples" / "macos-icloud-sync"
+
+    def test_scripts_parse(self) -> None:
+        checks = [("bash", "push-mirror.sh"), ("bash", "install.sh")]
+        if shutil.which("zsh"):
+            checks.append(("zsh", "icloud-prefetch.sh"))
+        for shell, name in checks:
+            proc = subprocess.run([shell, "-n", str(self.DIR / name)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"{name}: {proc.stderr}")
+
+    def test_launchd_templates_render(self) -> None:
+        import plistlib
+
+        templates = sorted((self.DIR / "launchd").glob("*.plist"))
+        self.assertEqual([t.stem for t in templates], ["local.carrel.icloud-prefetch", "local.carrel.mirror-push"])
+        shells = {"local.carrel.icloud-prefetch": ("/bin/zsh", "icloud-prefetch.sh"),
+                  "local.carrel.mirror-push": ("/bin/bash", "push-mirror.sh")}
+        for template in templates:
+            text = template.read_text(encoding="utf-8")
+            self.assertIn("__SYNC_HOME__", text)
+            agent = plistlib.loads(text.replace("__SYNC_HOME__", "/opt/carrel-sync").encode("utf-8"))
+            self.assertEqual(agent["Label"], template.stem)
+            shell, script = shells[template.stem]
+            self.assertEqual(agent["ProgramArguments"], [shell, f"/opt/carrel-sync/{script}"])
+            self.assertTrue((self.DIR / script).is_file(), script)
+            self.assertEqual(agent["StartInterval"], 60)
+        self.assertIn("__SYNC_HOME__", _read("examples/macos-icloud-sync/install.sh"))
+
+    def test_settings_template_lists_what_the_scripts_read(self) -> None:
+        read: set[str] = set()
+        for name in ("push-mirror.sh", "icloud-prefetch.sh", "install.sh"):
+            read |= set(re.findall(r"\$\{?(SYNC_[A-Z0-9_]+)", _read(f"examples/macos-icloud-sync/{name}")))
+        read -= {"SYNC_HOME", "SYNC_ENV_FILE"}               # the folder itself and the env-file override
+        listed = set(re.findall(r"(?m)^#?\s*(SYNC_[A-Z0-9_]+)=", _read("examples/macos-icloud-sync/sync.env.example")))
+        self.assertEqual(sorted(read - listed), [], "the scripts read settings the template leaves out")
+        self.assertEqual(sorted(listed - read), [], "the template lists settings no script reads")
 
 
 class SearchTemplateDefaultsTests(unittest.TestCase):

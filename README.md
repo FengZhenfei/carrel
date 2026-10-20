@@ -68,6 +68,9 @@ See [Architecture](docs/architecture.md) for the pipeline and retrieval design.
 | macOS with Docker Desktop | CPU containers and native Python services; arrange scheduling separately |
 | Windows | Use WSL2; native Windows deployment is not supported |
 
+[Example setup](docs/example-setup.md) describes the author's installation
+on an NVIDIA DGX Spark and some lighter alternatives.
+
 ## Quick start
 
 ### 1. Deploy the services
@@ -132,6 +135,7 @@ for authentication, response status, and citations.
 | [Architecture](docs/architecture.md) | Parsing, graph construction, retrieval, and code layout |
 | [Retrieval and API](docs/retrieval.md) | Agent setup, endpoints, evidence status, and evaluation |
 | [Operations and development](docs/operations.md) | Console, CLI, scheduling, troubleshooting, and tests |
+| [Example setup](docs/example-setup.md) | The author's installation on a DGX Spark, a Mac that syncs the documents, and lighter alternatives |
 | [Docker Compose](deployment/compose/README.md) | Infrastructure, model weights, and container settings |
 | [systemd](deployment/systemd/README.md) | Linux services and timers |
 

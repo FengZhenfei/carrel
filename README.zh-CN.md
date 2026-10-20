@@ -49,6 +49,8 @@ Carrel 使用 MinerU 和原生解析器处理文档，通过 Qdrant 存储向量
 | macOS + Docker Desktop | 容器使用 CPU，Python 应用在主机运行，需自行安排定时调度 |
 | Windows | 使用 WSL2，暂不支持原生 Windows 部署 |
 
+[部署实例](docs/example-setup.zh-CN.md) 介绍了作者在 NVIDIA DGX Spark 上的实际部署，以及更轻量的做法。
+
 ## 快速开始
 
 ### 1. 部署服务
@@ -95,6 +97,7 @@ curl -sS http://127.0.0.1:9810/search \
 | [架构说明](docs/architecture.zh-CN.md) | 解析、建图、检索流程与代码结构 |
 | [检索与 API](docs/retrieval.zh-CN.md) | 智能体接入、接口、证据状态与评测 |
 | [运维与开发](docs/operations.zh-CN.md) | 控制台、命令行、定时任务、排障和测试 |
+| [部署实例](docs/example-setup.zh-CN.md) | 作者在 DGX Spark 上的实际部署、负责同步资料的 Mac，以及更轻量的做法 |
 | [Docker Compose](deployment/compose/README.md) | 基础设施、模型权重和容器配置（英文） |
 | [systemd](deployment/systemd/README.md) | Linux 服务与定时任务（英文） |
 
