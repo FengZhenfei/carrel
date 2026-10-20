@@ -64,9 +64,11 @@ tail -f ~/carrel-sync/logs/push-mirror.log
 - `sync.env` 里的 `SYNC_REMOTE_LOCK_STALE_SECONDS` 要和服务器上的 `KB_MIRROR_LOCK_STALE_SECONDS` 保持一致（默认都是一小时）。
 - 如果用 `KB_MIRROR_ROOT` 改了镜像目录的位置，`SYNC_REMOTE_MIRROR` 也要指向同一处。
 
-## 同步 iCloud 云盘以外的文件夹
+## 同步其他文件夹或网盘
 
-把 `SYNC_SOURCE` 指向任意文件夹，再用 `./install.sh --push-only` 安装即可。这时占位文件检查找不到任何文件，不会带来额外开销。如果文件夹在个人目录下、又不在桌面、文稿和下载里，也不需要完全磁盘访问权限。
+推送脚本适用于 Mac 上的任意文件夹：把 `SYNC_SOURCE` 指向该文件夹，再用 `./install.sh --push-only` 安装即可。普通文件夹里不会有占位文件，这项检查也不会带来额外开销。
+
+NAS 或其他网盘的同步客户端在本机维护的文件夹也可以这样推送，前提是在客户端中把文件设为始终保留在本机：仅存于云端的文件同样是占位文件，推送会一直等到它们下载完成。这类文件夹可能和 iCloud 云盘一样受到 macOS 的保护，如果日志中出现 `abort: source unreadable`，按前文步骤授予完全磁盘访问权限即可；桌面、文稿和下载以外的普通文件夹则不需要。
 
 ## 文件说明
 

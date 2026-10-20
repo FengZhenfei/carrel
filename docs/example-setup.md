@@ -18,9 +18,6 @@ that `./deploy.sh --with-local-models` installs.
 Drive folder named `知识库` ("knowledge base"), and the Mac pushes that
 folder to the server. The author also asks questions here, in Codex.
 
-Files saved to the same iCloud Drive folder from other devices (a phone, a
-tablet, another Mac) take the same path.
-
 ## Server
 
 Nine containers, the ones in [deployment/compose](../deployment/compose/README.md)
@@ -47,6 +44,13 @@ every two hours, and the cleanups daily, weekly and monthly.
 
 ## Getting documents to the server
 
+iCloud Drive is the single entry point for documents. Files in `知识库` can
+be added, changed or removed on a Mac, an iPhone, an iPad or any other
+device signed in to the same Apple Account, and iCloud brings every change
+to this Mac. From there the automated pipeline takes over: pushing to the
+server, parsing, indexing and graph updates need no manual step (a new
+knowledge base only has to be enabled once in the console).
+
 The Mac runs two LaunchAgents, every minute. One asks iCloud to download
 files that are only in the cloud; the other copies the folder into the
 server's mirror (`runtime/mirror`) with rsync over SSH. Each subfolder of
@@ -61,6 +65,20 @@ In daily use:
    graph check adds it to that knowledge base's graph, if it has one.
 4. Ask Codex on the Mac. Its search skill queries the search service on the
    server, and Codex answers from the evidence.
+
+The approach does not depend on iCloud. If your documents live on a NAS or
+in another network or cloud drive, the same pattern applies: keep the
+server's mirror in step with that folder, by a scheduled sync or by
+mounting it, and the pipeline does the rest. Common options:
+
+- On a Mac, push the folder that the drive's sync client keeps locally,
+  with this example's push script (`./install.sh --push-only`).
+- Schedule an rsync task on the NAS that pushes to the server.
+- Mount the NAS share on the server and point `KB_MIRROR_ROOT` at the
+  mount point.
+
+[Document folders](configuration.md#document-folders) lists what a sync
+method should take care of.
 
 ## What stays manual
 

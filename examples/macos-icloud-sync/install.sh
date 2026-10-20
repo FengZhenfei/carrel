@@ -72,8 +72,9 @@ done
 if [[ "$with_prefetch" -eq 1 ]]; then shells="/bin/bash and /bin/zsh"; else shells="/bin/bash"; fi
 cat <<EOF
 
-If the source folder is in iCloud Drive, Desktop, Documents or Downloads, open System Settings > Privacy &
-Security > Full Disk Access and add $shells (Cmd+Shift+G in the file dialog takes a path). Without it the
-agents cannot read the folder, and every round stops at the safety checks. Then follow the log:
+If the source folder is in iCloud Drive or another cloud drive, or in Desktop, Documents or Downloads, open
+System Settings > Privacy & Security > Full Disk Access and add $shells (Cmd+Shift+G in the file dialog
+takes a path). Without it the agents cannot read the folder, and every round stops at the safety checks.
+Then follow the log:
   tail -f "$SYNC_HOME/logs/push-mirror.log"
 EOF

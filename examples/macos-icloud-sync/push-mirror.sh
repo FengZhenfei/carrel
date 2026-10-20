@@ -12,9 +12,10 @@
 #                        launchd runs; from a terminal or an IDE the same folder may read as empty, and
 #                        --delete would faithfully replicate "empty" to the server
 #   3. readable          the source must list and hold at least one file
-#   3b. no placeholders  iCloud keeps files it has not downloaded as "dataless" placeholders, which rsync
-#                        reads as empty; wait until icloud-prefetch.sh has materialized them. If the check
-#                        itself fails, skip the round (fail closed): it retries a minute later anyway
+#   3b. no placeholders  iCloud, like other cloud drive clients, keeps files it has not downloaded as "dataless"
+#                        placeholders, which rsync reads as empty; wait until they are downloaded
+#                        (icloud-prefetch.sh does that for iCloud). If the check itself fails, skip the round
+#                        (fail closed): it retries a minute later anyway
 #   4. reachable         SSH is tested on its own first, so an unreachable server is a logged skip
 #   5. server lock       runtime/state/mirror_sync.lock.d on the server is held during the transfer; Carrel's
 #                        scan does not walk the mirror while it exists. A lock left by a push that died is
@@ -184,7 +185,7 @@ if [[ "$local_count" -eq 0 ]]; then
   exit 1
 fi
 
-# ── gate 3b: no dataless placeholders (wait for icloud-prefetch.sh) ──
+# ── gate 3b: no dataless placeholders (for iCloud, icloud-prefetch.sh downloads them) ──
 # Fail closed: if find itself fails (a changed flag name after a macOS update, a revoked permission), skip
 # the round with a log line instead of pushing placeholders as empty files.
 dl_err="$(mktemp)"
@@ -193,13 +194,13 @@ dataless="$(/usr/bin/find "$SRC" -type f -flags +dataless -print -quit 2>"$dl_er
 dl_rc=$?
 set -e
 if [[ "$dl_rc" -ne 0 || -s "$dl_err" ]]; then
-  log "skip: cannot verify iCloud placeholders (find rc=$dl_rc): $(tr '\n' ';' < "$dl_err" | cut -c1-200)"
+  log "skip: cannot verify placeholders (find rc=$dl_rc): $(tr '\n' ';' < "$dl_err" | cut -c1-200)"
   rm -f "$dl_err"
   exit 0
 fi
 rm -f "$dl_err"
 if [[ -n "$dataless" ]]; then
-  log "skip: iCloud placeholder still downloading: ${dataless#"$SRC"/}"
+  log "skip: placeholder not downloaded yet: ${dataless#"$SRC"/}"
   exit 0
 fi
 if [[ -d "$STATE_DIR/icloud_prefetch.lock.d" ]]; then

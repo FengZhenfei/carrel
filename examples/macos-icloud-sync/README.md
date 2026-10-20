@@ -108,12 +108,19 @@ server.
 - If `KB_MIRROR_ROOT` moves the mirror, set `SYNC_REMOTE_MIRROR` to the same
   place.
 
-## A folder outside iCloud Drive
+## Other folders and drives
 
-Point `SYNC_SOURCE` at any folder and install with `./install.sh --push-only`.
-The placeholder check then finds nothing and costs nothing. A folder in
-your home folder but outside Desktop, Documents and Downloads needs no Full
-Disk Access either.
+The push works for any folder on the Mac: point `SYNC_SOURCE` at it and
+install with `./install.sh --push-only`. In an ordinary folder the
+placeholder check finds nothing and costs nothing.
+
+A folder kept by the sync client of a NAS or another cloud drive works the
+same way, as long as the client keeps its files downloaded on the Mac:
+online-only files are placeholders there too, and the push waits until
+they are downloaded. macOS may protect such folders as it does iCloud
+Drive; if the log shows `abort: source unreadable`, grant Full Disk Access
+as described above. Ordinary folders outside Desktop, Documents and
+Downloads need no Full Disk Access.
 
 ## Files
 
