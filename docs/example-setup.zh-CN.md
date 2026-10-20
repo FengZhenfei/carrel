@@ -32,7 +32,7 @@ Carrel 的组件比较多，完整的本地部署对机器也有一定要求。�
 
 ## 资料同步
 
-Mac 上有两个每分钟运行一次的 LaunchAgent：一个请 iCloud 把只在云端的文件下载到本机，另一个用 rsync 经 SSH 把文件夹推送到服务器的镜像目录（`runtime/mirror`）。「知识库」下的每个子文件夹对应一个知识库，比如产品资料、论文报告、项目资料等。脚本和安装步骤见 [examples/macos-icloud-sync](../examples/macos-icloud-sync/README.zh-CN.md)。
+Mac 上有两个每分钟运行一次的 LaunchAgent：一个请 iCloud 把只在云端的文件下载到本机，另一个用 rsync 经 SSH 把文件夹推送到服务器的镜像目录（`runtime/mirror`）。「知识库」下的每个子文件夹对应一个知识库。脚本和安装步骤见 [examples/macos-icloud-sync](../examples/macos-icloud-sync/README.zh-CN.md)。
 
 日常使用的流程是：
 

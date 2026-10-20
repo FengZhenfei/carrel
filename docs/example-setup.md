@@ -50,8 +50,7 @@ every two hours, and the cleanups daily, weekly and monthly.
 The Mac runs two LaunchAgents, every minute. One asks iCloud to download
 files that are only in the cloud; the other copies the folder into the
 server's mirror (`runtime/mirror`) with rsync over SSH. Each subfolder of
-`知识库` is one knowledge base, for example product documentation, papers
-and reports, or project files. The scripts, with installation steps, are in
+`知识库` is one knowledge base. The scripts, with installation steps, are in
 [examples/macos-icloud-sync](../examples/macos-icloud-sync/README.md).
 
 In daily use:
