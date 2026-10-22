@@ -524,6 +524,24 @@ class EvalsetTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     evalset.load_set(bad)                                                              # an unrecognised structure is no longer silently taken as 0 questions
 
+    def test_cli_reaches_the_evaluator_through_the_parser(self) -> None:
+        """kb search eval / make-set go through the real argument parser to evalset. The tests above call evalset
+        directly, so a lost registration would otherwise pass unnoticed."""
+        import contextlib
+
+        from kb_pipeline import cli
+
+        with mock.patch.object(evalset, "cli_eval", return_value=0) as run_cli, \
+                mock.patch.object(evalset, "cli_make_set", return_value=0) as make_cli:
+            self.assertEqual(cli.main(["search", "eval", "--set", "set.json", "--top-k", "8", "--auto"]), 0)
+            self.assertEqual(cli.main(["search", "make-set", "--kb", "kb_001", "--out", "draft.json"]), 0)
+        args = run_cli.call_args.args[0]
+        self.assertEqual((args.set, args.top_k, args.auto, args.out, args.compare), ("set.json", 8, True, None, None))
+        args = make_cli.call_args.args[0]
+        self.assertEqual((args.kb, args.n, args.seed, args.out), ("kb_001", 15, 7, "draft.json"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):           # a count that is not a number stops at the parser
+            cli.main(["search", "make-set", "--kb", "kb_001", "--out", "draft.json", "--n", "many"])
+
 
 class FusionTests(unittest.TestCase):
     def test_rrf_merge_keeps_every_channel_score_and_source(self) -> None:

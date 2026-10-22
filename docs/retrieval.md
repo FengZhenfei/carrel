@@ -413,12 +413,43 @@ cd app
 `--auto` evaluates automatic routing instead of using each question's supplied
 knowledge-base selection. The evaluator reports chunk and document hit rates,
 MRR, expected-answer checks, document coverage, negative-query behavior,
-latency, errors, and changes from the previous result. A re-parse changes
-chunk point IDs, so chunk-level gold is checked before the run: questions none
-of whose gold chunks remain are counted as `stale_gold` and left out of hit@k
-and MRR, while document gold and expected answers are still judged. Run
-`make-set` again to restore chunk-level scoring.
+latency, errors, and changes from the previous result. The previous result is
+the file named by `--compare`, or else the existing file at `--out`, which the
+run then replaces. A re-parse changes chunk point IDs, so chunk-level gold is
+checked before the run: questions none of whose gold chunks remain are counted
+as `stale_gold` and left out of hit@k and MRR, while document gold and expected
+answers are still judged. Run `make-set` again to restore chunk-level scoring.
 
 `kb search make-set` can draft a set using a knowledge base's extraction model.
 Review the generated questions and expected evidence, then run the set against
 your chosen documents and model configuration.
+
+### Question sets
+
+A set is a JSON list of questions, or an object whose `items` holds that list.
+Only `q` (or `question`) is required; every other field adds a check:
+
+```json
+{"items": [
+  {"q": "What is the operating temperature range of the ZK200?", "kbs": ["kb_001"],
+   "gold_docs": ["datasheets/zk200.pdf"], "expect": ["-40", "85"]},
+  {"q": "How did the delivery terms change from the 2024 contract to the 2025 one?",
+   "expect": ["2024", "2025"], "expect_all": true, "min_docs": 2},
+  {"q": "What is the boiling point of mercury?", "negative": true, "tag": "negative"}
+]}
+```
+
+| Field | Check |
+|---|---|
+| `kbs` | Knowledge bases to search, as `kb_NNN`; ignored with `--auto` |
+| `gold_point_ids` | Chunks the answer comes from, as `point_id`; ranked for hit@3/5/12 and MRR |
+| `gold_docs` | Documents the answer comes from, as `rel_path` or file name; ranked for doc_hit@k, and for hit@k and MRR when there is no chunk gold |
+| `expect` | Passes when at least one entry occurs in the returned evidence (case and spaces ignored) |
+| `expect_all` | A list whose entries must all occur, or `true` to require every entry of `expect` |
+| `min_docs` | The least number of distinct documents among the hits |
+| `negative` | `true` for a question the knowledge bases cannot answer; passes when the service reports `no_relevant_content` |
+| `tag` | A label printed next to the question |
+
+`make-set` fills `q`, `expect`, `gold_point_ids`, `gold_docs`, `kbs` and `tag`.
+For hand-written questions, take `point_id` and `rel_path` from the `sources`
+of a search response.

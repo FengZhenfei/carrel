@@ -201,6 +201,33 @@ cd app
   --out ../runtime/eval/result.json --auto
 ```
 
-`--auto` 使用自动路由，不使用题目预先指定的知识库。评测输出切片与文档命中率、MRR、预期答案检查、文档覆盖、负例表现、延迟、错误，以及相对上次结果的变化。重新解析会改变切块的 point ID，因此开跑前会核对切片金标：金标切片一个都不在了的题目计入 `stale_gold`，不计入 hit@k 和 MRR，文档金标与预期答案照常判定。要恢复切片口径，重新运行 `make-set`。
+`--auto` 使用自动路由，不使用题目预先指定的知识库。评测输出切片与文档命中率、MRR、预期答案检查、文档覆盖、负例表现、延迟、错误，以及相对上次结果的变化。上次结果取 `--compare` 指定的文件；未指定时取 `--out` 处已有的文件，本次结果随后覆盖它。重新解析会改变切块的 point ID，因此开跑前会核对切片金标：金标切片一个都不在了的题目计入 `stale_gold`，不计入 hit@k 和 MRR，文档金标与预期答案照常判定。要恢复切片口径，重新运行 `make-set`。
 
 `kb search make-set` 可调用知识库的抽取模型生成题集初稿。审核问题和预期证据后，可在选定的资料与模型配置上运行评测。
+
+### 题集格式
+
+题集是由题目组成的 JSON 列表，也可以是一个对象，把列表放在 `items` 字段里。每道题只有 `q`（或 `question`）是必填的，其余字段各自增加一项检查：
+
+```json
+{"items": [
+  {"q": "ZK200 的工作温度范围是多少？", "kbs": ["kb_001"],
+   "gold_docs": ["datasheets/zk200.pdf"], "expect": ["-40", "85"]},
+  {"q": "2025 年合同相比 2024 年合同，交付条款有哪些变化？",
+   "expect": ["2024", "2025"], "expect_all": true, "min_docs": 2},
+  {"q": "水银的沸点是多少？", "negative": true, "tag": "negative"}
+]}
+```
+
+| 字段 | 检查内容 |
+|---|---|
+| `kbs` | 检索的知识库，写 `kb_NNN` 编号；使用 `--auto` 时忽略 |
+| `gold_point_ids` | 答案所在的切片，写 `point_id`；按排名计算 hit@3/5/12 和 MRR |
+| `gold_docs` | 答案所在的文档，写 `rel_path` 或文件名；按排名计算 doc_hit@k，没有切片金标时也用于 hit@k 和 MRR |
+| `expect` | 返回的证据中至少出现其中一项即通过（忽略大小写和空格） |
+| `expect_all` | 列表中的各项都要出现；写 `true` 表示 `expect` 的各项都要出现 |
+| `min_docs` | 命中结果至少来自几份不同的文档 |
+| `negative` | 设为 `true` 表示知识库答不了的题，检索服务报告 `no_relevant_content` 时通过 |
+| `tag` | 输出时显示在题目旁边的标签 |
+
+`make-set` 生成的题目会带上 `q`、`expect`、`gold_point_ids`、`gold_docs`、`kbs` 和 `tag`。手写题目时，`point_id` 和 `rel_path` 可以从检索结果的 `sources` 中取得。
