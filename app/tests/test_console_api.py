@@ -13,7 +13,7 @@ from typing import Any
 from kb_pipeline import db
 from kb_pipeline.parsers.common import page_idx
 
-from _support import _CodexAudit20260906TestsSupport, _block, _local_file, _repo_file
+from _support import _block, _CodexAudit20260906TestsSupport, _local_file, _repo_file, _schema_entry
 
 
 
@@ -243,8 +243,9 @@ class DerivedSchemaPersistenceTests(unittest.TestCase):
         casually clicking save once would turn into an "I chose this version" out of thin air.
         """
         source = _repo_file("app/kb_server/static/app.js")
-        tune = source.split('$("#cfg-gtune")', 1)[1]
-        self.assertIn("dirty: true", tune.split('$("#cfg-', 1)[0])
+        tune = source.split('async function refreshSchemaTaskResult', 1)[1].split('$("#cfg-', 1)[0]
+        self.assertIn("const pending = r.pending && !state.graphSchema.dirty", tune)
+        self.assertIn("dirty: state.graphSchema.dirty || pending", tune)
         change = source.split('$("#cfg-gver").addEventListener', 1)[1].split("});", 1)[0]
         self.assertIn("dirty = true", change)
         load = source.split("if (state.cfgKey !== key)", 1)[1].split("} else if (draft)", 1)[0]
@@ -265,41 +266,40 @@ class DerivedSchemaPersistenceTests(unittest.TestCase):
 
 
 class SchemaVersionViewTests(unittest.TestCase):
-    def test_pre_version_labels_surface_as_one_honest_placeholder(self) -> None:
-        """Version management was added later. Labels extracted before it have no date / model / sampling record —
-        the view gives them one fallback entry with the metadata honestly left empty, rather than fabricating one
-        that looks real."""
-        from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID
+    def test_versions_are_shown_from_their_linkml(self) -> None:
+        """版本条目存的是 LinkML;视图把它展开成控制台要的形状(类型带上层类 / 父类 / 作用域,关系带两端与单值),
+        LinkML 本体不进视图(下载走单独的接口)。"""
         from kb_server.service import schema_versions_view
 
-        view = schema_versions_view({
-            "graph_entity_types": ["organization", "signal"],
-            "graph_language": "Chinese",
-        })
-        self.assertEqual(view["active"], CURRENT_SCHEMA_VERSION_ID)
-        self.assertEqual(len(view["versions"]), 1)
-        entry = view["versions"][0]
-        self.assertTrue(entry["legacy"])
-        self.assertIsNone(entry["created_at"])
-        self.assertIsNone(entry["model"])
-        self.assertEqual(entry["entity_types"], ["organization", "signal"])
+        entry = _schema_entry("v1", [("person", "agent"), ("checkup", "event"), ("indicator", "property")],
+                              language="Chinese", scopes={"checkup": "document"},
+                              predicates=[{"name": "has_indicator", "source_parents": ["agent"], "target_parents": ["property"],
+                                           "multivalued": False}],
+                              examples="Example 1: x", origin="manual", model="m")
+        view = schema_versions_view({"graph_schema_versions": [entry], "graph_schema_active": "v1"})
+        self.assertEqual(view["active"], "v1")
+        (v,) = view["versions"]
+        self.assertNotIn("linkml", v)
+        self.assertEqual((v["origin"], v["model"], v["language"], v["has_examples"]), ("manual", "m", "Chinese", True))
+        self.assertEqual({t["name"]: (t["upper"], t["scope"]) for t in v["types"]},
+                         {"person": ("agent", "global"), "checkup": ("event", "document"), "indicator": ("property", "document")})
+        preds = {p["name"]: p for p in v["predicates"]}
+        self.assertFalse(preds["has_indicator"]["multivalued"])
+        self.assertTrue(preds["precedes"]["core"])                     # 有事件类型就带上事件核心关系
 
-    def test_no_labels_at_all_means_no_versions(self) -> None:
+    def test_no_versions_at_all_means_nothing_to_select(self) -> None:
         from kb_server.service import schema_versions_view
 
-        view = schema_versions_view({})
-        self.assertEqual(view, {"versions": [], "active": ""})
+        self.assertEqual(schema_versions_view({}), {"versions": [], "active": ""})
+        # 生效字段还在、版本环已经空了(旧数据):不再造一条只读的兜底条目
+        self.assertEqual(schema_versions_view({"graph_entity_types": ["signal"]}), {"versions": [], "active": ""})
 
-    def test_a_dangling_active_id_falls_back_instead_of_pointing_nowhere(self) -> None:
-        from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID
+    def test_a_dangling_active_id_points_nowhere_instead_of_inventing_one(self) -> None:
         from kb_server.service import schema_versions_view
 
-        view = schema_versions_view({
-            "graph_schema_versions": [],
-            "graph_schema_active": "evicted",
-            "graph_entity_types": ["signal"],
-        })
-        self.assertEqual(view["active"], CURRENT_SCHEMA_VERSION_ID)
+        view = schema_versions_view({"graph_schema_versions": [_schema_entry("v2", ["signal"])], "graph_schema_active": "evicted"})
+        self.assertEqual(view["active"], "")
+        self.assertEqual([v["id"] for v in view["versions"]], ["v2"])
 
 
 class PendingSchemaSelectionTests(unittest.TestCase):
@@ -326,7 +326,7 @@ class PendingSchemaSelectionTests(unittest.TestCase):
         id gets stored under KB B — the backend cannot find that id and the save is a straight 422."""
         source = self._app_js()
         self.assertIn("kbId: String(kbId || \"\")", source)
-        tune = source.split('$("#cfg-gtune")', 1)[1].split('$("#cfg-', 1)[0]
+        tune = source.split('async function refreshSchemaTaskResult', 1)[1].split('$("#cfg-', 1)[0]
         self.assertIn("kbId: kb.kb_id", tune)
 
     def test_the_unsaved_state_is_visible(self) -> None:
@@ -365,31 +365,47 @@ class GraphTabAndConfigPanelTests(unittest.TestCase):
         for needle in ('$("#cfg-gparents")', '$("#cfg-gpreds")'):
             self.assertIn(needle, render, needle)
         view = js.split("function setSchemaView", 1)[1].split("\nfunction ", 1)[0]
-        for field in ("predicates", "parent_types"):
+        for field in ("predicates", "types", "abstract"):
             self.assertIn(field, view, field)
         self.assertIn("个谓词", js.split("function versionLabel", 1)[1].split("\nfunction ", 1)[0])
 
     def test_schema_view_reads_the_shapes_the_server_actually_stores(self) -> None:
-        """Parent types are {type: parent} and the predicate endpoint fields are called source_parents /
-        target_parents — both as normalize_* in limits defines them. The first console version wrote
-        {parent: [types]} and source/target, so loading the config threw a TypeError, which renderConfig's catch
-        swallowed into a "config failed to load" message plus endless refetching, and even the corpus hints stopped
-        refreshing. Both ends must be pinned to the same shape."""
-        from kb_pipeline.limits import normalize_parent_types, normalize_predicates
+        """视图里的类型是 [{name, is_a, upper, scope, abstract}],谓词的端点字段叫 source_parents / target_parents ——
+        都是 kb_pipeline.ontology.model_summary 的口径。控制台第一版按别的形状写,载入配置直接抛 TypeError,被
+        renderConfig 的 catch 吞成一条「配置载入失败」并无限重拉。两头必须钉在同一个形状上。"""
+        from kb_pipeline.ontology import model_summary, normalize_model
 
-        parents = normalize_parent_types({"pin": "component", "signal": "interface"})
-        self.assertEqual(parents, {"pin": "component", "signal": "interface"})
-        (pred,) = normalize_predicates([{"name": "has_pin", "source_parents": ["component"],
-                                         "target_parents": ["component"], "description": "d"}])
-        self.assertEqual(set(pred) >= {"name", "source_parents", "target_parents"}, True)
+        model, _ = normalize_model({"types": [{"name": "pin", "is_a": "part"}],
+                                    "predicates": [{"name": "has_pin", "source_parents": ["entity"], "target_parents": ["part"]}]})
+        summary = model_summary(model)
+        self.assertEqual(set(summary["types"][0]) >= {"name", "is_a", "upper", "scope", "abstract"}, True)
+        self.assertEqual(set(summary["predicates"][0]) >= {"name", "source_parents", "target_parents", "multivalued", "core"}, True)
         js = _repo_file("app/kb_server/static/app.js")
         render = js.split("function renderGraphSchema", 1)[1].split("\nfunction ", 1)[0]
-        self.assertIn("groupParentTypes(", render)
+        self.assertIn("groupTypesByUpper(", render)
         self.assertIn("pr.source_parents", render)
         self.assertIn("pr.target_parents", render)
-        self.assertNotIn("(map[name] || []).join", render)
-        group = js.split("function groupParentTypes", 1)[1].split("\nfunction ", 1)[0]
-        self.assertIn("(groups[String(value)] ||= []).push(key)", group)
+        self.assertIn("pr.multivalued === false", render)
+        group = js.split("function groupTypesByUpper", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn('(ty.upper || "entity") === key', group)
+        # 八个上层类的中文名和后端的上层类一一对应
+        from kb_pipeline.ontology import UPPER_CLASSES
+
+        upper_line = js.split("const UPPER_ZH = {", 1)[1].split("};", 1)[0]
+        self.assertEqual([k.split(":")[0].strip() for k in upper_line.split(",")], list(UPPER_CLASSES))
+
+    def test_linkml_download_and_upload_are_wired(self) -> None:
+        html = _repo_file("app/kb_server/static/index.html")
+        js = _repo_file("app/kb_server/static/app.js")
+        api = _repo_file("app/kb_server/api.py")
+        for needle in ('id="cfg-gvdl"', 'id="cfg-gvup"', 'id="cfg-gvfile"'):
+            self.assertIn(needle, html, needle)
+        self.assertIn("/graph_schema/${encodeURIComponent(chosen.id)}/linkml", js)
+        self.assertIn("/graph_schema/upload", js)
+        upload = js.split('$("#cfg-gvfile").addEventListener', 1)[1].split('$("#cfg-', 1)[0]
+        self.assertIn("dirty: true", upload)                 # 上传和抽取一样:入环不生效,选中保存才生效
+        self.assertIn('@router.get("/kbs/{kb_id}/graph_schema/{version_id}/linkml")', api)
+        self.assertIn('@router.post("/kbs/{kb_id}/graph_schema/upload")', api)
 
     def test_config_panel_drops_the_four_explanations(self) -> None:
         """2026-09-06: the four explanation paragraphs under unit chunk count / gleaning rounds / relation predicates /

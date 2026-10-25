@@ -1,19 +1,15 @@
-"""Structured graph lookups: the agent walks the graph and lists things step by step itself (multi-hop
-reasoning lives on the agent side; blindly expanding three to five hops showed no gain at all in evaluation).
-All four endpoints only read the current graph version and generate nothing:
-- neighbours: given an entity (name or id), its one-hop relations: predicate, direction, weight, the entity
-  at the other end and evidence chunks (ready for /context); every relation carries an excerpt of the original
-  text that names the far end, and the entity's relation counts per predicate come along; the name is first
-  matched exactly by title / alias, and if nothing matches a few candidates are offered by vector for the agent
-  to choose from;
-- entities: entities by type / upper class / name, with a total and paging ("all of them" questions);
-- facts: qualified facts by subject / property / document / conflict, with a total and paging, rows shaped
-  like the specs of /search;
-- pages: compiled pages by kind / title / entity / document, optionally with their full text.
-/search additionally carries the one-hop neighbourhood of its subjects (neighborhoods): for each entity the question
-names, a few of its strongest relations, so the agent can decide where to walk next.
-What is listed is what the graph registered (the result of model extraction), not a complete inventory of the
-documents."""
+"""图谱的结构化查询口:agent 自己一步步走图、列清单(多跳关联推理放在 agent 侧,盲目扩展三五跳在评测里没有任何收益)。
+四个接口都只读现行图版本、不做任何生成:
+· 邻域:给一个实体(名字、id、旧 id 或外部编号),返回一跳关系:谓语、方向、权重、对端实体、证据切片(可直接拿去 /context),
+  每条关系带一段提到对端的原文摘录,另给这个实体各类关系的条数;
+  名字先按标题 / 别名 / 外部编号精确匹配,匹配不到就按向量给几个候选让 agent 挑;
+· 列实体:按类型(含子类型)/ 上层类 / 类与实例 / 名字列实体,带总数与翻页(「全部 / 所有」类问题);
+· 查事实:按主体 / 属性 / 文档 / 冲突列限定事实,带总数与翻页,行结构与 /search 的 specs 相同;
+· 编译页:按类别 / 标题 / 实体 / 文档列编译页,可带全文。
+关系与事实默认只给现行的(没被更新的说法取代、来源文档没被标成被取代或归档、有效期没过),带 as_of 回看某一天,
+带 history 全部给;每行带 status,另给被筛掉了多少条(hidden),口径见 kb_pipeline.graph.currency。
+另有 /search 附带的「主体的一跳邻域」(neighborhoods):题目里点名的实体各列几条权重最高的关系,agent 看了再决定往哪走。
+列出来的是图谱里登记的内容(模型抽取的结果),不是资料里的完整清单。"""
 from __future__ import annotations
 
 import math
@@ -25,7 +21,12 @@ from kb_pipeline.models import KBSource
 
 from .text import place, position
 
-ENTITY_FIELDS = ("id", "title", "type", "parent_type", "scope", "description", "pagerank", "degree", "aliases")
+ENTITY_FIELDS = ("id", "title", "type", "upper", "type_path", "kind", "scope", "description", "pagerank", "degree", "aliases",
+                 "external_ids", "doc_count", "first_seen", "last_seen")
+ENTITY_RETURN = ", ".join(f"e.{k} AS {k}" for k in ENTITY_FIELDS)
+# 关系的时间与状态字段(建图时写在 RELATED_TO 边上),每条邻居关系原样带回、再按口径算 status
+RELATION_TIME_FIELDS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
+                        "lapses")
 EVIDENCE_PER_RELATION = 3
 EVIDENCE_PER_FACT = 3
 # Every relation carries an excerpt of the original text: only the few sentences of the evidence that name the far
@@ -66,7 +67,9 @@ FACT_MATCH = {
 # collection (the alias is switching versions); doc_id is also used to give every row its source document (the
 # payload projection does not carry it)
 _FACT_BASIC = ("id", "subject", "property", "symbol", "concept", "concept_key", "value", "min", "typ", "max", "unit", "unit_canonical",
-               "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section", "doc_id")
+               "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section", "doc_id",
+               "observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses")
+SERIES_MEMBERS_MAX = 40             # 一条序列最多带几档(体检指标一年一档,几十档已经很长)
 PAGE_KINDS = ("subject", "timeline", "source", "index")
 PAGE_SCROLL = 256
 
@@ -82,16 +85,48 @@ def _entity_row(rec: Any) -> dict[str, Any]:
     return {k: rec.get(k) for k in ENTITY_FIELDS}
 
 
+def time_scope(*, history: bool = False, as_of: str | None = None, today: str | None = None) -> dict[str, Any]:
+    """接口的时间口径:{"mode": current | as_of | history, "day": YYYY-MM-DD};见 currency.query_scope。"""
+    from kb_pipeline.graph.currency import query_scope
+
+    return query_scope(history=history, as_of=as_of, today=today)
+
+
+def in_effect(var: str, *, observed: str, scope: dict[str, Any]) -> str:
+    """Cypher 条件:这条关系边 / 事实节点按口径算不算数;history 一律算。"""
+    from kb_pipeline.graph.currency import cypher_in_scope
+
+    return cypher_in_scope(var, observed=observed, scope=scope)
+
+
+def with_status(row: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
+    from kb_pipeline.graph.currency import mark_status
+
+    mark_status(row, scope)
+    row.pop("lapses", None)             # 会不会过期只用来定状态,不返回
+    return row
+
+
+def time_echo(scope: dict[str, Any], hidden: int | None = None) -> dict[str, Any]:
+    """回给调用方的口径说明;hidden 是同样条件下按口径筛掉的条数(带 history 能看到它们)。"""
+    out: dict[str, Any] = {"mode": scope["mode"], "day": scope["day"]}
+    if hidden is not None and scope["mode"] != "history":
+        out["hidden"] = int(hidden)
+    return out
+
+
 def resolve_entity(session: Any, kb_id: str, gv: str, *, entity_id: str | None, name: str | None) -> list[dict[str, Any]]:
-    """Find an entity by id or by name (title / alias, ignoring case and spaces); several entities with the
-    same name are all returned in descending pagerank order, and the caller decides which to use.
-    Ignoring spaces: a question writes "ZK 200" where the graph registered "ZK200"; spellings that differ
-    only by spaces count as the same name."""
+    """按 id 或名字找实体;同名多个按 pagerank 降序全部返回,调用方决定用哪个。
+    id:现在的 id,或归并进来的成员原来的 id(ids;别名归并、更正文件强制合并之后,代表换了也查得到)。
+    名字:标题 / 别名 / 外部编号,不分大小写、不计空格;外部编号「体系:编号」只给编号也算。
+    不计空格:问题里写「Demo 365」、图里登记的是「Demo365」,这类只差空格的写法算同一个名字。"""
     if entity_id:
         rows = session.run(
-            "MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $id}) "
-            "RETURN e.id AS id, e.title AS title, e.type AS type, e.parent_type AS parent_type, e.scope AS scope, e.description AS description, "
-            "e.pagerank AS pagerank, e.degree AS degree, e.aliases AS aliases", kb=kb_id, gv=gv, id=str(entity_id)).data()
+            f"MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}}) RETURN {ENTITY_RETURN}", kb=kb_id, gv=gv, id=str(entity_id)).data()
+        if not rows:
+            rows = session.run(
+                "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) WHERE e.id IS NOT NULL AND $id IN coalesce(e.ids, []) "
+                f"RETURN {ENTITY_RETURN} LIMIT 5", kb=kb_id, gv=gv, id=str(entity_id)).data()
         return [_entity_row(r) for r in rows]
     key = "".join(str(name or "").casefold().split())
     if not key:
@@ -101,9 +136,9 @@ def resolve_entity(session: Any, kb_id: str, gv: str, *, entity_id: str | None, 
     rows = session.run(
         "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) "
         "WHERE e.id IS NOT NULL AND coalesce(e.boilerplate, false) = false "
-        "AND (replace(toLower(e.title), ' ', '') = $name OR any(a IN coalesce(e.aliases, []) WHERE replace(toLower(a), ' ', '') = $name)) "
-        "RETURN e.id AS id, e.title AS title, e.type AS type, e.parent_type AS parent_type, e.scope AS scope, e.description AS description, "
-        "e.pagerank AS pagerank, e.degree AS degree, e.aliases AS aliases ORDER BY coalesce(e.pagerank, 0) DESC LIMIT 10",
+        "AND (replace(toLower(e.title), ' ', '') = $name OR any(a IN coalesce(e.aliases, []) WHERE replace(toLower(a), ' ', '') = $name) "
+        "OR any(x IN coalesce(e.external_ids, []) WHERE replace(toLower(x), ' ', '') = $name OR replace(toLower(x), ' ', '') ENDS WITH ':' + $name)) "
+        f"RETURN {ENTITY_RETURN} ORDER BY coalesce(e.pagerank, 0) DESC LIMIT 10",
         kb=kb_id, gv=gv, name=key).data()
     return [_entity_row(r) for r in rows]
 
@@ -120,65 +155,74 @@ def dense_candidates(settings: Settings, source: KBSource, name: str, *, limit: 
     if q is None:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     rows = _query_points(q, graph_collection_alias(source.collection, "entity"), vector, int(limit), seed_filter())
-    return [{"id": r.get("gr_id"), "title": r.get("title"), "type": r.get("type"), "scope": r.get("scope"),
-             "description": str(r.get("description") or "")[:200], "score": round(float(r.get("_score") or 0.0), 4)} for r in rows]
+    return [{"id": r.get("gr_id"), "title": r.get("title"), "type": r.get("type"), "upper": r.get("upper"), "kind": r.get("kind"),
+             "scope": r.get("scope"), "description": str(r.get("description") or "")[:200],
+             "score": round(float(r.get("_score") or 0.0), 4)} for r in rows]
 
 
 def neighbor_rows(session: Any, kb_id: str, gv: str, entity_id: str, *, limit: int, types: list[str] | None,
-                  direction: str) -> list[dict[str, Any]]:
-    """One-hop relations: predicate, direction, weight, the entity at the other end; in descending
-    weight order, excluding boilerplate relations and reference-type counterparts."""
+                  direction: str, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """一跳关系:谓语、方向、权重、对端实体、时间与状态;按权重降序,样板关系与引用类对端不要,按口径筛掉不算数的
+    (scope 见 time_scope;不给就是现行)。"""
+    scope = scope or time_scope()
+    times = ", ".join(f"r.{k} AS {k}" for k in RELATION_TIME_FIELDS)
     rows = session.run(
-        """
-        MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $id})-[r:RELATED_TO]-(n:Entity)
+        f"""
+        MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}})-[r:RELATED_TO]-(n:Entity)
         WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
-          AND ($types = [] OR r.type IN $types)
+          AND ($types = [] OR r.type IN $types) AND {in_effect("r", observed="observed_first", scope=scope)}
         WITH r, n, (startNode(r).id = $id) AS outgoing
         WHERE $direction = 'both' OR ($direction = 'out' AND outgoing) OR ($direction = 'in' AND NOT outgoing)
         RETURN r.id AS relation_id, r.type AS type, outgoing AS outgoing, coalesce(r.directed, false) AS directed,
                r.weight AS weight, r.npmi AS npmi, r.cooccur AS cooccur, r.description AS description,
-               coalesce(r.type_violation, false) AS type_violation,
-               n.id AS other_id, n.title AS other_title, n.type AS other_type, n.scope AS other_scope, n.pagerank AS other_pagerank,
-               n.degree AS other_degree, n.aliases AS other_aliases
+               coalesce(r.type_violation, false) AS type_violation, {times},
+               n.id AS other_id, n.title AS other_title, n.type AS other_type, n.upper AS other_upper, n.kind AS other_kind,
+               n.scope AS other_scope, n.pagerank AS other_pagerank, n.degree AS other_degree, n.aliases AS other_aliases
         ORDER BY coalesce(r.weight, 0) DESC, coalesce(n.pagerank, 0) DESC
         LIMIT $limit
-        """, kb=kb_id, gv=gv, id=str(entity_id), types=[str(t) for t in (types or [])], direction=direction, limit=int(limit)).data()
+        """, kb=kb_id, gv=gv, id=str(entity_id), types=[str(t) for t in (types or [])], direction=direction, limit=int(limit),
+        day=scope["day"]).data()
     out = []
     for r in rows:
-        out.append({
+        row = {
             "relation_id": r.get("relation_id"), "type": r.get("type"), "direction": "out" if r.get("outgoing") else "in",
             "directed": bool(r.get("directed")), "weight": r.get("weight"), "npmi": r.get("npmi"), "cooccur": r.get("cooccur"),
             "description": r.get("description"), "type_violation": bool(r.get("type_violation")),
-            # degree: how many relations the far end has itself; the caller judges by it whether walking on that way is worthwhile
-            "other": {"id": r.get("other_id"), "title": r.get("other_title"), "type": r.get("other_type"), "scope": r.get("other_scope"),
-                      "pagerank": r.get("other_pagerank"), "degree": r.get("other_degree")},
+            **{k: r.get(k) for k in RELATION_TIME_FIELDS if r.get(k) not in (None, "")},
+            # degree:对端自己有多少条关系,调用方据此判断值不值得继续往那边走
+            "other": {"id": r.get("other_id"), "title": r.get("other_title"), "type": r.get("other_type"), "upper": r.get("other_upper"),
+                      "kind": r.get("other_kind"), "scope": r.get("other_scope"), "pagerank": r.get("other_pagerank"),
+                      "degree": r.get("other_degree")},
             "evidence": [],
-            "_names": [r.get("other_title"), *(r.get("other_aliases") or [])],       # to locate the far end in the original text when cutting the excerpt; not returned
-        })
+            "_names": [r.get("other_title"), *(r.get("other_aliases") or [])],       # 截摘录时用来在原文里定位对端,不返回
+        }
+        out.append(with_status(row, scope))
     return out
 
 
-def neighbor_kinds(session: Any, kb_id: str, gv: str, entity_id: str, *, direction: str) -> list[dict[str, Any]]:
-    """How many relations of each kind (predicate) this entity has, bounded neither by limit nor by the predicate
-    filter: an entity often has more than a thousand relations while one call returns the few dozen strongest, so
-    the caller learns from this which other kinds it can ask for by predicate; whether what it got is everything
-    is computed from it as well."""
+def neighbor_kinds(session: Any, kb_id: str, gv: str, entity_id: str, *, direction: str,
+                   scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """这个实体各类关系(谓语)各有多少条,不受 limit 与谓语筛选限制,按同一口径数:一个实体常有上千条关系而一次只返回
+    权重最高的几十条,调用方据此知道还有哪些种类可以按谓语去取,拿到的是不是全部也由它算出来。"""
+    scope = scope or time_scope()
     rows = session.run(
-        """
-        MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $id})-[r:RELATED_TO]-(n:Entity)
+        f"""
+        MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}})-[r:RELATED_TO]-(n:Entity)
         WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
+          AND {in_effect("r", observed="observed_first", scope=scope)}
         WITH r, (startNode(r).id = $id) AS outgoing
         WHERE $direction = 'both' OR ($direction = 'out' AND outgoing) OR ($direction = 'in' AND NOT outgoing)
         RETURN r.type AS type, count(r) AS n ORDER BY n DESC, type
-        """, kb=kb_id, gv=gv, id=str(entity_id), direction=direction).data()
+        """, kb=kb_id, gv=gv, id=str(entity_id), direction=direction, day=scope["day"]).data()
     return [{"type": r.get("type"), "count": int(r.get("n") or 0)} for r in rows]
 
 
-def fact_count(session: Any, kb_id: str, gv: str, entity_id: str) -> int:
-    """How many qualified facts are registered under this entity (tells the caller whether the facts endpoint has
-    anything for it)."""
-    rows = session.run("MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $id})-[:HAS_SPEC]->(f:Spec) RETURN count(f) AS n",
-                       kb=kb_id, gv=gv, id=str(entity_id)).data()
+def fact_count(session: Any, kb_id: str, gv: str, entity_id: str, *, scope: dict[str, Any] | None = None) -> int:
+    """这个实体名下登记了多少条限定事实(按同一口径数;调用方据此知道查事实接口有没有东西可取)。"""
+    scope = scope or time_scope()
+    rows = session.run(f"MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}})-[:HAS_SPEC]->(f:Spec) "
+                       f"WHERE {in_effect('f', observed='observed', scope=scope)} RETURN count(f) AS n",
+                       kb=kb_id, gv=gv, id=str(entity_id), day=scope["day"]).data()
     return int((rows or [{}])[0].get("n") or 0)
 
 
@@ -406,15 +450,20 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
 
 
 def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entity_id: str | None, limit: int = 20,
-              types: list[str] | None = None, direction: str = "both", q: Any = None, driver: Any = None,
-              timeout: float | None = None) -> dict[str, Any]:
-    """q / driver: the Qdrant client and Neo4j driver shared by the service; without a driver one is
-    created here and closed afterwards. timeout: transaction timeout (seconds) of each Neo4j query, except
-    the point lookup of the active version number."""
+              types: list[str] | None = None, direction: str = "both", history: bool = False, as_of: str | None = None,
+              q: Any = None, driver: Any = None, timeout: float | None = None) -> dict[str, Any]:
+    """q / driver:服务共用的 Qdrant 客户端与 Neo4j driver;不传 driver 就现建、用完关掉。
+    history / as_of:时间口径(见 time_scope);各类关系的条数、总数、实体名下的事实数都按同一口径数,
+    time.hidden 是同样条件下被口径筛掉的关系条数。
+    timeout:各条 Neo4j 查询的事务超时(秒),查现行版本号的那一条点查除外。"""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
     from kb_pipeline.graph.recall import TimedSession
 
     direction = direction if direction in ("both", "out", "in") else "both"
+    scope = time_scope(history=history, as_of=as_of)
+    from . import docstatus
+    if scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source):
+        raise ValueError("graph_refresh_pending: source validity changed; current graph answers are temporarily unavailable")
     own_driver = driver is None
     if own_driver:
         driver = neo4j_driver(settings)
@@ -434,11 +483,14 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
             # relations, list the rest in matches so the caller can query by id instead
             matches.sort(key=lambda m: (-int(m.get("degree") or 0), -float(m.get("pagerank") or 0.0)))
             center = matches[0]
-            rows = neighbor_rows(session, source.kb_id, gv, str(center["id"]), limit=max(1, min(100, int(limit))), types=types, direction=direction)
-            kinds = neighbor_kinds(session, source.kb_id, gv, str(center["id"]), direction=direction)
+            rows = neighbor_rows(session, source.kb_id, gv, str(center["id"]), limit=max(1, min(100, int(limit))), types=types,
+                                 direction=direction, scope=scope)
+            kinds = neighbor_kinds(session, source.kb_id, gv, str(center["id"]), direction=direction, scope=scope)
+            every = kinds if scope["mode"] == "history" else neighbor_kinds(
+                session, source.kb_id, gv, str(center["id"]), direction=direction, scope=time_scope(history=True))
             attach_evidence(session, source.kb_id, gv, rows)
             center["docs"] = entity_docs(session, source.kb_id, gv, str(center["id"]))
-            center["facts"] = fact_count(session, source.kb_id, gv, str(center["id"]))
+            center["facts"] = fact_count(session, source.kb_id, gv, str(center["id"]), scope=scope)
     finally:
         if own_driver:
             driver.close()
@@ -448,9 +500,10 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
     # Number of relations under the same filter (not bounded by limit): tells the caller whether what it got is everything
     wanted = {str(t) for t in (types or [])}
     total = sum(k["count"] for k in kinds if not wanted or str(k["type"]) in wanted)
+    total_all = sum(k["count"] for k in every if not wanted or str(k["type"]) in wanted)
     return {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv, "found": True, "entity": center, "matches": matches[1:],
             "candidates": [], "neighbors": rows, "count": len(rows), "total": total, "has_more": total > len(rows),
-            "predicates": kinds, "direction": direction, "types": list(types or [])}
+            "predicates": kinds, "direction": direction, "types": list(types or []), "time": time_echo(scope, total_all - total)}
 
 
 _names_lock = threading.Lock()
@@ -543,31 +596,22 @@ def named_entities(question: str, index: dict[str, Any]) -> list[dict[str, Any]]
 
 def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versions: dict[str, str], question: str,
                   seeds: list[dict[str, Any]], *, limit: int, per_entity: int = NEIGHBORHOOD_SIZE, driver: Any = None,
-                  timeout: float | None = None) -> list[dict[str, Any]]:
-    """The one-hop neighbourhood of the subjects that /search carries: the caller (the agent) reads it and then
-    decides whether to call the neighbours endpoint and walk on, instead of first looking each subject up.
-    graph_versions: the chosen knowledge bases that have a graph -> current graph version (in routing order);
-    seeds: the entity rows the graph route returned (with kb_id, already in descending score order).
-    Subjects are first the entities the question names (named_entities), then, to fill up, the graph route's seeds
-    by score - limit in total across the knowledge bases:
-    - the seeds are the entities semantically closest to the question, which often are not the subject it asks
-      about (measured on a comparison question on 2026-10-02: the five best-scoring seeds were small entities for
-      the comparison dimensions, neither of the two products being compared made the top five), so named entities
-      come first;
-    - a name of two or three characters without letters or digits is hit too easily (a question about "which
-      products the knowledge base lists" names entities called "product" and "knowledge base"), so such a short
-      name only counts when the entity is also a graph route seed; short names that really are asked about were
-      among the seeds in every case measured;
-    - of the seeds used to fill up, only the first of those sharing a name within one knowledge base is taken
-      (same-named entities of different scopes are often hit together), and one connected to nothing takes no slot.
-    Each subject gives: its relation total, the number of facts under it, relation counts per predicate, and its
-    per_entity strongest relations (predicate, direction, the far end and the far end's own relation count); a
-    far end is listed once, by its strongest relation (two entities often share several relations with different
-    predicates, and one far end must not fill the list).
-    These are leads only, without evidence or excerpts: to check a relation, call the neighbours endpoint."""
+                  timeout: float | None = None, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """/search 附带的「主体的一跳邻域」:调用方(agent)看了它再决定要不要调邻域接口继续走,不必先为每个主体各查一次。
+    graph_versions:选中的、有图的库 → 现行图版本(按选库的顺序);seeds:图路返回的实体行(带 kb_id,已按得分降序)。
+    主体先取题目里点名的实体(named_entities),不够再按图路种子的得分补,几个库合在一起一共 limit 个:
+    · 图路种子是与问题语义最接近的实体,常常不是题目问的那个主体(2026-10-02 实测一道对比题:得分前五是对比维度的小实体,
+      被比的两个主体都没进前五),所以点名的优先;
+    · 两三个字的中文名字太容易误中(泛指词可能碰巧与实体名相同),
+      这类短名字要同时是图路种子才算数;
+    · 补位的种子同一个库里同名的只取第一个(同名不同作用域的实体常常一起命中),在图里什么都没连着的不占位置。
+    每个主体给:关系总数、名下事实条数、各类关系(谓语)的条数、权重最高的 per_entity 条关系(谓语、方向、对端及对端
+    自己的关系数);同一个对端只列权重最高的那一条(两个实体之间常有好几条谓语不同的关系,不让一个对端占满)。
+    只给线索,不带证据和摘录:要核对某条关系时调邻域接口。关系与事实按 /search 的时间口径数(scope,默认现行)。"""
     from kb_pipeline.graph.neo4j_import import neo4j_driver
     from kb_pipeline.graph.recall import TimedSession
 
+    scope = scope or time_scope()
     seeded = {(str(e.get("kb_id")), str(e.get("id"))) for e in seeds}
     own_driver = driver is None
     if own_driver:
@@ -597,23 +641,29 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
             rel_rows: dict[tuple[str, str], dict[str, Any]] = {}
             facts: dict[tuple[str, str], int] = {}
             for kb in graph_versions:
+                from . import docstatus
+                if scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, sources[kb]):
+                    continue
                 ids = [s["id"] for s in subjects if s["kb_id"] == kb]
                 if not ids:
                     continue
                 for r in session.run(
-                        """
+                        f"""
                         UNWIND $ids AS eid
-                        MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[r:RELATED_TO]-(n:Entity)
+                        MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: eid}})-[r:RELATED_TO]-(n:Entity)
                         WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
-                        WITH eid, r, n, (startNode(r).id = eid) AS outgoing ORDER BY coalesce(r.weight, 0) DESC, coalesce(n.pagerank, 0) DESC
+                          AND {in_effect("r", observed="observed_first", scope=scope)}
+                        WITH eid, r, n, (startNode(r).id = eid) AS outgoing
+                        ORDER BY coalesce(r.weight, 0) DESC, coalesce(n.pagerank, 0) DESC, r.id, n.id
                         RETURN eid, count(r) AS total, collect(r.type) AS kinds,
-                               collect({relation_id: r.id, type: r.type, outgoing: outgoing, directed: coalesce(r.directed, false), weight: r.weight,
-                                        other_id: n.id, other_title: n.title, other_type: n.type, other_degree: n.degree})[0..$k] AS top
-                        """, ids=ids, kb=kb, gv=graph_versions[kb], k=int(per_entity) * NEIGHBORHOOD_SCAN).data():
+                               collect({{relation_id: r.id, type: r.type, outgoing: outgoing, directed: coalesce(r.directed, false), weight: r.weight,
+                                        other_id: n.id, other_title: n.title, other_type: n.type, other_degree: n.degree}})[0..$k] AS top
+                        """, ids=ids, kb=kb, gv=graph_versions[kb], k=int(per_entity) * NEIGHBORHOOD_SCAN, day=scope["day"]).data():
                     rel_rows[(kb, str(r.get("eid")))] = r
                 for r in session.run(
                         "UNWIND $ids AS eid MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid}) "
-                        "RETURN eid, size([(e)-[:HAS_SPEC]->(f:Spec) | 1]) AS facts", ids=ids, kb=kb, gv=graph_versions[kb]).data():
+                        f"RETURN eid, size([(e)-[:HAS_SPEC]->(f:Spec) WHERE {in_effect('f', observed='observed', scope=scope)} | 1]) AS facts",
+                        ids=ids, kb=kb, gv=graph_versions[kb], day=scope["day"]).data():
                     facts[(kb, str(r.get("eid")))] = int(r.get("facts") or 0)
     finally:
         if own_driver:
@@ -643,30 +693,35 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
 
 
 def _lowered(values: Iterable[Any] | None) -> list[str]:
-    return sorted({str(v).strip().lower() for v in (values or []) if str(v).strip()})
+    return sorted({str(v).strip().casefold() for v in (values or []) if str(v).strip()})
 
 
-def list_entities(settings: Settings, source: KBSource, *, types: list[str] | None = None, parent_types: list[str] | None = None,
-                  name: str | None = None, limit: int = 50, offset: int = 0, driver: Any = None,
+ENTITY_KINDS = ("instance", "class", "all")
+
+
+def list_entities(settings: Settings, source: KBSource, *, types: list[str] | None = None, uppers: list[str] | None = None,
+                  kind: str = "all", name: str | None = None, limit: int = 50, offset: int = 0, driver: Any = None,
                   timeout: float | None = None) -> dict[str, Any]:
-    """List the entities of the current graph version by type / upper class / name, with a total and paging,
-    in descending pagerank order (for "all of them" questions). The first page (offset=0) also carries the
-    number of entities per type, so the caller sees which types this knowledge base has and how large they are.
-    Every entity carries the few documents that mention it most (docs) and the number of documents (doc_count),
-    so a listed item can be cited directly.
-    types / parent_types are case-insensitive, each a union, intersected with each other; name is a piece of
-    text contained in the title or an alias.
-    What is listed is what the graph registered (the result of model extraction), not a complete inventory of
-    the documents; entities found only on boilerplate pages and reference numbers are left out."""
+    """按类型 / 上层类 / 类与实例 / 名字列出现行图版本里的实体,带总数与翻页,按 pagerank 降序(「全部 / 所有」类问题用)。
+    第一页(offset=0)另带各类型的实体数(含其中几个是类别名),调用方据此看这个库有哪些类型、各有多少。
+    每个实体带提到它最多的几份文档(docs)和文档总数(doc_count),清单里的条目可以直接引用。
+    types 按类型链匹配(给父类型就连子类型一起列);uppers 是八个上层类;两者不分大小写、各自取并集、两者之间取交集。
+    kind 默认都列(每行带 kind);instance 只列具体的,class 只列类别名(「传感器」这种泛指的)。默认不筛是因为模型对
+    专业术语的判法偏「类」:泛指术语经常标成 class(10-24 一组评估中占四分之三),筛掉就列不全了。
+    name 是标题、别名或外部编号里包含的一段文字。
+    列出的是图谱里登记的实体(模型抽取的结果),不是资料里的完整清单;只出现在样板页上的与引用编号类的不列。"""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
     from kb_pipeline.graph.recall import TimedSession
 
     limit = max(1, min(LIST_LIMIT_MAX, int(limit)))
     offset = max(0, int(offset))
-    filters = {"types": _lowered(types), "parent_types": _lowered(parent_types), "name": str(name or "").strip().lower()}
-    where = (LIVE_ENTITY + " AND ($types = [] OR toLower(e.type) IN $types)"
-             " AND ($parents = [] OR toLower(coalesce(e.parent_type, '')) IN $parents OR toLower(coalesce(e.upper, '')) IN $parents)"
-             " AND ($name = '' OR toLower(e.title) CONTAINS $name OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS $name))")
+    kind = kind if kind in ENTITY_KINDS else "all"
+    filters = {"types": _lowered(types), "uppers": _lowered(uppers), "kind": kind, "name": str(name or "").strip().casefold()}
+    where = (LIVE_ENTITY + " AND ($types = [] OR any(t IN coalesce(e.type_path, [toLower(e.type)]) WHERE t IN $types))"
+             " AND ($uppers = [] OR toLower(coalesce(e.upper, 'entity')) IN $uppers)"
+             " AND ($kind = 'all' OR coalesce(e.kind, 'instance') = $kind)"
+             " AND ($name = '' OR toLower(e.title) CONTAINS $name OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS $name)"
+             " OR any(x IN coalesce(e.external_ids, []) WHERE toLower(x) CONTAINS $name))")
     own_driver = driver is None
     if own_driver:
         driver = neo4j_driver(settings)
@@ -674,23 +729,23 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
         gv = active_neo4j_graph_version(driver, source.kb_id)
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
-        params = {"kb": source.kb_id, "gv": gv, "types": filters["types"], "parents": filters["parent_types"], "name": filters["name"]}
+        params = {"kb": source.kb_id, "gv": gv, "types": filters["types"], "uppers": filters["uppers"], "kind": kind,
+                  "name": filters["name"]}
         with driver.session() as session:
             if timeout:
                 session = TimedSession(session, timeout)
             head = "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) WHERE "
             total = int((session.run(head + where + " RETURN count(e) AS total", **params).data() or [{}])[0].get("total") or 0)
             rows = session.run(
-                head + where + " RETURN e.id AS id, e.title AS title, e.type AS type, e.parent_type AS parent_type, e.scope AS scope, "
-                "e.description AS description, e.pagerank AS pagerank, e.degree AS degree, e.aliases AS aliases "
+                head + where + f" RETURN {ENTITY_RETURN} "
                 "ORDER BY coalesce(e.pagerank, 0) DESC, e.id SKIP $offset LIMIT $limit", offset=offset, limit=limit, **params).data()
             type_rows = None
             if offset == 0:
                 type_rows = session.run(
-                    head + LIVE_ENTITY + " RETURN e.type AS etype, coalesce(e.parent_type, e.upper) AS parent, count(e) AS n "
-                    "ORDER BY n DESC, etype LIMIT 100", kb=source.kb_id, gv=gv).data()
-            # which documents each entity comes from: a listed item can be cited directly, without one more query
-            # per item just to find its source
+                    head + LIVE_ENTITY + " RETURN e.type AS etype, coalesce(e.upper, 'entity') AS upper, count(e) AS n, "
+                    "sum(CASE WHEN e.kind = 'class' THEN 1 ELSE 0 END) AS classes ORDER BY n DESC, etype LIMIT 100",
+                    kb=source.kb_id, gv=gv).data()
+            # 每个实体出自哪些文档:清单里的条目要能直接引用,不必为了找出处再各查一次
             doc_rows = session.run(
                 "UNWIND $ids AS eid "
                 "MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[:MENTIONED_IN]->(c:QdrantChunkSnapshot) "
@@ -708,38 +763,54 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
         row["description"] = str(row.get("description") or "")[:LIST_DESCRIPTION_CHARS] or None
         found = docs_of.get(str(row.get("id"))) or {}
         row["docs"] = [str(d) for d in (found.get("docs") or [])]
-        row["doc_count"] = int(found.get("doc_count") or 0)
+        # 文档数以建图时记的全数为准(出现在几份文档里,来源只存前几个);老一点的节点没有就按提及数
+        row["doc_count"] = int(row.get("doc_count") or found.get("doc_count") or 0)
         entities.append(row)
     out = {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv, "filters": filters,
            "total": total, "offset": offset, "limit": limit, "count": len(entities), "has_more": offset + len(entities) < total,
            "entities": entities}
     if type_rows is not None:
-        out["types"] = [{"type": r.get("etype"), "parent_type": r.get("parent"), "count": int(r.get("n") or 0)} for r in type_rows]
+        out["types"] = [{"type": r.get("etype"), "upper": r.get("upper"), "count": int(r.get("n") or 0),
+                         "classes": int(r.get("classes") or 0)} for r in type_rows]
+    return out
+
+
+def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
+    """各条序列的全部档位(不按时间口径筛):现行的那一档旁边要能看到它之前的值(「30(2024)、31(2025)」)。"""
+    wanted = sorted({str(k) for k in keys if k})
+    if not wanted:
+        return {}
+    rows = session.run(
+        "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys "
+        "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, f.unit AS unit, "
+        "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.axis AS axis, f.series_index AS series_index "
+        "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted).data()
+    out: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        members = out.setdefault(str(r["series_key"]), [])
+        if len(members) < SERIES_MEMBERS_MAX:
+            members.append({**{k: r.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical", "valid_from", "series_index")},
+                            "when": r.get("valid_from") or r.get("axis")})
     return out
 
 
 def list_facts(settings: Settings, source: KBSource, *, subject: str | None = None, subject_id: str | None = None,
                prop: str | None = None, match: str = "auto", doc_id: str | None = None, conflict_only: bool = False,
+               history: bool = False, as_of: str | None = None,
                limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, driver: Any = None,
                timeout: float | None = None) -> dict[str, Any]:
-    """List the qualified facts of the current graph version by subject / property / document, with a total and
-    paging ("every parameter of this subject", "this property across subjects", "the facts registered from this
-    document", "the values that disagree across documents").
-    The subject is found by id or name (title / alias) and its facts are taken along the HAS_SPEC edges; with
-    several entities of the same name the one with the most relations is used and the rest are listed in
-    matches. The property is matched against the property name / symbol / canonical concept name: match=auto
-    tries exact first and falls back to containment only when nothing matched; every spelling under the matched
-    concept keys comes back with it (the ones concept normalisation folded into one, such as "TC" and "total
-    cholesterol result").
-    doc_id keeps only the facts drawn from that document; conflict_only keeps only the facts in a cross-document
-    conflict group, with each group's facts next to each other. The conditions are intersected; the exact-then-
-    containment property probe also runs inside the document / conflict scope, so that a spelling found only in
-    other documents does not leave this document with nothing.
-    Fact rows are taken from the payloads of the fact collection, the same projection as the specs of /search,
-    so hint strings, series, conflicts and source verification follow the same rules; every row also carries
-    the locators of its evidence chunks (ready for /context), the entity it hangs under (subject_id) and the
-    document it came from (doc_id). With a subject or a document, the first page also lists the properties in
-    that scope."""
+    """按主体 / 属性 / 文档列出现行图版本里的限定事实,带总数与翻页(「某主体的全部参数」「某属性在各主体上的值」
+    「这份文档里登记了哪些事实」「哪些值在不同文档里对不上」用)。
+    主体按 id 或名字(标题 / 别名)找,沿 HAS_SPEC 边取它名下的事实;同名多个时用关系最多的那个,其余列在 matches 里。
+    属性按名字 / 符号 / 规范概念名匹配:match=auto 先精确、一条都没有再按包含;命中的概念键下的各种写法一并带回
+    (「TC」「总胆固醇测量结果」被概念规范化折成一个的那些)。
+    doc_id 只要出自这份文档的事实;conflict_only 只要带跨文档冲突组的事实,同一组排在一起。各条件之间取交集;
+    属性先精确后包含的那次试探也在文档 / 冲突的范围里做,免得精确写法只在别的文档里有、这份文档里一条都取不到。
+    事实行取自事实集合的负载,与 /search 的 specs 同一个投影,所以线索串、序列、冲突、来源核验的口径都一样;
+    每行另带证据切片的定位(可直接拿去 /context)、挂在哪个实体下(subject_id)、出自哪份文档(doc_id)。
+    给了主体或文档时,第一页附这个范围里的属性清单。
+    时间口径(history / as_of,见 time_scope):默认只列现行值,序列里更早的档位不单列、写在现行那一条的 series_text 里;
+    属性试探不受口径影响(只认写法),总数、清单、属性清单都按口径数,time.hidden 是被筛掉的条数。"""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
     from kb_pipeline.graph.recall import TimedSession, spec_result_row
     from kb_pipeline.graph.vectors import point_id_for
@@ -751,6 +822,11 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
     offset = max(0, int(offset))
     needle = str(prop or "").strip().lower()
     match = match if match in ("auto", "exact", "contains") else "auto"
+    tscope = time_scope(history=history, as_of=as_of)
+    from . import docstatus
+    if tscope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source):
+        raise ValueError("graph_refresh_pending: source validity changed; current graph answers are temporarily unavailable")
+    effect = in_effect("f", observed="observed", scope=tscope)
     base = {"kb_id": source.kb_id, "kb_name": kb_name(source)}
     own_driver = driver is None
     if own_driver:
@@ -775,7 +851,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                 center = matches[0]
             scope = ("MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $sid})-[:HAS_SPEC]->(f:Spec)" if center is not None
                      else "MATCH (f:Spec {kb_id: $kb, graph_version: $gv})")
-            params: dict[str, Any] = {"kb": source.kb_id, "gv": gv, "p": needle, "keys": []}
+            params: dict[str, Any] = {"kb": source.kb_id, "gv": gv, "p": needle, "keys": [], "day": tscope["day"]}
             if center is not None:
                 params["sid"] = str(center["id"])
             # The document and conflict conditions go into the property probe, the count and the listing; the property
@@ -798,6 +874,10 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                 # older graphs without concept keys can only be reached by the latter)
                 where = f"(f.concept_key IN $keys OR {FACT_MATCH[matched]})" if matched else "false"
             where += also
+            every = None
+            if tscope["mode"] != "history":
+                every = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
+            where += f" AND {effect}"
             total = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
             order = "coalesce(f.concept, f.property, ''), coalesce(f.valid_from, ''), coalesce(f.series_index, 0), f.id"
             if center is None:
@@ -817,10 +897,12 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
             picked = [dict(r.get("row") or {}) for r in records]
             subject_ids = [r.get("subject_id") for r in records]
+            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked))
             properties = None
             if (center is not None or doc_id) and offset == 0:
                 properties = session.run(
-                    f"{scope} WHERE {in_doc or 'true'} RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
+                    f"{scope} WHERE {in_doc or 'true'} AND {effect} "
+                    "RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
                     "ORDER BY n DESC, concept LIMIT $top", top=PROPERTY_SUMMARY_LIMIT, **params).data()
     finally:
         if own_driver:
@@ -847,6 +929,13 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
         # database, with the payload's as a fallback
         row["doc_id"] = r.get("doc_id") or (payloads.get(str(r["id"])) or {}).get("doc_id")
         row["subject_id"] = sid
+        # 时间与状态以图库为准(负载与它同一次建图写入,图库这份不受别名切换影响)
+        for k in ("observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses"):
+            if r.get(k) not in (None, ""):
+                row[k] = r[k]
+        if row.get("series_key") and members.get(str(row["series_key"])):
+            row["series_members"] = members[str(row["series_key"])]
+        with_status(row, tscope)
     missing = sum(1 for fid in fact_ids if fid not in payloads)
     if missing and not degraded:
         # the alias of the fact collection points at another version (the few seconds of a publish switch): only
@@ -872,7 +961,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
     out = {**base, "found": True, "subject": center, "matches": matches[1:], "candidates": [],
            "property": {"query": str(prop).strip(), "matched": matched, "concepts": len(keys)} if needle else None,
            "total": total, "offset": offset, "limit": limit, "count": len(facts), "has_more": offset + len(facts) < total,
-           "facts": facts}
+           "facts": facts, "time": time_echo(tscope, (every - total) if every is not None else None)}
     if properties is not None:
         out["properties"] = [{"concept": r.get("concept"), "concept_key": r.get("concept_key"), "count": int(r.get("n") or 0)}
                              for r in properties]
@@ -885,18 +974,13 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
 
 def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None, title: str | None = None, page_id: str | None = None,
                entity_id: str | None = None, doc_id: str | None = None, with_text: bool = True, limit: int = 20, offset: int = 0,
-               paths: dict[str, str] | None = None, q: Any = None) -> dict[str, Any]:
-    """The list and full text of the compiled pages (subject / timeline / source / index pages): a caller that wants
-    to read a whole page need not hope a search happens to hit it.
-    The page collection is small (a few hundred points per knowledge base), so the whole collection is scrolled
-    once and filtered, sorted and paged in process, which is simpler than a payload index for every filter; it
-    goes through the alias, so what is read is the current version. A missing collection (the knowledge base has
-    no graph, or no pages were generated) -> KeyError.
-    entity_keys become entity ids (the same algorithm as the ids in the entity collection and the graph
-    database), so the caller can take them straight to the neighbours / facts endpoints; doc_ids become paths
-    through paths (doc_id -> rel_path from the state database), and a position that cannot be resolved stays
-    empty while its doc_id is kept. kinds counts the whole collection by kind and is not affected by the filters.
-    Page text is already cut to at most 8,000 characters when written."""
+               paths: dict[str, str] | None = None, q: Any = None, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+    """编译页(主体页 / 时间线页 / 来源页 / 索引页)的清单与全文:调用方要整页读,不必靠检索碰运气命中。
+    页面集合很小(每库几百个点),整个集合 scroll 一遍、在进程里筛选排序翻页,比给每种筛选建 payload 索引简单;
+    走别名,读到的就是现行版本。集合不存在(这个库没有图谱或没生成页面)→ KeyError。
+    entity_keys 换成实体 id(与实体集合、图库里实体的 id 同一个算法),调用方可以直接拿去查邻域 / 事实;
+    doc_ids 按 paths(状态库的 doc_id → rel_path)换成路径,换不到的位置留空、doc_id 照留。
+    kinds 是整个集合按类别的计数,不受筛选影响。页面正文在写入时已截到 8000 字以内。"""
     from kb_pipeline.graph.vectors import entity_id as entity_id_for
     from kb_pipeline.vector.qdrant import client as qdrant_client, graph_collection_alias
 
@@ -917,6 +1001,10 @@ def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None,
         if getattr(exc, "status_code", None) == 404:          # no such collection: no graph, or this graph version generated no pages
             raise KeyError(f"{source.kb_id} has no compiled pages") from exc
         raise
+    from . import docstatus
+    scope = time_scope(history=history, as_of=as_of)
+    pending = scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source)
+    pages = [] if pending else [p for p in pages if docstatus.page_allowed(settings, source, p, scope, paths=paths)]
     kinds = {k: 0 for k in PAGE_KINDS}
     for p in pages:
         if p.get("kind") in kinds:
@@ -944,7 +1032,8 @@ def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None,
     for i, (p, eids, docs) in enumerate(rows[offset:offset + limit]):
         text = str(p.get("text") or "")
         row: dict[str, Any] = {"n": offset + i + 1, "id": p.get("gr_id"), "kind": p.get("kind"), "title": p.get("title"),
-                               "summary": p.get("description")}
+                               "summary": p.get("description"), "compiled_day": p.get("compiled_day"),
+                               "time_mode": p.get("time_mode"), "source_paths": list(p.get("source_paths") or [])}
         if with_text:
             row["text"] = text
         row.update({"text_chars": len(text), "series": list(p.get("series") or []), "docs": [paths.get(d) for d in docs], "doc_ids": docs,
@@ -952,4 +1041,27 @@ def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None,
         out_pages.append(row)
     gv = next((str(p["graph_version"]) for p in pages if p.get("graph_version")), None)
     return {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv, "total": len(rows), "offset": offset, "limit": limit,
-            "count": len(out_pages), "has_more": offset + len(out_pages) < len(rows), "kinds": kinds, "pages": out_pages}
+            "count": len(out_pages), "has_more": offset + len(out_pages) < len(rows), "kinds": kinds, "pages": out_pages,
+            "time": scope, "degraded": ["graph_refresh_pending"] if pending else []}
+
+
+def version_stats(driver: Any, kb_id: str, *, timeout: float | None = None) -> tuple[str | None, dict[str, Any]]:
+    """现行图版本与它在导入时算好的整版统计(GraphVersion.stats_json,见 kb_pipeline.graph.stats);没有生效版本 → (None, {})。"""
+    import json
+
+    from kb_pipeline.graph.recall import TimedSession
+
+    with driver.session() as session:
+        if timeout:
+            session = TimedSession(session, timeout)
+        rows = session.run(
+            "MATCH (kb:KB {kb_id: $kb}) WHERE kb.active_graph_version IS NOT NULL "
+            "MATCH (gv:GraphVersion {kb_id: $kb, graph_version: kb.active_graph_version}) "
+            "RETURN gv.graph_version AS graph_version, gv.stats_json AS stats LIMIT 1", kb=kb_id).data()
+    if not rows:
+        return None, {}
+    try:
+        stats = json.loads(rows[0].get("stats") or "{}")
+    except ValueError:
+        stats = {}
+    return str(rows[0]["graph_version"]), stats if isinstance(stats, dict) else {}

@@ -38,7 +38,6 @@ from typing import Any, Iterable, Callable
 
 from .. import db
 from ..config import Settings
-from ..limits import GRAPH_ENTITY_TYPES_DEFAULT
 from ..models import KBSource
 from ..utils import stable_json_hash
 from ..vector.qdrant import (
@@ -59,7 +58,11 @@ from ..vector.qdrant import (
     parse_graph_collection_name,
     restore_graph_aliases,
 )
-from . import prompts
+from . import prompts, unit_cache
+from .corrections import (
+    apply_entity_corrections, apply_fact_corrections, apply_relation_corrections, corrections_path,
+    load_corrections, mark_document_status, effective_sha, status_fingerprint,
+)
 from .extract import ExtractionSchema, GraphExtractor
 from .llm import ChatClient, LLMCache, LLMCircuitOpen, LLMInputRejected, LLMInterrupted, LLMSpec, cache_count
 
@@ -298,15 +301,38 @@ def deterministic_extractor(settings: Settings, source: KBSource, units: list[An
     return DeterministicExtractor(units, file_for=file_for, kb_id=source.kb_id)
 
 
-def extraction_fingerprint(base_fingerprint: str, *, deterministic_units: int) -> str:
-    """Cache fingerprint of the extraction results: when some units use deterministic extraction, mix the rule
-    version in (rule changes must trigger a recompute); KBs without such units keep the same fingerprint (so old
-    KBs' caches are not invalidated for nothing)."""
+def extraction_fingerprint(base_fingerprint: str, *, deterministic_units: int,
+                           table_profiles: dict[str, Any] | None = None) -> str:
+    """抽取结果的缓存指纹:有规则抽取的单元时把规则版本掺进去(规则改了要重算);有按规则建图的表格时
+    再掺进表格路线的版本与各表画像(画像变了,哪些单元走规则、行怎么读都变)。都没有的库指纹不变。"""
     from .deterministic import VERSION
+    from .tables import VERSION as TABLES_VERSION
 
-    if not deterministic_units:
+    entity_tables = {k: v for k, v in (table_profiles or {}).items() if (v or {}).get("row_type")}
+    if not deterministic_units and not entity_tables:
         return base_fingerprint
-    return hashlib.sha256(f"{base_fingerprint}|{VERSION}".encode("utf-8")).hexdigest()[:24]
+    raw = f"{base_fingerprint}|{VERSION}" if deterministic_units else base_fingerprint
+    if entity_tables:
+        raw += f"|{TABLES_VERSION}|{stable_json_hash(entity_tables)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+TABLE_PROFILES_FILE = "tables.json"
+PIPELINE_REVISION = "audit-20261025-v2"  # Resume guard only; does not invalidate LLM input caches.
+
+
+def table_extractor(units: list[Any], schema: ExtractionSchema, paths: "GraphPaths"):
+    """这个库的表格规则抽取器;各表画像在抽取阶段问一次模型后写进工作区(tables.json),后面的阶段直接读。"""
+    from .tables import TableExtractor
+
+    tx = TableExtractor(units, schema=schema)
+    path = paths.work_dir / TABLE_PROFILES_FILE
+    if tx.units and path.exists():
+        try:
+            tx.load_profiles(json.loads(path.read_text(encoding="utf-8")).get("profiles") or {})
+        except ValueError:
+            pass
+    return tx
 
 
 def prune_unit_caches(settings: Settings, source: KBSource, units_file: Path) -> dict[str, int]:
@@ -323,15 +349,27 @@ def prune_unit_caches(settings: Settings, source: KBSource, units_file: Path) ->
 
 
 def extraction_schema_for(source: KBSource) -> ExtractionSchema:
+    """本库生效的模式 → 抽取用的 schema。没有任何模式版本(归纳失败的空白图)时用 ontology 的兜底模式。"""
+    if not source.graph_entity_types:
+        from ..ontology import default_model
+
+        fallback = ExtractionSchema.from_model(default_model(), examples=str(getattr(source, "graph_examples", "") or ""))
+        return ExtractionSchema(
+            entity_types=fallback.entity_types, predicates=tuple(dict(p) for p in (source.graph_predicates or ())) or fallback.predicates,
+            language=source.graph_language or "English", parent_types=fallback.parent_types,
+            type_definitions=fallback.type_definitions, examples=fallback.examples,
+            type_parents=fallback.type_parents, type_scopes=fallback.type_scopes)
     profile = dict(getattr(source, "graph_profile", None) or {})
     return ExtractionSchema(
-        entity_types=tuple(source.graph_entity_types) or tuple(GRAPH_ENTITY_TYPES_DEFAULT),
+        entity_types=tuple(source.graph_entity_types),
         predicates=tuple(dict(p) for p in (source.graph_predicates or ())),
         language=source.graph_language or "English",
         parent_types=dict(source.graph_parent_types or {}),
         type_definitions=dict(getattr(source, "graph_type_definitions", None) or {}),
         examples=str(getattr(source, "graph_examples", "") or ""),
         subject_types=tuple(str(t) for t in (profile.get("subject_types") or ())),
+        type_parents=dict(getattr(source, "graph_type_parents", None) or {}),
+        type_scopes=dict(getattr(source, "graph_type_scopes", None) or {}),
     )
 
 
@@ -359,6 +397,15 @@ def prompts_hash() -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def ontology_hash() -> str:
+    """固定上层本体里会影响建图的常量(上层类的描述进提示词,默认作用域与事件核心关系决定键与谓词表)。"""
+    from .. import ontology
+
+    return stable_json_hash({"uppers": ontology.UPPER_DESCRIPTIONS, "scopes": ontology.DEFAULT_SCOPE,
+                             "events": ontology.EVENT_PREDICATES, "inverse": ontology.INVERSE_PREDICATES,
+                             "defaults": ontology.DEFAULT_TYPES})[:16]
+
+
 def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
     """Compress the configuration items whose change invalidates the whole extraction cache into one fingerprint:
     the per-step models, the type table, the predicate table, parent types, language, unit size, gleaning rounds
@@ -368,25 +415,35 @@ def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
     from .facts import FACTS_MAX_PER_UNIT
 
     specs = resolve_llm_specs(settings, source, GRAPH_LLM_STEPS)
+    schema = extraction_schema_for(source)
     return stable_json_hash({
         # Version tag of the fingerprint layout. Any change to the constants below invalidates every recorded
         # fingerprint: resume is judged impossible and append is judged "configuration changed", so every
         # graph-enabled knowledge base has to be rebuilt in full. Bump it only together with such a change.
-        "v": "local-graph-3",
+        # 2026-09-29: aligned with the open-source tree (local-graph-3 / entity_graph, prompts hashed by
+        # constant instead of by file); the fingerprints recorded on the live builds were relabelled in place
+        # because nothing about the extraction inputs changed.
+        # 2026-10-24 破坏性改版(八个上层类、LinkML 模式、逐类型作用域、新的实体身份规则):local-graph-4,
+        # 旧版本的建图记录一律判为配置已变。
+        "v": "local-graph-4",
         "mode": "entity_graph",
         "models": {step: spec.model_id for step, spec in sorted(specs.items())},
-        "entity_types": list(source.graph_entity_types) or list(GRAPH_ENTITY_TYPES_DEFAULT),
-        "predicates": [str(p.get("name") or "") for p in (source.graph_predicates or ())],
-        # Predicate descriptions and endpoint constraints are part of the fingerprint too: they go into the
-        # extraction prompt and decide the later type-violation flags. Comparing names only would let phase
-        # artifacts extracted / flagged under the old definitions be reused after a change
+        "entity_types": list(schema.entity_types),
+        "predicates": [str(p.get("name") or "") for p in schema.predicates],
+        # 谓词的描述、端点约束与单值与否也进指纹:它们进抽取提示词,也决定事后的类型越界标记与新旧取代 —— 改了
+        # 只比名字就会沿用按旧定义抽出来 / 标出来的阶段产物
         "predicate_defs": [
             {"name": str(p.get("name") or ""), "description": str(p.get("description") or ""),
              "source_parents": sorted(str(x) for x in (p.get("source_parents") or ())),
-             "target_parents": sorted(str(x) for x in (p.get("target_parents") or ()))}
-            for p in sorted((source.graph_predicates or ()), key=lambda p: str(p.get("name") or ""))
+             "target_parents": sorted(str(x) for x in (p.get("target_parents") or ())),
+             "multivalued": p.get("multivalued") is not False}
+            for p in sorted(schema.predicates, key=lambda p: str(p.get("name") or ""))
         ],
-        "parent_types": dict(source.graph_parent_types or {}),
+        "parent_types": dict(schema.parent_types or {}),
+        # 类型树与作用域决定实体键(作用域)和端点判定(按祖先),改了实体编号就变
+        "type_parents": dict(schema.type_parents or {}),
+        "type_scopes": dict(schema.type_scopes or {}),
+        "ontology": ontology_hash(),
         "language": source.graph_language or "",
         # 2026-09-07: type definitions, per-KB few-shot examples and the scenario profile all feed the prompt or
         # decide unit classification / axis, so changing them invalidates the cache
@@ -552,6 +609,7 @@ def prepare_graph_input(settings: Settings, source: KBSource, *, paths: GraphPat
     axes = axis_for_units(units, kind=profile["axis"])
     for u in units:
         u.axis = str((axes.get(u.doc_id) or {}).get("value") or "")
+        u.doc_date = str((axes.get(u.doc_id) or {}).get("date") or "")
     summary = units_summary(units)
     manifest = {
         "source": "qdrant_chunks",
@@ -666,7 +724,26 @@ def _resumable_phases(con, previous, *, settings: Settings, source: KBSource) ->
     stored_hash = str(previous["source_content_hash"] or "")
     same_corpus = bool(stored_hash) and stored_hash == source_snapshot_hash(db.active_chunk_refs(con, source.collection))
     if same_config and same_corpus:
-        return set(db.graph_phases_done(con, build_id))
+        try:
+            manifest = json.loads(previous["manifest_json"] or "{}")
+        except (ValueError, KeyError):
+            manifest = {}
+        corr = load_corrections(corrections_path(settings, source.kb_id))
+        paths = [c.get("rel_path", "") for c in db.active_chunk_refs(con, source.collection)]
+        current_status = status_fingerprint(corr, paths, today=time.strftime("%Y-%m-%d"))
+        done = set(db.graph_phases_done(con, build_id))
+        if manifest.get("pipeline_revision") != PIPELINE_REVISION:
+            # Old phase outputs predate the route-specific caches and validity guards.
+            # Re-enter extraction: compatible LLM rows are migrated/reused there.
+            done &= {"prepare_input"}
+            con.execute("DELETE FROM graph_build_phases WHERE graph_build_id=? AND phase != 'prepare_input'", (build_id,))
+        elif (manifest.get("corrections_sha", "") != effective_sha(corr)
+                or manifest.get("document_status_sha", "") != current_status
+                or (manifest.get("temporal_refresh_on") and manifest["temporal_refresh_on"] <= time.strftime("%Y-%m-%d"))):
+            # Raw extraction remains reusable; derived identity/facts/pages/publication must rerun.
+            done &= {"prepare_input", "extract"}
+            con.execute("DELETE FROM graph_build_phases WHERE graph_build_id=? AND phase NOT IN ('prepare_input','extract')", (build_id,))
+        return done
     db.clear_graph_phases(con, build_id)
     return set()
 
@@ -774,8 +851,11 @@ def build_graph(
                 ) from exc
 
         db.init_db(settings.state_db)
-        # Baseline for an incremental append: the current version (latest completed, non-trial build). Its
-        # extraction and resolution cannot be reused once the config fingerprint has changed.
+        corrections_snapshot = load_corrections(corrections_path(settings, source.kb_id))
+        if corrections_snapshot.get("errors"):
+            raise ValueError("Invalid corrections: " + "; ".join(corrections_snapshot["errors"][:10]))
+        corrections_day = time.strftime("%Y-%m-%d")
+        # 增量并入的基线:现行版本(最近一次建成、非试建)。配置指纹变了就不能沿用它的抽取与归并。
         base_row = None
         base_graph: dict[str, Any] | None = None
         base_docs: dict[str, set[tuple[str, str]]] = {}
@@ -796,15 +876,19 @@ def build_graph(
             with db.connect(settings.state_db) as con:
                 previous = (db.graph_build_by_version(con, source.collection, graph_version)
                             if allow_existing_graph_version else None)
+                if previous is not None:
+                    try:
+                        result = {**json.loads(previous["manifest_json"] or "{}"), "intent": intent}
+                    except (ValueError, TypeError):
+                        result = {"intent": intent}
                 build_id = db.begin_graph_build(
                     con, source_key=source_key, kb_id=source.kb_id, source_collection=source.collection,
                     graph_version=graph_version, allow_existing=allow_existing_graph_version,
                     cache_fingerprint=graph_cache_fingerprint(settings, source),
                     build_kind="append" if incremental else "full",
                 )
-                db.update_graph_build_manifest(con, build_id, {"intent": intent})   # nobody writes it after a SIGKILL
-                # in the same transaction as the fingerprint rewrite: once the record carries this run's fingerprint,
-                # the phase marks left on it must be the ones checked against it
+                db.update_graph_build_manifest(con, build_id, result)   # Preserve resume evidence even if stopped before preparation.
+                # 与改写指纹同一个事务:记录上的指纹换成这次的之后,留下的阶段标记必须是按它核对过的
                 if previous is not None:
                     phases_done = _resumable_phases(con, previous, settings=settings, source=source)
             switched_off = graph_switched_off(settings, source, paused_at_start=paused_at_start)
@@ -852,9 +936,13 @@ def build_graph(
         prior_pairs = confirmed_pairs((schema_entry or {}).get("observed") or {})
         result = {
             "dry_run": dry_run, "mode": "entity_graph", "source": source_key, "kb_id": source.kb_id,
+            "pipeline_revision": PIPELINE_REVISION,
             "schema_version_id": str(schema_entry.get("id")) if schema_entry else None,
             "schema_auto": ({"version_id": schema_auto.get("version_id"), "origin": schema_auto.get("origin")}
                             if schema_auto else None),
+            # 更正文件(覆盖层)的指纹:只改了更正、语料没变时,增量并入据此判断要重新合并(evaluate_append)
+            "corrections_sha": effective_sha(corrections_snapshot),
+            "schema_snapshot": dict(schema_entry or {}),
             "source_collection": source.collection, "graph_version": graph_version,
             "graph_build_id": build_id, "resumed_phases": sorted(phases_done),
             "build_kind": "append" if incremental else "full", "intent": intent,
@@ -862,6 +950,8 @@ def build_graph(
             "paths": {"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir), "cache_file": str(paths.cache_file)},
             "models": {step: spec.name for step, spec in specs.items()},
             "schema": {
+                # 建这一版图用的模式版本:检索服务的 /graph/schema 按它取 LinkML(之后切换了模式版本、还没重建时两者不同)
+                "version_id": str(schema_entry.get("id")) if schema_entry else None,
                 "entity_types": list(schema.entity_types), "predicates": list(schema.predicate_names),
                 "parent_types": dict(schema.parent_types), "language": schema.language,
                 "unit_chunks": int(source.graph_unit_chunks), "max_gleanings": int(source.graph_max_gleanings),
@@ -914,6 +1004,10 @@ def build_graph(
         else:
             input_manifest, build_chunks = prepared
         result["input"] = input_manifest
+        result["document_status_sha"] = status_fingerprint(corrections_snapshot, [c.get("rel_path", "") for c in build_chunks], today=corrections_day)
+        if not dry_run:
+            with db.connect(settings.state_db) as con:
+                db.update_graph_build_manifest(con, build_id, result)
         result["steps"].append("prepare_input")
         if incremental:
             result["delta"] = document_delta(base_docs, build_chunks)
@@ -932,12 +1026,28 @@ def build_graph(
                 extractor = GraphExtractor(client, schema, max_gleanings=source.graph_max_gleanings)
                 det = deterministic_extractor(settings, source, units)
                 det_units = [u for u in units if det.wants(u)]
-                fingerprint = extraction_fingerprint(extractor.fingerprint, deterministic_units=len(det_units))
+                # 表格:每张表问一次模型拿画像(是不是实体清单、编号列、名字列、引用列),写进工作区;实体清单按行规则建图
+                tables = table_extractor(units, schema, paths)
+                if tables.units:
+                    from .tables import VERSION as TABLES_VERSION
+
+                    stage(f"表格画像 {len({u.doc_id for u in tables.units})} 份表格文件")
+                    tables.profile(client)
+                    (paths.work_dir / TABLE_PROFILES_FILE).write_text(json.dumps(
+                        {"version": TABLES_VERSION, "profiles": tables.profiles, "stats": tables.stats}, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+                det_ids = {u.unit_id for u in det_units}
+                table_units = [u for u in units if u.unit_id not in det_ids and tables.wants(u)]
+                fingerprint = extractor.fingerprint
+                fingerprints = unit_cache.fingerprints(fingerprint, units, det_ids, tables)
                 with db.connect(settings.state_db) as con:
-                    # Rows where a bad response was recorded as a "zero-entity success" do not count as cached and
-                    # are re-extracted (final review F09)
-                    have = db.graph_extraction_unit_ids(con, source.kb_id, fingerprint, skip_empty_malformed=True)
-                # Rule-based extraction (code / structured markdown / config): no calls, computed and stored first
+                    result.setdefault("cache_fingerprints", {})["extract"] = fingerprints
+                    db.update_graph_build_manifest(con, build_id, result)
+                    # 坏响应被记成「零实体成功」的行不算缓存,要重抽(终审 F09)
+                    unit_cache.migrate_legacy(con, source, graph_cache_fingerprint(settings, source),
+                                              {u.unit_id: fingerprint for u in units if fingerprints[u.unit_id] == fingerprint})
+                    have = unit_cache.valid_ids(unit_cache.load(con, source.kb_id, fingerprints))
+                # 规则抽取(代码 / 结构化 markdown / 配置):不花调用,先算完落库
                 det_done = 0
                 for unit in det_units:
                     if unit.unit_id in have:
@@ -945,11 +1055,21 @@ def build_graph(
                     res = det.extract(unit)
                     with db.connect(settings.state_db) as con:
                         db.save_graph_extraction(
-                            con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprint,
+                            con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
                             entities=res.entities, relations=res.relations, model="deterministic", calls=0, stats=res.stats,
                         )
                     det_done += 1
-                det_ids = {u.unit_id for u in det_units}
+                for unit in table_units:
+                    if unit.unit_id in have:
+                        continue
+                    res = tables.extract(unit)
+                    with db.connect(settings.state_db) as con:
+                        db.save_graph_extraction(
+                            con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
+                            entities=res.entities, relations=res.relations, model="table", calls=0, stats=res.stats,
+                        )
+                    det_done += 1
+                det_ids |= {u.unit_id for u in table_units}
                 todo = [u for u in units if u.unit_id not in have and u.unit_id not in det_ids]
                 cached = len(units) - len(todo) - det_done
                 stage(f"Entity extraction {cached}/{len(units)} units (cached {cached})")
@@ -958,7 +1078,7 @@ def build_graph(
                     res = extractor.extract(unit)
                     with db.connect(settings.state_db) as con:
                         db.save_graph_extraction(
-                            con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprint,
+                            con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
                             entities=res.entities, relations=res.relations, model=specs["extract"].model_id,
                             calls=res.calls, stats=res.stats,
                         )
@@ -990,16 +1110,18 @@ def build_graph(
                     print(f"[graph] {truncated_units} units still truncated at {extractor.max_tokens * 2} output tokens; "
                           "records after the cut are lost", flush=True)
                 with db.connect(settings.state_db) as con:
-                    asset_flags = db.graph_extraction_flag_counts(con, source.kb_id, fingerprint, flags=("truncated",))
+                    assets = unit_cache.load(con, source.kb_id, fingerprints)
+                    asset_flags = {"truncated": sum(bool(r.get("stats", {}).get("truncated")) for r in assets.values())}
                 stats = {
                     "units": len(units), "cached": cached, "extracted": len(extracted),
                     "deterministic_units": len(det_units), "deterministic_routes": dict(det.route_counts),
+                    "table_units": len(table_units), "tables": dict(tables.stats),
                     "failed_units": len(failed), "rejected_units": len(rejected), "truncated_units": truncated_units,
                     # How many new calls this round got truncated vs how many units in the current cache asset ever
                     # were (the former is 0 when everything hits the cache)
                     "truncated_cached": asset_flags.get("truncated", 0),
                     "failed_documents": failed_docs,
-                    "fingerprint": fingerprint, "llm": dict(client.stats),
+                    "fingerprint": fingerprint, "unit_fingerprints": fingerprints, "llm": dict(client.stats),
                     "new_entities": sum(len(r.entities) for r in extracted),
                     "new_relations": sum(len(r.relations) for r in extracted),
                     "parse": {
@@ -1013,7 +1135,7 @@ def build_graph(
                         f"successful units are stored and a rerun only redoes the failed ones. Last error: {broken[-1][1]!r}"
                     )
                 with db.connect(settings.state_db) as con:
-                    total_entities = db.graph_extraction_entity_total(con, source.kb_id, fingerprint, [u.unit_id for u in units])
+                    total_entities = sum(len(r.get("entities") or []) for r in unit_cache.load(con, source.kb_id, fingerprints).values())
                 stats["entities_total"] = total_entities
                 if total_entities == 0:
                     raise RuntimeError("Entity extraction returned nothing: no unit produced any entity; check the model and the type table")
@@ -1047,14 +1169,13 @@ def build_graph(
             units_by_id = {u.unit_id: u for u in units}
             det = deterministic_extractor(settings, source, units)
             det_count = sum(1 for u in units if det.wants(u))
-            fingerprint = extraction_fingerprint(
-                GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema,
-                               max_gleanings=source.graph_max_gleanings).fingerprint,
-                deterministic_units=det_count)
+            fingerprint = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema,
+                                         max_gleanings=source.graph_max_gleanings).fingerprint
+            fingerprints = unit_cache.fingerprints(fingerprint, units, {u.unit_id for u in units if det.wants(u)},
+                                                   table_extractor(units, schema, paths))
             with db.connect(settings.state_db) as con:
-                rows = db.load_graph_extractions(con, source.kb_id, fingerprint, [u.unit_id for u in units])
-            # Cached extraction results go through the name gate and grounding filter too (2026-09-12): rule changes
-            # need no re-extraction, they are cleaned in place before merging
+                rows = unit_cache.load(con, source.kb_id, fingerprints)
+            # 已缓存的抽取结果同样过名字闸门与接地过滤(2026-09-12):规则改了不必重抽,归并前就地清
             from .extract import entity_key, entity_name_ok, ground_records, prompt_example_names
 
             example_names = prompt_example_names(schema)
@@ -1078,32 +1199,32 @@ def build_graph(
                 u.unit_id: combine_unit_kind(u.kind, ((rows.get(u.unit_id) or {}).get("stats") or {}).get("unit_kind"))
                 for u in units
             }
-            # Upper ontology: type → one of the six classes. If the schema version's parent types are already the
-            # six classes, use them directly; old versions (home-made parent types) get one mapping pass by the
-            # summary model (response-cached, one call per type table), falling back to the old names on failure.
-            from ..limits import UPPER_PARENTS
-            from .schema import map_types_to_upper
-
-            if schema.parent_types and all(str(v) in UPPER_PARENTS for v in schema.parent_types.values()):
-                upper_parents = {t: str(schema.parent_types[t]) for t in schema.entity_types if t in schema.parent_types}
-            else:
-                map_cache = LLMCache(paths.cache_file)
-                try:
-                    upper_parents = map_types_to_upper(
-                        ChatClient(specs["summarize"], cache=map_cache, stop=stop_event,
-                                   timeout=settings.graph_llm_timeout_seconds, workers=1, circuit_fails=0),
-                        list(schema.entity_types), dict(schema.parent_types or {}))
-                finally:
-                    map_cache.close()
-            if det_count:
-                upper_parents = {**upper_parents, **DET_UPPER}
+            # 上层本体:模式版本展开出来的父类表就是八个上层类之一(ontology.expand_model),规则抽取的类型
+            # 只用于规则抽取出来的实体(exact_types),不覆盖模式里的同名类型
+            upper_parents = {t: str(schema.parent_types.get(t) or "entity") for t in schema.entity_types}
             merge_types = tuple(schema.entity_types) + (DET_TYPES if det_count else ())
-            merge_parents = {**schema.parent_types, **(DET_UPPER if det_count else {})}
             merge_ends = {**schema.allowed_ends(), **(DET_ENDS if det_count else {})}
             merged = merge_extractions(units, rows, entity_types=merge_types,
-                                       parent_types=merge_parents, allowed_ends=merge_ends,
-                                       unit_kinds=unit_kinds, upper_parents=upper_parents, prior_pairs=prior_pairs)
+                                       upper_parents=dict(schema.parent_types or upper_parents),
+                                       type_parents=dict(schema.type_parents or {}),
+                                       type_scopes=dict(schema.type_scopes or {}),
+                                       allowed_ends=merge_ends, unit_kinds=unit_kinds, prior_pairs=prior_pairs,
+                                       exact_types=dict(DET_UPPER) if det_count else None)
             entities, relations = merged["entities"], merged["relations"]
+            # 正文或别的表里直接写编号的提及并到带这个编号的实体上(全库只有一个实体带这个编号才并)
+            from .merge import link_external_ids
+
+            entities, relations, link_stats = link_external_ids(entities, relations)
+            merged["stats"].update(link_stats)
+            # 更正文件(覆盖层):删实体、指定类型、补别名、强制合并;禁止合并的对交给归并守住
+            corr = corrections_snapshot
+            entities, relations, corr_stats, forbidden = apply_entity_corrections(
+                entities, relations, corr, known_types=schema.entity_types,
+                upper_of=lambda t: schema.type_path(t)[-1], path_of=schema.type_path)
+            merged["stats"]["corrections"] = {**corr_stats, "sha": corr.get("sha", ""), "errors": list(corr.get("errors") or [])[:20],
+                                              "forbidden_pairs": len(forbidden)}
+            if corr.get("errors"):
+                print(f"[graph] corrections file has {len(corr['errors'])} problems: {corr['errors'][:3]}", flush=True)
             merged["stats"]["bad_name_dropped"] = gate_dropped
             merged["stats"]["ungrounded_dropped"] = ungrounded_dropped
             if gate_dropped or ungrounded_dropped:
@@ -1131,13 +1252,18 @@ def build_graph(
                     client, entities, relations,
                     progress=lambda d, t: progress(f"Entity resolution {d}/{t} batches", force=d == t),
                     embed=embedder.embed, prior=prior,
-                    type_words=((input_manifest or {}).get("profile") or scenario_profile(source)).get("type_words") or ())
+                    type_words=((input_manifest or {}).get("profile") or scenario_profile(source)).get("type_words") or (),
+                    forbidden=forbidden)
+                relations, rejected_relations = apply_relation_corrections(relations, entities, corr)
+                stats["merge"]["corrections"]["rejected_relations"] = rejected_relations
                 resolution_map = res_stats.pop("_map", {})
                 resolution_judged = res_stats.pop("_judged", [])
                 resolution_log = res_stats.pop("_log", [])[:5000]
                 resolution_rejected = res_stats.pop("_rejected", [])[:1000]
                 stats["resolution"] = res_stats
                 stage("Description summaries")
+                from .current_view import filter_descriptions
+                filter_descriptions(entities + relations, corr, today=corrections_day)
                 stats["summaries"] = {
                     "entities": summarize_rows(
                         client, entities, language=schema.language, name_of=lambda e: str(e.get("title") or ""),
@@ -1152,6 +1278,13 @@ def build_graph(
                 cache.close()
             stage("Computing weights and chunk attribution")
             stats["weights"] = compute_weights(entities, relations, n_units=len(units))
+            # 关系的观察时间与新旧(单值关系:最新的说法现行,更早的标被取代)
+            from .currency import relation_currency
+
+            stats["currency"] = relation_currency(relations, units_by_id, predicates=schema.predicates, entities=entities)
+            # 来源文档全都不是现行的关系(被取代 / 归档 / 过了有效期):记 doc_status,检索默认不走它们
+            stats["currency"]["non_current_relations"] = mark_document_status(
+                relations, corr, rel_of_doc={u.doc_id: u.rel_path for u in units}, today=time.strftime("%Y-%m-%d"))
             payloads = fetch_chunk_payloads(q, source.collection, build_chunks)
             chunk_texts, chunk_sections, stale_chunks = attribution_texts(build_chunks, payloads)
             if stale_chunks:
@@ -1160,6 +1293,9 @@ def build_graph(
             stats["attribution_stale_chunks"] = stale_chunks
             mentions = attribute_mentions(entities, units_by_id, chunk_texts, chunk_sections=chunk_sections)
             documents_axis = dict((input_manifest or {}).get("documents_axis") or {})
+            from .corrections import document_status
+            for doc, item in documents_axis.items():
+                item.update(document_status(str(item.get("rel_path") or ""), corr) or {})
             graph = {
                 "kb_id": source.kb_id, "graph_version": graph_version, "built_at": int(time.time()),
                 "schema": result["schema"], "models": result["models"],
@@ -1186,7 +1322,7 @@ def build_graph(
 
         # ── 3b. Structured facts (table / list units) ──
         def facts() -> dict[str, Any]:
-            from .facts import FactExtractor, document_subjects, link_facts, normalize_measurements, wants_facts
+            from .facts import FactExtractor, link_facts, normalize_measurements, unit_subjects, wants_facts, wants_narrative_facts
             from .llm import LLMMalformedResponse
 
             graph = json.loads(paths.graph_file.read_text(encoding="utf-8"))
@@ -1196,42 +1332,65 @@ def build_graph(
             det = deterministic_extractor(settings, source, units)
             det_fact_units = [u for u in units if det.route(u) in ("config", "structured_md")]
             det_ids = {u.unit_id for u in det_fact_units}
-            # Units handled by the rule extractor (code, config, structured markdown) never go to the model for
-            # facts: regex alternations, `str | None`, and the tables in test fixtures and prompt examples push the
-            # share of pipe lines over the threshold, and fixture data and examples were published as facts
-            # (2026-09-29 audit)
-            todo_units = [u for u in units if not det.wants(u) and wants_facts(u, kinds.get(u.unit_id))]
-            doc_paths = {u.doc_id: u.rel_path for u in units}       # document paths are evidence of subject identity (Li Hua/checkup report/…, ZK7C1049GN/…)
-            subjects = document_subjects(graph.get("entities") or [], subject_types=(graph.get("profile") or {}).get("subject_types") or (),
-                                         documents=doc_paths)
+            # 按规则建图的表格单元:事实也按规则出(每行的属性列),不送模型
+            tables = table_extractor(units, schema, paths)
+            table_fact_units = [u for u in units if u.unit_id not in det_ids and not det.wants(u) and tables.wants(u)]
+            # 走规则抽取的单元(代码、配置、结构化 markdown)一律不送模型抽事实:代码里的正则交替、`str | None`、
+            # 测试夹具和提示词示例里的表格会把竖线行占比推过阈值,夹具数据和示例被当成事实发布(2026-09-29 审查)
+            table_ids = {u.unit_id for u in table_fact_units}
+            todo_units = [u for u in units if not det.wants(u) and u.unit_id not in table_ids and wants_facts(u, kinds.get(u.unit_id))]
+            # 按日期组织的资料(画像 axis = date):叙述段也抽状态事实(负责人、进度、截止日期、叙述里的数值);
+            # 别的库不抽,省下这一遍调用(方案第 7 条)
+            narrative_ids: set[str] = set()
+            if str((graph.get("profile") or {}).get("axis") or "") == "date":
+                narrative = [u for u in units if not det.wants(u) and u.unit_id not in table_ids
+                             and wants_narrative_facts(u, kinds.get(u.unit_id))]
+                narrative_ids = {u.unit_id for u in narrative}
+                todo_units = todo_units + narrative
+            doc_paths = {u.doc_id: u.rel_path for u in units}       # 文档路径是主体身份的证据(李华/体检报告/…、CY7C1049GN/…)
+            # 候选主体按单元给:这一段里出现的人员与组织、实体排在整份文档的主要主体前面(长文档一份讲好几样东西)
+            subjects = unit_subjects(todo_units, graph.get("entities") or [],
+                                     subject_types=(graph.get("profile") or {}).get("subject_types") or (), documents=doc_paths)
             cache = LLMCache(paths.cache_file)
             client = ChatClient(specs["extract"], cache=cache, stop=stop_event,
                                 timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
                                 circuit_fails=settings.graph_circuit_fails)
             try:
                 extractor = FactExtractor(client)
-                fingerprint = extraction_fingerprint(extractor.fingerprint, deterministic_units=len(det_fact_units))
+                fingerprint = extractor.fingerprint
+                fingerprints = unit_cache.fingerprints(fingerprint, det_fact_units + table_fact_units + todo_units, det_ids, tables)
                 with db.connect(settings.state_db) as con:
-                    have = db.graph_fact_unit_ids(con, source.kb_id, fingerprint)
+                    result.setdefault("cache_fingerprints", {})["facts"] = fingerprints
+                    db.update_graph_build_manifest(con, build_id, result)
+                    unit_cache.migrate_legacy(con, source, graph_cache_fingerprint(settings, source),
+                                              {u.unit_id: fingerprint for u in todo_units}, facts=True)
+                    have = unit_cache.valid_ids(unit_cache.load(con, source.kb_id, fingerprints, facts=True), facts=True)
                 det_facts_written = 0
                 for unit in det_fact_units:
                     if unit.unit_id in have:
                         continue
                     rows_det = det.facts(unit)
                     with db.connect(settings.state_db) as con:
-                        db.save_graph_facts(con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprint,
+                        db.save_graph_facts(con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
                                             facts=rows_det, model="deterministic", calls=0,
                                             stats={"facts": len(rows_det), "builder": det.route(unit)})
                     det_facts_written += 1
+                for unit in table_fact_units:
+                    if unit.unit_id in have:
+                        continue
+                    rows_tab = tables.facts(unit)
+                    with db.connect(settings.state_db) as con:
+                        db.save_graph_facts(con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
+                                            facts=rows_tab, model="table", calls=0, stats={"facts": len(rows_tab), "builder": "table"})
                 todo = [u for u in todo_units if u.unit_id not in have]
                 cached = len(todo_units) - len(todo)
                 stage(f"Structured facts {cached}/{len(todo_units)} table units (cached {cached})")
 
                 def work(unit):
-                    res = extractor.extract(unit, document=unit.rel_path, subjects=subjects.get(unit.doc_id, []),
-                                            axis=unit.axis)
+                    res = extractor.extract(unit, document=unit.rel_path, subjects=subjects.get(unit.unit_id, []),
+                                            axis=unit.axis, narrative=unit.unit_id in narrative_ids)
                     with db.connect(settings.state_db) as con:
-                        db.save_graph_facts(con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprint,
+                        db.save_graph_facts(con, kb_id=source.kb_id, unit_id=unit.unit_id, fingerprint=fingerprints[unit.unit_id],
                                             facts=res.facts, model=specs["extract"].model_id, calls=res.calls, stats=res.stats)
                     return res
 
@@ -1246,9 +1405,9 @@ def build_graph(
                     print(f"[graph] facts: {len(rejected_units)} units rejected by the provider (content inspection / length); "
                           "they carry no facts and do not fail the phase", flush=True)
                 malformed_units = [u.unit_id for u, err in failed if isinstance(err, LLMMalformedResponse)]
-                fact_units = det_fact_units + todo_units
+                fact_units = det_fact_units + table_fact_units + todo_units
                 with db.connect(settings.state_db) as con:
-                    rows = db.load_graph_facts(con, source.kb_id, fingerprint, [u.unit_id for u in fact_units])
+                    rows = unit_cache.load(con, source.kb_id, fingerprints, facts=True)
                 all_facts: list[dict[str, Any]] = []
                 from .facts import apply_unit_quality
                 requalified = {"ambiguous": 0, "evidence_conflicts": 0}
@@ -1266,8 +1425,10 @@ def build_graph(
                 # go to the examinee, marker words are split off into flag, period conditions go into the axis)
                 measure_stats = normalize_measurements(all_facts, graph.get("entities") or [], units_by_id=units_by_id,
                                                        profile=graph.get("profile") or {}, documents=doc_paths)
-                # Fact skeleton (plan 5.A): property concept keys (normalization + vector neighbours + same-concept
-                # judgement) and cross-document reconciliation (sequences / conflicts, annotation only)
+                # 更正文件里驳回的事实不进序列、不进对账
+                corr = corrections_snapshot
+                all_facts, rejected_facts = apply_fact_corrections(all_facts, corr)
+                # 事实骨架(方案 5.A):属性概念键(规范化 + 向量近邻 + 判同)与跨文档对账(序列 / 冲突,只标注)
                 from .concepts import build_concepts
                 from .reconcile import reconcile_facts
 
@@ -1277,16 +1438,22 @@ def build_graph(
                 stage("Normalizing property concepts")
                 concepts, concept_stats = build_concepts(all_facts, embed=embedder.embed, client=judge)
                 reconciled = reconcile_facts(all_facts)
+                non_current = mark_document_status(all_facts, corr, rel_of_doc=doc_paths, today=time.strftime("%Y-%m-%d"))
+                # 写明的一段状态才会过期(主体是事件的、起止相同的不算),检索时止期只对它们算
+                from .currency import mark_fact_lapses
+
+                lapsing = mark_fact_lapses(all_facts, graph.get("entities") or [])
                 graph["specs"] = all_facts
                 graph["concepts"] = concepts
                 graph["conflicts"] = reconciled["conflicts"]
                 stats = {
                     "concepts": concept_stats, "reconcile": reconciled["stats"], "measurements": measure_stats,
-                    "units": len(todo_units), "deterministic_units": len(det_fact_units),
+                    "units": len(todo_units), "deterministic_units": len(det_fact_units), "narrative_units": len(narrative_ids),
+                    "table_units": len(table_fact_units), "rejected_by_corrections": rejected_facts, "non_current_facts": non_current,
+                    "lapsing_facts": lapsing,
                     "cached": cached, "extracted": len(todo) - len(failed), "failed_units": len(failed),
-                    "facts": len(all_facts), "fingerprint": fingerprint, "llm": dict(client.stats), **link_stats,
-                    # Malformed responses are no longer stored, so this counts the units that failed this round (the
-                    # next resume calls them again)
+                    "facts": len(all_facts), "fingerprint": fingerprint, "unit_fingerprints": fingerprints, "llm": dict(client.stats), **link_stats,
+                    # 畸形响应不再落库,所以这里数的是这一轮没抽成的单元(下一轮续跑会重调)
                     "malformed_json": len(malformed_units), "malformed_units": malformed_units[:50],
                     "failed_unit_ids": [u.unit_id for u, _ in failed][:50],
                     "rejected_units": len(rejected_units), "rejected_unit_ids": rejected_units[:50],
@@ -1297,7 +1464,7 @@ def build_graph(
                     "partial_units": [u.unit_id for u in fact_units
                                       if int((rows.get(u.unit_id) or {}).get("stats", {}).get("partial") or 0)][:50],
                     # The sample list keeps 50; totals are recorded separately and used by the status card / API
-                    # (Codex 2026-09-13 F05: the library KB had 160 but reported 50)
+                    # (Codex 2026-09-13 F05: one evaluation corpus had 160 but reported 50)
                     "partial_units_total": sum(1 for u in fact_units if int((rows.get(u.unit_id) or {}).get("stats", {}).get("partial") or 0)),
                     "truncated_units_total": sum(1 for u in fact_units if int((rows.get(u.unit_id) or {}).get("stats", {}).get("truncated") or 0)),
                     "split_units": sum(1 for u in fact_units if int((rows.get(u.unit_id) or {}).get("stats", {}).get("split") or 0)),
@@ -1345,6 +1512,10 @@ def build_graph(
             compile_stats = (json.loads(paths.graph_file.read_text(encoding="utf-8")).get("stats") or {}).get("compile") or {"skipped": True}
         result["compile"] = compile_stats
         result["steps"].append("compile")
+        from .currency import next_change_day
+        compiled_graph = json.loads(paths.graph_file.read_text(encoding="utf-8"))
+        result["temporal_refresh_on"] = next_change_day(
+            list(compiled_graph.get("specs") or []) + list(compiled_graph.get("relations") or []), today=corrections_day)
 
         # ── 4. Write vectors ──
         def enrich() -> dict[str, Any]:
@@ -1406,6 +1577,12 @@ def build_graph(
         # ── 6. Switch version ──
         check_stop()                 # a stop signal swallowed in the last phase: stop before publishing
         if should_activate:
+            live_corrections = load_corrections(corrections_path(settings, source.kb_id))
+            live_status = status_fingerprint(live_corrections, [c.get("rel_path", "") for c in build_chunks], today=time.strftime("%Y-%m-%d"))
+            if (live_corrections.get("errors") or effective_sha(live_corrections) != result["corrections_sha"]
+                    or live_status != result["document_status_sha"]
+                    or (result.get("temporal_refresh_on") and result["temporal_refresh_on"] <= time.strftime("%Y-%m-%d"))):
+                raise GraphBuildInterrupted("Corrections or effective document status changed during build; resume to refresh derived phases")
             if not dry_run and not kb_still_active(settings, source.kb_id):
                 # The KB was turned off during the build (final review F02): this version is not published, the
                 # record says cancelled; cache and artifacts stay so a resume can follow once it is re-enabled
@@ -1595,18 +1772,18 @@ def _cached_extract_summary(settings: Settings, source: KBSource, schema: Extrac
     units = read_units(paths.units_file)
     det = deterministic_extractor(settings, source, units)
     det_units = [u for u in units if det.wants(u)]
-    fingerprint = extraction_fingerprint(
-        GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema, max_gleanings=source.graph_max_gleanings).fingerprint,
-        deterministic_units=len(det_units))
+    fingerprint = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema, max_gleanings=source.graph_max_gleanings).fingerprint
+    fingerprints = unit_cache.fingerprints(fingerprint, units, {u.unit_id for u in det_units}, table_extractor(units, schema, paths))
     with db.connect(settings.state_db) as con:
-        have = db.graph_extraction_unit_ids(con, source.kb_id, fingerprint, skip_empty_malformed=True)
-        flags = db.graph_extraction_flag_counts(con, source.kb_id, fingerprint, flags=("truncated",))
+        rows = unit_cache.load(con, source.kb_id, fingerprints)
+        have = unit_cache.valid_ids(rows)
+        flags = {"truncated": sum(bool(r.get("stats", {}).get("truncated")) for r in rows.values())}
     failed = [u for u in units if u.unit_id not in have]
     return {
         "units": len(units), "cached": len(units) - len(failed), "extracted": 0,
         "deterministic_units": len(det_units), "failed_units": len(failed), "rejected_units": 0, "truncated_units": 0,
         "truncated_cached": flags.get("truncated", 0), "failed_documents": sorted({u.doc_id for u in failed}),
-        "fingerprint": fingerprint,
+        "fingerprint": fingerprint, "unit_fingerprints": fingerprints,
     }
 
 
@@ -1886,7 +2063,19 @@ def evaluate_append(settings: Settings, *, source_key: str, source: KBSource,
     out["base_version"] = str(base["graph_version"])
     delta = document_delta(base_docs, chunks)
     out["delta"] = delta
-    out["changed"] = bool(delta["added_docs"] or delta["removed_docs"] or delta["modified_docs"])
+    try:
+        base_manifest = json.loads(base["manifest_json"] or "{}")
+    except (ValueError, TypeError, IndexError, KeyError):
+        base_manifest = {}
+    corr = load_corrections(corrections_path(settings, source.kb_id))
+    if corr.get("errors"):
+        return {**out, "reason": "invalid_corrections", "errors": corr["errors"]}
+    current_corr = effective_sha(corr)
+    current_status = status_fingerprint(corr, [c.get("rel_path", "") for c in chunks], today=time.strftime("%Y-%m-%d"))
+    out["document_status_changed"] = current_status != str(base_manifest.get("document_status_sha") or "")
+    out["corrections_changed"] = current_corr != str(base_manifest.get("corrections_sha") or "")
+    out["temporal_refresh_due"] = bool(base_manifest.get("temporal_refresh_on") and base_manifest["temporal_refresh_on"] <= time.strftime("%Y-%m-%d"))
+    out["changed"] = bool(delta["added_docs"] or delta["removed_docs"] or delta["modified_docs"] or out["corrections_changed"] or out["document_status_changed"] or out["temporal_refresh_due"])
     try:
         same_config = str(base["cache_fingerprint"] or "") == graph_cache_fingerprint(settings, source)
     except RuntimeError as exc:

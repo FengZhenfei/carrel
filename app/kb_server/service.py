@@ -22,7 +22,6 @@ from kb_pipeline.config import (
 )
 from kb_pipeline.localfs import scanner
 from kb_pipeline.limits import (
-    CURRENT_SCHEMA_VERSION_ID,
     chunk_limits,
     validate_chunk_config,
     validate_graph_schema_config,
@@ -366,7 +365,9 @@ def _schema_suggest_info(con, kb_id: str) -> dict[str, Any] | None:
     started = int(mark.get("started_at") or 0)
     if time.time() - started > SUGGEST_MARK_FRESH_SECONDS:
         return None
-    return {"origin": mark.get("origin"), "started_at": started, "seconds": max(0, int(time.time() - started))}
+    created = int(mark.get("created_at") or started)
+    return {"origin": mark.get("origin"), "started_at": created, "seconds": max(0, int(time.time() - created)),
+            "sampled": mark.get("sampled"), "phase": mark.get("phase"), "task_id": mark.get("token")}
 
 
 def _delete_state(row) -> str | None:
@@ -451,6 +452,8 @@ def overview() -> dict[str, Any]:
                 # stays truthful across switching KBs / tabs / reloads, and re-fetches the config once it is
                 # done so the new version appears
                 entry["schema_suggest"] = _schema_suggest_info(con, entry["kb_id"])
+                from .schema_tasks import summary as schema_task_summary
+                entry["schema_task"] = schema_task_summary(con, entry["kb_id"])
             else:
                 entry["state"] = "inactive"
                 try:
@@ -835,7 +838,10 @@ def enroll(dir_name: str, config: dict[str, Any] | None = None) -> dict[str, Any
     """Enroll a directory, optionally with the config the user drafted in the
     console. The draft is validated BEFORE enrollment (a bad draft leaves
     nothing enrolled) and written before the scan kick, so the very first
-    parse already runs with the user's strategy."""
+    parse already runs with the user's strategy. A new library is committed
+    only after any previous owner's correction file has been isolated."""
+    from kb_pipeline.graph.corrections import ensure_corrections_file
+
     cfg = settings()
     db.init_db(cfg.state_db)
     config = strip_retired_config(config) if config else config
@@ -848,6 +854,10 @@ def enroll(dir_name: str, config: dict[str, Any] | None = None) -> dict[str, Any
             errors = _validate_config(con, effective, normalize_graph_updates(config), limits)
             if errors:
                 raise ValueError("; ".join(errors))
+        # Serialize identity allocation and file preparation. Until commit,
+        # readers must not see a new active library with its predecessor's rules.
+        # Keep model/network validation above this short write transaction.
+        con.execute("BEGIN IMMEDIATE")
         source, outcome = discovery.enroll(con, cfg.mirror_root, dir_name)
         if config:
             # Write the draft when re-enabling a deactivated knowledge base too: the console's semantics are
@@ -855,10 +865,15 @@ def enroll(dir_name: str, config: dict[str, Any] | None = None) -> dict[str, Any
             # of a deactivated KB and clicking save saw a success message, yet a reload brought the old
             # values back. Saving only updates the strategy; it has no side effect on indexed content.
             discovery.set_config(con, source.kb_id, config)
-    # External resources are created outside the transaction: by the time one fails the knowledge base is
-    # already active. Rather than raising a bare 500 (the frontend would show only Internal Server Error
-    # while polling shows it enabled), return normally with warnings -- the main collection is lazily
-    # created by the first parse job, so it self-heals.
+        try:
+            ensure_corrections_file(cfg, source.kb_id, folder=dir_name, fresh=outcome == "new")
+        except OSError as exc:
+            # Roll back registration/config and the sequence on failure. Files
+            # already isolated stay in orphaned/; a retry prepares a new template.
+            raise ValueError("Could not prepare correction rules; this operation was not saved. Check directory permissions and free disk space, then retry.") from exc
+    # 外部资源在事务之外创建:失败时库已经是 active 了。与其抛裸 500(前端只
+    # 显示 Internal Server Error,轮询却显示已开启),不如带着告警正常返回——
+    # 主库 collection 由首个解析任务懒建,能自愈。
     warnings: list[str] = []
     created: Any = None
     q = qdrant_client(cfg.qdrant_url, cfg.qdrant_api_key)
@@ -949,6 +964,11 @@ def unenroll(kb_id: str) -> dict[str, Any]:
     # re-queued by the next scan -- i.e. parsing continues from where it stopped.
     from kb_pipeline.maintenance import stop_graph_build_now, stop_kb_parse_jobs
 
+    from .schema_tasks import cancel, summary
+    with db.connect(cfg.state_db) as con:
+        task = summary(con, kb_id)
+    if task and task.get("status") == "running":
+        cancel(cfg, kb_id, task["task_id"])
     stopped = stop_kb_parse_jobs(cfg, kb_id=kb_id, reason="cancelled because the knowledge base was closed")
     # Closing the knowledge base also stops its graph build (final review F02): cooperative SIGTERM, cache
     # and artifacts kept for the retention period, resumed after re-enabling; a build that cannot be stopped
@@ -1055,31 +1075,87 @@ def _validate_config(con, effective: dict[str, Any], updates: dict[str, Any], li
     return errors
 
 
-def schema_versions_view(effective: dict[str, Any]) -> dict[str, Any]:
-    """Label version view for the console: the version list plus the currently selected id.
+# 版本条目里给控制台看的元信息(LinkML 本体不进视图:体积大,下载走单独的接口)
+_VERSION_META_FIELDS = ("id", "created_at", "model", "sample_size", "sampled", "chunks_total", "documents", "domain",
+                        "origin", "prior_id", "guard", "example_stats", "observed", "upload")
 
-    Version management was added later. Labels extracted before it exist only as graph_entity_types, with
-    no record of "when, with which model, at what sample size" -- such knowledge bases get a fallback entry
-    whose id is CURRENT_SCHEMA_VERSION_ID, with empty metadata honestly shown as unknown. It exists only in
-    this view and is never persisted; on save it is treated as "keep things as they are" rather than a real
-    selection.
-    """
-    versions = [dict(v) for v in (effective.get("graph_schema_versions") or [])]
+
+def schema_version_summary(entry: dict[str, Any]) -> dict[str, Any]:
+    """一条模式版本 → 控制台的展示形状:元信息 + 从 LinkML 展开的类型(上层类、父类、作用域)、关系(两端、单值)、画像。"""
+    from kb_pipeline.ontology import entry_model, model_summary
+
+    out = {k: entry.get(k) for k in _VERSION_META_FIELDS if k in entry}
+    model = entry_model(entry)
+    if model is None:
+        out.update({"broken": True, "language": "", "types": [], "predicates": [], "profile": {}})
+    else:
+        out.update(model_summary(model))
+    out["has_examples"] = bool(str(entry.get("examples") or "").strip())
+    return out
+
+
+def schema_versions_view(effective: dict[str, Any]) -> dict[str, Any]:
+    """控制台用的模式版本视图:版本列表(最新在前)+ 当前生效的 id(没有就是空串)。"""
+    versions = [schema_version_summary(dict(v)) for v in (effective.get("graph_schema_versions") or [])]
     active = str(effective.get("graph_schema_active") or "")
-    known = {str(v.get("id")) for v in versions}
-    types = list(effective.get("graph_entity_types") or [])
-    if active not in known:
+    if active not in {str(v.get("id")) for v in versions}:
         active = ""
-    if not active and types:
-        versions.insert(0, {
-            "id": CURRENT_SCHEMA_VERSION_ID,
-            "created_at": None, "model": None, "sample_size": None,
-            "language": effective.get("graph_language"),
-            "entity_types": types,
-            "legacy": True,
-        })
-        active = CURRENT_SCHEMA_VERSION_ID
     return {"versions": versions, "active": active}
+
+
+def graph_schema_linkml(kb_id: str, version_id: str) -> dict[str, Any]:
+    """下载一版模式的 LinkML(YAML)。version_id 写 active 就是现行版本。"""
+    from kb_pipeline.ontology import dump_linkml
+
+    cfg = settings()
+    with db.connect(cfg.state_db) as con:
+        row = con.execute("SELECT kb_id FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+        if row is None:
+            raise KeyError(kb_id)
+        config = discovery.get_config(con, kb_id)
+    wanted = str(version_id or "").strip()
+    if wanted in ("", "active"):
+        wanted = str(config.get("graph_schema_active") or "")
+        if not wanted:
+            raise ValueError("This knowledge base has no schema version in effect yet")
+    entry = next((dict(v) for v in (config.get("graph_schema_versions") or []) if str(v.get("id")) == wanted), None)
+    if entry is None or not isinstance(entry.get("linkml"), dict):
+        raise ValueError("The schema version does not exist or has been rotated out")
+    return {"filename": f"{kb_id}-{wanted}.linkml.yaml", "text": dump_linkml(entry["linkml"])}
+
+
+def upload_graph_schema(kb_id: str, text: str | bytes, *, adopt: bool = False) -> dict[str, Any]:
+    """上传 LinkML 模式(插件审定的本体、手写的模式)入环;adopt=True 直接生效(下一次建图按它)。
+    校验不过的返回 422 并带全部错误;读取时丢掉的部分作为 warnings 返回。"""
+    from kb_pipeline.graph.schema_flow import register_uploaded_schema
+
+    cfg = settings()
+    size = len(text) if isinstance(text, (bytes, bytearray)) else len(str(text or "").encode("utf-8"))
+    if size > _SCHEMA_UPLOAD_MAX_BYTES:
+        raise ValueError(f"Schema file too large (limit {_SCHEMA_UPLOAD_MAX_BYTES // 1024} KB)")
+    if not size:
+        raise ValueError("The schema file is empty")
+    with db.connect(cfg.state_db) as con:
+        row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+        if row is None:
+            raise KeyError(kb_id)
+        if str(row["status"]) != "active":
+            raise ValueError("The knowledge base is not enabled")
+        config = discovery.get_config(con, kb_id)
+    source = discovery.build_source(cfg.mirror_root, str(row["source_root"]), config,
+                                    kb_id=kb_id, collection=str(row["collection"]))
+    result = register_uploaded_schema(cfg, source, text, adopt=adopt)
+    with db.connect(cfg.state_db) as con:
+        merged = dict(discovery.DEFAULTS)
+        merged.update(_dir_defaults(con, kb_id))
+        merged.update(discovery.get_config(con, kb_id))
+    result["schema"] = schema_versions_view(merged)
+    if not adopt:
+        result["schema"]["active"] = result["version_id"]     # 和抽取一样:下拉框指到刚上传的这一版,保存才生效
+    return result
+
+
+_SCHEMA_UPLOAD_MAX_BYTES = 512 * 1024
 
 
 def _apply_schema_version(current: dict[str, Any], updates: dict[str, Any]) -> None:
@@ -1106,27 +1182,21 @@ def get_kb_config(kb_id: str) -> dict[str, Any]:
 
 
 def delete_graph_schema_version(kb_id: str, version_id: str) -> dict[str, Any]:
-    """Delete one entry from the version ring.
+    """删掉版本环里的一条。
 
-    This goes through the server instead of letting the console write graph_schema_versions directly, for
-    the same reason extraction adds to the ring server-side: if clients could write it, "when, with which
-    model and at what sample size this version was extracted" becomes something anyone can make up, while
-    the entire value of rolling back to a version rests on that record being trustworthy.
+    走服务端而不是让控制台直接写 graph_schema_versions,理由和「抽取时入环」是同
+    一条:放开给客户端写,「这一版是何时、用哪个模型、按多少采样抽出来的」就变成
+    可以随手编的东西,而回退版本的全部价值都建立在这份记录可信上。
 
-    The only thing blocked is **the version currently in effect**. The effective graph_entity_types /
-    graph_language were copied from it and the built graph was built with it; deleting it would make the
-    dropdown silently fall back to the newest version, so the UI would show A's labels while the build used
-    B's -- and since both are just lists of words, nobody would notice the mismatch. push_schema_version
-    skips it too when rotating out old versions: one rule, two exits.
+    唯一挡住的是**正在生效的那一版**。生效的模式字段是从它展开出来的,已经建成的图
+    也是按它建的;删掉之后下拉框会静默回落到最新那一版,于是界面显示 A 的模式、
+    建图用的是 B 的模式 —— 这种不一致没人看得出来。push_schema_version 淘汰旧版时
+    同样跳过它,是一条规则的两个出口。
     """
     cfg = settings()
     wanted = str(version_id or "").strip()
     if not wanted:
         raise ValueError("Missing label version id")
-    if wanted == CURRENT_SCHEMA_VERSION_ID:
-        # This is the read-only entry schema_versions_view makes up on the fly; it is never persisted, so
-        # there is nothing to delete.
-        raise ValueError("This entry is only a read-only view of the labels in effect, not a saved version")
     with db.connect(cfg.state_db) as con:
         row = con.execute("SELECT kb_id FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
         if row is None:
@@ -1135,7 +1205,8 @@ def delete_graph_schema_version(kb_id: str, version_id: str) -> dict[str, Any]:
         versions = [dict(v) for v in (current.get("graph_schema_versions") or [])]
         if not any(str(v.get("id")) == wanted for v in versions):
             raise ValueError("The label version does not exist or has been rotated out")
-        if wanted == str(current.get("graph_schema_active") or ""):
+        from kb_pipeline.graph.schema_flow import protected_schema_ids
+        if wanted == str(current.get("graph_schema_active") or "") or wanted in protected_schema_ids(con, kb_id):
             raise ValueError("The version in effect cannot be deleted: the graph was built with it and it could never be selected again")
         kept = [v for v in versions if str(v.get("id")) != wanted]
         # An empty list has to be written as None: set_config uses None to mean "remove this key", whereas []
@@ -1182,9 +1253,7 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     with db.connect(cfg.state_db) as con:
         current = discovery.get_config(con, kb_id)
         normalize_graph_updates(updates)
-        # "Select a label version and save" = copy that version's labels / language into the effective
-        # values. The effective values are still just graph_entity_types / graph_language, so the build path
-        # needs no change at all.
+        # 「选一个模式版本并保存」= 把那一版的 LinkML 展开成生效的模式字段(limits.apply_schema_version)
         _apply_schema_version(current, updates)
         # Mirror the post-save runtime view: a None update clears the key, so
         # validation and warnings run against what build_source will see.
@@ -1235,6 +1304,18 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
             updates = dict(updates)
             updates["graph_paused"] = None
         saved = discovery.set_config(con, kb_id, updates)
+        if updates.get("graph_schema_active"):
+            from kb_pipeline.graph.schema_flow import SUGGEST_TASK_PREFIX
+            task = db.get_app_config(con, SUGGEST_TASK_PREFIX + kb_id)
+            if isinstance(task, dict) and task.get("status") == "completed":
+                task["acknowledged"] = True
+                db.set_app_config(con, SUGGEST_TASK_PREFIX + kb_id, task)
+    if updates.get("graph_enabled") is False:
+        from .schema_tasks import cancel, summary
+        with db.connect(cfg.state_db) as con:
+            task = summary(con, kb_id)
+        if task and task.get("status") == "running":
+            cancel(cfg, kb_id, task["task_id"])
     if stop_build:
         # Only the process is stopped; artifacts and the LLM cache are all kept: a build after re-enabling
         # hits the cache and resumes.
@@ -1533,24 +1614,8 @@ def graph_corpus_stats(kb_id: str) -> dict[str, Any]:
     }
 
 
-# Label extraction is a synchronous endpoint; a flash-class model finishes the whole set in about 1-2 minutes.
-# Past this duration only a log line is added afterwards, the request is not interrupted: the timeout and
-# retries of each single call are handled by ChatClient.
-_SUGGEST_SLOW_SECONDS = 600
-
-
-def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
-    """The "Extract labels now / again" action: sample chunks from this knowledge base and have the LLM infer
-    the domain, output language, entity labels, parent types, relation predicates, type definitions, scene
-    profile and corpus examples (plan 4.10).
-
-    Only returns the suggestion and adds it to the version ring; it does **not** take effect automatically --
-    the result is filled back into the console form for you to review and edit, and takes effect only when
-    "Save config" is clicked. When a current version exists, the revision is based on it and the endpoint
-    ledger (schema_flow.suggest_schema_version).
-    """
+def _prepare_graph_schema(kb_id: str):
     from kb_pipeline.graph import build as graph_build
-    from kb_pipeline.graph.schema_flow import ORIGIN_MANUAL, SUGGEST_BUSY_MESSAGE, suggest_in_progress, suggest_schema_version
 
     cfg = settings()
     with db.connect(cfg.state_db) as con:
@@ -1569,10 +1634,6 @@ def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
         # inferred type table would be skewed. Same gate as the graph build.
         if db.kb_parse_busy(con, kb_id):
             raise ValueError("This knowledge base is being parsed; label extraction is unavailable until it finishes.")
-    # The automatic pre-build extraction (or another window) is extracting right now: another run would only
-    # duplicate it, and the version it produces takes effect directly once it finishes
-    if suggest_in_progress(cfg, kb_id) is not None:
-        raise ValueError(SUGGEST_BUSY_MESSAGE)
     with db.connect(cfg.state_db) as con:
         ledger = db.active_chunk_refs(con, str(row["collection"]))
     if not ledger:
@@ -1589,6 +1650,28 @@ def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
         # ValueError into a 422 with the original text for the console, while a RuntimeError becomes an
         # uninformative 500.
         raise ValueError(str(exc)) from exc
+    return cfg, source, spec
+
+
+def start_graph_schema(kb_id: str) -> dict[str, Any]:
+    from . import schema_tasks
+    return schema_tasks.start(*_prepare_graph_schema(kb_id))
+
+
+def graph_schema_task(kb_id: str) -> dict[str, Any]:
+    from . import schema_tasks
+    return schema_tasks.status(settings(), kb_id)
+
+
+def cancel_graph_schema(kb_id: str, task_id: str) -> dict[str, Any]:
+    from . import schema_tasks
+    return schema_tasks.cancel(settings(), kb_id, task_id)
+
+
+def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
+    """Synchronous internal compatibility path; the console uses start_graph_schema."""
+    from kb_pipeline.graph.schema_flow import ORIGIN_MANUAL, suggest_schema_version
+    cfg, source, spec = _prepare_graph_schema(kb_id)
     started = time.time()
     try:
         result = suggest_schema_version(cfg, source, origin=ORIGIN_MANUAL, adopt=False, use_prior=True, spec=spec)
@@ -1596,7 +1679,7 @@ def suggest_graph_schema(kb_id: str) -> dict[str, Any]:
         raise
     except Exception as exc:
         raise ValueError(f"Extraction failed ({exc.__class__.__name__}): {str(exc)[:300]}") from exc
-    if time.time() - started > _SUGGEST_SLOW_SECONDS:
+    if time.time() - started > 600:
         print(f"[web] suggest_graph_schema took {time.time() - started:.0f}s for {kb_id}", flush=True)
     with db.connect(cfg.state_db) as con:
         merged = dict(discovery.DEFAULTS)
@@ -2044,6 +2127,7 @@ def _mask(row) -> dict[str, Any]:
         "name": str(row["name"]),
         "base_url": str(row["base_url"]),
         "model_id": str(row["model_id"]),
+        "max_input_tokens": row["max_input_tokens"] if "max_input_tokens" in row.keys() else None,
         "has_api_key": bool(str(row["api_key"] or "")),
         "protocol": str(row["protocol"] if "protocol" in row.keys() else "openai") or "openai",
     }
@@ -2162,11 +2246,22 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
     with db.connect(cfg.state_db) as con:
         existing = db.get_llm(con, name)
     stored_key = str(existing["api_key"] or "") if existing is not None else ""
-    # Leaving the key empty while editing = keep the stored key; it is cleared only when clear_api_key is
-    # passed explicitly (endpoints that need no key, like a local vLLM, used to have no way to remove a
-    # key entered by mistake). Keeping it is limited to the same endpoint: if the address's scheme / host /
-    # port or the protocol changed, the old key must not follow to the new address and has to be
-    # re-entered.
+    # Old API clients may omit the new field. Preserve it only for the same
+    # model/endpoint; a capacity belonging to another model must not follow it.
+    max_input = payload.get("max_input_tokens")
+    if "max_input_tokens" not in payload and existing is not None:
+        if (str(existing["model_id"]) == model_id and str(existing["base_url"]).rstrip("/") == base_url.rstrip("/")
+                and str(existing["protocol"] or "openai") == protocol):
+            max_input = existing["max_input_tokens"] if "max_input_tokens" in existing.keys() else None
+    if max_input is not None:
+        if isinstance(max_input, bool) or not re.fullmatch(r"[0-9]+", str(max_input)):
+            raise ValueError("Max Input must be a positive integer (tokens)")
+        max_input = int(max_input)
+        if not 1 <= max_input <= 2_147_483_647:
+            raise ValueError("Max Input must be a positive integer (tokens), no greater than 2147483647")
+    # 编辑时留空 Key = 沿用已存 Key;显式传 clear_api_key 才清空(本机 vLLM
+    # 之类不需要 Key 的端点过去无法把误填的 Key 去掉)。沿用只限同一个端点:
+    # 地址的 scheme / host / port 或协议变了,旧 Key 不能跟去新地址,必须重新填。
     if (api_key == "" and stored_key and not clear_key
             and (_endpoint_id(str(existing["base_url"] or "")) != _endpoint_id(base_url)
                  or str(existing["protocol"] or "openai").lower() != protocol)):
@@ -2182,6 +2277,7 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
             api_key=api_key,
             model_id=model_id,
             protocol=protocol,
+            max_input_tokens=max_input,
         )
         if clear_key:
             con.execute("UPDATE llm_registry SET api_key='' WHERE name=?", (name,))
@@ -2221,7 +2317,10 @@ def remove_llm(name: str) -> dict[str, Any]:
 
 
 def init_state() -> None:
-    db.init_db(settings().state_db)
+    from .schema_tasks import recover_interrupted
+    cfg = settings()
+    db.init_db(cfg.state_db)
+    recover_interrupted(cfg)
 
 
 # ── service restarts ────────────────────────────────────────────────────

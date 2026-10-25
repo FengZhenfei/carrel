@@ -10,6 +10,8 @@ secrets/
 __pycache__/
 *.py[cod]
 *.egg-info/
+/app/build/
+/app/dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -31,3 +33,6 @@ logs/
 
 # Model weights (bind-mounted into the compose containers, never committed)
 models/
+
+# Per-library correction rules belong to the installation
+config/corrections/

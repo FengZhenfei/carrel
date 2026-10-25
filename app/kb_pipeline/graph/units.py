@@ -46,7 +46,7 @@ TABLE_BLOCK_TYPES = {"table"}
 # conclusions, recommendations, Summary). It is a kind of body text (goes into recall and fact extraction);
 # it is labelled separately so the view layer can use it as the source of "conclusion facts". The boilerplate
 # structural rules also gained the layouts of Chinese reports (TOC pages without dot leaders, reading guides,
-# cover letters, QR-code / app promotion pages) -- the health KB's 215 units had only 3 recognised as boilerplate.
+# cover letters, QR-code / app promotion pages) -- a 215-unit evaluation corpus had only 3 recognised as boilerplate.
 UNIT_KINDS = ("body", "conclusion", "listing", "boilerplate")
 _TOC_RE = re.compile(r"(?:\.{3,}|…{2,}|(?:\s\.){3,})\s*\d{1,4}\b")
 # TOC lines without dot leaders: "1 Key abnormal findings and follow-up advice 04", "3 Checkup results 07 Details"
@@ -59,7 +59,7 @@ _READING_GUIDE_RE = re.compile(r"阅读说明|阅读须知|使用须知|报告�
 # "Worldwide Sales") are induced per KB by the scenario profile (conclusion_headings / boilerplate_headings /
 # listing_headings) and never written into code -- 2026-09-08 generality review.
 # The Chinese word for "advice" stays out of the generic list: it appears in every section of a Chinese report
-# (it classed 72 units of the health KB as conclusions); the specific "medication advice / prevention advice"
+# (an evaluation classified 72 units as conclusions); more specific
 # headings come from the profile instead.
 _CONCLUSION_HINT_RE = re.compile(
     r"结论|小结|总结|摘要|汇总|"
@@ -220,6 +220,8 @@ class Unit:
     # Document line and is the default validity period of facts. Not part of unit_id (content addressing looks only
     # at text and position), so a changed axis value needs no re-extraction.
     axis: str = ""
+    # 文档日期(不管轴是日期还是版本,能认出日期就有):抽取提示词的 Document date 行、关系的观察时间
+    doc_date: str = ""
 
     @property
     def document_label(self) -> str:
@@ -250,6 +252,7 @@ class Unit:
             ambiguous_values=[str(x) for x in (data.get("ambiguous_values") or [])],
             value_conflicts=[dict(x) for x in (data.get("value_conflicts") or []) if isinstance(x, dict)],
             axis=str(data.get("axis") or ""),
+            doc_date=str(data.get("doc_date") or ""),
         )
 
 

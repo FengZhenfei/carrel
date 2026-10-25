@@ -1043,24 +1043,39 @@ def graph_extraction_flag_counts(con: sqlite3.Connection, kb_id: str, fingerprin
 
 def prune_graph_extractions(con: sqlite3.Connection, kb_id: str, keep_unit_ids: Iterable[str], *,
                             table: str = "graph_extractions") -> int:
-    """Drop extraction cache rows that no longer correspond to any existing unit (deleting a document or
-    changing its text changes the unit_id, so old rows only take up space). Rows of existing units are
-    kept regardless of fingerprint: switching the configuration and back still hits the cache. Called
-    after a full build completes, and only for whole-corpus builds (not trial builds with doc_ids),
-    otherwise cache outside the trial scope would be deleted by mistake.
-    With table="graph_facts" it prunes the facts cache: stored by (kb, unit, fingerprint) as well, same rule."""
+    """Retain two recent fingerprints per live unit and all active/resumable references."""
     assert table in ("graph_extractions", "graph_facts")
     keep = {str(u) for u in keep_unit_ids}
-    stale = [str(r["unit_id"]) for r in con.execute(
-        f"SELECT DISTINCT unit_id FROM {table} WHERE kb_id = ?", (kb_id,)) if str(r["unit_id"]) not in keep]
-    removed = 0
-    for i in range(0, len(stale), 500):
-        batch = stale[i:i + 500]
-        cur = con.execute(
-            f"DELETE FROM {table} WHERE kb_id = ? AND unit_id IN ({','.join('?' * len(batch))})",
-            (kb_id, *batch))
-        removed += int(cur.rowcount or 0)
-    return removed
+    phase = "facts" if table == "graph_facts" else "extract"
+    protected = set()
+    legacy_fps = set()
+    resumable = resumable_graph_versions(con, kb_id)
+    latest = latest_successful_graph_build(con, kb_id)
+    protected_versions = resumable | ({str(latest["graph_version"])} if latest else set())
+    for row in con.execute("SELECT graph_version, status, manifest_json FROM graph_builds WHERE kb_id=?", (kb_id,)):
+        if str(row["graph_version"]) not in protected_versions and row["status"] != "running":
+            continue
+        try:
+            manifest = json.loads(row["manifest_json"] or "{}")
+        except ValueError:
+            return 0  # Cannot prove which cached work an interrupted build still needs.
+        keys = (manifest.get("cache_fingerprints") or {}).get(phase) or (manifest.get(phase) or {}).get("unit_fingerprints")
+        if keys:
+            protected.update((str(uid), str(fp)) for uid, fp in keys.items())
+        elif (manifest.get(phase) or {}).get("fingerprint"):
+            legacy_fps.add(str(manifest[phase]["fingerprint"]))
+        elif str(row["graph_version"]) in resumable:
+            return 0
+    recent = {}
+    stale = []
+    for row in con.execute(f"SELECT unit_id, fingerprint FROM {table} WHERE kb_id=? ORDER BY created_at DESC, rowid DESC", (kb_id,)):
+        uid, fp = str(row["unit_id"]), str(row["fingerprint"])
+        recent[uid] = recent.get(uid, 0) + 1
+        if (uid, fp) in protected or fp in legacy_fps or (uid in keep and recent[uid] <= 2):
+            continue
+        stale.append((kb_id, uid, fp))
+    con.executemany(f"DELETE FROM {table} WHERE kb_id=? AND unit_id=? AND fingerprint=?", stale)
+    return len(stale)
 
 
 def graph_build_point_ids(con: sqlite3.Connection, graph_build_id: str) -> set[str]:
@@ -1384,7 +1399,8 @@ _JOBS_MIGRATIONS = (
     "ALTER TABLE graph_builds ADD COLUMN stage TEXT",
     # API protocol: openai = /chat/completions compatible; anthropic = /v1/messages
     "ALTER TABLE llm_registry ADD COLUMN protocol TEXT NOT NULL DEFAULT 'openai'",
-    # Graph build process identity: after a kill / power loss it tells stale running rows apart for reclaiming
+    "ALTER TABLE llm_registry ADD COLUMN max_input_tokens INTEGER",
+    # 建图进程身份:进程被杀/断电后,running 行靠它判定陈旧并回收
     "ALTER TABLE graph_builds ADD COLUMN worker_host TEXT",
     "ALTER TABLE graph_builds ADD COLUMN worker_pid INTEGER",
     "ALTER TABLE graph_builds ADD COLUMN heartbeat_at INTEGER",
@@ -1513,21 +1529,23 @@ def upsert_llm(
     protocol: str = "openai",
     notes: str = "",
     builtin: bool = False,
+    max_input_tokens: int | None = None,
 ) -> None:
     ts = now_ts()
     con.execute(
         """
-        INSERT INTO llm_registry(name, base_url, api_key, model_id, protocol, notes, builtin, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO llm_registry(name, base_url, api_key, model_id, protocol, notes, builtin, created_at, updated_at, max_input_tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           base_url = excluded.base_url,
           api_key = CASE WHEN excluded.api_key != '' THEN excluded.api_key ELSE llm_registry.api_key END,
           model_id = excluded.model_id,
           protocol = excluded.protocol,
+          max_input_tokens = excluded.max_input_tokens,
           notes = excluded.notes,
           updated_at = excluded.updated_at
         """,
-        (name, base_url, api_key, model_id, protocol, notes, 1 if builtin else 0, ts, ts),
+        (name, base_url, api_key, model_id, protocol, notes, 1 if builtin else 0, ts, ts, max_input_tokens),
     )
 
 
@@ -1795,7 +1813,7 @@ def cancel_job_if_owned(con: sqlite3.Connection, job_id: str, worker_id: str, re
     ours: running with locked_by set to us, or explicitly requested to cancel. Jobs reclaimed as orphans
     into retry by another worker, or taken over, are left alone -- this used to write cancelled
     unconditionally, overwriting a retry that someone else had scheduled, and the file was never parsed
-    again (on 2026-09-09, 8 files of the product KB and 1 file of the health KB were stuck on the old
+    again (on 2026-09-09, 8 files in one corpus and 1 in another were stuck on the old
     parser version because of this). Returns whether anything was written."""
     ts = now_ts()
     cur = con.execute(

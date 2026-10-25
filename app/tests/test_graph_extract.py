@@ -18,7 +18,7 @@ from kb_pipeline.graph.merge import attribute_mentions, compute_weights, is_nega
 from kb_pipeline.graph.units import ChunkRef, Unit, build_units, dedupe_overlap, read_units, unit_id_for, write_units
 from kb_pipeline.models import KBSource
 
-from _support import SPEC, _CodexAudit20260906TestsSupport, _CodexFinalTestsSupport, _bundle_dir, _chunk, _client, _ext, _fake_chat_client, _repo_file, _unit
+from _support import SPEC, _CodexAudit20260906TestsSupport, _CodexFinalTestsSupport, _bundle_dir, _chunk, _client, _ext, _fake_chat_client, _repo_file, _schema_entry, _unit
 
 
 class UnitBuildingTests(unittest.TestCase):
@@ -260,6 +260,61 @@ class ExtractionOutputParserTests(unittest.TestCase):
         self.assertEqual(entity_key("Ｎorthwind  Tech"), "northwind tech")
 
 
+class RecordFormatTests(unittest.TestCase):
+    """2026-10-24:实体记录多一段类与实例,关系记录多一段起止;旧格式(少这两段)照样能读。
+    抽取提示词带 Document date 行,相对日期、缺年份的日期按它换算。"""
+
+    def test_kind_and_period_fields_parse_and_old_records_still_read(self) -> None:
+        from kb_pipeline.graph.extract import parse_period, parse_records
+
+        schema = ExtractionSchema(entity_types=("person", "org", "meeting"), predicates=({"name": "works_for"}, {"name": "precedes"}),
+                                  parent_types={"meeting": "event"})
+        raw = ('("entity"<|>张三<|>person<|>工程师<|>instance)##("entity"<|>客户<|>org<|>泛指的客户<|>class)##'
+               '("entity"<|>Acme<|>org<|>old style)##'
+               '("relationship"<|>张三<|>Acme<|>works_for<|>2021 年入职<|>8<|>2021-03..)##'
+               '("relationship"<|>张三<|>客户<|>related_to<|>对接客户<|>3<|>)##'
+               '("relationship"<|>Acme<|>张三<|>related_to<|>old style<|>2)##'
+               '("relationship"<|>周会 2026-03-21<|>评审 2026-03-14<|>follows<|>周会在评审之后<|>5<|>)<|COMPLETE|>')
+        ents, rels, stats = parse_records(raw, schema)
+        self.assertEqual([(e["name"], e["kind"], e["description"]) for e in ents],
+                         [("张三", "instance", "工程师"), ("客户", "class", "泛指的客户"), ("Acme", "instance", "old style")])
+        by = {(r["source"], r["target"]): r for r in rels}
+        self.assertEqual((by[("张三", "Acme")]["valid_from"], by[("张三", "Acme")]["valid_until"], by[("张三", "Acme")]["strength"]),
+                         ("2021-03", "", 8.0))
+        self.assertEqual((by[("张三", "客户")]["valid_from"], by[("张三", "客户")]["strength"]), ("", 3.0))
+        self.assertEqual((by[("Acme", "张三")]["description"], by[("Acme", "张三")]["strength"]), ("old style", 2.0))
+        flipped = by[("评审 2026-03-14", "周会 2026-03-21")]                 # follows 归一成反向的 precedes
+        self.assertEqual(flipped["predicate"], "precedes")
+        self.assertEqual(stats["malformed"], 0)
+        self.assertEqual(parse_period("2021..2023-06"), ("2021", "2023-06"))
+        self.assertEqual(parse_period("..2025"), ("", "2025"))
+        self.assertEqual(parse_period("2024年3月"), ("2024-03", ""))
+        self.assertEqual(parse_period("2025..2021"), ("2021", "2025"))
+        self.assertIsNone(parse_period("not a period"))
+
+    def test_prompt_carries_the_document_date(self) -> None:
+        from kb_pipeline.graph.extract import render_extract_prompt
+
+        schema = ExtractionSchema(entity_types=("person",))
+        text = render_extract_prompt("x", section="S", schema=schema, document="周报.docx", document_date="2026-03-14")
+        self.assertIn("Document date: 2026-03-14", text.split("-Real Data-", 1)[1])
+        self.assertIn("Document date: (unknown)", render_extract_prompt("x", section="S", schema=schema).split("-Real Data-", 1)[1])
+        for needle in ("entity_kind", "relationship_period", "add the event's date to the name", "Turn relative or incomplete dates"):
+            self.assertIn(needle, prompts.GRAPH_EXTRACTION_PROMPT, needle)
+        self.assertIn("<|>class)", prompts.DEFAULT_EXAMPLES)                   # 通用示例里有一个泛指的类别名
+        self.assertIn("<|>2014..)", prompts.DEFAULT_EXAMPLES)                  # 和一条带起点的关系
+
+    def test_file_names_do_not_turn_part_numbers_into_years(self) -> None:
+        from kb_pipeline.graph.temporal import document_axis, name_date
+
+        self.assertIsNone(name_date("ZX8C2048KV17.pdf"))
+        self.assertIsNone(name_date("plan_2099.pdf"))                          # 晚于明年的不是文档日期
+        self.assertEqual(name_date("report_2024.pdf"), "2024")                 # 扩展名前的年份照认
+        self.assertEqual(name_date("notes-20240315.md"), "2024-03-15")
+        self.assertEqual(name_date("2025-心电图.pdf"), "2025")
+        self.assertEqual(document_axis("ZX8C2048KV17.pdf", "Rev. *L")["kind"], "version")
+
+
 class MergeTests(unittest.TestCase):
     def test_entities_merge_by_normalized_name_with_majority_type(self) -> None:
         units = [_unit("u1"), _unit("u2", order=1)]
@@ -270,22 +325,37 @@ class MergeTests(unittest.TestCase):
                        [("SRAM", "Northwind", "related_to", "made by", 3), ("Ghost", "SRAM", "related_to", "x", 1)]),
         }
         out = merge_extractions(units, ext, entity_types=("organization", "memory device"),
-                                parent_types={"organization": "org"},
-                                allowed_ends={"produces": ({"org"}, {"component"})})
+                                upper_parents={"organization": "agent", "memory device": "entity"},
+                                allowed_ends={"produces": ({"agent"}, {"part"})})
         ents = {e["key"]: e for e in out["entities"]}
         self.assertEqual(set(ents), {"northwind", "sram"})
-        self.assertEqual(ents["northwind"]["title"], "Northwind")          # a tie on occurrences takes the first spelling
+        self.assertEqual(ents["northwind"]["title"], "Northwind")          # 出现次数平手取首次写法
         self.assertEqual(ents["northwind"]["descriptions"], ["maker", "German company"])
         self.assertEqual(ents["northwind"]["frequency"], 2)
-        self.assertEqual(ents["northwind"]["parent_type"], "org")
-        self.assertEqual(ents["sram"]["descriptions"], ["chip"])          # deduplicated
+        self.assertEqual((ents["northwind"]["upper"], ents["northwind"]["type_path"]), ("agent", ["organization", "agent"]))
+        self.assertEqual(ents["northwind"]["kind"], "instance")
+        self.assertEqual(ents["sram"]["descriptions"], ["chip"])          # 去重
         rels = {(r["source_key"], r["target_key"], r["predicate"]): r for r in out["relations"]}
-        self.assertIn(("northwind", "sram", "produces"), rels)             # controlled predicates keep their direction
-        self.assertIn(("northwind", "sram", "related_to"), rels)           # the fallback predicate uses sorted endpoints
-        self.assertTrue(rels[("northwind", "sram", "produces")]["type_violation"])   # sram's parent type is not component
-        self.assertEqual(out["stats"]["orphan_dropped"], 1)               # Ghost has no entity
-        self.assertEqual(out["stats"]["schema_drift_types"], 0)           # company lost to organization
+        self.assertIn(("northwind", "sram", "produces"), rels)             # 受控谓词保留方向
+        self.assertIn(("northwind", "sram", "related_to"), rels)           # 兜底谓词按 sorted 端点
+        self.assertTrue(rels[("northwind", "sram", "produces")]["type_violation"])   # sram 的上层类是 entity 不是 part
+        self.assertEqual(out["stats"]["orphan_dropped"], 1)               # Ghost 没有实体
+        self.assertEqual(out["stats"]["schema_drift_types"], 0)           # company 输给了 organization
         self.assertEqual(out["stats"]["type_violations"], 1)
+
+    def test_out_of_schema_type_names_get_the_upper_they_name(self) -> None:
+        """10-24 真机:类型表里没有 concept 以后,抽取模型说不出具体类型时照样写 concept,合并时表外类型一律算实体,
+        一组评估中 1.6 千个概念成了实体。表外的名字先按本体认(上层类名或同义词),认不出才算实体。"""
+        units = [_unit("u1")]
+        ext = {"u1": _ext([("上下文工程", "concept", "x"), ("功能安全标准", "standard", "y"), ("小部件", "gizmo", "z"),
+                           ("Acme", "organization", "w")], [])}
+        out = merge_extractions(units, ext, entity_types=("organization",), upper_parents={"organization": "agent"})
+        ents = {e["title"]: e for e in out["entities"]}
+        self.assertEqual((ents["上下文工程"]["upper"], ents["上下文工程"]["type_path"]), ("concept", ["concept"]))
+        self.assertEqual((ents["功能安全标准"]["upper"], ents["功能安全标准"]["type_path"]), ("concept", ["standard", "concept"]))
+        self.assertEqual(ents["小部件"]["upper"], "entity")
+        self.assertEqual(ents["Acme"]["upper"], "agent")
+        self.assertEqual(out["stats"]["schema_drift_types"], 3)
 
     def test_negated_and_self_loop_relations_are_dropped(self) -> None:
         self.assertTrue(is_negated("There is no clear relationship between A and B"))
@@ -327,6 +397,75 @@ class MergeTests(unittest.TestCase):
         self.assertAlmostEqual(sum(e["pagerank"] for e in out["entities"]), 1.0, places=5)
         self.assertEqual(ents["aa"]["pagerank_norm"], 1.0)
         self.assertEqual(info["n_units"], 4)
+
+    def test_scope_is_decided_per_name_not_per_unit(self) -> None:
+        """2026-10-24:作用域按名字在全库的类型众数定一次。以前按每个单元自己的类型定,同一份文档里一处抽成参数、
+        一处抽成器件,就同时成了文档内节点和全局节点,两者永远并不到一起。"""
+        units = [_unit("u1", doc="kb:1"), _unit("u2", doc="kb:1", order=1), _unit("u3", doc="kb:2", order=2)]
+        ext = {"u1": _ext([("tAS", "timing parameter", "setup")], []),
+               "u2": _ext([("tAS", "device", "odd label")], []),
+               "u3": _ext([("tAS", "timing parameter", "setup B")], [])}
+        out = merge_extractions(units, ext, entity_types=("timing parameter", "device"),
+                                upper_parents={"timing parameter": "property", "device": "entity"})
+        self.assertEqual(sorted(e["key"] for e in out["entities"]), ["kb:1::tas", "kb:2::tas"])
+        # 作用域也可以按类型单独判定:同一个上层类,声明全局的类型就跨文档认同一个
+        out = merge_extractions(units, ext, entity_types=("timing parameter", "device"),
+                                upper_parents={"timing parameter": "property", "device": "entity"},
+                                type_scopes={"timing parameter": "global"})
+        self.assertEqual([e["key"] for e in out["entities"]], ["tas"])
+
+    def test_same_name_with_different_upper_classes_splits_only_on_real_evidence(self) -> None:
+        """公司与它的同名产品:两种上层类各有足够的提及、来自不同文档,才拆成两个节点;零星的类型分歧仍按众数归一个。"""
+        units = [_unit(f"u{i}", doc=f"kb:{i}", order=i) for i in range(5)]
+        ext = {f"u{i}": _ext([("Notion", "organization" if i < 3 else "product", f"d{i}")], []) for i in range(5)}
+        kw = dict(entity_types=("organization", "product"), upper_parents={"organization": "agent", "product": "entity"})
+        out = merge_extractions(units, ext, **kw)
+        ents = {e["key"]: e for e in out["entities"]}
+        self.assertEqual(set(ents), {"notion", "notion||entity"})
+        self.assertEqual((ents["notion"]["upper"], ents["notion||entity"]["upper"]), ("agent", "entity"))
+        self.assertEqual(out["stats"]["homonyms_split"], 1)
+        noisy = {f"u{i}": _ext([("Notion", "organization" if i else "product", f"d{i}")], []) for i in range(5)}
+        self.assertEqual([e["key"] for e in merge_extractions(units, noisy, **kw)["entities"]], ["notion"])   # 1/5 只算噪声
+
+    def test_dated_event_names_are_global_and_undated_ones_stay_in_their_document(self) -> None:
+        units = [_unit("u1", doc="kb:1"), _unit("u2", doc="kb:2", order=1)]
+        ext = {u: _ext([("2026-03-14 设计评审", "meeting", "评审"), ("周会", "meeting", "例会")], []) for u in ("u1", "u2")}
+        out = merge_extractions(units, ext, entity_types=("meeting",), upper_parents={"meeting": "event"})
+        self.assertEqual(sorted(e["key"] for e in out["entities"]), ["2026-03-14 设计评审", "kb:1::周会", "kb:2::周会"])
+
+    def test_undated_events_in_documents_of_different_dates_are_separate_occurrences(self) -> None:
+        """合成的年度记录包含同名事件,这些事件不能因类型作用域为全局就跨年合并。不带日期的事件名
+        出现在几份日期不同的文档里时按文档各算一次;日期相同(或文档都没有日期)时照类型的作用域;名字里只有年份也算带日期。"""
+        units = [_unit("u1", doc="kb:1"), _unit("u2", doc="kb:2", order=1), _unit("u3", doc="kb:3", order=2)]
+        for u, day in zip(units, ("2024-07-26", "2025-10-11", "2025-10-11")):
+            u.doc_date = day
+        ext = {u.unit_id: _ext([("健康体检", "examination", "体检"), ("2024年健康体检", "examination", "那一年的体检")], []) for u in units}
+        kw = dict(entity_types=("examination",), upper_parents={"examination": "event"}, type_scopes={"examination": "global"})
+        keys = sorted(e["key"] for e in merge_extractions(units, ext, **kw)["entities"])
+        self.assertEqual(keys, ["2024年健康体检", "kb:1::健康体检", "kb:2::健康体检", "kb:3::健康体检"])
+        same_day = [units[1], units[2]]
+        keys = sorted(e["key"] for e in merge_extractions(same_day, {u.unit_id: ext[u.unit_id] for u in same_day}, **kw)["entities"])
+        self.assertEqual(keys, ["2024年健康体检", "健康体检"])                   # 同一天的两份文档说的是同一次
+
+    def test_type_disagreement_among_abstract_classes_is_noise_not_two_things(self) -> None:
+        """同一个名字一处判成病症(概念)、一处判成风险因素(属性),是同一个东西的类型摇摆,不拆;
+        人员与组织 / 具体的东西 / 抽象的东西三组之间的分歧才拆(见上一条的公司与同名产品)。"""
+        units = [_unit(f"u{i}", doc=f"kb:{i}", order=i) for i in range(5)]
+        ext = {f"u{i}": _ext([("肥胖", "condition" if i < 3 else "risk factor", f"d{i}")], []) for i in range(5)}
+        out = merge_extractions(units, ext, entity_types=("condition", "risk factor"),
+                                upper_parents={"condition": "concept", "risk factor": "property"},
+                                type_scopes={"condition": "global", "risk factor": "global"})
+        self.assertEqual([(e["key"], e["type"]) for e in out["entities"]], [("肥胖", "condition")])
+        self.assertEqual(out["stats"]["homonyms_split"], 0)
+
+    def test_kind_scope_and_external_ids_are_carried_to_the_entity(self) -> None:
+        units = [_unit("u1"), _unit("u2", order=1), _unit("u3", order=2)]
+        rec = lambda kind, ext=None: {"name": "传感器", "type": "product", "description": "x", "mentions": 1, "types": {"product": 1},
+                                     "kind": kind, **({"external_ids": [ext]} if ext else {})}
+        ext = {"u1": {"entities": [rec("class")], "relations": []}, "u2": {"entities": [rec("class")], "relations": []},
+               "u3": {"entities": [rec("instance", {"scheme": "SKU", "value": "S-1"})], "relations": []}}
+        (e,) = merge_extractions(units, ext, entity_types=("product",), upper_parents={"product": "entity"})["entities"]
+        self.assertEqual((e["kind"], e["external_ids"], e["scope"]), ("class", [{"scheme": "SKU", "value": "S-1"}], ""))
 
     def test_pagerank_handles_isolated_nodes(self) -> None:
         ranks = pagerank(["a", "b", "c"], [("a", "b", 1.0)])
@@ -395,6 +534,27 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(edges[0]["unit_ids"], ["t1", "t2"])
         self.assertEqual(stats["self_loops_dropped"], 1)
 
+    def test_merges_keep_old_ids_and_never_join_different_external_ids(self) -> None:
+        """方案附录第 4 条:归并后代表换了、名字变了,旧编号照样能查到(member_keys → 负载里的 ids);
+        同一体系下外部编号不同的两个实体绝不合并,经由第三个实体传递也不行;带外部编号的优先当代表。"""
+        from kb_pipeline.graph.vectors import entity_id, entity_ids
+
+        ents = [
+            {"key": "acme", "title": "Acme", "type": "org", "frequency": 9, "unit_ids": ["u1"], "aliases": [], "descriptions": ["a"]},
+            {"key": "acme inc", "title": "Acme Inc", "type": "org", "frequency": 1, "unit_ids": ["u2"], "aliases": [], "descriptions": ["b"],
+             "external_ids": [{"scheme": "客户编号", "value": "C-001"}]},
+            {"key": "acme ltd", "title": "Acme Ltd", "type": "org", "frequency": 1, "unit_ids": ["u3"], "aliases": [], "descriptions": ["c"],
+             "external_ids": [{"scheme": "客户编号", "value": "C-002"}]},
+        ]
+        merged, _, stats = resolution.merge_entities(ents, [], [(0, 1), (0, 2)])
+        self.assertEqual(stats["external_id_conflicts_blocked"], 1)
+        self.assertEqual(stats["entities_after"], 2)
+        head = next(e for e in merged if e["key"] == "acme inc")              # 带编号的当代表,哪怕提及少
+        self.assertEqual(head["member_keys"], ["acme inc", "acme"])
+        self.assertEqual(entity_ids(head), [entity_id("acme inc"), entity_id("acme")])
+        self.assertEqual(head["external_ids"], [{"scheme": "客户编号", "value": "C-001"}])
+        self.assertIn("acme ltd", {e["key"] for e in merged})
+
     def test_merged_rows_keep_every_description_with_its_source(self) -> None:
         """A merged entity used to keep only its first 8 descriptions, with source labels only for the
         representative's own, and merged relations did not carry sources either: the statements merged in reached
@@ -458,7 +618,7 @@ class ResolutionTests(unittest.TestCase):
 
 
 class NoiseReductionTests(unittest.TestCase):
-    """Graph-build noise reduction (Desktop "Graph-build noise reduction plan 2026-09-04"): unit classification,
+    """Graph-build noise reduction (2026-09-04): unit classification,
     value / reference admission, splitting of combined names, deterministic resolution rules and vector candidates,
     section-path attribution, type health check, landing checks for capability questions, recall filtering."""
 
@@ -845,33 +1005,65 @@ class NoiseReductionTests(unittest.TestCase):
         self.assertEqual([(r["gr_id"], r["_score"]) for r in rels], [("r1", 0.8)])
         self.assertEqual(len(calls), 6)                                   # 3 identifiers × (entity + relation)
         flt = calls[0][1]
-        self.assertEqual(sorted(c.key for c in flt.should), ["aliases", "title"])
+        self.assertEqual(sorted(c.key for c in flt.should), ["aliases", "external_ids", "title"])        # 外部编号也按记号精确找
         self.assertEqual(sorted(c.key for c in flt.must_not), ["boilerplate", "reference"])
         self.assertEqual(lexical_seeds(FakeQ(), "a", "b", "这是一个没有记号的问题？"), ([], []))
 
+    def test_lexical_relations_of_a_hub_follow_the_question(self) -> None:
+        """合成的中心实体有许多关系时,仅按存储顺序取边可能错过与问题相关的能力关系。
+        有问题向量时在端点匹配的边里按语义相似度取;只走词法时按存储顺序取,分数口径不变。"""
+        from kb_pipeline.graph.recall import LEXICAL_SEED_SCORE, lexical_seeds
+
+        rels = [SimpleNamespace(id=f"p{i}", payload={"gr_id": f"r{i}", "source": "DSE", "target": t, "type": "related_to"})
+                for i, t in enumerate(["日程管理", "库存管理", "工程能力"])]
+        used: list[str] = []
+
+        class FakeQ:
+            def scroll(self, collection_name, scroll_filter, limit, with_payload, with_vectors):
+                used.append(f"scroll:{collection_name}")
+                return (rels[:limit] if collection_name == "rel" else []), None
+
+            def query_points(self, collection_name, query, limit, with_payload, query_filter=None, **kw):
+                used.append(f"query:{collection_name}")
+                self.filter = query_filter
+                return SimpleNamespace(points=[SimpleNamespace(id="p2", score=0.93, payload=rels[2].payload)][:limit])
+
+        fake = FakeQ()
+        _, got = lexical_seeds(fake, "ent", "rel", "DSE 需要具备哪些能力？", per_token=1, vector=[0.1, 0.2])
+        self.assertEqual([(r["gr_id"], r["_score"]) for r in got], [("r2", LEXICAL_SEED_SCORE["relation"])])
+        self.assertEqual(sorted(c.key for c in fake.filter.should), ["source", "target"])     # 仍只在端点对得上的边里挑
+        self.assertEqual(used, ["scroll:ent", "query:rel"])
+        used.clear()
+        _, got = lexical_seeds(fake, "ent", "rel", "DSE 需要具备哪些能力？", per_token=1)
+        self.assertEqual([r["gr_id"] for r in got], ["r0", "r1"])
+        self.assertEqual(used, ["scroll:ent", "scroll:rel"])
+
 
 class OntologyTests(unittest.TestCase):
-    """Ontology strengthening (Desktop "Knowledge graph ontology strengthening plan 2026-09-04"): fixed upper
+    """Ontology strengthening (2026-09-04): fixed upper
     ontology, document-local scope, qualified facts, derived variant edges, predicate health check, fact seeds in
     recall."""
 
-    def test_upper_ontology_is_fixed_and_legacy_parents_map_onto_it(self) -> None:
-        from kb_pipeline.limits import DOCUMENT_SCOPED_PARENTS, UPPER_PARENTS, normalize_upper_parents, upper_parent_of
+    def test_upper_ontology_is_fixed_and_synonyms_map_onto_it(self) -> None:
+        from kb_pipeline.ontology import DEFAULT_SCOPE, UPPER_CLASSES, upper_of_name
 
-        self.assertEqual(UPPER_PARENTS, ("entity", "part", "property", "process", "standard", "document"))
-        self.assertEqual(upper_parent_of("component"), "entity")
-        self.assertEqual(upper_parent_of("parameter"), "property")
-        self.assertEqual(upper_parent_of("Interface"), "part")
-        self.assertEqual(upper_parent_of("mode"), "process")
-        self.assertIsNone(upper_parent_of("something new"))
-        self.assertEqual(normalize_upper_parents({"Timing Parameter": "parameter", "pin": "part", "x": "??"}, ["timing parameter", "pin", "x"]),
-                         {"timing parameter": "property", "pin": "part"})
-        self.assertEqual(DOCUMENT_SCOPED_PARENTS, {"part", "property", "process"})
-        # The sampling prompts allow only the six classes
+        self.assertEqual(UPPER_CLASSES, ("agent", "entity", "part", "property", "process", "event", "concept", "document"))
+        self.assertEqual(upper_of_name("Organization"), "agent")
+        self.assertEqual(upper_of_name("person"), "agent")
+        self.assertEqual(upper_of_name("parameter"), "property")
+        self.assertEqual(upper_of_name("standard"), "concept")
+        self.assertEqual(upper_of_name("事件"), "event")
+        self.assertIsNone(upper_of_name("something new"))
+        self.assertEqual({k for k, v in DEFAULT_SCOPE.items() if v == "document"}, {"part", "property", "process", "event"})
+        # 采样提示词给的是八个上层类;父类也可以是表内另一个类型(多层)
         self.assertIn("{upper_parents}", prompts.PARENT_TYPES_PROMPT)
-        self.assertIn("{upper_parents}", prompts.UPPER_MAPPING_PROMPT)
-        self.assertEqual(graph_schema.normalize_parent_types({"parent_types": {"pin": "component", "tAS": "parameter"}}, ["pin", "tAS"]),
-                         {"pin": "entity", "tAS": "property"})
+        self.assertFalse(hasattr(prompts, "UPPER_MAPPING_PROMPT"))
+        self.assertEqual(graph_schema.normalize_parent_types(
+            {"parent_types": {"pin": "component", "tAS": "parameter", "chip": "device", "device": "entity", "x": "??"}},
+            ["pin", "tAS", "chip", "device", "x"]),
+            {"pin": "part", "tAS": "property", "chip": "device", "device": "entity", "x": "entity"})
+        for name in ("agent", "event", "concept"):
+            self.assertIn(f"- {name}: ", graph_schema.upper_parents_text())
 
     def test_scoped_types_get_document_local_keys(self) -> None:
         from kb_pipeline.graph.merge import scoped_key
@@ -928,13 +1120,13 @@ class OntologyTests(unittest.TestCase):
     def test_predicate_health_reports_violations_and_fanout(self) -> None:
         from kb_pipeline.graph.merge import predicate_health
 
-        ents = [{"key": "a", "parent_type": "component"}, {"key": "b", "parent_type": "document"}, {"key": "c", "parent_type": "component"}]
+        ents = [{"key": "a", "upper": "part"}, {"key": "b", "upper": "document"}, {"key": "c", "upper": "part"}]
         rels = [{"source_key": "a", "target_key": "b", "predicate": "has_pin", "type_violation": True},
                 {"source_key": "a", "target_key": "c", "predicate": "has_pin", "type_violation": False},
                 {"source_key": "c", "target_key": "a", "predicate": "variant_of", "derived": True}]
         rows = {r["predicate"]: r for r in predicate_health(rels, ents)}
         self.assertEqual((rows["has_pin"]["edges"], rows["has_pin"]["violations"], rows["has_pin"]["violation_ratio"]), (2, 1, 0.5))
-        self.assertEqual(rows["has_pin"]["top_violating_pairs"], [{"source_parent": "component", "target_parent": "document", "count": 1}])
+        self.assertEqual(rows["has_pin"]["top_violating_pairs"], [{"source_parent": "part", "target_parent": "document", "count": 1}])
         self.assertEqual(rows["has_pin"]["fanout_p95"], 2)
         self.assertEqual(rows["variant_of"]["derived"], 1)
 
@@ -1045,7 +1237,7 @@ class DeterministicBuilderTests(unittest.TestCase):
         "wiki/lib/util.py": "def helper(x):\n    \"\"\"Help.\"\"\"\n    return x\n\n\nclass Base:\n    def ping(self):\n        return 1\n",
         "wiki/cli.py": "import os\nimport requests\nfrom lib.util import helper, Base\n\nLIMIT = 3\n\n\ndef main():\n    \"\"\"Entry.\"\"\"\n    return helper(LIMIT) + Engine().run()\n\n\nclass Engine(Base):\n    def run(self):\n        return self.ping() + os.getpid()\n\n\nif __name__ == \"__main__\":\n    main()\n",
         "wiki/SKILL.md": "---\nname: wiki-skill\ndescription: 编译 wiki。\nversion: 1.2\ntags: a,b\n---\n\n# 用法\n\n运行 `python cli.py build`,配置见 skillhub.json。\n",
-        "wiki/skillhub.json": "{\"name\": \"wiki-skill\", \"ns\": \"wps\", \"limits\": {\"max\": 5}}",
+        "wiki/skillhub.json": "{\"name\": \"wiki-skill\", \"ns\": \"demo\", \"limits\": {\"max\": 5}}",
         "wiki/requirements.txt": "requests>=2.28\n# comment\npyyaml>=6.0\n",
         "wiki/design.md": "# 设计\n\n普通说明文档。\n",
     }
@@ -1121,7 +1313,7 @@ class DeterministicBuilderTests(unittest.TestCase):
             self.assertEqual({(f["property"], f["value"]) for f in md_facts}, {("version", "1.2"), ("tags", "a,b")})
             # Config: key-path facts; requirements: package entities and depends_on
             cfg = by_rel["wiki/skillhub.json"][0]
-            self.assertEqual({(f["property"], f["value"]) for f in det.facts(cfg)}, {("name", "wiki-skill"), ("ns", "wps"), ("limits.max", "5")})
+            self.assertEqual({(f["property"], f["value"]) for f in det.facts(cfg)}, {("name", "wiki-skill"), ("ns", "demo"), ("limits.max", "5")})
             req = by_rel["wiki/requirements.txt"][0]
             res = det.extract(req)
             self.assertEqual({(r["source"], r["predicate"], r["target"]) for r in res.relations}, {("wiki", "depends_on", "requests"), ("wiki", "depends_on", "pyyaml")})
@@ -1140,7 +1332,7 @@ class DeterministicBuilderTests(unittest.TestCase):
                                {"name": "helper", "type": "function", "descriptions": [], "mentions": 1, "types": {"function": 1}, "exact": True, "scope_doc": "kb_006:1"}],
                    "relations": [{"source": "main", "target": "helper", "predicate": "calls", "predicate_raw": "calls", "descriptions": ["main calls helper"], "strength": 1}]},
         }
-        out = merge_extractions([u1, u2], ext, entity_types=TYPES, parent_types=UPPER, upper_parents=UPPER)
+        out = merge_extractions([u1, u2], ext, entity_types=TYPES, exact_types=UPPER)
         ents = {e["key"]: e for e in out["entities"]}
         self.assertEqual(set(ents), {scoped_key("helper", "kb_006:1"), scoped_key("main", "kb_006:2")})   # no kb_006:2::helper
         helper = ents[scoped_key("helper", "kb_006:1")]
@@ -1373,7 +1565,7 @@ class DeterministicBuilderTests(unittest.TestCase):
 
 class ConceptNeighbourScaleTests(unittest.TestCase):
     def test_numpy_neighbour_search_matches_the_pairwise_definition_and_scales(self) -> None:
-        """2026-09-12, product documentation KB with 12,933 concept candidates: pairwise cosine meant 167 million
+        """2026-09-12 benchmark with 12,933 concept candidates: pairwise cosine meant 167 million
         computations, about 3 hours, and the graph build stalled at "property concept normalisation". The numpy
         path must give the same result in the same order as the pairwise implementation, and a few thousand
         candidates must finish within seconds."""
@@ -1638,20 +1830,31 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         from kb_pipeline.graph.schema import generate_examples
 
         answers = ["Health reports", "Chinese", "You are an expert.",
-                   '{"entity_types": ["person", "indicator"]}',
-                   '{"parent_types": {"person": "entity", "indicator": "property"}}',
-                   '{"predicates": [{"name": "has_indicator", "description": "d", "source_parents": ["entity"], "target_parents": ["property"]}]}',
-                   '{"definitions": {"person": "the examinee a report is about", "indicator": "a measured health metric", "ghost": "x"}}',
+                   '{"entity_types": ["person", "indicator", "examination"]}',
+                   '{"parent_types": {"person": "agent", "indicator": "property", "examination": "event"}}',
+                   '{"predicates": [{"name": "has_indicator", "description": "d", "source_parents": ["agent"], "target_parents": ["property"]},'
+                   ' {"name": "examined_by", "description": "e", "source_parents": ["agent"], "target_parents": ["agent"], "single_valued": true}]}',
+                   '{"types": {"person": {"definition": "the examinee a report is about", "scope": "global"},'
+                   ' "indicator": {"definition": "a measured health metric", "scope": "document"}, "ghost": {"definition": "x"}}}',
                    '{"subject_types": ["person", "nope"], "axis": "date", "conclusion_headings": ["异常结果汇总", "综合建议"], "extension_predicates": ["has_indicator", "bogus"]}']
         client = _client(list(answers))
         out = graph_schema.suggest(client, ["sample text"], examples=False)
-        self.assertEqual(out["type_definitions"], {"person": "the examinee a report is about", "indicator": "a measured health metric"})
-        self.assertEqual(out["profile"], {"subject_types": ["person"], "axis": "date", "conclusion_headings": ["异常结果汇总", "综合建议"],
-                                          "boilerplate_headings": [], "listing_headings": [], "type_words": [], "extension_predicates": ["has_indicator"]})
+        model = out["model"]
+        types = {t["name"]: t for t in model["types"]}
+        self.assertEqual({k: v["description"] for k, v in types.items()},
+                         {"person": "the examinee a report is about", "indicator": "a measured health metric", "examination": ""})
+        self.assertEqual({k: (v["is_a"], v["scope"]) for k, v in types.items()},
+                         {"person": ("agent", "global"), "indicator": ("property", "document"), "examination": ("event", "document")})
+        self.assertEqual(model["profile"], {"subject_types": ["person"], "axis": "date", "conclusion_headings": ["异常结果汇总", "综合建议"],
+                                            "boilerplate_headings": [], "listing_headings": [], "type_words": [], "extension_predicates": ["has_indicator"]})
+        preds = {p["name"]: p for p in model["predicates"]}
+        self.assertEqual((preds["has_indicator"]["multivalued"], preds["examined_by"]["multivalued"]), (True, False))
+        self.assertTrue({"precedes", "concurrent_with", "causes", "results_in"} <= set(preds))     # 有事件类型就带上事件核心关系
+        self.assertTrue(all(preds[n]["core"] for n in ("precedes", "causes")))
         self.assertEqual(out["examples"], "")
         self.assertEqual(client.stats["calls"], 8)
-        schema = ExtractionSchema(entity_types=("person", "indicator"), predicates=({"name": "has_indicator", "source_parents": ["entity"], "target_parents": ["property"]},),
-                                  language="Chinese", parent_types={"person": "entity", "indicator": "property"})
+        schema = ExtractionSchema(entity_types=("person", "indicator"), predicates=({"name": "has_indicator", "source_parents": ["agent"], "target_parents": ["property"]},),
+                                  language="Chinese", parent_types={"person": "agent", "indicator": "property"})
         good = ('("unit"<|>body<|>s)##("entity"<|>李华<|>person<|>受检者)##("entity"<|>体重指数<|>indicator<|>指标)##'
                 '("relationship"<|>李华<|>体重指数<|>has_indicator<|>报告给出体重指数<|>8)##'
                 '("relationship"<|>体重指数<|>李华<|>has_indicator<|>越界的方向<|>3)<|COMPLETE|>')
@@ -1661,7 +1864,8 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         # one gets good; the reversed record in good violates the endpoints (1/2, not over half) and is removed
         self.assertEqual((stats["kept"], stats["fallback"], stats["violations_removed"], stats["dropped_empty"]), (1, 0, 1, 0))
         self.assertIn("Example 1:", text)
-        self.assertIn('("relationship"<|>李华<|>体重指数<|>has_indicator<|>报告给出体重指数<|>8)', text)
+        self.assertIn('("relationship"<|>李华<|>体重指数<|>has_indicator<|>报告给出体重指数<|>8<|>)', text)
+        self.assertIn('("entity"<|>李华<|>person<|>受检者<|>instance)', text)        # 示例与正文提示词用同一种记录格式
         self.assertNotIn("越界的方向", text)
         self.assertNotIn("(parent:", text)                                          # the menu in examples lists names only, definitions are not repeated
         self.assertIn("Predicates: has_indicator", text)
@@ -1692,13 +1896,15 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertEqual(scenario_profile(src)["axis"], "version")
         schema = extraction_schema_for(src)
         self.assertEqual((schema.type_definitions, schema.examples, schema.subject_types), ({"pin": "a terminal"}, "Example 1: x", ("pin",)))
-        current = {"graph_schema_versions": [{"id": "v9", "entity_types": ["pin"], "language": "Chinese",
-                                              "type_definitions": {"pin": "t"}, "examples": "E", "profile": {"axis": "date"}},
-                                             {"id": "v8", "entity_types": ["pin"]}]}
+        current = {"graph_schema_versions": [_schema_entry("v9", [("pin", "part")], language="Chinese", definitions={"pin": "t"},
+                                                           examples="E", profile={"axis": "date"}),
+                                             _schema_entry("v8", ["pin"])]}
         updates = {"graph_schema_active": "v9"}
         _apply_schema_version(current, updates)
         self.assertEqual((updates["graph_type_definitions"], updates["graph_examples"], updates["graph_profile"]),
                          ({"pin": "t"}, "E", {"subject_types": [], "axis": "date", "conclusion_headings": [], "boilerplate_headings": [], "listing_headings": [], "type_words": [], "extension_predicates": []}))
+        self.assertEqual((updates["graph_parent_types"], updates["graph_type_scopes"], updates["graph_language"]),
+                         ({"pin": "part"}, {"pin": "document"}, "Chinese"))
         old = {"graph_schema_active": "v8"}
         _apply_schema_version(current, old)
         self.assertEqual((old["graph_type_definitions"], old["graph_examples"], old["graph_profile"]), (None, None, None))
@@ -1741,7 +1947,7 @@ class ResolutionEvidenceTests(unittest.TestCase):
             self.assertNotEqual(canonical_identifier(a), canonical_identifier(b), (a, b))
             self.assertEqual(pairs(a, b), [], (a, b))
         for a, b in (("t_AS", "t AS"), ("ZK7C 1049 GN", "ZK7C1049GN"), ("ZM32 F103", "ZM32F103"), ("表 3-12", "表3.12"),
-                     ("2024-01-05", "2024/01/05"), ("ISO 9001:2015", "ISO9001-2015"), ("W.B.", "WB")):
+                     ("2024-01-05", "2024/01/05"), ("ISO 9001:2015", "ISO9001-2015"), ("W.W.", "WW")):
             self.assertEqual(pairs(a, b), [(0, 1)], (a, b))
         # keys obtained by stripping type words or bracketed aliases go through the same function: a different grouping
         # of digits still does not merge
@@ -1789,19 +1995,19 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertEqual(paren_alias("低密度脂蛋白胆固醇 (LDL-C)"), ("低密度脂蛋白胆固醇", "LDL-C"))
         self.assertEqual(paren_alias("深色蔬菜(紫甘蓝)"), ("", ""))                       # the parenthesis holds an example, not an alias
         self.assertEqual(paren_alias("脑梗(缺血性脑卒中)"), ("", ""))
-        # The reverse "identifier (expansion)" is an alias too: FDE (Forward-Deployed Engineer), AIP (AI Platform); the
+        # The reverse "identifier (expansion)" is an alias too: DSE (Data-Systems Engineer), AIP (AI Platform); the
         # expansion may contain Chinese characters and may exceed 24 characters
-        self.assertEqual(paren_alias("FDE (Forward-Deployed Engineer)"), ("FDE", "Forward-Deployed Engineer"))
-        self.assertEqual(paren_alias("FDE(Forward Deployed Engineer,前线部署工程师)"), ("FDE", "Forward Deployed Engineer,前线部署工程师"))
+        self.assertEqual(paren_alias("DSE (Data-Systems Engineer)"), ("DSE", "Data-Systems Engineer"))
+        self.assertEqual(paren_alias("DSE(Data Systems Engineer,数据系统工程师)"), ("DSE", "Data Systems Engineer,数据系统工程师"))
         self.assertEqual(paren_alias("AIP (AI Platform)"), ("AIP", "AI Platform"))      # the capital letters joined = AIP
         self.assertEqual(paren_alias("Skill(x)"), ("", ""))
         self.assertEqual(paren_alias("ΘJA (With Still Air)"), ("", ""))                    # the parenthesis holds a condition, the initials do not match
         self.assertEqual(paren_alias("HSB (STORE only)"), ("", ""))
-        self.assertEqual(paren_alias("FDE(前线部署工程师)"), ("", ""))                       # a purely Chinese expansion cannot be checked by initials; left to the model
-        fde = [{"title": "FDE", "type": "role"}, {"title": "FDE (Forward-Deployed Engineer)", "type": "role"},
-               {"title": "FDE(Forward Deployed Engineer,前线部署工程师)", "type": "role"}, {"title": "Forward-Deployed Engineer", "type": "role"}]
+        self.assertEqual(paren_alias("DSE(数据系统工程师)"), ("", ""))                       # a purely Chinese expansion cannot be checked by initials; left to the model
+        dse = [{"title": "DSE", "type": "role"}, {"title": "DSE (Data-Systems Engineer)", "type": "role"},
+               {"title": "DSE(Data Systems Engineer,数据系统工程师)", "type": "role"}, {"title": "Data-Systems Engineer", "type": "role"}]
         reasons: dict = {}
-        groups = auto_merge_pairs(fde, reasons)
+        groups = auto_merge_pairs(dse, reasons)
         self.assertEqual({frozenset(p) for p in groups} & {frozenset((0, 1)), frozenset((0, 2)), frozenset((1, 3))},
                          {frozenset((0, 1)), frozenset((0, 2)), frozenset((1, 3))})
         self.assertEqual({reasons[p] for p in groups}, {"paren"})                                   # the resolution log records a paren alias, not identifier equality
@@ -2052,16 +2258,18 @@ class ExtractionFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalT
                 con.commit()
                 self.assertEqual(db.graph_extraction_unit_ids(con, "kb", "fp"), {"u-bad", "u-empty", "u-ok"})
                 self.assertEqual(db.graph_extraction_unit_ids(con, "kb", "fp", skip_empty_malformed=True), {"u-empty", "u-ok"})
-        self.assertIn("skip_empty_malformed=True", _repo_file("app/kb_pipeline/graph/build.py"))
+        from kb_pipeline.graph.unit_cache import valid_ids
+        self.assertEqual(valid_ids({"bad": {"entities": [], "stats": {"malformed": 1}},
+                                    "empty": {"entities": [], "stats": {"malformed": 0}}}), {"empty"})
 
 
 class WideTableRenderingTests(unittest.TestCase):
     """Wide tables reach the model as "column: value" pairs (spot check: entity descriptions read the wrong column of a
     15-column comparison sheet); chunk text is untouched and only expanded units get a render-versioned unit_id."""
 
-    NATIVE = ("SHEET: 竞品对比表\nROWS: 126-129\nHEADER: 一级模块 | 二级模块 | 功能 | 描述 | 钉钉 | 飞书 | 热聊v4.8.61 | 备注\n"
+    NATIVE = ("SHEET: 竞品对比表\nROWS: 126-129\nHEADER: 一级模块 | 二级模块 | 功能 | 描述 | 协作甲 | 协作乙 | 协作丙v2.3.0 | 备注\n"
               "聊天能力 | 会话列表 | 移除会话 |  | 1 | 0 | 1 | \n聊天能力 | 会话列表 | 标签 |  | 1 | 1 | 0 | 计划支持")
-    NARROW = "SHEET: s\nROWS: 1-2\nHEADER: 功能 | 钉钉 | 飞书\n标签 | 1 | 0"
+    NARROW = "SHEET: s\nROWS: 1-2\nHEADER: 功能 | 协作甲 | 协作乙\n标签 | 1 | 0"
     MARKDOWN = "| 功能 | a | b | c | d | e |\n|---|---|---|---|---|---|\n| 标签 | 1 | 0 | 1 |  | 0 |\n\n后面的正文 | 不是表"
 
     def test_native_and_markdown_wide_rows_become_name_value_pairs(self) -> None:
@@ -2069,8 +2277,8 @@ class WideTableRenderingTests(unittest.TestCase):
 
         out = expand_wide_tables(self.NATIVE)
         self.assertIn("HEADER: 一级模块 | 二级模块", out)                                          # prefix lines stay as they are
-        self.assertIn("一级模块: 聊天能力 | 二级模块: 会话列表 | 功能: 移除会话 | 钉钉: 1 | 飞书: 0 | 热聊v4.8.61: 1", out)
-        self.assertIn("功能: 标签 | 钉钉: 1 | 飞书: 1 | 热聊v4.8.61: 0 | 备注: 计划支持", out)
+        self.assertIn("一级模块: 聊天能力 | 二级模块: 会话列表 | 功能: 移除会话 | 协作甲: 1 | 协作乙: 0 | 协作丙v2.3.0: 1", out)
+        self.assertIn("功能: 标签 | 协作甲: 1 | 协作乙: 1 | 协作丙v2.3.0: 0 | 备注: 计划支持", out)
         self.assertNotIn("聊天能力 | 会话列表 | 标签", out)                                          # empty cells skipped, column names keep positions clear
         self.assertIsNone(expand_wide_tables(self.NARROW))                                       # tables with few columns are left alone
         md = expand_wide_tables(self.MARKDOWN)
@@ -2159,3 +2367,317 @@ class WideTableRenderingTests(unittest.TestCase):
         self.assertIn("render_extract_prompt(expand_wide_tables(unit.text) or unit.text", src)   # the extraction prompt uses the expanded text
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "units.py").read_text(encoding="utf-8")
         self.assertIn("render_tag=table_render_tag(text)", src)
+
+
+class TableRouteTests(unittest.TestCase):
+    """2026-10-24 表格规则路线(方案第 4、5 条):每张表问一次模型拿画像,是实体清单的按行规则建图 —— 编号列进外部编号、
+    引用列建关系、其余列进事实;不是清单的表(对比矩阵、报表)照旧交给模型。"""
+
+    SCHEMA = ExtractionSchema(entity_types=("scenario", "person", "department"),
+                              predicates=({"name": "owned_by"}, {"name": "depends_on"}),
+                              parent_types={"scenario": "concept", "person": "agent", "department": "agent"})
+
+    def _unit(self, uid: str, text: str, order: int = 0) -> Unit:
+        u = _unit(uid, doc="kb:t", order=order)
+        u.rel_path = "客户A/需求清单.xlsx"
+        u.text = text
+        u.block_types = ["table"]
+        return u
+
+    def _text(self, rows: list[str], *, start: int = 2) -> str:
+        return "\n".join(["SHEET: 场景", f"ROWS: {start}-{start + len(rows) - 1}",
+                          "HEADER: 编号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
+
+    ROWS = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01",
+            "S02 | 预算差异分析 | 李四 | S01 | 待启动 | 2026-05-01",
+            "S03 | 报表问数 | 张三 | S01、S02 | 进行中 | 2026-04-15"]
+    PROFILE = ('{"row_type": "scenario", "key_column": "编号", "name_column": "场景名称", '
+               '"references": [{"column": "负责人", "target_type": "person", "predicate": "owned_by"}, '
+               '{"column": "依赖", "target_type": "scenario", "predicate": "depends_on"}, {"column": "不存在", "target_type": "person"}], '
+               '"date_column": "上线日期"}')
+
+    def test_a_running_row_number_is_not_an_identifier(self) -> None:
+        """10-24 真机:需求清单的「序号」(1、2、3…)被当成编号列,行号成了需求的外部编号,还各出一条「序号 = 3」的事实。
+        编号列是从 1 附近数上来的小整数时不当编号、不出事实;真编号(S01、10086)照旧。"""
+        from kb_pipeline.graph.tables import TableExtractor, running_numbers
+
+        self.assertTrue(running_numbers(["1", "2", "3", "5"]))
+        self.assertFalse(running_numbers(["10086", "10087", "10090"]))
+        self.assertFalse(running_numbers(["S01", "S02"]))
+        rows = ["1 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "2 | 预算差异分析 | 李四 |  | 待启动 | 2026-05-01",
+                "3 | 报表问数 | 张三 |  | 进行中 | 2026-04-15"]
+        text = "\n".join(["SHEET: 场景", "ROWS: 2-4", "HEADER: 序号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
+        tx = TableExtractor([self._unit("u1", text)], schema=self.SCHEMA)
+        (p,) = tx.profile(_client(['{"row_type": "scenario", "key_column": "序号", "name_column": "场景名称", "references": []}'])).values()
+        self.assertEqual((p["key_column"], p["name_column"], p.get("skip_columns")), ("", "场景名称", ["序号"]))
+        res = tx.extract(tx.units[0])
+        ents = {e["name"]: e for e in res.entities if e.get("source_kind") == "table"}
+        self.assertNotIn("external_ids", ents["月结辅助"]); self.assertNotIn("序号: 1", ents["月结辅助"]["descriptions"][0])
+        self.assertNotIn("序号", {f["property"] for f in tx.facts(tx.units[0])})
+        # 名字列也写成行号:这张表不当实体清单
+        (q,) = TableExtractor([self._unit("u2", text)], schema=self.SCHEMA).profile(
+            _client(['{"row_type": "scenario", "key_column": "序号", "name_column": "序号"}'])).values()
+        self.assertEqual(q["row_type"], "")
+
+    def test_a_long_table_split_across_units_is_judged_as_a_whole(self) -> None:
+        """10-24 真机:一百多行的需求清单按行切成了几十个单元,一段两三行;只看行最多的那一段时,末尾那段的序号从 137 起,
+        没认出是行号,而一段只有一两行的长表又会被当成「不是清单」。各段的行合回整张表再判,重叠切块重复的行只算一次。"""
+        from kb_pipeline.graph.tables import TableExtractor
+
+        def text(rows, start):
+            return "\n".join(["SHEET: 场景", f"ROWS: {start}-{start + len(rows) - 1}",
+                              "HEADER: 序号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
+
+        rows = [f"{i} | 场景{i} | 张三 |  | 进行中 | 2026-03-01" for i in range(1, 8)]
+        units = [self._unit("u1", text(rows[:2], 2)), self._unit("u2", text(rows[1:3], 3), order=1),     # 第 2 行两段都有
+                 self._unit("u3", text(rows[3:4], 5), order=2), self._unit("u4", text(rows[4:7], 6), order=3)]   # 最长的一段从 5 起
+        # 切块器把开头几行写成「列名: 值」的散行:那段算成另一张表,带表头的段合起来序号从 3 起
+        scattered = "\n".join(["SHEET: 场景", "ROWS: 2-4"] + [f"序号: {i} | 场景名称: 场景{i} | 负责人: 李四" for i in (1, 2, 8)])
+        prompts_seen: list[str] = []
+
+        def answer(messages):
+            prompts_seen.append(str(messages[-1]["content"]))
+            return '{"row_type": "scenario", "key_column": "序号", "name_column": "场景名称", "references": []}'
+
+        tx = TableExtractor(units, schema=self.SCHEMA)
+        (p,) = tx.profile(_client(answer)).values()
+        self.assertEqual((p["key_column"], p.get("skip_columns")), ("", ["序号"]))
+        self.assertEqual(tx.stats["profile_calls"], 1)
+        self.assertIn("场景名称: 场景1", prompts_seen[0]); self.assertIn("场景名称: 场景7", prompts_seen[0])   # 样例从整张表里取
+        tx = TableExtractor([*units[2:], self._unit("u5", scattered, order=4)], schema=self.SCHEMA)
+        profiles = list(tx.profile(_client(answer)).values())
+        self.assertEqual(len(profiles), 2)                                                          # 散行段是另一张表
+        self.assertEqual([(q["key_column"], q.get("skip_columns")) for q in profiles], [("", ["序号"])] * 2)   # 两张都认出是行号
+        # 真编号:合回整张表后照样唯一(重叠切块重复的那行只算一次)
+        ids = ["S01", "S02", "S03", "S04"]
+        units = [self._unit(f"v{i}", "\n".join(["SHEET: 场景", f"ROWS: {i + 2}-{i + 3}", "HEADER: 编号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期",
+                                                 f"{ids[i]} | 场景{i} | 张三 |  | 进行中 | 2026-03-01",
+                                                 f"{ids[i + 1]} | 场景{i + 1} | 张三 |  | 进行中 | 2026-03-01"]), order=i) for i in range(3)]
+        (q,) = TableExtractor(units, schema=self.SCHEMA).profile(
+            _client(['{"row_type": "scenario", "key_column": "编号", "name_column": "场景名称", "references": []}'])).values()
+        self.assertEqual(q["key_column"], "编号")
+
+    def test_chunk_text_is_read_back_into_rows(self) -> None:
+        from kb_pipeline.graph.tables import parse_table_text
+
+        text = ("Sheet: 场景\nRows: 3\nColumns: 编号 | 场景名称\n" + self._text(self.ROWS[:2]) + "\n"
+                + "SHEET: 场景\nROWS: 4-4\n编号: S09 | 场景名称: 长文本\n编号: S09 | 备注: 第二段")
+        sections = parse_table_text(text)
+        self.assertEqual([len(s["rows"]) for s in sections], [2, 1])
+        self.assertEqual(sections[0]["header"][:2], ["编号", "场景名称"])
+        self.assertEqual(sections[0]["rows"][0]["cells"][3], "")                 # 空格子保住位置
+        self.assertEqual(sections[1]["rows"][0]["labelled"], {"编号": "S09", "场景名称": "长文本", "备注": "第二段"})
+
+    def test_entity_tables_become_rows_with_ids_references_and_facts(self) -> None:
+        from kb_pipeline.graph.tables import TableExtractor
+
+        u1 = self._unit("u1", self._text(self.ROWS))
+        u2 = self._unit("u2", self._text(["S04 | 主数据映射 | 王五 | S03 | 待启动 | 2026-06-01"], start=5), order=1)
+        tx = TableExtractor([u1, u2], schema=self.SCHEMA)
+        prof = tx.profile(_client([self.PROFILE]))
+        (p,) = prof.values()
+        self.assertEqual((p["row_type"], p["key_column"], p["name_column"], p["date_column"]), ("scenario", "编号", "场景名称", "上线日期"))
+        self.assertEqual([r["column"] for r in p["references"]], ["负责人", "依赖"])     # 表里没有的列丢掉
+        self.assertTrue(tx.wants(u1) and tx.wants(u2))
+        res = tx.extract(u1)
+        rows = {e["name"]: e for e in res.entities if e.get("source_kind") == "table"}
+        self.assertEqual(set(rows), {"月结辅助", "预算差异分析", "报表问数"})
+        self.assertEqual(rows["月结辅助"]["external_ids"], [{"scheme": "编号", "value": "S01"}])
+        self.assertEqual(rows["月结辅助"]["aliases"], ["S01"])
+        self.assertIn("状态: 进行中", rows["月结辅助"]["descriptions"][0])
+        rels = {(r["source"], r["target"], r["predicate"]) for r in res.relations}
+        self.assertIn(("报表问数", "张三", "owned_by"), rels)
+        self.assertIn(("报表问数", "S02", "depends_on"), rels)                 # 「S01、S02」拆成两条
+        facts = {(f["subject"], f["property"], f["value"], f.get("valid_from")) for f in tx.facts(u1)}
+        self.assertIn(("月结辅助", "状态", "进行中", "2026-03-01"), facts)
+        self.assertIn(("月结辅助", "编号", "S01", "2026-03-01"), facts)
+        self.assertFalse(any(f[1] == "负责人" for f in facts))                    # 引用列是关系,不是事实
+        self.assertEqual(res.calls, 0)
+
+    def test_tables_that_are_not_entity_lists_go_back_to_the_model(self) -> None:
+        from kb_pipeline.graph.tables import TableExtractor
+
+        matrix = self._unit("u1", "SHEET: 对比\nROWS: 2-5\nHEADER: 功能 | 产品A | 产品B\n导出 | 1 | 0\n协作 | 1 | 1\n权限 | 0 | 1\n日志 | 1 | 1")
+        tx = TableExtractor([matrix], schema=self.SCHEMA)
+        tx.profile(_client(['{"row_type": "none"}']))
+        self.assertFalse(tx.wants(matrix))
+        tx2 = TableExtractor([self._unit("u2", self._text(self.ROWS + ["一期验收方法", "编号 | 验收方面", "V01 | 业务数字", "V02 | 连续运行"]))],
+                             schema=self.SCHEMA)
+        tx2.profile(_client([self.PROFILE]))
+        self.assertFalse(tx2.wants(tx2.units[0]))                                 # 子表与说明行占了四成以上:整单元退回模型
+        dup = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "S01 | 预算差异分析 | 李四 |  | 待启动 | 2026-05-01",
+               "S01 | 报表问数 | 张三 |  | 进行中 | 2026-04-15"]
+        tx3 = TableExtractor([self._unit("u3", self._text(dup))], schema=self.SCHEMA)
+        (p3,) = tx3.profile(_client([self.PROFILE])).values()
+        self.assertEqual((p3["key_column"], p3["name_column"]), ("", "场景名称"))    # 编号不唯一:不当外部编号
+
+    def test_same_name_with_different_ids_stays_apart_and_id_mentions_link_up(self) -> None:
+        from kb_pipeline.graph.merge import link_external_ids
+        from kb_pipeline.graph.tables import TableExtractor
+
+        rows = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "S02 | 月结辅助 | 李四 |  | 待启动 | 2026-05-01",
+                "S03 | 报表问数 | 张三 |  | 进行中"]
+        unit = self._unit("u1", self._text(rows))
+        tx = TableExtractor([unit], schema=self.SCHEMA)
+        tx.profile(_client([self.PROFILE]))
+        res = tx.extract(unit)
+        prose = _unit("u2", doc="kb:p", order=1)
+        ext = {"u1": {"entities": res.entities, "relations": res.relations},
+               "u2": _ext([("S03", "scenario", "文中直接写编号"), ("月结辅助", "scenario", "只写名字")], [("S03", "月结辅助", "depends_on", "x", 3)])}
+        out = merge_extractions([unit, prose], ext, entity_types=self.SCHEMA.entity_types,
+                                upper_parents=dict(self.SCHEMA.parent_types))
+        keys = {e["key"] for e in out["entities"]}
+        self.assertTrue({"月结辅助||编号:S01", "月结辅助||编号:S02", "月结辅助"} <= keys)      # 同名不同号:各成一个,只写名字的另成一个
+        ents, rels, stats = link_external_ids(out["entities"], out["relations"])
+        self.assertEqual(stats["external_id_mentions_linked"], 1)                 # 正文里的「S03」并到编号 S03 那一行
+        merged = next(e for e in ents if e["key"] == "报表问数")
+        self.assertIn("S03", merged["aliases"])
+        self.assertIn("s03", merged["member_keys"])
+
+
+class CorrectionsOverlayTests(unittest.TestCase):
+    """2026-10-24 更正文件(方案第 8、9 条):建图时套在抽取结果之上,重建后依然有效;写错的条目记进 errors,其余照常生效。
+    2026-10-25 起一个库一份 config/corrections/<kb_id>.yaml,跟着库的生命周期建删,不跟着图谱。"""
+
+    TEXT = """
+entities:
+  merge:
+    - [Acme Inc, Acme, ACME 公司]
+  separate:
+    - [苹果公司, 苹果]
+  aliases:
+    Acme Inc: [艾克米]
+  types:
+    张三: person
+    李四: nonexistent_type
+  reject: [噪声实体]
+relations:
+  reject:
+    - {source: 张三, predicate: works_for, target: Acme Inc}
+facts:
+  reject:
+    - {subject: Acme Inc, property: 价格}
+documents:
+  - {path: 2024/价格表.xlsx, status: superseded, superseded_by: 2025/价格表.xlsx}
+  - {path: 旧资料/, status: archived}
+  - {path: 合同/*.pdf, valid_until: 2024-12-31}
+  - {path: x.pdf, status: weird}
+"""
+
+    def _corr(self):
+        from kb_pipeline.graph.corrections import load_corrections
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "kb_009.yaml"          # 手写的文件可以不带文件头
+            path.write_text(self.TEXT, encoding="utf-8")
+            return load_corrections(path)
+
+    def test_one_file_per_library_with_a_template_and_an_owner_check(self) -> None:
+        from kb_pipeline.graph.corrections import (
+            corrections_path, corrections_sha, ensure_corrections_file, is_empty, load_corrections, reconcile_corrections_files,
+            remove_corrections_file)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = SimpleNamespace(corrections_dir=Path(tmp) / "corrections")
+            path = corrections_path(settings, "kb_004")
+            self.assertEqual(path, Path(tmp) / "corrections" / "kb_004.yaml")
+            self.assertIsNone(corrections_path(SimpleNamespace(), "kb_004"))           # 设置里没有更正目录:等于没有更正
+            made = ensure_corrections_file(settings, "kb_004", folder="Project Library: 2026", fresh=True)
+            self.assertTrue(made["created"])
+            self.assertIsNone(made["orphaned"])
+            corr = load_corrections(path)
+            self.assertTrue(is_empty(corr))                                          # 模板本身是空的更正,能解析
+            self.assertEqual(corr["errors"], [])
+            # 指纹按有效条目算:空模板与没有文件一样,已建好的图不会因为开库补了模板就重新合并;改注释也不算改动
+            self.assertEqual(corrections_sha(path), "")
+            self.assertEqual(corrections_sha(None), "")
+            path.write_text("kb:\n  id: kb_004\nentities:\n  reject: [噪声]\n", encoding="utf-8")
+            sha = corrections_sha(path)
+            self.assertNotEqual(sha, "")
+            path.write_text("# 改个注释\nkb:\n  id: kb_004\nentities:\n  reject: [噪声]   # 噪声实体\n", encoding="utf-8")
+            self.assertEqual(corrections_sha(path), sha)
+            self.assertFalse(ensure_corrections_file(settings, "kb_004", folder="Project Library")["created"])   # 重新开启:原样保留
+            self.assertEqual(load_corrections(path)["reject_entities"], ["噪声"])
+            # 整库初始化后编号从头再排:新编号第一次开库,同名的旧文件先挪开再写模板,旧库的更正不会套到新库上
+            again = ensure_corrections_file(settings, "kb_004", folder="别的库", fresh=True)
+            self.assertTrue(again["created"])
+            self.assertIn("噪声", Path(again["orphaned"]).read_text(encoding="utf-8"))
+            self.assertTrue(is_empty(load_corrections(path)))
+            # 文件头和文件名对不上:整份不套用
+            stray = settings.corrections_dir / "kb_005.yaml"
+            stray.write_text("kb:\n  id: kb_004\nentities:\n  reject: [噪声]\n", encoding="utf-8")
+            wrong = load_corrections(stray)
+            self.assertTrue(is_empty(wrong))
+            self.assertIn("kb_004", wrong["errors"][0])
+            # 每晚对账:登记着的缺文件补模板,登记表里没有的挪进 orphaned/,删到一半的留着
+            (settings.corrections_dir / "kb_007.yaml").write_text("documents: []\n", encoding="utf-8")
+            (settings.corrections_dir / "kb_008.yaml").write_text("documents: []\n", encoding="utf-8")
+            out = reconcile_corrections_files(settings, {"kb_004": "别的库", "kb_006": "新库"}, keep=["kb_008"])
+            self.assertEqual(out["created"], ["kb_006"])
+            self.assertEqual(sorted(Path(p).name.split("-")[0] for p in out["orphaned"]), ["kb_005", "kb_007"])
+            self.assertEqual(sorted(p.name for p in settings.corrections_dir.glob("*.yaml")),
+                             ["kb_004.yaml", "kb_006.yaml", "kb_008.yaml"])
+            self.assertEqual(remove_corrections_file(settings, "kb_006"), str(settings.corrections_dir / "kb_006.yaml"))
+            self.assertIsNone(remove_corrections_file(settings, "kb_006"))
+            self.assertEqual(reconcile_corrections_files(SimpleNamespace(), {"kb_004": "x"}), {})
+
+    def test_file_is_parsed_and_bad_entries_are_reported_not_fatal(self) -> None:
+        from kb_pipeline.graph.corrections import document_status, load_corrections, status_on
+
+        corr = self._corr()
+        self.assertEqual(corr["merge"], [["Acme Inc", "Acme", "ACME 公司"]])
+        self.assertEqual(len(corr["documents"]), 3)
+        self.assertTrue(any("weird" in e or "current / superseded" in e for e in corr["errors"]))
+        self.assertEqual(document_status("2024/价格表.xlsx", corr)["superseded_by"], "2025/价格表.xlsx")
+        self.assertEqual(status_on(document_status("旧资料/a/b.docx", corr), today="2026-10-24"), "archived")
+        self.assertEqual(status_on(document_status("合同/框架协议.pdf", corr), today="2026-10-24"), "superseded")   # 过了有效期
+        self.assertEqual(status_on(document_status("合同/框架协议.pdf", corr), today="2024-06-01"), "current")
+        self.assertIsNone(document_status("2025/价格表.xlsx", corr))
+        self.assertEqual(load_corrections(None)["merge"], [])
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "c.yaml"
+            bad.write_text("entities: [unclosed", encoding="utf-8")
+            self.assertTrue(load_corrections(bad)["errors"])
+
+    def test_entity_relation_and_fact_corrections_apply(self) -> None:
+        from kb_pipeline.graph.corrections import apply_entity_corrections, apply_fact_corrections, apply_relation_corrections
+
+        corr = self._corr()
+        ents = [{"key": k, "title": t, "type": ty, "frequency": f, "unit_ids": [], "aliases": [], "descriptions": []}
+                for k, t, ty, f in (("acme", "Acme", "org", 5), ("acme inc", "Acme Inc", "org", 1), ("acme 公司", "ACME 公司", "org", 1),
+                                    ("张三", "张三", "org", 2), ("噪声实体", "噪声实体", "org", 1), ("苹果公司", "苹果公司", "org", 3),
+                                    ("苹果", "苹果", "org", 3))]
+        rels = [{"source_key": "张三", "target_key": "acme inc", "predicate": "works_for", "directed": True, "descriptions": [], "strength_sum": 1, "evidence": 1, "unit_ids": []},
+                {"source_key": "噪声实体", "target_key": "acme", "predicate": "related_to", "directed": False, "descriptions": [], "strength_sum": 1, "evidence": 1, "unit_ids": []}]
+        out, rels2, stats, forbidden = apply_entity_corrections(ents, rels, corr, known_types=("org", "person"),
+                                                                upper_of=lambda t: "agent", path_of=lambda t: [t, "agent"])
+        by_title = {e["title"]: e for e in out}
+        self.assertNotIn("噪声实体", by_title)
+        self.assertEqual(stats["rejected_entities"], 1)
+        self.assertEqual((by_title["张三"]["type"], by_title["张三"]["type_path"]), ("person", ["person", "agent"]))
+        self.assertEqual(stats["unknown_types"], ["李四: nonexistent_type"])
+        acme = by_title["Acme Inc"]                                                # 规范名是更正里写的第一个
+        self.assertTrue({"Acme", "ACME 公司", "艾克米"} <= set(acme["aliases"]))
+        self.assertEqual(stats["forced_merges"], 2)
+        self.assertEqual(forbidden, {frozenset(("苹果公司", "苹果"))})
+        # 归并阶段守住禁止合并:模型判成同一个也不并
+        merged, _, rstats = resolution.merge_entities(out, rels2, [(next(i for i, e in enumerate(out) if e["title"] == "苹果公司"),
+                                                                     next(i for i, e in enumerate(out) if e["title"] == "苹果"))],
+                                                      forbidden=forbidden)
+        self.assertEqual(rstats["merged_away"], 0)
+        kept, dropped = apply_relation_corrections(rels2, out, corr)
+        self.assertEqual(dropped, 1)
+        facts = [{"subject": "Acme Inc", "property": "价格", "value": "100"}, {"subject": "Acme Inc", "property": "地址", "value": "x"}]
+        self.assertEqual([f["property"] for f in apply_fact_corrections(facts, corr)[0]], ["地址"])
+
+    def test_rows_from_only_non_current_documents_are_marked(self) -> None:
+        from kb_pipeline.graph.corrections import mark_document_status
+
+        corr = self._corr()
+        rows = [{"doc_ids": ["d1"]}, {"doc_ids": ["d1", "d2"]}, {"doc_id": "d3"}]
+        n = mark_document_status(rows, corr, rel_of_doc={"d1": "2024/价格表.xlsx", "d2": "2025/价格表.xlsx", "d3": "旧资料/x.pdf"},
+                                 today="2026-10-24")
+        self.assertEqual(n, 2)
+        self.assertEqual([r.get("doc_status") for r in rows], ["superseded", None, "archived"])   # 现行文档里也说过的还是现行
+        build = _repo_file("app/kb_pipeline/graph/build.py")
+        self.assertIn('out["corrections_changed"] = current_corr != str(base_manifest.get("corrections_sha") or "")', build)

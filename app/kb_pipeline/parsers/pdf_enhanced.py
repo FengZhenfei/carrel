@@ -10,6 +10,7 @@ from ..models import ParsedBlock
 from ..utils import count_tokens
 from .mineru_pdf import MinerUServiceError, mineru_pdf_blocks
 from .pdf_textlayer import mark_degraded_pages, repair_lost_text_layer
+from .pdf_longpage import prepare_long_pages, restore_page_coordinates
 from ..vision.vlm import compose_prompt
 from .table_check import high_confidence
 from .table_repair import repair_ambiguous_tables
@@ -54,7 +55,12 @@ def parse_pdf_enhanced(
     in the parse cache, never call MinerU."""
     print(f"[parser] pdf mineru start file={path.name}", flush=True)
     try:
-        blocks = mineru_pdf_blocks(mineru_url=mineru_url, path=path, cache_dir=cache_dir, timeout=timeout)
+        parse_path, segments = prepare_long_pages(path, cache_dir)
+        parse_cache = parse_path.parent if segments else cache_dir
+        blocks = mineru_pdf_blocks(mineru_url=mineru_url, path=parse_path, cache_dir=parse_cache, timeout=timeout)
+        if segments:
+            blocks = restore_page_coordinates(blocks, segments)
+            print(f"[parser] pdf long-page tiles={len(segments)} original_pages={len({s['page'] for s in segments})}", flush=True)
         print(f"[parser] pdf mineru done blocks={len(blocks)} file={path.name}", flush=True)
     except MinerUServiceError as exc:
         print(f"[parser] pdf mineru failed file={path.name} error={exc!r}", flush=True)
@@ -110,14 +116,20 @@ def parse_pdf_enhanced(
         stats = repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
                                         cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
         print(f"[parser] pdf table-repair {stats} file={path.name}", flush=True)
+    if segments:
+        # Keep re-parsed blocks distinct from the old whole-page OCR, even when
+        # source bytes did not change. No global route-profile bump: historical
+        # documents are upgraded by an explicit per-file reparse.
+        from .pdf_longpage import VERSION
+        for block in blocks:
+            block.block_id = f"{VERSION}-{block.block_id}"
     return blocks
 
 
 # ── Merging tables split across pages ─────────────────────────────────────────
-# MinerU emits tables per page: the part of a lab report continuing on the next page has no header
-# ("| Total protein | TP | 73.4 | ... |"), or the header is printed again. The fragment becomes a block
-# of its own, and rows without their header are meaningless (2026-09-07 health knowledge base audit:
-# 5 header-less tables in a 2026 check-up report). Two adjacent table blocks with the same column
+# MinerU emits tables per page: a continuation page may repeat or omit the header.
+# The fragment becomes a block of its own, and rows without their header lose context
+# (2026-09-07 evaluation: 5 header-less table fragments in one document). Two adjacent table blocks with the same column
 # count, on the same or consecutive pages, where the second has no title of its own and its first row
 # either equals the first table's header or looks like a data row, are merged back into the first.
 # Tables flagged for merged cells are not merged (screenshot verification aligns rows on the original
@@ -187,6 +199,13 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         prev.table_markdown = merged
         prev.text = merged
         prev.metadata.setdefault("merged_tables", []).append(block.block_id)
+        if (prev.metadata.get("source_tile") and block.metadata.get("source_tile")
+                and prev.page_idx == block.page_idx and prev.bbox and block.bbox):
+            # Two tiles can be portions of one physical page. The merged table
+            # must point to both regions, not only the first tile's rectangle.
+            prev.bbox = [min(prev.bbox[0], block.bbox[0]), min(prev.bbox[1], block.bbox[1]),
+                         max(prev.bbox[2], block.bbox[2]), max(prev.bbox[3], block.bbox[3])]
+            prev.metadata.setdefault("merged_source_tiles", []).append(dict(block.metadata["source_tile"]))
         if block.page_idx is not None:
             prev.metadata["page_end"] = block.page_idx
     return out
@@ -215,8 +234,7 @@ def merge_mineru_text_blocks(
     """Merge MinerU body blocks up to target_tokens; tables / images are not mergeable and act as the
     boundaries of the merge stream.
 
-    Rules at a boundary (refined after the 2026-09-05 sampling, see the chunking optimisation plan on
-    the desktop):
+    Rules at a boundary (refined after the 2026-09-05 sampling):
       - Title blocks and one short lead-in line at the tail of the buffer go to the following
         figure/table as its TITLE. A title block goes to it whether or not the figure/table has its own
         caption (the title names the section, the figure/table is the section's first content); a short

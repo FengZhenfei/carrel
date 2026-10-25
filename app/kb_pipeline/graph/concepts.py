@@ -6,9 +6,8 @@ underscores, restore LaTeX, symbol first) merges directly -> vector nearest neig
 pairs (only between concepts with compatible units) -> the model judges sameness in batches -> union-find.
 The concept key is derived from the representative name, so building the same corpus twice yields the same
 keys; the concept table is written into graph.json, facts carry concept / concept_key, and the timeline pages
-and reconciliation group by it. There are no domain words in the pipeline: the health KB folds "total
-cholesterol / TC / total cholesterol measurement result" into one concept and a datasheet folds
-"V_CC / VCC / Supply voltage" into one, using the same rules and the same judging.
+and reconciliation group by it. The same rules and judging apply across domains: for example, "length / L / measured length"
+and "V_CC / VCC / Supply voltage" each resolve to their respective concept.
 """
 from __future__ import annotations
 
@@ -84,14 +83,20 @@ def _identity_tokens(label: str, symbols: str = "") -> set[str]:
 
 
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+|[^\sA-Za-z0-9\u4e00-\u9fff]")
+_NUMBER_VALUE_RE = re.compile(r"^\s*[<>≤≥~约]?\s*[-+]?\d")
+
+
+def _numeric_fact(f: dict[str, Any]) -> bool:
+    """取值是不是一个量(数值、区间、带比较号的数):并概念时数值桶和文字结论桶(「增高」「阳性」)不能并成一条序列。"""
+    if any(f.get(k) is not None for k in ("value_num", "min_num", "typ_num", "max_num")):
+        return True
+    return bool(_NUMBER_VALUE_RE.match(str(f.get("value") or f.get("typ") or f.get("min") or f.get("max") or "")))
 
 
 def _contrast(a: str, b: str) -> bool:
-    """Two labels that differ by a single short token: left/right, I/II, +/-, mild/severe, vein/artery, v7 2407 /
-    v7 2407b. The names are alike enough, but the difference is exactly the token that tells them apart -- never
-    auto-merge, only the model may decide (2026-09-12: the health KB auto-merged corrected vision (right)/(left)
-    and pepsinogen I/II by cosine, the library KB the CG coefficients j=j1+1/2 and j=j1-1/2). Domain-independent:
-    looks at token form only."""
+    """Two labels differing by a short token can denote different concepts: left/right, I/II, +/-,
+    mild/severe or version suffixes. Do not auto-merge them by similarity alone.
+    The check uses token form and does not depend on a corpus or domain."""
     ta, tb = _TOKEN_RE.findall(str(a or "")), _TOKEN_RE.findall(str(b or ""))
     if not ta or not tb or ta == tb:
         return False
@@ -184,7 +189,7 @@ def _neighbour_pairs(vectors: list[list[float]], cands: list[dict[str, Any]], k:
     """For every candidate take the top-k neighbours by cosine within its comparable pool (same unit family plus
     the unit-less ones; everything when it has no unit itself); returns (i, j, sim) with i ascending and, within
     each i, (sim, j) descending -- the same order as the pairwise implementation.
-    2026-09-12, product-documentation KB: 48,201 facts and 12,933 concept candidates; pure-Python pairwise meant
+    2026-09-12 benchmark: 48,201 facts and 12,933 concept candidates; pure-Python pairwise meant
     167 million cosines, about 3 hours, with the build stuck motionless at "property concept normalisation"; this
     is now a blocked numpy matrix product (256 rows per block, 26 MB of memory) and takes seconds."""
     n = len(cands)
@@ -291,8 +296,8 @@ def build_concepts(
     stats: dict[str, Any] = {"facts": len(facts), "norms": 0, "concepts": 0, "auto_merged": 0, "asked_pairs": 0,
                              "judged_yes": 0, "judge_batches": 0, "judge_failed": 0, "skipped_llm": False,
                              "blocked_identity": 0, "measure_to_judge": 0, "contrast_to_judge": 0, "blocked_bridge": 0,
-                             "symbol_contained": 0, "symbol_to_judge": 0}
-    merges: list[dict[str, Any]] = []        # merge log: which two, which route, similarity (entity resolution had an audit; concept merging did not)
+                             "symbol_contained": 0, "symbol_to_judge": 0, "same_property_merged": 0}
+    merges: list[dict[str, Any]] = []        # 归并日志:并了哪两个、走的哪一路、相似度(实体归并有审计,概念归并过去没有)
     blocked: list[dict[str, Any]] = []
     groups: dict[str, dict[str, Any]] = {}
     for f in facts:
@@ -302,7 +307,7 @@ def build_concepts(
         slot = groups.get(norm)
         if slot is None:
             slot = groups[norm] = {"norm": norm, "labels": Counter(), "symbols": Counter(), "units": Counter(),
-                                   "count": 0, "docs": set(), "example": ""}
+                                   "count": 0, "numeric": 0, "docs": set(), "example": ""}
         slot["labels"][str(f.get("property") or "")] += 1
         if f.get("symbol"):
             slot["symbols"][str(f["symbol"])] += 1
@@ -310,6 +315,7 @@ def build_concepts(
         if unit:
             slot["units"][unit] += 1
         slot["count"] += 1
+        slot["numeric"] += int(_numeric_fact(f))
         if f.get("doc_id"):
             slot["docs"].add(str(f["doc_id"]))
         if not slot["example"]:
@@ -381,6 +387,32 @@ def build_concepts(
                 else:
                     stats["symbol_to_judge"] += 1
                     forced_ask.append((min(a, b), max(a, b)))
+
+    # 同一个属性名,有的事实写了符号、有的没写(「体重指数 BMI」与「体重指数」):分桶时有符号的按符号进桶,两边就成了
+    # 两个概念,后面的向量相似和判同也不一定并得回来。没写符号的桶并进那个写了符号的桶 —— 前提是这个属性名只对上一个
+    # 写了符号的桶(「电压 VCC / 电压 VDD」两个符号共用一个属性名时不知道归谁,不并),单位家族相容,也过 compatible()。
+    # 符号可有可无时,同一属性的跨文档序列仍应连贯。
+    with_symbol: dict[str, set[int]] = {}
+    for i, c in enumerate(cands):
+        if c["symbols"]:
+            for label in c["labels"]:
+                prop_norm = concept_norm(label)
+                if prop_norm:
+                    with_symbol.setdefault(prop_norm, set()).add(i)
+    for i, c in enumerate(cands):
+        targets = with_symbol.get(c["norm"]) if not c["symbols"] else None
+        if not targets or len(targets) != 1:
+            continue
+        j = next(iter(targets))
+        if c["unit"] and cands[j]["unit"] and _unit_family(c["unit"]) != _unit_family(cands[j]["unit"]):
+            continue
+        # 一边是数值、一边是文字结论时不并桶,否则同一时期会混入两种不同性质的取值。
+        if (c["numeric"] * 2 >= c["count"]) != (cands[j]["numeric"] * 2 >= cands[j]["count"]):
+            continue
+        if compatible(c, cands[j]) != "ok":
+            continue
+        if merge(i, j, "same_property"):
+            stats["same_property_merged"] += 1
 
     if embed is not None and len(cands) >= 2:
         texts = [f"{c['label']} ({c['symbols_text']})" if c["symbols_text"] else c["label"] for c in cands]

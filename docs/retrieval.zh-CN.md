@@ -19,13 +19,19 @@ python3 skills/carrel-search/scripts/carrel_search.py search \
 
 每条命令输出一份精简结果：检索状态、来源正文及其所在的文件和位置、事实、页面摘要、图谱线索和参考文件。精简掉的是各种 ID、分数和调试字段，正文不删；一次工具输出装不下时分页，`show <调用编号> --page 2` 取下一页。完整响应保存在工作目录里，每一条都有编号，后续命令用 `--ref <调用编号>:<条目编号>` 指向它，不必重抄 ID：`context --ref 3fa2c1:S3` 回读某条来源前后的原文，`context --ref 3fa2c1:S3 --whole` 通读它所在的整份文档，`neighbors --ref 3fa2c1:H1` 从某个主体沿图谱走一跳，`show 3fa2c1:F2` 打印某一条的全部字段。加 `--json` 则输出完整响应。
 
-Skill 检索一次就作答：先是答案，然后列出所依据的文件（从知识库一级目录开始的明文路径），最后给出几条带序号的追问，追问取自图谱线索。用户回一个序号，智能体就从对应的线索沿图谱走一跳，再答一次。要不要深挖由用户决定，首次回答不必等一轮多跳探索。
+Skill 从一次检索开始，依据证据作答，再列出参考文件和有用的图谱追问。当前问题缺少关键证据时，可定向补查一次事实或邻域。原图经查看后可配入回答，并标注原文档及图号或页码；低置信和读数冲突回到原文核对，历史摘要只作线索。整份文档通读用于用户明确要求的完整逐项核对，概括和范围比较使用已有证据及局部回读。
 
 一次回答要多久，主要取决于智能体的推理档位，而不是检索服务：检索几秒内返回，其余时间是智能体在阅读和思考，最高档的耗时是中等偏上档位的数倍。Claude Code 可以在 `SKILL.md` 的 frontmatter 里加一行 `effort:`（例如 `effort: high`）给这个 Skill 单独定档，只对调用 Skill 的那一轮生效；其他智能体按会话选择档位。
 
 令牌保存在客户端环境变量或独立令牌文件中。服务端使用 `KB_SEARCH_TOKEN`，客户端使用上述 `CARREL_` 变量。服务端没有设置令牌时，受保护接口只接受本机调用；`/health` 无需认证。
 
 运行中的服务每分钟重读一次 `config/knowledge-base.env` 里的 `KB_SEARCH_*`，改了令牌或参数一分钟内生效，无需重启，换下的旧令牌随即失效。监听地址和端口仍需重启才生效；在服务自身环境中显式设置的键优先于文件。
+
+## 时间与模式查询
+
+`/search`、`/graph/neighbors`、`/graph/facts` 和 `/graph/pages` 默认返回现行证据。传入 `history: true` 可包含被取代或过期的记录；`as_of: "2025-06-30"` 按指定日期回看，仅给年份或月份时取其最后一天。结果附带时间口径和状态。
+
+`POST /graph/schema` 接受 `kb_id`、可选的 `version` 和 `format`（`json` 或 `yaml`）。`POST /graph/stats` 接受 `kb_id`，返回图谱覆盖与类型统计；`/catalog` 也提供类型、关系、主体及时间覆盖摘要。配套客户端提供 `schema`、`stats`、`--history` 和 `--as-of`。
 
 ## HTTP 接口
 
@@ -47,6 +53,17 @@ Skill 检索一次就作答：先是答案，然后列出所依据的文件（�
 控制台在端口 9800 使用独立的 `/api` 管理接口，智能体通常连接端口 9810 的检索服务。
 
 目录缓存 `KB_SEARCH_CATALOG_TTL` 秒（默认 60），开启或关闭知识库时立即重建。只有库里还有活跃文档时 `has_graph` 才为 true。建目录时某个库的向量库读不出来（集合尚未创建按空库处理），该条目的 `chunks` 和 `has_graph` 为 `null` 并带 `degraded` 说明，检索照常尝试它的图谱，这份目录约 15 秒后重建。
+
+### 图文分路重排
+
+配置 `VISUAL_RERANKER_BASE_URL` 后，图片重排自动参与检索，`KB_SEARCH_RERANK` 统一控制两路，无需单独启用。未配置图片端点或没有图片候选时，沿用文本流程。
+
+- 总候选预算默认 64（`KB_SEARCH_RERANK_N`），截断前为图片保留最多 8 个位置（`KB_SEARCH_VISUAL_RERANK_N`）。文档状态和明确的检索范围通过检查后才读取缓存图片。
+- 文本与图片并行打分。图片模型接收缓存像素、有限长度的来源文字；图搜图时也接收查询图片。接口使用多模态 `/v1/rerank`，每批最多 4 张，图片阶段默认 15 秒，并受整次请求预算约束。
+- 两路独立判断相关性，图片阈值默认 0.5，更换模型时需重新核对阈值。图片评分成功后只进入图片分路；通过相关性判断的候选按 `1 / (KB_SEARCH_RRF_K + 名次)` 融合，同名次保留召回顺序，带图请求优先图片。文档与主体名额、去重、MMR 和上下文预算继续生效。
+- 图片缺失、超时或评分异常时回退文本并报告降级；图片低相关性仍保留为拒绝，不用高向量分将其重新接受。表格等类型偏好在各分路内、融合前应用。
+
+`retrieval_summary.ranking` 报告两路状态和评分数量，来源的 `ranking` 给出所属分路及名次。融合分是排名分，不是可信度概率。这些检索调整直接复用已有解析结果、索引和图谱。
 
 ### 检索
 
@@ -116,7 +133,7 @@ curl -sS http://127.0.0.1:9810/search \
 
 问题要求列出某一类的全部内容时（“所有产品”“这个器件的全部参数”）使用这两个接口；普通问题只用 `/search` 即可。
 
-`POST /graph/entities` 接受 `kb_id`，以及可选的 `types`、`parent_types`（上层类 `entity`、`part`、`property`、`process`、`standard`、`document`）、`name`（标题或别名中包含的文字）、`limit`（默认 50，最多 200）和 `offset`。实体按重要程度排序，每个实体带 `docs`（提及它最多的文档）和 `doc_count`。第一页同时返回 `types`，即该知识库各类型的实体数量。
+`POST /graph/entities` 接受 `kb_id`，以及可选的 `types`、`uppers`（上层类 `agent`、`entity`、`part`、`property`、`process`、`event`、`concept`、`document`）、`kind`（`all`、`instance` 或 `class`）、`name`（标题、别名或外部标识中包含的文字）、`limit`（默认 50，最多 200）和 `offset`。实体按重要程度排序，每个实体带 `docs`（提及它最多的文档）和 `doc_count`。第一页同时返回 `types`，即该知识库各类型的实体数量。
 
 `POST /graph/facts` 接受 `kb_id`、主体名称 `subject` 或 `subject_id`、可选的 `property`（属性名、符号或概念名）、`match`（`auto`、`exact` 或 `contains`）、以 `doc_id` 或 `rel_path` 指定的文档、`conflict_only`、`limit` 和 `offset`。主体、属性、文档、`conflict_only` 至少提供一个，多个条件取交集。返回行的结构与 `/search` 的 `specs` 相同，并带 `evidence` 列表，其中的位置可用于 `/context`；每行有值时另带 `subject_id`（事实所属的实体）、`doc_id`（事实出自的文档）和 `concept_key`，取不到值的字段直接省略（不挂在任何实体下的事实没有 `subject_id`，没有记录来源文档的事实没有 `doc_id`）。
 
@@ -172,7 +189,7 @@ curl -sS http://127.0.0.1:9810/search \
 
 首先检查 `retrieval_summary.evidence_state`：`accepted`、`diagnostic` 或 `unranked`。当 `no_relevant_content=true` 时，返回的候选不足以支持答案。重排不可用时可能返回 `unranked`；服务错误与不可用通道会在诊断字段中单独报告。
 
-事实、页面、实体和关系还需检查 `verified` 和 `sources_active`；实体和关系按代表性来源点核验，每份文档一个。文档删除或重新解析后，图谱要到下一个版本才会跟上；在此之前，来源全部失效的条目标为 `verified=false`，不能作为现行依据，这类事实不给线索，这类页面不附正文。来源点未能核验的条目不做标记。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。返回的事实按序列归组。
+事实、页面、实体和关系还需检查 `verified` 和 `sources_active`；实体和关系按代表性来源点核验，每份文档一个。文档删除或重新解析后，图谱要到下一个版本才会跟上；在此之前，来源全部失效的条目标为 `verified=false`，不能作为现行依据，这类事实不给线索，这类页面不附正文。来源点未能核验的条目不做标记。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。序列包含指定时间口径内已登记的时间档位，也可以补入未进入本次事实排序结果的档位。
 
 `text_truncated` 表示可能需要补取原文，`stitched.pieces` 给出拼接片段的位置。来源正文受 `KB_SEARCH_CONTEXT_TOKENS` 限制，编译页面另受 `KB_SEARCH_PAGE_TEXT_TOKENS` 限制，这两个预算独立于 `top_k`。被省略的条件、表头或上下文影响结论时，可调用 `/context` 补取。
 

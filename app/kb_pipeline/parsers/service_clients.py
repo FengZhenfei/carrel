@@ -18,6 +18,19 @@ def _local_service_session() -> requests.Session:
     return session
 
 
+def valid_mineru_result(payload: Any) -> bool:
+    """Only document output is cacheable; metadata/error messages are not content."""
+    if not isinstance(payload, dict):
+        return False
+    if extract_markdown(payload):
+        return True
+    from .common import item_text, walk_dicts
+
+    content = extract_content_list(payload)
+    items = content or [x for x in walk_dicts(payload) if x.get("type") or x.get("label")]
+    return any(item_text(x) or x.get("img_path") or x.get("image_path") for x in items)
+
+
 def _load_cached_mineru(output_json: Path, input_path: Path, backend: str) -> dict[str, Any] | None:
     """Reuse the previous MinerU result. Accepted only when the source-file size and the backend of the
     request, both recorded in the cache, match the current ones (the cache directory is already isolated
@@ -42,7 +55,7 @@ def _load_cached_mineru(output_json: Path, input_path: Path, backend: str) -> di
             return None
         if stamp.get("backend") not in (None, backend):
             return None
-    return payload
+    return payload if valid_mineru_result(payload) else None
 
 
 def call_mineru_sync(
@@ -106,7 +119,9 @@ def call_mineru_sync(
     assert response is not None
     response.raise_for_status()
     payload = response.json()
-    try:   # source stamp: used to confirm that neither the file nor the backend has changed before reusing the cache
+    if not valid_mineru_result(payload):
+        raise RuntimeError("MinerU returned no valid document content; response was not cached")
+    try:   # 来源标记:复用缓存前用它确认文件没换过、后端没换过
         payload["_kb_source"] = {"name": input_path.name, "size": int(input_path.stat().st_size), "backend": backend}
     except (OSError, TypeError):
         pass
@@ -155,7 +170,9 @@ def _find_first_string(value: Any, keys: Sequence[str]) -> str:
             found = value.get(key)
             if isinstance(found, str) and found.strip():
                 return found
-        for found in value.values():
+        for key, found in value.items():
+            if str(key).startswith("_kb_"):
+                continue
             result = _find_first_string(found, keys)
             if result:
                 return result
@@ -173,7 +190,9 @@ def _find_first_list(value: Any, keys: Sequence[str]) -> list[Any]:
             found = value.get(key)
             if isinstance(found, list):
                 return found
-        for found in value.values():
+        for key, found in value.items():
+            if str(key).startswith("_kb_"):
+                continue
             result = _find_first_list(found, keys)
             if result:
                 return result
@@ -191,7 +210,9 @@ def _find_first_dict(value: Any, keys: Sequence[str]) -> dict[str, Any]:
             found = value.get(key)
             if isinstance(found, dict):
                 return found
-        for found in value.values():
+        for key, found in value.items():
+            if str(key).startswith("_kb_"):
+                continue
             result = _find_first_dict(found, keys)
             if result:
                 return result

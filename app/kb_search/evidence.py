@@ -55,9 +55,9 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "boilerplate": bool(cand.get("boilerplate")) or is_boilerplate(payload),
         "bucket": cand.get("bucket"),
         "degraded": payload.get("degraded"),      # parse-time degradation reason (e.g. text_layer_cjk_lost), distinct from the channel-level degraded list
-        "accepted": cand.get("accepted"),
+        "accepted": cand.get("accepted"), "ranking": cand.get("ranking"),
     }
-    for key in ("score_rerank", "score_final"):
+    for key in ("score_rerank", "score_rerank_visual", "score_fusion", "score_final"):
         if cand.get(key) is not None:
             row["scores"][key] = cand[key]
     return row
@@ -423,8 +423,11 @@ def spec_rows(specs: list[dict[str, Any]], *, source_ns: dict[str, int], limit_h
             hints_given += 1
         row["hint"] = hint
         key = str(sp.get("series_key") or "")
-        if key and len(series.get(key, [])) > 1:
-            members = sorted(series[key], key=lambda x: (str(x.get("valid_from") or x.get("when") or ""), int(x.get("series_index") or 0)))
+        # 序列的全部档位:图召回 / 查事实接口另外取回来的(series_members,现行口径下更早的档位不在 specs 里),没有就用同批里的
+        members = list(sp.get("series_members") or series.get(key, [])) if key else []
+        row.pop("series_members", None)
+        if len(members) > 1:
+            members.sort(key=lambda x: (int(x.get("series_index") or 0), str(x.get("valid_from") or x.get("when") or "")))
             row["series_text"] = "、".join(f"{_value_repr(m)}({m.get('when') or m.get('valid_from') or '?'})" for m in members)
         conflict = bool(sp.get("conflict_group")) or bool(sp.get("evidence_conflict"))
         row["conflict"] = conflict

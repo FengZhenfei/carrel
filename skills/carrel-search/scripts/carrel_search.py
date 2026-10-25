@@ -42,6 +42,35 @@ INDEX_LINE_RE = re.compile(r"^(ENTITIES|KEYWORDS):", re.I)      # index fodder o
 
 # Wording of the compact view.
 TXT = {
+    "scope_as_of": "Scope: as of {day} (relations, facts and documents)",
+    "scope_history": "Scope: all history, including superseded, expired and archived evidence",
+    "excluded_docs": "Document status excluded {n} documents; use --history or --as-of for past records",
+    "hidden": "{n} other records are outside the current scope; use --history or --as-of to include past records",
+    "hidden_as_of": "{n} other records are outside the scope for {day}; use --history for all records",
+    "doc_date": "document date {d}",
+    "status_superseded": "superseded by a later statement",
+    "status_ended": "ended (the stated end date has passed)",
+    "status_not_started": "not yet started on that date",
+    "status_doc_superseded": "source document superseded",
+    "status_doc_archived": "source document archived",
+    "period": "{a}–{b}",
+    "since": "since {a}",
+    "until": "until {b}",
+    "seen": "observed {a}",
+    "seen_range": "observed {a} to {b}",
+    "kind_class": "class",
+    "ext_ids": "identifiers {ids}",
+    "overview": "  Graph overview: {docs} documents · {span} · {entities} entities · {facts} facts",
+    "overview_types": "  Main types (entities / documents): {items}",
+    "overview_predicates": "  Common relations: {items}",
+    "overview_subjects": "  Core subjects: {items}",
+    "span": "{a} to {b}",
+    "schema_head": "Schema {id} ({origin}) · graph built with {built} · selected in console {active}",
+    "schema_upper": "{upper}: {items}",
+    "schema_preds": "Relations: {items}",
+    "schema_single": "single-valued",
+    "schema_yaml": "LinkML source: schema --kb {kb} --format yaml --output new-file",
+    "stats_line": "{k}: {v}",
     "call": "call {id} · {op}",
     "kb": "knowledge base: {names}",
     "ref_hint": "Point at an entry as {id}:{label} after --ref: context (read the original), image / crop (see the picture), neighbors (walk the graph), facts (facts under it); show {id}:{label} prints its full text or every field",
@@ -91,7 +120,7 @@ TXT = {
     "same_file": "same file as {label}",
     "conflict": "conflict",
     "stale": "sources no longer active",
-    "series": "series: {text}",
+    "series": "Historical series summary available (per-entry quality is missing; values are omitted from this view and retained in the full response). Compare independent facts or source text; query historical facts when needed.",
     "sources_active": "sources active {x}",
     "more_docs": "(one of {n} documents)",
     "hoods": "One-hop neighbourhood of the subjects (→ points at the object, — is undirected; the number in brackets is the far end's own relation count):",
@@ -113,7 +142,7 @@ TXT = {
     "no_evidence": "no evidence text retrieved",
     "total_page": "{total} in all, this page {first}–{last}",
     "has_more": "more: --offset {offset}",
-    "types": "entities per type (--type takes the type name; the upper class in brackets goes with --parent-type): {items}",
+    "types": "Entities per type (--type includes subtypes; --upper filters the upper class; --kind instance selects concrete instances): {items}",
     "properties": "properties: {items}",
     "subject": "subject {title} ({type})",
     "property": "property \"{query}\" matched by {matched}, {concepts} concepts",
@@ -422,9 +451,28 @@ def fact_body(row):
     """"subject · property = value unit @ conditions · time", the form of the service's hint, also for the rows the
     service gave no hint (it composes one for the first few facts only); the stored text when the value is not a
     single one."""
+    unresolved = bool(row.get("evidence_conflict")) or row.get("quality") == "ambiguous_source"
+    if unresolved:
+        head = TXT["dot"].join(str(x).strip() for x in (row.get("subject"), row.get("property") or row.get("concept")) if x)
+        conflict = row.get("evidence_conflict")
+        readings = []
+        if isinstance(conflict, dict):
+            for key, label in (("text_value", "text reading"), ("model_value", "extracted reading")):
+                if conflict.get(key) not in (None, ""):
+                    readings.append(label + ":" + str(conflict[key]))
+        if not readings:
+            value = row.get("value")
+            readings.append("original extracted value: " + str(value) if value not in (None, "") else str(row.get("text") or "reading not provided"))
+        unit = str(row.get("unit") or "").strip()
+        when = str(row.get("when") or row.get("valid_from") or "").strip()
+        detail = "; ".join(readings)
+        body = head + " · Awaiting verification (" + detail + (" " + unit if unit and unit.casefold() not in detail.casefold() else "") + ")"
+        if row.get("conditions_text"):
+            body += " @ " + str(row["conditions_text"]).strip()
+        return body + (" · " + when if when else "")
     if row.get("hint"):
         return row["hint"]
-    value = str(row.get("value") or "").strip()
+    value = "" if row.get("value") is None else str(row["value"]).strip()
     if not value or not row.get("subject"):
         return row.get("text")
     unit = str(row.get("unit") or "").strip()
@@ -436,11 +484,43 @@ def fact_body(row):
     return body + (TXT["dot"] + when if when else "")
 
 
+STATUS_TXT = {"superseded": "status_superseded", "ended": "status_ended", "not_started": "status_not_started",
+              "doc_superseded": "status_doc_superseded", "doc_archived": "status_doc_archived"}
+
+
+def status_flag(row):
+    """A fact or relation the service marks as not in effect (only listed with --history, or looking back with --as-of)."""
+    key = STATUS_TXT.get(str(row.get("status") or ""))
+    return TXT[key] if key else ""
+
+
 def fact_line(row):
     flags = [TXT["conflict"]] if row.get("conflict") else []
+    if row.get("evidence_conflict"):
+        flags.append("reading conflict; check source")
+    if row.get("comparable") is False:
+        flags.append("not directly comparable numerically")
+    if str(row.get("confidence") or "").lower() == "low":
+        flags.append("low confidence; check source")
     if row.get("verified") is False:
         flags.append(TXT["stale"])
+    if status_flag(row):
+        flags.append(status_flag(row))
     return flat(fact_body(row)) + "".join(" [" + f + "]" for f in flags)
+
+
+def relation_time(row):
+    """When a relation holds and when it was seen: the period the text states, and the dates of the documents it is in."""
+    bits = []
+    a, b = row.get("valid_from"), row.get("valid_until")
+    if a and b:
+        bits.append(TXT["period"].format(a=a, b=b))
+    elif a or b:
+        bits.append(TXT["since"].format(a=a) if a else TXT["until"].format(b=b))
+    first, last = row.get("observed_first"), row.get("observed_last")
+    if first:
+        bits.append(TXT["seen"].format(a=first) if not last or last == first else TXT["seen_range"].format(a=first, b=last))
+    return bits
 
 
 def cited(body, cite):
@@ -482,8 +562,23 @@ def forget(headers, label):
         del headers[line]
 
 
+def scope_lines(t):
+    """Which time scope a search ran in, and how many documents the current scope left out."""
+    out = []
+    if t.get("mode") == "as_of":
+        out.append(TXT["scope_as_of"].format(day=t.get("day")))
+    elif t.get("mode") == "history":
+        out.append(TXT["scope_history"])
+    n = sum(int(v or 0) for v in (t.get("excluded_documents") or {}).values())
+    if n:
+        out.append(TXT["excluded_docs"].format(n=n))
+    return out
+
+
 def source_notes(s, ref, parent=None, position=False):
     notes = []
+    if s.get("doc_status") in ("superseded", "archived"):
+        notes.append(TXT["status_doc_archived" if s["doc_status"] == "archived" else "status_doc_superseded"])
     if parent is not None:
         notes.append(TXT["neighbor_of"].format(label=parent))
     elif s.get("accepted") is False:
@@ -510,6 +605,8 @@ def source_notes(s, ref, parent=None, position=False):
         if st.get("chunk_from") is not None and st.get("chunk_to") is not None and st["chunk_to"] != st["chunk_from"]:
             k = str(int(st["chunk_from"]) + 1) + "–" + str(int(st["chunk_to"]) + 1)
         notes.append(TXT["position"].format(k=k, n=s["chunk_total"]))
+    if position and s.get("doc_date"):
+        notes.append(TXT["doc_date"].format(d=s["doc_date"]))
     return notes
 
 
@@ -542,6 +639,13 @@ def view_search(envelope, limit=PAGE_BYTES):
         out.append(TXT["rel_path_none"].format(paths=TXT["list"].join(missed)))
     if summary.get("degraded"):
         out.append(TXT["degraded"].format(items="; ".join(str(x) for x in summary["degraded"])))
+    ranking = summary.get("ranking") or {}
+    if ranking.get("method") == "rrf":
+        visual_status = (ranking.get("visual") or {}).get("status")
+        out.append("Ranking: text/image fusion" + (" · partial image rerank failure; missing scores fall back to text" if visual_status == "partial" else ""))
+    elif (ranking.get("visual") or {}).get("status") == "skipped":
+        out.append("Ranking: image reranking unavailable; text fallback")
+    out += scope_lines(summary.get("time") or {})
     routing = summary.get("routing") or {}
     if routing.get("weak"):
         out.append(TXT["routing_weak"])
@@ -565,7 +669,8 @@ def view_search(envelope, limit=PAGE_BYTES):
             tail.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"), row)))
             files.add(label, row.get("file"))
             if row.get("series_text"):
-                tail.append("     " + TXT["series"].format(text=flat(row["series_text"])))
+                # The summary drops per-member quality; retain values only in the full payload.
+                tail.append("     " + TXT["series"])
     pages = r.get("pages") or []
     if any(row.get("kind") != "source" or row.get("text") for row in pages):
         tail += ["", TXT["sec_pages"]]
@@ -608,7 +713,7 @@ def view_search(envelope, limit=PAGE_BYTES):
         tail.append(TXT["entities"] + " " + TXT["dot"].join(lines))
     seen, lines = set(), []
     for x in relations:
-        text = link(x)
+        text = link(x) + (" [" + status_flag(x) + "]" if status_flag(x) else "")
         if text not in seen and len(lines) < GRAPH_LIST_MAX:
             seen.add(text)
             lines.append("[R" + str(x.get("n")) + "] " + text)
@@ -716,6 +821,7 @@ def view_neighbors(envelope, limit=PAGE_BYTES):
                                                facts=center.get("facts")))]
     if r.get("predicates"):
         out.append(TXT["kinds"].format(items=TXT["dot"].join(str(k.get("type")) + " " + str(k.get("count")) for k in r["predicates"])))
+    out += time_lines(r.get("time") or {})
     if r.get("matches"):
         out.append(also_named(r["matches"]))
     if r.get("neighbors"):
@@ -724,8 +830,9 @@ def view_neighbors(envelope, limit=PAGE_BYTES):
     for x in r.get("neighbors") or []:
         label = "N" + str(x.get("n"))
         other = x.get("other") or {}
+        notes = relation_time(x) + ([status_flag(x)] if status_flag(x) else []) + ([TXT["violation"]] if x.get("type_violation") else [])
         out.append("[" + label + "] " + arrow(x) + " " + str(other.get("title")) + par(other.get("type"), TXT["relations_n"].format(n=other.get("degree")))
-                   + notes_of([TXT["violation"]] if x.get("type_violation") else []))
+                   + notes_of(notes))
         ev = next((e for e in x.get("evidence") or [] if e.get("excerpt")), None) or next(iter(x.get("evidence") or []), None)
         if ev is None:
             out.append("     " + TXT["no_evidence"])
@@ -747,6 +854,19 @@ def view_neighbors(envelope, limit=PAGE_BYTES):
     return out + files.lines() + (["", TXT["next_hop"]] if r.get("neighbors") else [])
 
 
+def time_lines(t):
+    """The time scope of a graph lookup and how many rows it left out."""
+    out = []
+    if t.get("mode") == "as_of":
+        out.append(TXT["scope_as_of"].format(day=t.get("day")))
+    elif t.get("mode") == "history":
+        out.append(TXT["scope_history"])
+    if t.get("hidden"):
+        key = "hidden_as_of" if t.get("mode") == "as_of" else "hidden"
+        out.append(TXT[key].format(n=t["hidden"], day=t.get("day")))
+    return out
+
+
 def page_bits(r, count):
     offset = int(r.get("offset") or 0)
     bits = [TXT["total_page"].format(total=r.get("total"), first=offset + 1 if count else 0, last=offset + count)]
@@ -760,13 +880,15 @@ def view_entities(envelope, limit=PAGE_BYTES):
     rows = r.get("entities") or []
     out = [head(envelope, *page_bits(r, len(rows)))]
     if r.get("types"):
-        out.append(TXT["types"].format(items=TXT["dot"].join(str(t.get("type")) + " " + str(t.get("count")) + par(t.get("parent_type")) for t in r["types"])))
+        out.append(TXT["types"].format(items=TXT["dot"].join(str(t.get("type")) + " " + str(t.get("count")) + par(t.get("upper")) for t in r["types"])))
     out.append(TXT["ref_hint"].format(id=envelope["call_id"], label="E3") if rows else TXT["no_rows"])
     cites, files = Cites(), Files()
     for e in rows:
         label = "E" + str(e.get("n"))
         docs = e.get("docs_cite") or []
-        out.append(cited("[" + label + "] " + str(e.get("title")) + par(e.get("type"), TXT["relations_n"].format(n=e.get("degree")),
+        ids = TXT["ext_ids"].format(ids=TXT["list"].join(str(x) for x in e["external_ids"])) if e.get("external_ids") else ""
+        out.append(cited("[" + label + "] " + str(e.get("title")) + par(e.get("type"), TXT["kind_class"] if e.get("kind") == "class" else "", ids,
+                                                                        TXT["relations_n"].format(n=e.get("degree")),
                                                                         TXT["docs_n"].format(n=e.get("doc_count"))),
                          cites.put(label, docs[0]) if docs else ""))
         files.add(label, next(iter(e.get("docs_file") or []), None))
@@ -786,6 +908,7 @@ def view_facts(envelope, limit=PAGE_BYTES):
     out = [head(envelope, *(parts + page_bits(r, len(rows))))]
     if r.get("degraded"):
         out.append(TXT["degraded"].format(items="; ".join(str(x) for x in r["degraded"])))
+    out += time_lines(r.get("time") or {})
     if r.get("matches"):
         out.append(also_named(r["matches"]))
     if r.get("properties"):
@@ -797,7 +920,7 @@ def view_facts(envelope, limit=PAGE_BYTES):
         out.append(cited("[" + label + "] " + fact_line(row), cites.put(label, row.get("cite"), row)))
         files.add(label, row.get("file"))
         if row.get("series_text"):
-            out.append("     " + TXT["series"].format(text=flat(row["series_text"])))
+            out.append("     " + TXT["series"])
     return out + files.lines() + (["", TXT["next_hop"]] if rows and r.get("subject") else [])
 
 
@@ -806,14 +929,90 @@ def view_catalog(envelope, limit=PAGE_BYTES):
     for kb in (envelope["result"].get("kbs") or []):
         out.append(TXT["catalog_kb"].format(kb=kb.get("kb_id"), name=kb.get("name"), docs=kb.get("docs"), chunks=kb.get("chunks"),
                                             graph=TXT["graph_yes"] if kb.get("has_graph") else TXT["graph_no"]))
-        for key in ("domain", "subject_types", "entity_types", "docs_sample"):
+        for key in ("domain", "subject_types", "docs_sample"):
             if kb.get(key):
                 out.append("  " + key + ": " + flat(kb[key] if isinstance(kb[key], str) else json.dumps(kb[key], ensure_ascii=False), 400))
+        ov = kb.get("overview") or {}
+        if ov:
+            span = ov.get("time_span") or {}
+            out.append(TXT["overview"].format(docs=ov.get("documents"), span=TXT["span"].format(a=span.get("from") or "?", b=span.get("to") or "?"),
+                                              entities=ov.get("entities"), facts=ov.get("facts")))
+            if ov.get("types"):
+                out.append(TXT["overview_types"].format(items=TXT["dot"].join(
+                    str(t.get("type")) + par(t.get("upper")) + " " + str(t.get("entities")) + "/" + str(t.get("docs")) for t in ov["types"])))
+            if ov.get("predicates"):
+                out.append(TXT["overview_predicates"].format(items=TXT["dot"].join(
+                    str(p.get("predicate")) + par(p.get("pair")) + " " + str(p.get("edges")) for p in ov["predicates"])))
+            if ov.get("subjects"):
+                out.append(TXT["overview_subjects"].format(items=TXT["list"].join(str(x) for x in ov["subjects"])))
+        elif kb.get("entity_types"):
+            out.append("  entity_types: " + flat(json.dumps(kb["entity_types"], ensure_ascii=False), 400))
+    return out
+
+
+def view_schema(envelope, limit=PAGE_BYTES):
+    r = envelope["result"]
+    summary = r.get("summary") or {}
+    out = [head(envelope, TXT["schema_head"].format(id=r.get("schema_id"), origin=r.get("origin"), built=r.get("graph_schema_id") or "-",
+                                                    active=r.get("active_schema_id") or "-"))]
+    if r.get("domain"):
+        out.append("domain: " + flat(r["domain"], 300))
+    by_upper = {}
+    for t in summary.get("types") or []:
+        if t.get("abstract"):
+            continue
+        parent = "" if t.get("is_a") == t.get("upper") else str(t.get("is_a"))
+        scope = "" if (t.get("scope") or "global") == "global" else str(t.get("scope"))
+        by_upper.setdefault(str(t.get("upper")), []).append(str(t.get("name")) + par(parent, scope))
+    for upper, items in by_upper.items():
+        out.append(TXT["schema_upper"].format(upper=upper, items=TXT["list"].join(items)))
+    preds = []
+    for p in summary.get("predicates") or []:
+        ends = "/".join(p.get("source_parents") or ["*"]) + " → " + "/".join(p.get("target_parents") or ["*"])
+        preds.append(str(p.get("name")) + par(ends, TXT["schema_single"] if p.get("multivalued") is False else ""))
+    if preds:
+        out.append(TXT["schema_preds"].format(items=TXT["semi"].join(preds)))
+    if r.get("linkml_yaml"):
+        out += ["", str(r["linkml_yaml"])]
+    else:
+        out.append(TXT["schema_yaml"].format(kb=r.get("kb_id")))
+    return out
+
+
+def view_stats(envelope, limit=PAGE_BYTES):
+    st = (envelope["result"] or {}).get("stats") or {}
+    out = [head(envelope, "graph " + str((envelope["result"] or {}).get("graph_version")))]
+    span = st.get("time_span") or {}
+    out.append(TXT["overview"].format(docs=st.get("documents"), span=TXT["span"].format(a=span.get("from") or "?", b=span.get("to") or "?"),
+                                      entities=(st.get("entities") or {}).get("total"), facts=(st.get("facts") or {}).get("total")).strip())
+    for key in ("entities", "relations", "facts"):
+        if st.get(key):
+            out.append(key + ": " + flat(json.dumps({k: v for k, v in st[key].items() if k != "properties"}, ensure_ascii=False), 600))
+    if st.get("types"):
+        out.append("types: " + TXT["dot"].join(
+            str(t.get("type")) + par(t.get("upper")) + " " + str(t.get("entities")) + "/" + str(t.get("docs")) + "/" + str(t.get("weeks"))
+            + ("" if t.get("in_schema", True) else "*") for t in st["types"]))
+    if st.get("predicates"):
+        out.append("predicates: " + TXT["dot"].join(
+            str(p.get("predicate")) + " " + str(p.get("edges")) + par(TXT["list"].join(
+                str(x.get("source_type")) + "→" + str(x.get("target_type")) + " " + str(x.get("count")) for x in p.get("pairs") or []))
+            for p in st["predicates"]))
+    props = (st.get("facts") or {}).get("properties") or []
+    if props:
+        out.append("properties: " + TXT["dot"].join(str(x.get("property")) + " " + str(x.get("facts")) + "/" + str(x.get("subjects")) for x in props))
+    if st.get("subjects"):
+        out.append("subjects: " + TXT["list"].join(str(x.get("title")) + par(x.get("type"), x.get("first_seen"), x.get("last_seen")) for x in st["subjects"]))
+    if st.get("alias_clusters"):
+        out.append("aliases: " + TXT["semi"].join(str(x.get("title")) + "=" + TXT["list"].join(str(a) for a in x.get("aliases") or [])
+                                                 for x in st["alias_clusters"]))
+    un = st.get("unclassified") or {}
+    if un.get("types_outside_schema") or un.get("frequent_related_to"):
+        out.append("unclassified: " + flat(json.dumps(un, ensure_ascii=False), 800))
     return out
 
 
 VIEWS = {"search": view_search, "context": view_context, "neighbors": view_neighbors, "entities": view_entities, "facts": view_facts,
-         "catalog": view_catalog}
+         "catalog": view_catalog, "schema": view_schema, "stats": view_stats}
 
 
 BLOCK_RE = re.compile(r"^(\[(?:[0-9a-f]{6}:)?[A-Z]\d+(?:\.\d+)?\] |▶ )")
@@ -945,6 +1144,7 @@ def payload(args, work=None):
             data["hints"] = hints
         if args.top_k is not None:
             data["top_k"] = args.top_k
+        time_scope(args, data)
         if args.no_context:
             data["context"] = False
         if args.explain:
@@ -1005,6 +1205,7 @@ def payload(args, work=None):
             data["types"] = args.type
         if args.direction:
             data["direction"] = args.direction
+        time_scope(args, data)
         if not data.get("kb_id") or not (data.get("entity") or data.get("entity_id")):
             raise ValueError("neighbors requires --ref, or --kb with one of --entity / --entity-id")
     if args.command in ("entities", "facts"):
@@ -1016,22 +1217,53 @@ def payload(args, work=None):
         for key in ("limit", "offset"):
             if getattr(args, key) is not None:
                 data[key] = getattr(args, key)
-        if not data.get("kb_id"):
-            raise ValueError(args.command + " requires --kb" + (" or --ref" if args.command == "facts" else ""))
+        if not data.get("kb_id") and not (args.command == "facts" and getattr(args, "in_doc", None)):
+            raise ValueError(args.command + " requires --kb" + (" or --ref / --in-doc" if args.command == "facts" else ""))
     if args.command == "entities":
         if args.type:
             data["types"] = args.type
-        if args.parent_type:
-            data["parent_types"] = args.parent_type
+        if getattr(args, "upper", None):
+            data["uppers"] = args.upper
+        if getattr(args, "kind", None):
+            data["kind"] = args.kind
         if args.name:
             data["name"] = args.name
     if args.command == "facts":
-        for key, field in (("subject", "subject"), ("subject_id", "subject_id"), ("property", "property"), ("match", "match")):
-            if getattr(args, key):
+        for key, field in (("subject", "subject"), ("subject_id", "subject_id"), ("property", "property"), ("match", "match"),
+                           ("rel_path", "rel_path")):
+            if getattr(args, key, None):
                 data[field] = getattr(args, key)
-        if not (data.get("subject") or data.get("subject_id") or data.get("property")):
-            raise ValueError("facts requires at least one of --ref / --subject / --subject-id / --property")
+        if getattr(args, "in_doc", None):
+            kb, row = chunk_of(*resolve(work, args.in_doc)[:3])
+            within([data["kb_id"]] if data.get("kb_id") else [], kb, "--in-doc " + args.in_doc)
+            if not row.get("doc_id"):
+                raise ValueError("the referenced entry carries no document id: " + args.in_doc)
+            data["kb_id"], data["doc_id"] = kb, row["doc_id"]
+        if getattr(args, "conflict_only", False):
+            data["conflict_only"] = True
+        time_scope(args, data)
+        if not any(data.get(k) for k in ("subject", "subject_id", "property", "doc_id", "rel_path", "conflict_only")):
+            raise ValueError("facts requires at least one of --ref / --subject / --subject-id / --property / --in-doc / --rel-path / --conflict-only")
+    if args.command in ("schema", "stats"):
+        if args.kb:
+            data["kb_id"] = args.kb
+        if args.command == "schema":
+            if args.format:
+                data["format"] = args.format
+            if args.version:
+                data["version"] = args.version
+        if not data.get("kb_id"):
+            raise ValueError(args.command + " requires --kb")
     return data
+
+
+def time_scope(args, data):
+    """--history / --as-of: relations, facts and documents not in effect today (replaced by a newer statement, past their
+    validity, from a document marked replaced or archived) are left out unless asked for."""
+    if getattr(args, "history", False):
+        data["history"] = True
+    if getattr(args, "as_of", None):
+        data["as_of"] = args.as_of
 
 
 def request(url, token, timeout, method, route, data=None):
@@ -1110,7 +1342,7 @@ def parser():
     p.add_argument("--timeout", type=float, help="HTTP timeout seconds (default 60); no automatic retries")
     sub = p.add_subparsers(dest="command", required=True)
     ref_help = "An entry of an earlier response: <call id>:<label>, e.g. 3fa2c1:S3"
-    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors", "entities", "facts", "show"):
+    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors", "entities", "facts", "schema", "stats", "show"):
         cmd = sub.add_parser(name)
         if name == "show":
             cmd.add_argument("refs", nargs="+", help="A call id (prints its compact view again) or references such as 3fa2c1:S3")
@@ -1119,8 +1351,12 @@ def parser():
             continue
         cmd.add_argument("--output", help="Also save to this new file (pictures: save here instead of the work directory)")
         cmd.add_argument("--json", action="store_true", help="Print the complete response instead of the compact view")
-        if name in ("search", "context", "crop", "neighbors", "entities", "facts"):
+        if name in ("search", "context", "crop", "neighbors", "entities", "facts", "schema", "stats"):
             cmd.add_argument("--request", help="UTF-8 JSON request file, or - for stdin")
+        if name in ("search", "neighbors", "facts"):
+            cmd.add_argument("--history", action="store_true",
+                             help="Also what is no longer in effect: replaced statements, ended relations, documents marked replaced or archived")
+            cmd.add_argument("--as-of", help="Look back to a day: YYYY, YYYY-MM or YYYY-MM-DD (a year or month means its last day)")
         if name in ("context", "image", "crop", "neighbors", "facts"):
             cmd.add_argument("--ref", help=ref_help)
         if name == "context":
@@ -1135,14 +1371,19 @@ def parser():
             cmd.add_argument("--limit", type=int, choices=range(1, 201), metavar="1..200")
             cmd.add_argument("--offset", type=int, help="Skip this many rows (paging)")
         if name == "entities":
-            cmd.add_argument("--type", action="append", help="Only these entity types; repeat to allow several")
-            cmd.add_argument("--parent-type", action="append", help="Only these upper classes (entity / part / property / process / standard / document)")
-            cmd.add_argument("--name", help="Text contained in the title or an alias")
+            cmd.add_argument("--type", action="append", help="Only these entity types and their sub-types; repeat to allow several")
+            cmd.add_argument("--upper", action="append",
+                             help="Only these upper classes (agent / entity / part / property / process / event / concept / document)")
+            cmd.add_argument("--kind", choices=("instance", "class", "all"), help="Both (default), specific things only (instance), or class names only")
+            cmd.add_argument("--name", help="Text contained in the title, an alias or an external id")
         if name == "facts":
             cmd.add_argument("--subject", help="Subject title or alias (case and spaces ignored)")
             cmd.add_argument("--subject-id", help="Entity id from a previous response")
             cmd.add_argument("--property", help="Property name, symbol or concept name")
             cmd.add_argument("--match", choices=("auto", "exact", "contains"))
+            cmd.add_argument("--in-doc", metavar="REF", help="Only facts from the document of this entry (e.g. 3fa2c1:S3)")
+            cmd.add_argument("--rel-path", help="Only facts from this document: its path inside the knowledge base")
+            cmd.add_argument("--conflict-only", action="store_true", help="Only facts that disagree across documents, grouped")
         if name == "neighbors":
             cmd.add_argument("--kb", help="KB ID that has a graph")
             cmd.add_argument("--entity", help="Entity title or alias (case and spaces ignored)")
@@ -1160,8 +1401,13 @@ def parser():
             cmd.add_argument("--block-type", action="append", help="Prefer chunks of this kind (table, image, ...); a soft preference, repeatable")
             cmd.add_argument("--in-doc", action="append", metavar="REF", help="Search only inside the document of this entry (e.g. 3fa2c1:S3); repeatable")
             cmd.add_argument("--rel-path", action="append",
-                             help="Search only this document: its path inside the knowledge base, sub-folders included (the path on "
-                                  "a source line without the knowledge base folder at its start; catalog lists bare file names); repeatable")
+                             help="Search only this document: its path inside the knowledge base, sub-folders included (the path of "
+                                  "a source line without the leading knowledge base name; catalog lists bare file names); repeatable")
+        if name in ("schema", "stats"):
+            cmd.add_argument("--kb", help="KB ID")
+        if name == "schema":
+            cmd.add_argument("--format", choices=("json", "yaml"), help="yaml prints the LinkML text after the overview")
+            cmd.add_argument("--version", help="Schema version id; default: the one the current graph was built with")
         if name == "image":
             cmd.add_argument("--kb")
             cmd.add_argument("--point-id")
@@ -1196,6 +1442,20 @@ def show(work, refs, raw=False, page=None, limit=PAGE_BYTES):
     return 0
 
 
+def md_link(label, target, style="angle"):
+    """A Markdown link to a local file, whose path may contain spaces. "angle" puts the target in angle brackets
+    (CommonMark). An application that takes the text between the parentheses literally would keep the brackets as
+    part of the path: for it, "plain" writes the path as it is and "percent" escapes the characters a bare target
+    cannot hold."""
+    label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    if style == "plain":
+        return "[" + label + "](" + target + ")"
+    if style == "percent":
+        return "[" + label + "](" + "".join("%{:02X}".format(ord(c)) if c in ' ()<>%"\\`' or ord(c) < 0x20 else c for c in target) + ")"
+    target = target.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
+    return "[" + label + "](<" + target + ">)"
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     token = ""
@@ -1212,10 +1472,12 @@ def main(argv=None):
         url, token, timeout = settings(args, cfg)
         binary = args.command in ("image", "crop")
         tag = None
+        image_row = None
         if args.command == "image":
             kb, point = args.kb, args.point_id
             if args.ref:
                 kb, row = chunk_of(*resolve(work, args.ref)[:3])
+                image_row = row
                 within([args.kb] if args.kb else [], kb, "--ref " + args.ref)
                 point, tag = row["point_id"], args.ref.replace(":", "-")
             if not kb or not point:
@@ -1223,12 +1485,13 @@ def main(argv=None):
             quote = lambda s: urllib.parse.quote(s, safe="")
             route = "/image/" + quote(kb) + "/" + quote(point)
             method, data = "GET", None
-        elif args.command in ("neighbors", "entities", "facts"):
+        elif args.command in ("neighbors", "entities", "facts", "schema", "stats"):
             route, method, data = "/graph/" + args.command, "POST", payload(args, work)
         elif args.command in ("search", "context", "crop"):
             route, method, data = "/" + args.command, "POST", payload(args, work)
             if args.command == "crop" and args.ref:
                 tag = args.ref.replace(":", "-") + "-crop"
+                _, image_row = chunk_of(*resolve(work, args.ref)[:3])
         else:
             route, method, data = "/" + args.command, "GET", None
         envelope = {"call_id": call_id, "operation": args.command}
@@ -1251,11 +1514,19 @@ def main(argv=None):
                 "width": headers.get("X-Image-Width"), "height": headers.get("X-Image-Height"),
                 "crop_box": headers.get("X-Crop-Box"),
             }
+            res = envelope["result"]
+            label = "Source image crop" if args.command == "crop" else "Source image"
+            res["display_markdown"] = "!" + md_link(label, res["path"])
+            if image_row:
+                res["source_cite"], res["source_file"] = image_row.get("cite"), image_row.get("file")
             if args.json:
                 print(json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False))
             else:
                 res = envelope["result"]
                 print(TXT["saved"].format(path=res["path"], mime=mime, w=res["width"], h=res["height"], source=res["source"]))
+                if res.get("source_cite"):
+                    print("Source: " + str(res["source_cite"]))
+                print("After inspecting the image, embed it when useful: " + res["display_markdown"])
             return 0
         envelope["request"] = {k: v for k, v in (data or {}).items() if k != "image_b64"}
         envelope["result"] = result

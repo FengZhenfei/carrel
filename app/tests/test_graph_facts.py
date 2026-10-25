@@ -139,11 +139,9 @@ class FactsSpineTests(unittest.TestCase):
         self.assertEqual({f.get("concept_key") for f in facts[:2]}.__len__(), 1)
 
     def test_contrast_markers_and_bare_labels_never_auto_merge(self) -> None:
-        """2026-09-12 spot check: the health KB auto-merged corrected vision (right)/(left), pepsinogen I/II, venous
-        occlusion/arterial occlusion and mild/severe diabetic retinopathy; the library KB merged the CG coefficients
-        for j=j1+1/2 and j=j1-1/2; and the sameness judge then folded each gene's "xx genotype" into the bare
-        "genotype". Generic rule: pairs differing by only one short token are never auto-merged but go to the model;
-        a pair where one side carries an identity token and the other is a bare label is blocked outright."""
+        """Synthetic contrast pairs exercise short-token distinctions and identity tokens.
+        Similarity alone must not merge distinct labels; a label with an identity token
+        must not merge with a bare generic label."""
         from kb_pipeline.graph.concepts import _contrast, build_concepts, compatible
 
         for a, b in (("矫正视力(右)", "矫正视力(左)"), ("胃蛋白酶原I(T-12)", "胃蛋白酶原II(T-12)"), ("静脉阻塞 类似", "动脉阻塞 类似"),
@@ -155,8 +153,8 @@ class FactsSpineTests(unittest.TestCase):
             self.assertFalse(_contrast(a, b), (a, b))
         cand = lambda label, sym="": {"label": label, "symbols_text": sym, "unit": ""}
         self.assertEqual(compatible(cand("矫正视力(右)"), cand("矫正视力(左)")), "contrast")
-        # Library KB: the CG-coefficient parameter cases differ by more than one token and are blocked by their differing
-        # number sequences (j=j1+1/2 and j=j1,m2=1 were once auto-merged)
+        # The synthetic coefficient cases differ by more than one token and are blocked by their differing
+        # number sequences (j=j1+1/2 versus j=j1,m2=1)
         self.assertEqual(compatible(cand("j = j1 + 1/2, m2 = 1/2 的CG系数"), cand("j = j1, m2 = 1 的CG系数")), "contrast")
         self.assertEqual(compatible(cand("量子力学(第2版)"), cand("量子力学(第3版)")), "contrast")
         self.assertEqual(compatible(cand("F分布 分位数 0.05"), cand("F-分布 分位数 0.05")), "ok")
@@ -183,14 +181,14 @@ class FactsSpineTests(unittest.TestCase):
         self.assertNotEqual(facts[0]["concept_key"], facts[1]["concept_key"])
 
     def test_shared_global_subjects_keep_their_facts_under_a_path_subject(self) -> None:
-        """2026-09-12 product documentation KB: the top-level directory (the vendor name) matched an entity, and every
+        """Synthetic multi-subject documents: the top-level directory (the vendor name) matched an entity, and every
         fact in the per-product columns of the feature comparison table was re-attributed to the vendor. Generic rule:
         path / series evidence only re-attributes facts filed under the document's own subject entities (scoped ones,
         or ones appearing only in this document); facts under cross-document global entities stay put."""
         from kb_pipeline.graph.facts import normalize_measurements
 
         ents = [{"key": "vendor", "title": "示例办公", "type": "product", "upper": "entity", "frequency": 50, "doc_ids": ["d1", "d2", "d3", "d4"], "scope": ""},
-                {"key": "wpsx", "title": "示例协作", "type": "product", "upper": "entity", "frequency": 40, "doc_ids": ["d1", "d2"], "scope": ""},
+                {"key": "demo-collab", "title": "示例协作", "type": "product", "upper": "entity", "frequency": 40, "doc_ids": ["d1", "d2"], "scope": ""},
                 {"key": "rival", "title": "移动办公", "type": "product", "upper": "entity", "frequency": 30, "doc_ids": ["d1", "d2"], "scope": ""},
                 {"key": "d1::定制工作台", "title": "定制工作台", "type": "product_module", "upper": "part", "frequency": 5, "doc_ids": ["d1"], "scope": "d1"},
                 {"key": "own", "title": "某某_编号0001", "type": "product", "upper": "entity", "frequency": 3, "doc_ids": ["d4"], "scope": ""}]
@@ -208,13 +206,12 @@ class FactsSpineTests(unittest.TestCase):
         self.assertEqual((stats["resubjected_identity"], stats["identity_kept_shared"]), (1, 3))
 
     def test_entity_name_gate_and_prompt_example_grounding(self) -> None:
-        """2026-09-12 spot check across five KBs: the library KB extracted formula fragments / SQL statements / whole
-        questionnaire sentences as entity names; the product documentation KB extracted an example given in a type
-        definition into a sample document that never contained the word. Both gates look only at form, not domain."""
+        """Formula fragments, SQL statements and whole questions are not entity names.
+        Synthetic schema examples must not enter a graph unless the source contains them."""
         from kb_pipeline.graph.extract import entity_name_ok, ground_records, parse_records, prompt_example_names
 
-        for bad in ("x = y + 1", "SELECT * FROM fruits;", "app:", "Corn Prod,", "(hat a dagger)", "fr(q)", "请描述一例最能代表当前问题的补货案例。?",
-                    "发现生产数据过期时,目前如何处理?", "langle n | hat q | n prime rangle", "AI 项目方案组 (202...", "", "···"):
+        for bad in ("x = y + 1", "SELECT * FROM fruits;", "app:", "Corn Prod,", "(hat a dagger)", "fr(q)", "请描述一例最能代表当前问题的演示案例。?",
+                    "发现示例数据过期时,目前如何处理?", "langle n | hat q | n prime rangle", "AI 项目方案组 (202...", "", "···"):
             self.assertFalse(entity_name_ok(bad), bad)
         for good in ("肝", "A", "σ", "示例+365", "A/B测试", "CPI(UNME)", "Skill(技能)", "RV5/SV1", "C++", "Johnson & Johnson", "v7.0.2412a"):
             self.assertTrue(entity_name_ok(good), good)
@@ -222,34 +219,34 @@ class FactsSpineTests(unittest.TestCase):
                                           '("relationship"<|>肝<|>x = 1<|>related_to<|>d<|>3)')
         self.assertEqual(([e["name"] for e in ents], rels, stats["bad_names"]), (["肝"], [], 2))
         schema = ExtractionSchema(entity_types=("product", "feature"),
-                                  type_definitions={"product": "A named commercial offering such as 示例 365, 示例协作, or 知识社区; not a module.",
+                                  type_definitions={"product": "A named commercial offering such as 示例 365, 示例协作, or 示例社区; not a module.",
                                                     "feature": "A capability like 邮箱搬家 or 轻打卡."},
                                   examples='("entity"<|>Prometheus<|>tool<|>monitoring)')
-        self.assertEqual(prompt_example_names(schema), {"示例365", "示例协作", "知识社区", "邮箱搬家", "轻打卡", "prometheus"})
-        entities = [{"name": "知识社区", "type": "product", "description": "示例办公旗下的产品"},
+        self.assertEqual(prompt_example_names(schema), {"示例365", "示例协作", "示例社区", "邮箱搬家", "轻打卡", "prometheus"})
+        entities = [{"name": "示例社区", "type": "product", "description": "示例办公旗下的产品"},
                     {"name": "示例 365", "type": "product", "description": "套件"},
                     {"name": "示例PC客户端(Win&Linux&Mac)", "type": "feature", "description": "客户端"},
                     {"name": "文档中心", "type": "product", "description": "本单元真正讲的东西"}]
-        relations = [{"source": "知识社区", "target": "文档中心", "predicate": "related_to"},
+        relations = [{"source": "示例社区", "target": "文档中心", "predicate": "related_to"},
                      {"source": "示例 365", "target": "文档中心", "predicate": "has_feature"}]
         context = "示例 365 里的文档中心支持 示例PC客户端（Win&Linux&Mac）。"
         kept, rels2, dropped = ground_records(entities, relations, context=context, example_names=prompt_example_names(schema))
         self.assertEqual(([e["name"] for e in kept], len(rels2), dropped), (["示例 365", "示例PC客户端(Win&Linux&Mac)", "文档中心"], 1, 1))
-        kept2, _, dropped2 = ground_records(entities, relations, context="知识社区是腾讯的知识库产品 " + context, example_names=prompt_example_names(schema))
+        kept2, _, dropped2 = ground_records(entities, relations, context="示例社区是示例软件的知识库产品 " + context, example_names=prompt_example_names(schema))
         self.assertEqual((len(kept2), dropped2), (4, 0))                                     # the one that really appears in the text is left alone
         build = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
         self.assertIn("ents, rels, n = ground_records(ents, rels, context=context, example_names=example_names)", build)   # cached extractions also pass through it before merging
         self.assertIn('merged["stats"]["ungrounded_dropped"] = ungrounded_dropped', build)
 
     def test_symbol_names_are_document_scoped_and_year_parens_are_not_aliases(self) -> None:
-        """Library KB: A, C, r and N were merged into global entities across four subject directories; "Moore & McCabe
-        (1998)" and "Goldberger (1998)" were auto-merged because the years in parentheses matched."""
+        """Symbols are scoped to their documents. Two fictional citations sharing a year
+        must remain distinct; a parenthesized year is not an alias."""
         from kb_pipeline.graph.merge import merge_extractions, scoped_key, symbol_like_name
         from kb_pipeline.graph.resolution import auto_merge_pairs, paren_alias
 
         for s in ("A", "r", "σ", "x0", "r1", "σ2"):
             self.assertTrue(symbol_like_name(s), s)
-        for g in ("OA", "IM", "WB", "肝", "AI", "3D", "WPS", "π介子"):
+        for g in ("OA", "IM", "WW", "肝", "AI", "3D", "EXO", "π介子"):
             self.assertFalse(symbol_like_name(g), g)
         u1, u2 = _unit("u1", doc="kb_004:1"), _unit("u2", doc="kb_004:2")
         ext = {"u1": {"entities": [{"name": "A", "type": "concept", "description": "总资产"}, {"name": "OA", "type": "system", "description": "办公"}], "relations": []},
@@ -257,64 +254,59 @@ class FactsSpineTests(unittest.TestCase):
         out = merge_extractions([u1, u2], ext, entity_types=("concept", "system"), upper_parents={"concept": "entity", "system": "entity"})
         keys = {e["key"] for e in out["entities"]}
         self.assertEqual(keys, {scoped_key("a", "kb_004:1"), scoped_key("a", "kb_004:2"), "oa"})
-        self.assertEqual(paren_alias("Moore和McCabe(1998)"), ("", ""))
+        self.assertEqual(paren_alias("AuthorA和AuthorB(1998)"), ("", ""))
         self.assertEqual(paren_alias("体重指数(BMI)"), ("体重指数", "BMI"))
-        rows = [{"key": "a", "title": "Moore和McCabe(1998)", "type": "publication"}, {"key": "b", "title": "Goldberger(1998)", "type": "publication"}]
+        rows = [{"key": "a", "title": "AuthorA和AuthorB(1998)", "type": "publication"}, {"key": "b", "title": "AuthorC(1998)", "type": "publication"}]
         self.assertEqual(auto_merge_pairs(rows), [])
 
     def test_prefix_and_initial_alias_candidates(self) -> None:
-        """Product documentation KB: WPS Comate / Comate were two hubs, and neither Tencent Knowledge Community /
-        Knowledge Community nor WorkBuddy / WB got merged, since literal similarity cannot reach them. Generic
-        candidates: equal after stripping a name prefix that exists in this graph, or one side is the other's
-        initialism; candidates only, still judged by the model."""
+        """Synthetic vendor prefixes and initials create candidates for model judgment.
+        Literal similarity alone cannot recover every shortened name."""
         from kb_pipeline.graph.resolution import _initials, candidate_pairs
 
-        self.assertEqual((_initials("WorkBuddy"), _initials("Forward Deployed Engineer"), _initials("WB"), _initials("知识社区")), ("WB", "FDE", "", ""))
-        ents = [{"title": "WPS", "type": "product"}, {"title": "WPS Comate", "type": "product"}, {"title": "Comate", "type": "product"},
-                {"title": "腾讯", "type": "organization"}, {"title": "腾讯知识社区", "type": "product"}, {"title": "知识社区", "type": "product"},
-                {"title": "WorkBuddy", "type": "product"}, {"title": "WB", "type": "product"}, {"title": "文档中心", "type": "product"},
+        self.assertEqual((_initials("WorkWidget"), _initials("Data Systems Engineer"), _initials("WW"), _initials("示例社区")), ("WW", "DSE", "", ""))
+        ents = [{"title": "EXO", "type": "product"}, {"title": "EXO Gadget", "type": "product"}, {"title": "Gadget", "type": "product"},
+                {"title": "示例软件", "type": "organization"}, {"title": "示例软件示例社区", "type": "product"}, {"title": "示例社区", "type": "product"},
+                {"title": "WorkWidget", "type": "product"}, {"title": "WW", "type": "product"}, {"title": "文档中心", "type": "product"},
                 {"title": "Office", "type": "product"}]
         pairs = candidate_pairs(ents)
-        self.assertIn((1, 2), pairs)           # WPS Comate / Comate
-        self.assertIn((4, 5), pairs)           # Tencent Knowledge Community / Knowledge Community
-        self.assertIn((6, 7), pairs)           # WorkBuddy / WB
-        self.assertNotIn((0, 9), pairs)        # WPS / Office is not a prefix relation
+        self.assertIn((1, 2), pairs)           # EXO Gadget / Gadget
+        self.assertIn((4, 5), pairs)           # Example Vendor Knowledge Community / Knowledge Community
+        self.assertIn((6, 7), pairs)           # WorkWidget / WW
+        self.assertNotIn((0, 9), pairs)        # EXO / Office is not a prefix relation
         # Scoped entities never enter these two candidate classes
-        scoped = [{"title": "WPS Comate", "type": "product", "scope": "d1"}, {"title": "Comate", "type": "product", "scope": "d1"}]
+        scoped = [{"title": "EXO Gadget", "type": "product", "scope": "d1"}, {"title": "Gadget", "type": "product", "scope": "d1"}]
         self.assertEqual(candidate_pairs(scoped), [])
 
     def test_declared_alias_in_description_merges_without_the_judge(self) -> None:
-        """Product documentation KB: WB's description opens with WB(WorkBuddy), yet the sameness judge saw WorkBuddy's
-        first, unrelated description in extraction order and answered no. Generic rule: an alias the description
-        declares itself merges directly (declared); the evidence shown to the model prefers a definition-style
-        description that starts with the entity name, else the longest one."""
+        """An explicitly declared alias merges directly. Synthetic descriptions test
+        definition-first selection, Chinese parentheses and the longest-text fallback."""
         from kb_pipeline.graph.resolution import _first_sentence, auto_merge_pairs, declared_alias
 
-        self.assertEqual(declared_alias("WB", ["WB（WorkBuddy）是腾讯国内团队打造的AI办公产品"]), "WorkBuddy")
-        self.assertEqual(declared_alias("FDE", ["FDE (Forward Deployed Engineer) 是一种岗位"]), "Forward Deployed Engineer")
-        self.assertEqual(declared_alias("WB", ["WorkBuddy(WB)是…"]), "")                 # the parenthesis does not follow its own name: does not count
-        self.assertEqual(declared_alias("Moore和McCabe", ["Moore和McCabe(1998)提出…"]), "")   # a year is not an alias
-        self.assertEqual(declared_alias("WB", ["WB(WB)…"]), "")
-        # A description opening with "short for X" (or its Chinese equivalents) is a declared alias too (the product
-        # documentation KB's original description of WB was exactly "short for WorkBuddy, ...")
-        self.assertEqual(declared_alias("WB", ["WorkBuddy的简称，被老板当作秘书使用"]), "WorkBuddy")
-        self.assertEqual(declared_alias("FDE", ["Short for Forward Deployed Engineer, a role"]), "Forward Deployed Engineer")
-        self.assertEqual(declared_alias("WB", ["一款AI办公产品，是WorkBuddy的简称"]), "")     # not at the start: does not count (avoids false catches)
-        self.assertEqual(declared_alias("WPS文档中台系统V7", ["对客产品全称/软著全称，对应专业版与增强版"]), "")   # no possessive particle: a column heading, not a self-description
+        self.assertEqual(declared_alias("WW", ["WW（WorkWidget）是示例软件开发的协作工具"]), "WorkWidget")
+        self.assertEqual(declared_alias("DSE", ["DSE (Data Systems Engineer) 是一种岗位"]), "Data Systems Engineer")
+        self.assertEqual(declared_alias("WW", ["WorkWidget(WW)是…"]), "")                 # the parenthesis does not follow its own name: does not count
+        self.assertEqual(declared_alias("AuthorA和AuthorB", ["AuthorA和AuthorB(1998)提出…"]), "")   # a year is not an alias
+        self.assertEqual(declared_alias("WW", ["WW(WW)…"]), "")
+        # A description opening with "short for X" (or its Chinese equivalents) is a declared alias too.
+        self.assertEqual(declared_alias("WW", ["WorkWidget的简称，用于示例日程管理"]), "WorkWidget")
+        self.assertEqual(declared_alias("DSE", ["Short for Data Systems Engineer, a role"]), "Data Systems Engineer")
+        self.assertEqual(declared_alias("WW", ["一款示例协作工具，是WorkWidget的简称"]), "")     # not at the start: does not count (avoids false catches)
+        self.assertEqual(declared_alias("EXO文档中台系统V7", ["对客产品全称/软著全称，对应专业版与增强版"]), "")   # no possessive particle: a column heading, not a self-description
         # Two entities each claiming to be short for the same non-existent name: not merged with each other
         ghosts = [{"key": "a", "title": "系统A V7", "type": "product", "descriptions": ["对客产品的全称，专业版"]},
                   {"key": "b", "title": "系统B V7", "type": "product", "descriptions": ["对客产品的全称，增强版"]}]
         self.assertEqual(auto_merge_pairs(ghosts), [])
-        ents = [{"key": "workbuddy", "title": "WorkBuddy", "type": "product", "descriptions": ["一款面向制造业的AI Agent产品", "腾讯的AI办公产品"]},
-                {"key": "wb", "title": "WB", "type": "product", "descriptions": ["WB（WorkBuddy）是腾讯国内团队打造的AI办公产品，定位为数字员工助理。它被老板当作秘书使用。"]},
-                {"key": "wb2", "title": "W.B.", "type": "product", "descriptions": ["WorkBuddy的简称"]},
-                {"key": "腾讯", "title": "腾讯", "type": "organization", "descriptions": ["腾讯（WB 的厂商）"]}]
+        ents = [{"key": "workwidget", "title": "WorkWidget", "type": "product", "descriptions": ["一款用于示例流程的协作工具", "示例软件的协作工具"]},
+                {"key": "ww", "title": "WW", "type": "product", "descriptions": ["WW（WorkWidget）是示例软件开发的协作工具，用于整理虚构任务。它也支持示例日程。"]},
+                {"key": "ww2", "title": "W.W.", "type": "product", "descriptions": ["WorkWidget的简称"]},
+                {"key": "示例软件", "title": "示例软件", "type": "organization", "descriptions": ["示例软件（WW 的厂商）"]}]
         reasons: dict = {}
-        self.assertEqual(auto_merge_pairs(ents, reasons), [(0, 1), (0, 2), (1, 2)])      # (1, 2): WB / W.B. are equal identifiers, merged anyway
+        self.assertEqual(auto_merge_pairs(ents, reasons), [(0, 1), (0, 2), (1, 2)])      # (1, 2): WW / W.W. are equal identifiers, merged anyway
         self.assertEqual((reasons[(0, 1)], reasons[(0, 2)], reasons[(1, 2)]), ("declared", "declared", "identifier"))
-        self.assertTrue(_first_sentence(ents[1]).startswith("WB（WorkBuddy）是腾讯"))     # given verbatim (full-width kept), the definition-style one first
-        long_row = {"title": "WorkBuddy", "descriptions": ["短。", "一款面向制造业的AI Agent产品，能够穿透重系统外壳，将智能能力推到产线面前。第二句。第三句。"]}
-        self.assertTrue(_first_sentence(long_row).startswith("一款面向制造业的AI Agent产品"))    # no definition-style description: take the longest
+        self.assertTrue(_first_sentence(ents[1]).startswith("WW（WorkWidget）是示例软件"))     # given verbatim (full-width kept), the definition-style one first
+        long_row = {"title": "WorkWidget", "descriptions": ["短。", "一款用于示例流程的协作工具，包含任务、日程和列表功能，供团队成员在示例流程中协作。第二句。第三句。"]}
+        self.assertTrue(_first_sentence(long_row).startswith("一款用于示例流程的协作工具"))    # no definition-style description: take the longest
 
     def test_reconcile_marks_series_and_real_conflicts_only(self) -> None:
         from kb_pipeline.graph.reconcile import reconcile_facts, series_of
@@ -748,6 +740,70 @@ class ViewLayerTests(unittest.TestCase):
         self.assertEqual([p["title"] for p in pages if p["kind"] == "source"], ["d1.pdf", "d2.pdf"])
         self.assertEqual([p["title"] for p in pages if p["kind"] == "subject"][0], "张三")
 
+    def test_subject_pages_list_the_facts_of_their_parts(self) -> None:
+        """10-24 改版二十二:事实挂到各部分名下以后,上级实体的主体页说不全它由什么组成。组成关系(两个方向都认)连着的
+        部分一个一行、紧跟概述(放在事实表后面的话叙述输入和页面向量都截不到),每行带它名下最多 FACTS_PER_PART 条事实;
+        另有主体页的部分只列名字和事实数;类别名、非组成关系连着的东西不算。"""
+        from kb_pipeline.graph.compile import FACTS_PER_PART, compile_pages, parts_index
+        from kb_pipeline.ontology import composition_ends
+
+        self.assertEqual(composition_ends("has_component", "a", "b"), ("a", "b"))
+        self.assertEqual(composition_ends("Part-Of", "b", "a"), ("a", "b"))
+        self.assertIsNone(composition_ends("uses", "a", "b"))
+        self.assertIsNone(composition_ends("belongs_to", "b", "a"))           # 归属不是组成
+
+        def ent(key, title, etype, upper, **kw):
+            return {"key": key, "title": title, "type": etype, "parent_type": upper, "upper": upper, "description": "", "frequency": 3,
+                    "degree": 1, "pagerank": 0.1, "doc_ids": ["d1"], "aliases": [], "unit_ids": ["u1"], **kw}
+
+        def fact(fid, subject_key, prop, value, when="2025-01-01", flag=""):
+            return {"id": fid, "subject": subject_key, "subject_key": subject_key, "subject_keys": [subject_key], "property": prop,
+                    "concept": prop, "concept_key": f"c-{prop}", "value": value, "unit": "", "doc_id": "d1", "rel_path": "d1.md",
+                    "section": "S", "valid_from": when, "axis": when, "point_ids": [f"p-{fid}"], "flag": flag, "conditions": {}}
+
+        entities = [ent("plat", "平台甲", "product", "entity"), ent("mod", "调度模块", "module", "part"),
+                    ent("db", "数据库乙", "product", "entity"), ent("api", "接口层", "module", "part"),
+                    ent("skill", "技能", "concept", "concept", kind="class"), ent("tool", "工具丙", "product", "entity")]
+        relations = [{"source_key": "plat", "target_key": "mod", "predicate": "has_component", "weight": 3.0},
+                     {"source_key": "plat", "target_key": "db", "predicate": "composed_of", "weight": 2.0},
+                     {"source_key": "api", "target_key": "plat", "predicate": "part_of", "weight": 2.0},
+                     {"source_key": "plat", "target_key": "skill", "predicate": "includes", "weight": 2.0},
+                     {"source_key": "plat", "target_key": "tool", "predicate": "uses", "weight": 5.0},
+                     {"source_key": "plat", "target_key": "api", "predicate": "has_component", "weight": 1.0, "boilerplate": True}]
+        facts = [fact(f"o{i}", "plat", f"own{i}", str(i)) for i in range(3)]
+        facts += [fact(f"m{i}", "mod", f"参数{i}", str(i), when=f"202{i}-01-01") for i in range(6)]
+        facts += [fact("m-flag", "mod", "告警阈值", "90", when="2020-01-01", flag="↑")]
+        facts += [fact(f"d{i}", "db", f"容量{i}", str(i)) for i in range(3)]
+        facts += [fact("a0", "api", "接口数", "12"), fact("s0", "skill", "数量", "8"), fact("t0", "tool", "版本", "2")]
+        self.assertEqual(parts_index(relations, entities), {"plat": ["mod", "db", "api"]})    # 类别名、uses、版式关系不算
+        graph = {"kb_id": "kb_x", "entities": entities, "relations": relations, "specs": facts, "concepts": [], "conflicts": [],
+                 "documents": {"d1": {"rel_path": "d1.md", "kind": "none", "value": ""}}, "profile": {"subject_types": ["product"]},
+                 "mentions": [], "unit_kinds": {}}
+        pages, _ = compile_pages(graph, [_unit("u1", doc="d1")], out_dir=None, language="Chinese")
+        page = next(p for p in pages if p["kind"] == "subject" and p["title"] == "平台甲")
+        text = page["text"]
+        self.assertLess(text.index("## 概述"), text.index("## 组成部分"))
+        self.assertLess(text.index("## 组成部分"), text.index("## 事实"))
+        section = text.split("## 组成部分", 1)[1].split("## 事实", 1)[0]
+        self.assertIn("3 个组成部分", text)
+        self.assertLess(section.index("- 调度模块 (module): "), section.index("- 接口层 (module): "))     # 事实多的部分在前
+        mod_line = next(line for line in section.splitlines() if line.startswith("- 调度模块"))
+        self.assertEqual(mod_line.count("参数") + mod_line.count("告警阈值"), FACTS_PER_PART)
+        self.assertLess(mod_line.index("告警阈值 90 ↑"), mod_line.index("参数5"))     # 有标记的在前,其余从新到旧
+        self.assertLess(mod_line.index("参数5"), mod_line.index("参数4"))
+        self.assertTrue(mod_line.endswith("另有 4 条未列出"))
+        self.assertIn("- 接口层 (module): 接口数 12(2025-01-01)", section)
+        self.assertIn("数据库乙(3 条事实,另有主体页)", section)                 # 自己有主体页:只列名字,不搬事实
+        self.assertNotIn("容量", section)
+        self.assertNotIn("技能", section)
+        self.assertNotIn("工具丙", section)
+        self.assertIn("## 组成部分", page["narrate_text"])
+        self.assertEqual(page["point_ids"][:3], ["p-o0", "p-o1", "p-o2"])         # 自己的事实在前,部分的事实在后
+        self.assertIn("p-a0", page["point_ids"])
+        self.assertEqual((page["parts"], page["part_facts"]), (3, FACTS_PER_PART + 1))
+        db_page = next(p for p in pages if p["kind"] == "subject" and p["title"] == "数据库乙")
+        self.assertNotIn("## 组成部分", db_page["text"])
+
     def test_series_line_prefers_numeric_endpoints(self) -> None:
         from kb_pipeline.graph.compile import _series_line, labels_for
 
@@ -892,10 +948,8 @@ class ViewLayerTests(unittest.TestCase):
 
 
 class MeasurementNormalizationTests(unittest.TestCase):
-    """2026-09-08 health KB on the real box: a table row's subject is the lab-sheet name / indicator name / diagnosis in
-    the abnormal-findings summary, while the value is the examinee's measurement; property names carry an "elevated"
-    tail so concepts fail to merge; the years of the multi-year comparison table sit in conditions so no series forms.
-    The re-attribution rules are deterministic and profile-driven."""
+    """Synthetic measurement tables exercise subject ownership, flag suffixes and
+    multi-year axes. Re-attribution stays deterministic and profile-driven."""
 
     def _entities(self):
         def ent(key, title, etype, upper, docs, freq=1, scope=""):
@@ -947,7 +1001,9 @@ class MeasurementNormalizationTests(unittest.TestCase):
             {"id": "k", "unit_id": "u2", "doc_id": "d2", "subject": "李华", "property": "年龄", "value": "44", "value_num": 44.0, "unit": "岁", "conditions": {}},
             {"id": "l", "unit_id": "u1", "doc_id": "d1", "subject": "本体反馈单", "property": "提交人", "value": "某成员", "value_num": None, "unit": "", "conditions": {}},
         ]
-        stats = normalize_measurements(facts, self._entities(), units_by_id=units, profile={"subject_types": ["patient"], "axis": "date"})
+        docs = {"d1": "李华/体检报告/2024.pdf", "d2": "李华/体检报告/2025.pdf", "d4": "其他/心电图.pdf"}     # d1、d2 由路径定归属人
+        stats = normalize_measurements(facts, self._entities(), units_by_id=units, profile={"subject_types": ["patient"], "axis": "date"},
+                                       documents=docs)
         by = {f["id"]: f for f in facts}
         self.assertEqual((by["a"]["subject"], by["a"]["context"], by["a"]["property"], by["a"]["subject_key"]), ("李华", "心电图", "心率", "p1"))   # lab sheet / examination item → examinee
         self.assertEqual((by["b"]["subject"], by["b"]["context"]), ("李华", "血常规"))
@@ -964,8 +1020,14 @@ class MeasurementNormalizationTests(unittest.TestCase):
         self.assertEqual((by["k"]["subject"], by["k"].get("subject_raw")), ("李华", None))
         self.assertEqual((by["l"]["subject"], by["l"].get("subject_raw")), ("本体反馈单", None))   # a business fact under a process subject (not a measurement): stays with the original subject (Codex 2026-09-13 F03)
         self.assertEqual(stats, {"flag_words": 1, "period_conditions": 1, "resubjected_process": 2, "resubjected_indicator": 1,
-                                 "resubjected_generic": 4, "resubjected_context": 0, "resubjected_identity": 0, "identity_kept_shared": 0})     # obesity is a risk factor in this KB (upper type property): follows the indicator rule, the original subject stays as context
-        # No profile subject types (datasheet KB): only strip flag words and move periods, subjects are never touched
+                                 "resubjected_generic": 4, "resubjected_context": 0, "resubjected_identity": 0, "identity_kept_shared": 0})     # 肥胖在本库是 risk factor(上层 property):走指标规则,原主体留作 context
+        # 归属人只是按频次猜的(没有路径 / 序列证据):不归位。合成汇编中子项目的数字不能归到出现最多的主体名下
+        facts3 = [{"id": "a", "unit_id": "u1", "doc_id": "d1", "subject": "心电图", "property": "心率", "value": "65", "value_num": 65.0, "unit": "bpm", "conditions": {}},
+                  {"id": "c", "unit_id": "u2", "doc_id": "d2", "subject": "总胆固醇", "property": "测量结果", "value": "6.05", "value_num": 6.15, "unit": "mmol/L", "conditions": {}}]
+        stats3 = normalize_measurements(facts3, self._entities(), units_by_id=units, profile={"subject_types": ["patient"], "axis": "date"})
+        self.assertEqual([(f["subject"], f.get("subject_raw")) for f in facts3], [("心电图", None), ("总胆固醇", None)])
+        self.assertEqual(stats3["resubjected_process"] + stats3["resubjected_generic"], 0)
+        # 没有画像主体类型(手册库):只剥标记词、搬时期,主体一律不动
         facts2 = [{"id": "x", "unit_id": "u1", "doc_id": "d1", "subject": "总胆固醇", "property": "测量结果", "value": "6", "value_num": 6.1, "unit": "mmol/L", "conditions": {}}]
         stats2 = normalize_measurements(facts2, self._entities(), units_by_id=units, profile={"subject_types": [], "axis": "version"})
         self.assertEqual((facts2[0]["subject"], stats2["resubjected_generic"]), ("总胆固醇", 0))
@@ -1034,10 +1096,9 @@ class MeasurementNormalizationTests(unittest.TestCase):
     def test_concentrated_endpoint_pairs_are_relaxed_per_pair(self) -> None:
         from kb_pipeline.graph.merge import predicate_health, relax_bad_endpoint_pairs, relax_bad_endpoints
 
-        ents = [{"key": f"e{i}", "parent_type": "entity"} for i in range(60)] + [{"key": f"p{i}", "parent_type": "property"} for i in range(60)] \
-            + [{"key": f"c{i}", "parent_type": "process"} for i in range(60)]
-        # associated_with, 100 edges: entity → property 25 violations (concentrated, 25%), process → property 3 violations
-        # (sporadic), the other 72 compliant
+        ents = [{"key": f"e{i}", "upper": "entity"} for i in range(60)] + [{"key": f"p{i}", "upper": "property"} for i in range(60)] \
+            + [{"key": f"c{i}", "upper": "process"} for i in range(60)]
+        # associated_with 100 条:entity → property 25 条越界(集中,25%)、process → property 3 条越界(零星)、其余 72 条合规
         rels = [{"source_key": f"e{i}", "target_key": f"p{i}", "predicate": "associated_with", "type_violation": True} for i in range(25)]
         rels += [{"source_key": f"c{i}", "target_key": f"p{i}", "predicate": "associated_with", "type_violation": True} for i in range(3)]
         rels += [{"source_key": f"e{i}", "target_key": f"e{i + 1}", "predicate": "associated_with", "type_violation": False} for i in range(72)]
@@ -1242,6 +1303,27 @@ class QualityStateProjectionTests(unittest.TestCase):
         src = (Path(__file__).resolve().parents[2] / "app/kb_pipeline/graph/build.py").read_text(encoding="utf-8")
         self.assertIn("apply_unit_quality(unit_facts, u)", src)
 
+    def test_the_same_property_with_and_without_its_symbol_is_one_concept(self) -> None:
+        """合成样本中同一属性有时带符号、有时不带,两种写法应归入同一序列。
+        没写符号的桶并进唯一一个同属性名、写了符号的桶;两个符号共用一个属性名时不并。"""
+        from kb_pipeline.graph.concepts import build_concepts
+
+        facts = [{"id": "f1", "property": "体重指数", "symbol": "BMI", "value": "24", "doc_id": "d1"},
+                 {"id": "f2", "property": "体重指数", "symbol": "", "value": "25", "doc_id": "d2"},
+                 {"id": "f3", "property": "电压", "symbol": "VCC", "value": "3.3", "unit": "V", "doc_id": "d1"},
+                 {"id": "f4", "property": "电压", "symbol": "VDD", "value": "1.8", "unit": "V", "doc_id": "d1"},
+                 {"id": "f5", "property": "电压", "symbol": "", "value": "5", "unit": "V", "doc_id": "d2"},
+                 {"id": "f6", "property": "低密度脂蛋白胆固醇", "symbol": "LDL-C", "value": "3.4", "unit": "mmol/L", "doc_id": "d1"},
+                 {"id": "f7", "property": "低密度脂蛋白胆固醇", "symbol": "LDL-C", "value": "3.6", "unit": "mmol/L", "doc_id": "d2"},
+                 {"id": "f8", "property": "低密度脂蛋白胆固醇", "symbol": "", "value": "增高", "doc_id": "d2"}]
+        _, stats = build_concepts(facts)
+        by = {f["id"]: f["concept_key"] for f in facts}
+        self.assertEqual(by["f1"], by["f2"])
+        self.assertEqual(len({by["f3"], by["f4"], by["f5"]}), 3)          # 归谁说不清:三个都留着
+        self.assertNotEqual(by["f8"], by["f6"])      # 文字结论(异常汇总表的「增高」)不并进数值桶:并了序列同一年两个点
+        self.assertEqual(by["f6"], by["f7"])
+        self.assertEqual(stats["same_property_merged"], 1)
+
     def test_concept_sets_cannot_be_bridged_across_identity_tokens(self) -> None:
         from kb_pipeline.graph.concepts import build_concepts
 
@@ -1254,7 +1336,7 @@ class QualityStateProjectionTests(unittest.TestCase):
         _, stats = build_concepts(facts, embed=lambda texts: [vectors[t] for t in texts], auto_threshold=0.95, ask_threshold=0.9)
         keys = {f["id"]: f["concept_key"] for f in facts}
         # 2026-09-12: the bare label "genotype" no longer merges into any concept carrying a locus (it used to merge into
-        # one side, which is how the health KB blended 29 property names into a single "genotype")
+        # one side; the generic label must not absorb identity-bearing property names)
         self.assertEqual(len({keys["a"], keys["b"], keys["c"]}), 3)
         self.assertEqual(stats["blocked_bridge"], 0)
         self.assertTrue(stats["blocked"] and all(m["reason"] == "identity" for m in stats["blocked"]))
@@ -1622,9 +1704,9 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
             facts_phase_gate(failed + rejected, partial_ok=False)          # real failures still stop the phase, rejections are not counted
         build_src = _repo_file("app/kb_pipeline/graph/build.py")
         self.assertIn('"rejected_units": len(rejected_units)', build_src)
-        # units handled by the rule extractor (code, config, structured markdown) never go to the model for facts
-        self.assertIn("todo_units = [u for u in units if not det.wants(u) and wants_facts(u, kinds.get(u.unit_id))]", build_src)
-        self.assertIn("facts-v4", _repo_file("app/kb_pipeline/graph/facts.py"))     # v3 on 09-07 for the axis / bound fields; v4 when number parsing and value cleaning changed
+        # 走规则抽取的单元(代码、配置、结构化 markdown)不送模型抽事实
+        self.assertIn("todo_units = [u for u in units if not det.wants(u) and u.unit_id not in table_ids and wants_facts(u, kinds.get(u.unit_id))]", build_src)
+        self.assertIn("facts-v4", _repo_file("app/kb_pipeline/graph/facts.py"))     # 09-07 加轴 / 边界字段升到 v3;数值与取值清洗改了升到 v4
         self.assertNotEqual(facts_fingerprint(spec), "")
         src = _repo_file("app/kb_pipeline/graph/build.py")
         self.assertIn('facts_phase_gate(failed, partial_ok=_env_flag("KB_GRAPH_FACTS_PARTIAL_OK"))', src)
@@ -1772,12 +1854,350 @@ class WideTableFactsPromptTests(unittest.TestCase):
         from kb_pipeline.graph.facts import render_facts_prompt
         from kb_pipeline.graph.units import Unit
 
-        text = ("SHEET: 表\nROWS: 1-2\nHEADER: 功能 | 描述 | 钉钉 | 飞书 | 热聊 | 云之家\n"
+        text = ("SHEET: 表\nROWS: 1-2\nHEADER: 功能 | 描述 | 协作甲 | 协作乙 | 协作丙 | 协作丁\n"
                 "标签 |  | 1 | 1 | 0 | 1")
         unit = Unit(unit_id="u", doc_id="d", rel_path="a.xlsx", section_path=[], block_ids=[], chunk_uids=[], point_ids=[], n_tokens=10, text=text)
         with patch.object(tabletext, "FACTS_EXPAND_WIDE_TABLES", True), patch("kb_pipeline.graph.facts.FACTS_EXPAND_WIDE_TABLES", True):
-            self.assertIn("功能: 标签 | 钉钉: 1 | 飞书: 1 | 热聊: 0 | 云之家: 1", render_facts_prompt(unit, document="a", subjects=["热聊"]))
+            self.assertIn("功能: 标签 | 协作甲: 1 | 协作乙: 1 | 协作丙: 0 | 协作丁: 1", render_facts_prompt(unit, document="a", subjects=["协作丙"]))
         with patch("kb_pipeline.graph.facts.FACTS_EXPAND_WIDE_TABLES", False):
-            prompt = render_facts_prompt(unit, document="a", subjects=["热聊"])
+            prompt = render_facts_prompt(unit, document="a", subjects=["协作丙"])
             self.assertIn("标签 |  | 1 | 1 | 0 | 1", prompt)
-            self.assertNotIn("钉钉: 1", prompt)
+            self.assertNotIn("协作甲: 1", prompt)
+
+
+class CurrencyTests(unittest.TestCase):
+    """2026-10-24 破坏性改版(方案附录第 3 条与第 7 条):关系与事实同一套时间与新旧字段。
+    关系带观察时间(来源文档的日期)和原文写明的起止;只有显式声明单值的关系才判新旧;
+    事实序列里最新那一档是现行值;版本串不再写进有效期;按日期组织的资料里叙述段也抽状态事实。"""
+
+    def _units(self):
+        u1 = _unit("u1", doc="kb:1"); u1.doc_date = "2025-03-01"
+        u2 = _unit("u2", doc="kb:2", order=1); u2.doc_date = "2026-01-10"
+        u3 = _unit("u3", doc="kb:3", order=2)
+        return {u.unit_id: u for u in (u1, u2, u3)}
+
+    def test_only_things_with_changing_states_have_their_relations_superseded(self) -> None:
+        """一般概念上的不同说法可以并存。只有具备可变状态的实例才按时间判断关系的新旧。"""
+        from kb_pipeline.graph.currency import relation_currency
+
+        units = self._units()
+        rels = [{"source_key": "某病", "target_key": "部位a", "predicate": "located_in", "unit_ids": ["u1"]},
+                {"source_key": "某病", "target_key": "部位b", "predicate": "located_in", "unit_ids": ["u2"]},
+                {"source_key": "张三", "target_key": "城市a", "predicate": "located_in", "unit_ids": ["u1"]},
+                {"source_key": "张三", "target_key": "城市b", "predicate": "located_in", "unit_ids": ["u2"]}]
+        ents = [{"key": "某病", "upper": "concept", "kind": "instance"}, {"key": "张三", "upper": "agent", "kind": "instance"}]
+        stats = relation_currency(rels, units, predicates=[{"name": "located_in", "multivalued": False}], entities=ents)
+        self.assertEqual([bool(r.get("superseded_by")) for r in rels], [False, False, True, False])
+        self.assertEqual((stats["superseded"], stats["stateless_sources_skipped"]), (1, 2))
+
+    def test_only_stated_periods_of_a_state_lapse(self) -> None:
+        """单次事件的发生时间不等于有效期。只有实例明确的一段状态才会在止期后失效。"""
+        from kb_pipeline.graph.currency import is_interval, mark_fact_lapses, relation_currency
+
+        self.assertTrue(is_interval("2014", "2016"))
+        self.assertTrue(is_interval("", "2025-06"))                     # 只写了止期:合同到 2025 年 6 月
+        self.assertFalse(is_interval("2025-10-18", "2025-10-18"))       # 某天做的一次检查
+        self.assertFalse(is_interval("2025", "2025"))
+        self.assertFalse(is_interval("2021", ""))
+        self.assertFalse(is_interval("", "v2.0"))
+        units = self._units()
+        rels = [{"source_key": "张三", "target_key": "公司a", "predicate": "works_at", "unit_ids": ["u1"],
+                 "valid_from": "2014", "valid_until": "2016"},
+                {"source_key": "张三", "target_key": "机构b", "predicate": "related_to", "unit_ids": ["u1"],
+                 "valid_from": "2025-03-01", "valid_until": "2025-03-01"},
+                {"source_key": "张三", "target_key": "年会", "predicate": "attends", "unit_ids": ["u1"],
+                 "valid_from": "2025-03-01", "valid_until": "2025-03-03"},
+                {"source_key": "张三", "target_key": "公司a", "predicate": "related_to", "unit_ids": ["u1"]},
+                {"source_key": "张三", "target_key": "检查c", "predicate": "related_to", "unit_ids": ["u1"],      # 兜底关系不说状态
+                 "valid_from": "2026-08-31", "valid_until": "2026-09-16"},
+                {"source_key": "某病", "target_key": "某项风险", "predicate": "has_biomarker", "unit_ids": ["u1"],   # 报告的检测期
+                 "valid_from": "2025-10-11", "valid_until": "2025-12-11"}]
+        ents = [{"key": "张三", "upper": "agent"}, {"key": "公司a", "upper": "agent"}, {"key": "机构b", "upper": "agent"},
+                {"key": "年会", "upper": "event"}, {"key": "检查c", "upper": "process"}, {"key": "某病", "upper": "concept"},
+                {"key": "某项风险", "upper": "property"}]
+        stats = relation_currency(rels, units, entities=ents)
+        self.assertEqual([r["lapses"] for r in rels], [True, False, False, False, False, False])
+        self.assertEqual(stats["relations_lapsing"], 1)
+        facts = [{"subject_key": "张三", "valid_from": "2024-01", "valid_until": "2024-06"},
+                 {"subject_key": "年会", "valid_from": "2025-03-01", "valid_until": "2025-03-03"},
+                 {"subject_key": "某病", "valid_from": "2020", "valid_until": "2022"},
+                 {"subject_key": "张三", "valid_from": "2024-07-26", "valid_until": "2024-07-26"},
+                 {"subject_key": "张三", "valid_from": "2024-07-26"}]
+        self.assertEqual(mark_fact_lapses(facts, ents), 1)
+        self.assertEqual([f["lapses"] for f in facts], [True, False, False, False, False])
+
+    def test_merged_relations_do_not_make_a_period_out_of_two_dates(self) -> None:
+        """两次检查各一条起止相同的关系,归并后不能变成「从第一次到第二次」的一段状态(过了第二次就被当成已结束)。"""
+        from kb_pipeline.graph.resolution import merged_period
+
+        self.assertEqual(merged_period({"valid_from": "2024-07-26", "valid_until": "2024-07-26"},
+                                       {"valid_from": "2025-06-12", "valid_until": "2025-06-12"}), ("2024-07-26", "2024-07-26"))
+        self.assertEqual(merged_period({"valid_from": "2021"}, {"valid_until": "2025-06"}), ("2021", "2025-06"))
+        self.assertEqual(merged_period({"valid_from": "2014", "valid_until": "2016"},
+                                       {"valid_from": "2015", "valid_until": "2018"}), ("2014", "2018"))
+        self.assertEqual(merged_period({}, {"valid_from": "2020-05-01", "valid_until": "2020-05-01"}), ("2020-05-01", "2020-05-01"))
+        self.assertEqual(merged_period({}, {}), ("", ""))
+
+    def test_single_valued_relations_are_superseded_by_the_newest_statement(self) -> None:
+        from kb_pipeline.graph.currency import relation_currency
+        from kb_pipeline.graph.vectors import relation_id
+
+        units = self._units()
+        rels = [
+            {"source_key": "张三", "target_key": "组a", "predicate": "reports_to", "unit_ids": ["u1"]},
+            {"source_key": "张三", "target_key": "组b", "predicate": "reports_to", "unit_ids": ["u2"]},
+            {"source_key": "张三", "target_key": "组c", "predicate": "reports_to", "unit_ids": ["u3"]},      # 没有日期:不判
+            {"source_key": "张三", "target_key": "项目x", "predicate": "works_on", "unit_ids": ["u1"]},
+            {"source_key": "张三", "target_key": "项目y", "predicate": "works_on", "unit_ids": ["u2"]},
+            {"source_key": "李四", "target_key": "组a", "predicate": "reports_to", "unit_ids": ["u1"], "valid_from": "2026-05"},
+            {"source_key": "李四", "target_key": "组b", "predicate": "reports_to", "unit_ids": ["u2"]},
+        ]
+        stats = relation_currency(rels, units, predicates=[{"name": "reports_to", "multivalued": False}, {"name": "works_on"}])
+        by = {(r["source_key"], r["target_key"]): r for r in rels}
+        self.assertEqual((by[("张三", "组a")]["observed_first"], by[("张三", "组a")]["observed_last"]), ("2025-03-01", "2025-03-01"))
+        self.assertEqual(by[("张三", "组a")]["superseded_by"], relation_id("张三", "组b", "reports_to"))
+        self.assertEqual(by[("张三", "组a")]["superseded_on"], "2026-01-10")
+        self.assertNotIn("superseded_by", by[("张三", "组b")])
+        self.assertNotIn("superseded_by", by[("张三", "组c")])             # 没有时间的说法不凭空判旧
+        self.assertNotIn("superseded_by", by[("张三", "项目x")])           # 多值关系不判新旧
+        # 原文写明的起点优先于观察时间:李四 2026-05 起向组 a 汇报,比 2026-01 的文档新
+        self.assertEqual(by[("李四", "组b")]["superseded_by"], relation_id("李四", "组a", "reports_to"))
+        self.assertEqual((stats["superseded"], stats["single_valued_groups"]), (2, 2))
+
+    def test_fact_series_mark_the_newest_value_current(self) -> None:
+        from kb_pipeline.graph.reconcile import reconcile_facts
+
+        facts = [{"id": f"f{y}", "subject": "张三", "property": "体重", "value": str(60 + i), "unit": "kg", "doc_id": f"d{y}",
+                  "valid_from": str(y)} for i, y in enumerate((2023, 2024, 2025))]
+        reconcile_facts(facts)
+        by = {f["id"]: f for f in facts}
+        self.assertEqual((by["f2023"]["superseded_by"], by["f2023"]["superseded_on"]), ("f2024", "2024"))
+        self.assertEqual(by["f2024"]["superseded_by"], "f2025")
+        self.assertNotIn("superseded_by", by["f2025"])
+
+    def test_versions_stay_out_of_the_validity_dates(self) -> None:
+        from kb_pipeline.graph.facts import link_facts
+
+        unit = _unit("u1", doc="kb:1"); unit.axis = "rev *L"; unit.doc_date = "2024-05"
+        dated = _unit("u2", doc="kb:2", order=1); dated.axis = "2025-01-02"; dated.doc_date = "2025-01-02"
+        facts = [{"unit_id": "u1", "subject": "x", "property": "p", "value": "1"},
+                 {"unit_id": "u2", "subject": "x", "property": "p", "value": "2"}]
+        link_facts(facts, [], units_by_id={"u1": unit, "u2": dated})
+        self.assertEqual((facts[0]["axis"], facts[0]["valid_from"], facts[0]["observed"]), ("rev *L", "2024-05", "2024-05"))
+        self.assertEqual(facts[1]["valid_from"], "2025-01-02")
+
+    def test_narrative_state_facts_only_for_prose_units_and_with_the_document_date(self) -> None:
+        from kb_pipeline.graph.facts import render_facts_prompt, wants_narrative_facts
+
+        prose = _unit("u1"); prose.text = "项目负责人改为王五,上线日期推迟到下月底。" * 10; prose.n_tokens = 120; prose.doc_date = "2026-03-14"
+        table = _unit("u2"); table.text = "| a | b |\n| 1 | 2 |\n| 3 | 4 |"; table.block_types = ["table"]; table.n_tokens = 120
+        short = _unit("u3"); short.text = "好的"; short.n_tokens = 3
+        self.assertTrue(wants_narrative_facts(prose))
+        self.assertFalse(wants_narrative_facts(table))                     # 表格单元走表格事实
+        self.assertFalse(wants_narrative_facts(short))
+        self.assertFalse(wants_narrative_facts(prose, "boilerplate"))
+        text = render_facts_prompt(prose, document="周报.docx", subjects=["项目X"], narrative=True)
+        self.assertIn("Document date, if known: 2026-03-14", text)
+        self.assertIn("state facts", text)
+        self.assertIn("Document version, if known: (unknown)", render_facts_prompt(table, document="t.xlsx", subjects=[]))
+        build = _repo_file("app/kb_pipeline/graph/build.py")
+        self.assertIn('if str((graph.get("profile") or {}).get("axis") or "") == "date":', build)    # 只对按日期组织的库开
+
+
+class SeriesConditionTests(unittest.TestCase):
+    """合成的跨年记录验证条件分组:记录上下文不能被随意丢弃,真正区分不同取值的条件应保留。"""
+
+    def _fact(self, fid, doc, when, value, conditions):
+        return {"id": fid, "subject": "某甲", "subject_key": "某甲", "property": "血红蛋白", "concept_key": "c-hb", "value": value,
+                "value_num": float(value), "unit": "g/L", "valid_from": when, "doc_id": doc, "conditions": conditions}
+
+    def test_unclassified_cross_document_conditions_are_preserved(self) -> None:
+        from kb_pipeline.graph.reconcile import reconcile_facts
+
+        facts = [self._fact("f1", "d1", "2024", "147", {"检查项目": "血红蛋白", "科室": "血常规", "检查者": "某医生"}),
+                 self._fact("f2", "d2", "2025", "159", {}),
+                 self._fact("f3", "d3", "2026", "154", {"检查类型": "血常规"}),
+                 self._fact("f4", "d3", "2024-07", "147", {"时间": "2024/07"})]       # 历年对照表:时期是轴,不是条件
+        out = reconcile_facts(facts)
+        self.assertIsNone(facts[0].get("superseded_by"))
+        self.assertIsNone(facts[2].get("superseded_by"))
+        self.assertNotEqual(facts[0].get("series_key"), facts[1].get("series_key"))
+        self.assertEqual(out["stats"]["conflicts"], 0)
+
+    def test_a_condition_that_tells_values_apart_still_splits(self) -> None:
+        from kb_pipeline.graph.reconcile import reconcile_facts
+
+        facts = [self._fact("f1", "d1", "2024", "3.3", {"温度": "25°C"}), self._fact("f2", "d1", "2024", "3.1", {"温度": "85°C"}),
+                 self._fact("f3", "d2", "2025", "3.3", {"温度": "25°C"}), self._fact("f4", "d2", "2025", "3.0", {"温度": "85°C"})]
+        reconcile_facts(facts)
+        self.assertEqual(facts[0]["series_key"], facts[2]["series_key"])
+        self.assertEqual(facts[1]["series_key"], facts[3]["series_key"])
+        self.assertNotEqual(facts[0]["series_key"], facts[1]["series_key"])
+
+
+class SubjectEvidenceTests(unittest.TestCase):
+    def test_events_named_like_the_file_do_not_become_the_document_subject(self) -> None:
+        """虚构的事件与文件同名时,不能压过上级目录所指的人员主体。"""
+        from kb_pipeline.graph.facts import subject_evidence_by_doc
+
+        ents = [{"key": "某甲", "title": "某甲", "type": "patient", "upper": "agent", "kind": "instance", "doc_ids": ["d1", "d2"], "frequency": 9},
+                {"key": "2024体检报告", "title": "2024体检报告", "type": "health examination", "upper": "event", "kind": "instance",
+                 "doc_ids": ["d1"], "frequency": 3}]
+        ev = subject_evidence_by_doc(ents, ["patient", "health examination"],
+                                     documents={"d1": "某甲/体检报告/2024体检报告.pdf", "d2": "某甲/体检报告/2025体检报告.pdf"})
+        self.assertEqual({d: (e["title"], how) for d, (e, how) in ev.items()}, {"d1": ("某甲", "path"), "d2": ("某甲", "path")})
+
+
+class TimeScopeTests(unittest.TestCase):
+    """检索时的时间口径(关系、事实、文档状态共用一套):默认现行、as_of 回看某一天、history 全给。
+    Cypher 条件与 Python 里的判定必须是同一个口径,否则清单和计数对不上。"""
+
+    def test_as_of_dates_close_the_period_they_name(self) -> None:
+        from kb_pipeline.graph.currency import as_of_day
+
+        self.assertEqual(as_of_day("2024"), "2024-12-31")
+        self.assertEqual(as_of_day("2024-02"), "2024-02-29")                 # 「截至 2024 年 2 月」:那月的最后一天
+        self.assertEqual(as_of_day("2023-2-3"), "2023-02-03")
+        self.assertEqual(as_of_day(""), "")
+        for bad in ("2024-13", "2023-02-30", "去年", "2024/01"):
+            with self.assertRaises(ValueError):
+                as_of_day(bad)
+
+    def test_row_status_by_scope(self) -> None:
+        from kb_pipeline.graph.currency import in_scope, query_scope, row_status
+
+        today = "2026-10-24"
+        self.assertEqual(row_status({}, day=today), "current")
+        self.assertEqual(row_status({"valid_until": "2014", "lapses": True}, day=today), "ended")
+        self.assertEqual(row_status({"valid_until": "2026", "lapses": True}, day=today), "current")   # 只写到年:那一整年都算
+        self.assertEqual(row_status({"valid_from": "2014-05-01", "valid_until": "2014-05-01"}, day=today), "current")  # 发生过的事不过期
+        self.assertEqual(row_status({"superseded_by": "r2"}, day=today), "superseded")
+        self.assertEqual(row_status({"doc_status": "archived"}, day=today), "doc_archived")
+        self.assertEqual(row_status({"doc_status": "superseded"}, day=today), "doc_superseded")
+        self.assertEqual(row_status({"valid_until": "v2.0", "lapses": True}, day=today), "current")   # 不是日期的值不比
+        self.assertEqual(row_status({"valid_until": "2014", "lapses": True}, day="2015-01-01", as_of=True), "ended")
+        self.assertEqual(row_status({"valid_from": "2014-05-01", "valid_until": "2014-05-01"}, day="2015-01-01", as_of=True), "current")
+        # 回看:被取代的时间晚于那一天就还算数;那天还没开始(或还没有文档提到)的不算;文档状态是现在的事,不看
+        old = {"superseded_by": "r2", "superseded_on": "2025-03", "observed_first": "2024-05-01", "doc_status": "archived"}
+        self.assertEqual(row_status(old, day="2025-02-28", as_of=True), "current")
+        self.assertEqual(row_status(old, day="2025-03-31", as_of=True), "superseded")
+        self.assertEqual(row_status(old, day="2024-01-01", as_of=True), "not_started")
+        self.assertEqual(row_status({"superseded_by": "s2", "superseded_on": "v7.0"}, day="2020-01-01", as_of=True), "current")  # 版本轴说不出哪天
+        scope = query_scope(as_of="2025-02")
+        self.assertEqual((scope["mode"], scope["day"]), ("as_of", "2025-02-28"))
+        self.assertTrue(in_scope(old, scope))
+        self.assertTrue(in_scope({"superseded_by": "x"}, query_scope(history=True)))
+        self.assertFalse(in_scope({"superseded_by": "x"}, query_scope(today=today)))
+        self.assertEqual(query_scope(history=True, as_of="2024")["day"], "2024-12-31")       # history 照样按回看那天标状态
+
+    def test_cypher_condition_carries_the_same_rule(self) -> None:
+        """Cypher 条件与 row_status 是同一个口径:现行看取代 / 文档状态 / 有效期,回看看起点 / 有效期 / 取代的时间、不看文档状态。
+        (条件在真库上的行为由上线前的实库核对覆盖,这里钉住条件的构成。)"""
+        from kb_pipeline.graph.currency import cypher_in_effect, cypher_in_scope, query_scope, row_status
+
+        cur = cypher_in_effect("r", observed="observed_first", as_of=False)
+        for piece in ("r.superseded_on", "r.valid_from", "coalesce(r.doc_status, '') = ''", "NOT coalesce(r.lapses, false)",
+                      "r.valid_until >= left($day, size(r.valid_until))", "NOT coalesce(r.valid_until, '') =~ '[0-9]{4}.*'"):
+            self.assertIn(piece, cur)
+        self.assertIn("NOT coalesce(f.lapses, false)", cypher_in_effect("f", observed="observed", as_of=True))
+        back = cypher_in_effect("f", observed="observed", as_of=True)
+        for piece in ("coalesce(f.valid_from, f.observed, '') <= left($day, size(coalesce(f.valid_from, f.observed, '')))",
+                      "f.superseded_on <= left($day, size(f.superseded_on))", "NOT (coalesce(f.superseded_by, '') <> ''"):
+            self.assertIn(piece, back)
+        self.assertNotIn("doc_status", back)                     # 回看不看文档的现在状态
+        self.assertEqual(cypher_in_scope("r", observed="observed_first", scope=query_scope(history=True)), "true")
+        self.assertEqual(row_status({"valid_from": "2027"}, day="2026-10-24"), "not_started")  # Current is evaluated at today's date.
+
+
+class FactAttributionTests(unittest.TestCase):
+    """10-24 新旧图对比里暴露的挂错与噪声:长文档(一份讲好几样东西)里一节的数值挂到别的小节的主体上;报告里按等级
+    列出的参考建议当成了本人的事实;证据里同一条事实重复好几遍;中心实体扩展出来的边只按强度挑,跟问题对不上。"""
+
+    def _units(self):
+        u1 = _unit("u1", doc="d1"); u1.rel_path = "合集/手册.md"
+        u2 = _unit("u2", doc="d1", order=1); u2.rel_path = "合集/手册.md"
+        u3 = _unit("u3", doc="d2", order=2); u3.rel_path = "李华/体检报告/2025.pdf"
+        return [u1, u2, u3]
+
+    def test_units_get_their_own_subjects_before_the_document_ones(self) -> None:
+        from kb_pipeline.graph.facts import unit_subjects
+
+        ents = [
+            {"key": "harness", "title": "评测框架甲", "type": "framework", "upper": "entity", "frequency": 30, "doc_ids": ["d1"], "unit_ids": ["u1"]},
+            {"key": "bench", "title": "题库乙", "type": "benchmark", "upper": "entity", "frequency": 5, "doc_ids": ["d1"], "unit_ids": ["u2"]},
+            {"key": "lh", "title": "李华", "type": "person", "upper": "agent", "frequency": 3, "doc_ids": ["d2"], "unit_ids": ["u3"]},
+            {"key": "org", "title": "某医院", "type": "organization", "upper": "agent", "frequency": 9, "doc_ids": ["d2"], "unit_ids": ["u3"]},
+            {"key": "cls", "title": "患者", "type": "person", "upper": "agent", "kind": "class", "frequency": 50, "doc_ids": ["d2"], "unit_ids": ["u3"]},
+        ]
+        units = self._units()
+        out = unit_subjects(units, ents, subject_types=["person", "framework"], documents={u.doc_id: u.rel_path for u in units})
+        self.assertEqual(out["u2"][:2], ["题库乙", "评测框架甲"])           # 这一节讲题库乙:排在整份文档的主要主体前面
+        self.assertEqual(out["u1"][0], "评测框架甲")
+        self.assertEqual(out["u3"][0], "李华")                             # 路径说明这份报告就是李华的:排最前,医院在后
+        self.assertIn("某医院", out["u3"])
+        self.assertNotIn("患者", out["u3"])                                # 泛指的类别名不当主体
+
+    def test_a_section_heading_names_the_topic_of_a_compilation(self) -> None:
+        """无归属人的合成汇编中,小节里的值不能都归到整份文档的主要主体名下。小节标题点名的那样东西排在单元自己点名的东西后面、整份文档的主要主体前面;有归属人的
+        文档不加;英文名按整词认,类别名、文档不算。"""
+        from kb_pipeline.graph.facts import unit_subjects
+
+        u1, u2, u3 = _unit("u1", doc="d1"), _unit("u2", doc="d1", order=1), _unit("u3", doc="d1", order=2)
+        u4 = _unit("u4", doc="d2", order=3)
+        for u in (u1, u2, u3):
+            u.rel_path = "合集/手册.md"
+        u4.rel_path = "李华/体检报告/2025.pdf"
+        u1.section_path = ["21点实验报告", "4. 实验怎么做的"]
+        u2.section_path = ["21点实验报告", "6. 结果"]
+        u3.section_path = ["Autoresearch Feature Discovery", "笔记本结构"]
+        u4.section_path = ["血常规检查"]
+        ents = [
+            {"key": "harness", "title": "评测框架甲", "type": "framework", "upper": "entity", "frequency": 30, "doc_ids": ["d1"], "unit_ids": []},
+            {"key": "exp", "title": "21点实验", "type": "experiment", "upper": "event", "scope": "d1", "frequency": 2, "doc_ids": ["d1"]},
+            {"key": "rep", "title": "21点实验报告", "type": "report", "upper": "document", "scope": "d1", "frequency": 1, "doc_ids": ["d1"]},
+            {"key": "judge", "title": "裁判", "type": "role", "upper": "agent", "frequency": 3, "doc_ids": ["d1"], "unit_ids": ["u2"]},
+            {"key": "redis", "title": "Redis", "type": "database", "upper": "entity", "frequency": 4, "doc_ids": ["d3"]},
+            {"key": "nb", "title": "笔记本结构", "type": "structure", "upper": "part", "kind": "class", "frequency": 6, "doc_ids": ["d1"]},
+            {"key": "lh", "title": "李华", "type": "person", "upper": "agent", "frequency": 3, "doc_ids": ["d2"], "unit_ids": ["u4"]},
+            {"key": "cbc", "title": "血常规检查", "type": "examination", "upper": "process", "frequency": 2, "doc_ids": ["d2"]},
+        ]
+        units = [u1, u2, u3, u4]
+        out = unit_subjects(units, ents, subject_types=["person", "framework"], documents={u.doc_id: u.rel_path for u in units})
+        self.assertEqual(out["u1"][:2], ["21点实验", "评测框架甲"])           # 这一节自己没点名任何东西:标题点名的实验在框架前面
+        self.assertEqual(out["u2"][:3], ["裁判", "21点实验", "评测框架甲"])   # 单元自己点名的东西仍排最前
+        self.assertNotIn("Redis", out["u3"])                                  # Feature Discovery 里没有 Redis
+        self.assertNotIn("笔记本结构", out["u3"])                             # 类别名不是哪一样东西
+        self.assertEqual(out["u4"], ["李华"])                                 # 有归属人的文档:数值归归属人,不加标题主题
+
+    def test_prompts_ask_for_the_subject_the_values_belong_to(self) -> None:
+        from kb_pipeline.graph import prompts
+
+        for text in (prompts.FACTS_PROMPT, prompts.NARRATIVE_FACTS_PROMPT):
+            self.assertIn("things named in this part of the document first", text)
+        self.assertIn("use the likely subject above that the values belong to", prompts.FACTS_PROMPT)
+        self.assertIn("Skip advice addressed to the reader", prompts.FACTS_PROMPT)
+        self.assertIn("A recommended value or setting of a thing", prompts.FACTS_PROMPT)     # 产品的推荐工作条件照样是事实
+
+    def test_duplicate_facts_collapse_into_one_row(self) -> None:
+        from kb_pipeline.graph.recall import collapse_duplicate_facts
+
+        base = {"subject": "李华", "subject_id": "e1", "property": "GENE_A rs0000111 风险/正常", "valid_from": "2023-05-10"}
+        rows = [{**base, "gr_id": "f1", "value": "正常", "conditions": {"基因": "GENE_A"}, "point_ids": ["p1"]},
+                {**base, "gr_id": "f2", "value": "正常", "conditions": {"基因": "GENE_A", "位点名称": "rs0000111"}, "point_ids": ["p7"]},
+                {**base, "gr_id": "f3", "value": "风险", "conditions": {"基因": "GENE_A"}, "point_ids": ["p3"]},
+                {"gr_id": "f4", "subject": "器件甲", "property": "tAS", "min": "0.5", "unit": "ns", "conditions": {"速度等级": "-250"}},
+                {"gr_id": "f5", "subject": "器件甲", "property": "tAS", "min": "0.5", "unit": "ns", "conditions": {"速度等级": "-200"}}]
+        out = collapse_duplicate_facts(rows)
+        # 条件只是复述属性名里已有的内容(位点名称)不算区别;取值不同、真正的条件(速度等级)不同的照留
+        self.assertEqual([r["gr_id"] for r in out], ["f1", "f3", "f4", "f5"])
+        self.assertEqual((out[0]["point_ids"], out[0]["_duplicates"]), (["p1", "p7"], 1))
+
+    def test_expansion_prefers_edges_that_match_the_question(self) -> None:
+        from kb_pipeline.graph.recall import expansion_relevance
+
+        q = "DSE 需要具备哪些能力？"
+        skill = {"title": "业务理解能力", "type": "requires", "description": "DSE 需要懂业务的能力"}
+        years = {"title": "3-5年经验", "type": "has_parameter", "description": "DSE 岗位常见的工作年限"}
+        self.assertGreater(expansion_relevance(q, "DSE", skill) * 3.0, expansion_relevance(q, "DSE", years) * 5.0)
+        self.assertEqual(expansion_relevance("DSE", "DSE", years), 1.0)               # 问题只点了实体名:不改按强度的排序
+        self.assertEqual(expansion_relevance("dse 的能力", "DSE", skill), expansion_relevance("能力", "", skill))   # 起点名字大小写不论都去掉

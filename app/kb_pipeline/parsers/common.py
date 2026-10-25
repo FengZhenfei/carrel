@@ -51,8 +51,9 @@ def clean_text(text: str) -> str:
 def walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
     if isinstance(value, dict):
         yield value
-        for child in value.values():
-            yield from walk_dicts(child)
+        for key, child in value.items():
+            if not str(key).startswith("_kb_"):
+                yield from walk_dicts(child)
     elif isinstance(value, list):
         for item in value:
             yield from walk_dicts(item)
@@ -280,12 +281,8 @@ def grid_to_markdown(rows: list[list[str]] | None) -> str | None:
 
 def item_text(item: dict[str, Any], *, fallback_json: bool = False) -> str:
     values: list[str] = []
-    # code_body: the text of MinerU's code listings / algorithm boxes ({"type": "code", "sub_type": "code" |
-    # "algorithm", "code_body", "code_caption"}) lives entirely in this key. It used not to be read: such items
-    # yielded an empty string, have no image, and were skipped as a whole, caption included, without a line in
-    # the log; on one deployment 23 documents had lost about 667k characters, some technical books nearly half
-    # of their text (2026-09-29 audit)
-    for key in ("text", "content", "orig", "caption", "latex", "md", "markdown", "html", "table_body", "code_body", "name"):
+    # MinerU code and algorithm blocks store their body in code_body.
+    for key in ("text", "content", "orig", "caption", "latex", "md", "markdown", "html", "table_body", "code_body"):
         value = item.get(key)
         if isinstance(value, str) and value.strip():
             if key in {"html", "table_body"}:
@@ -294,8 +291,7 @@ def item_text(item: dict[str, Any], *, fallback_json: bool = False) -> str:
                 value = html_table_to_markdown(value) or value
             values.append(value.strip())
     # MinerU 3.x list items: {"type": "list", "list_items": ["1. ...", "2. ..."]}; the whole body is in
-    # list_items and text is empty -- this key used to be ignored, so the "expert advice" sections of
-    # medical check-up reports were dropped wholesale (2026-09-07 health knowledge base audit)
+    # list_items and text is empty. Ignoring this key drops the entire list body.
     items = item.get("list_items")
     if isinstance(items, list):
         lines = [str(x).strip() for x in items if str(x).strip()]
@@ -575,10 +571,10 @@ def parser_profile_for_path(path: Path) -> str:
     pdf v7->v8 / docx v6->v7, same evening: detection rules tightened (mm / ** / multi-condition
     cells no longer misjudged), verification now matches the transcription by content; fixed the
     first real-machine round where all 9 tables went unverified.
-    pdf v8->v9 / docx v7->v8, 2026-09-07 (health knowledge base audit): MinerU list_items used to be
+    pdf v8->v9 / docx v7->v8, 2026-09-07 parsing audit: MinerU list_items used to be
     dropped wholesale; a table split across pages into a header-less fragment is merged back into the
     previous one; QR codes / barcodes / icons / signatures are folded into the body, and photos with a
-    substantive description (ultrasound image pages) are no longer folded away as decorative images.
+    substantive description are no longer folded away as decorative images.
     pdf v14->v15 / docx v9->v10 / py-symbols, code-symbols v1->v2 / md v2->v3 / other text types v1->v2,
     2026-09-30: integer chapter numbers ("4 Technical requirements") count as numbered headings and docx
     style headings are no longer demoted; a heading at the end of a block is no longer lost (every type

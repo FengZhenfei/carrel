@@ -1,19 +1,13 @@
-"""Retrieval orchestration: the two cheap channels probe every knowledge base -> knowledge bases are
-chosen by evidence -> the graph / visual channels run only on the chosen ones -> RRF fusion per
-knowledge base, interleaved by subject / document buckets -> cross-encoder rerank (threshold + floor)
--> boilerplate chunks / low-confidence images down-weighted -> quota reservation + MMR cut to top-k ->
-evidence assembly -> summary. Returns evidence only and never generates answers. When the chosen
-knowledge bases yield no decent evidence, the search automatically widens to all knowledge bases and
-runs again (the cheap channels' candidates are already in hand, only the graph channel is added).
-Requests carrying an image (image-to-image): the visual channel probes every knowledge base and takes
-part in the selection, and visual candidates are exempt from the text rerank threshold and get slots
-reserved by visual score (Codex S02). The whole service shares one bounded thread pool, every stage
-collects results against a deadline, and a slow channel is only recorded as degraded instead of
-holding up the whole request (Codex S06).
-The whole request also has a time budget: each stage gets the smaller of its own timeout and the
-remaining budget; when the budget runs short there is no widening and no neighbourhood backfill, and
-each such gap is recorded in degraded. Calls from the search process to Qdrant / OpenSearch / Neo4j
-are all bounded, so an abandoned job ends on its own when its time is up."""
+"""Evidence retrieval with automatic library routing and bounded parallel scoring.
+
+Vector and keyword probes select libraries; graph and visual recall enrich their
+candidates. Text and image rankers apply independent relevance gates before rank
+fusion. Missing image scores use the text path. Subject/document quotas, diversity
+selection and context assembly follow, with no answer generation in the service.
+Automatic routing can widen when the selected libraries lack relevant evidence.
+All stages share a bounded thread pool and the request deadline; unavailable or
+unfinished stages are reported as degraded evidence.
+"""
 from __future__ import annotations
 
 import os
@@ -30,24 +24,27 @@ from qdrant_client import QdrantClient
 from kb_pipeline.config import Settings, load_settings
 
 from . import catalog as catalog_mod
-from . import channels
+from . import channels, docstatus
 from .config import SearchSettings, env_file_values, load_search_settings
 from .evidence import assemble_sources, doc_aggs, numbered, page_rows, select_hits, spec_rows
 from .fusion import interleave, rrf_merge
-from .rerank import Reranker, rerank
+from .rerank import Reranker, rerank, rerank_images
 
 _state: dict[str, Any] = {"settings": None, "search": None, "q": None, "q_key": None, "at": 0.0, "pool": None, "pool_size": 0,
                           "explicit": None}       # explicit: KB_SEARCH_* keys set explicitly in the process environment (recognised on the first settings read)
 _state_lock = threading.Lock()
 SETTINGS_TTL = 60.0
 
-ENTITY_FIELDS = ("id", "title", "type", "scope", "score", "hop", "via", "docs", "description", "verified", "sources_active")
-RELATION_FIELDS = ("id", "source", "type", "target", "score", "hop", "via", "description", "verified", "sources_active")
+ENTITY_FIELDS = ("id", "title", "type", "upper", "kind", "scope", "score", "hop", "via", "docs", "description", "verified", "sources_active")
+# 关系与事实带时间与状态(status:current / superseded / ended / not_started / doc_superseded / doc_archived,见 currency)
+RELATION_FIELDS = ("id", "source", "type", "target", "status", "valid_from", "valid_until", "observed_first", "observed_last",
+                   "superseded_by", "score", "hop", "via", "description", "verified", "sources_active")
 SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "verified", "series_text", "conflict", "conflict_note",
                "subject", "property", "symbol", "concept", "value", "min", "typ", "max", "unit", "unit_canonical", "flag", "ref_min", "ref_max",
-               "when", "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
+               "when", "valid_from", "valid_until", "status", "observed", "superseded_by", "superseded_on", "doc_status", "source_kind",
+               "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
                "confidence", "comparable", "text", "note", "score", "rel_path", "section", "point_ids", "evidence")
-PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "verified", "sources_active", "docs", "series", "point_ids")
+PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "compiled_day", "time_mode", "source_paths", "verified", "sources_active", "docs", "series", "point_ids")
 NEIGHBORHOOD_FIELDS = ("id", "title", "type", "named", "relations", "facts", "predicates", "neighbors")
 NEIGHBORHOOD_TIMEOUT = 5.0          # subject neighbourhoods are leads that come along: wait at most this long for a slow graph database, never hold the request up
 # Generic words pointing across documents (Q08): when the question asks "both / each / respectively /
@@ -155,6 +152,12 @@ def rerank_active(settings: Any, ss: Any) -> bool:
     return bool(ss.rerank_enabled and str(getattr(settings, "reranker_base_url", "") or "").strip())
 
 
+def visual_rerank_active(settings: Any, ss: Any) -> bool:
+    """Image ranking participates automatically when reranking and its endpoint are available."""
+    return bool(getattr(ss, "rerank_enabled", False)
+                and str(getattr(settings, "visual_reranker_base_url", "") or "").strip())
+
+
 def health() -> dict[str, Any]:
     settings, ss, q = runtime()
     checks: dict[str, Any] = {}
@@ -166,33 +169,51 @@ def health() -> dict[str, Any]:
 
     checks["pdf_images"] = "ok" if importlib.util.find_spec("pymupdf") else "unavailable: install carrel[pdf-images] (PyMuPDF) for original-resolution PDF pictures"
     return {"ok": True, "service": "kb_search", "kbs": sorted(settings.sources), "auth": "bearer" if ss.token else "loopback-only",
-            "rerank": rerank_active(settings, ss), "visual": ss.visual_enabled, "checks": checks}
+            "rerank": rerank_active(settings, ss), "visual": ss.visual_enabled, "visual_rerank": visual_rerank_active(settings, ss), "checks": checks}
 
 
 def catalog(force: bool = False) -> dict[str, Any]:
     settings, ss, q = runtime()
-    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, force=force)
+    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, force=force, driver=_graph_driver(settings))
     return {"kbs": catalog_mod.public_view(entries)}
+
+
+def _graph_driver(settings: Settings) -> Any:
+    """目录要读各库的图谱概览:图库没配(没设密码)就不读,目录照常。"""
+    try:
+        return channels.shared_driver(settings)
+    except Exception:
+        return None
+
+
+def _kb_filters(hint: dict[str, Any] | None, excluded: list[str] | None) -> tuple[Any, list[dict[str, Any]] | None]:
+    """一个库的召回过滤:hints 的文档 / 路径 / 版本限定,加上按时间口径不给的文档路径(docstatus.excluded_paths)。"""
+    from qdrant_client.http import models as qm
+
+    qfilter = channels.hint_filter(hint) if hint else None
+    os_filters = channels.hint_os_filters(hint) if hint else None
+    if excluded:
+        base = qfilter or channels.ACTIVE_FILTER
+        qfilter = qm.Filter(must=list(base.must or []), must_not=[qm.FieldCondition(key="rel_path", match=qm.MatchAny(any=list(excluded)))])
+        os_filters = list(os_filters or []) + [{"bool": {"must_not": [{"terms": {"rel_path": list(excluded)}}]}}]
+    return qfilter, os_filters
 
 
 def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], question: str, vector: list[float] | None,
            identifiers: list[str], *, with_profile: bool, until: float, image_bytes: bytes | None = None,
-           hint: dict[str, Any] | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """The two cheap channels (vector, keyword) fetch candidates from the given knowledge bases in
-    parallel; with auto routing a knowledge-base-level lexical evidence count is taken along the way,
-    and the visual channel's question vector is computed in this step too; for a request carrying an
-    image the visual channel also probes every knowledge base (it takes part in the selection). A
-    failing channel is only recorded as degraded and does not affect other knowledge bases or channels."""
+           hint: dict[str, Any] | None = None, excluded: dict[str, list[str]] | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """便宜的两路(向量、关键词)在给定的库上并行取候选,自动路由时顺带数一份库级词法证据,视觉路的问题向量也在这一步算;
+    带图的请求视觉路也在全库探测(它要参与选库)。哪路失败只记降级,不影响别的库、别的路。
+    excluded:各库按时间口径不给的文档路径,两路都在查询条件里排除。"""
     out: dict[str, dict[str, Any]] = {kb: {"text": [], "bm25": [], "channels": {}, "degraded": []} for kb in kb_ids}
     profile: dict[str, Any] = {"lexical": None, "visual_vector": None, "visual": "disabled"}
     pool = _pool(ss)
     timeout = _left(ss.channel_timeout, until) or 1.0          # probing is a step that must happen: however tight the budget, it gets 1 second
     deadline = time.time() + timeout
-    qfilter = channels.hint_filter(hint) if hint else None
-    os_filters = channels.hint_os_filters(hint) if hint else None
     jobs: dict[tuple[str, str], Future] = {}
     for kb in kb_ids:
         src = settings.sources[kb]
+        qfilter, os_filters = _kb_filters(hint, (excluded or {}).get(kb))
         if vector is not None:
             jobs[(kb, "text")] = pool.submit(channels.vector_channel, q, src.collection, vector, limit=ss.vector_k, timeout=timeout,
                                              query_filter=qfilter)
@@ -235,7 +256,8 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
         # takes part in the selection (Codex S02)
         timeout = _left(ss.channel_timeout, until) or 1.0
         vjobs = {kb: pool.submit(channels.visual_channel, q, settings.sources[kb].collection, profile["visual_vector"],
-                                 limit=ss.visual_k, timeout=timeout, query_filter=qfilter) for kb in kb_ids}
+                                 limit=ss.visual_k, timeout=timeout, query_filter=_kb_filters(hint, (excluded or {}).get(kb))[0])
+                 for kb in kb_ids}
         for kb, (ok, val) in _collect(vjobs, time.time() + timeout).items():
             if ok:
                 out[kb]["visual"] = val
@@ -248,11 +270,9 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
 
 
 def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], entries: dict[str, dict[str, Any]],
-                 question: str, vector: list[float] | None, until: float) -> dict[str, dict[str, Any]]:
-    """The graph channel runs only on knowledge bases that have a graph (one without a graph simply
-    lacks this channel, no switch needed); a failure or timeout only skips the graph channel. The
-    question vector is passed in to save one embedding; when the embedding service is down only lexical
-    seeds are used (Q19)."""
+                 question: str, vector: list[float] | None, until: float, scope: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """图路只在有图的库上跑(没开图谱的库自然没有这一路,不需要开关);失败或超时只跳过图路。
+    问题向量传给它省一次嵌入;嵌入服务挂了就只走词法种子(Q19)。"""
     out: dict[str, dict[str, Any]] = {}
     # Knowledge bases where it is unknown whether there is a graph (the main store was out of reach when the
     # catalog was built) are tried anyway: without a graph the graph channel reports the skip itself
@@ -263,23 +283,26 @@ def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[st
     if timeout <= 0:
         return {kb: {"chunks": [], "skipped": BUDGET_SPENT} for kb in graph_kbs}
     pool = _pool(ss)
+    scope = scope or {"mode": "current"}
     jobs = {kb: pool.submit(channels.graph_channel, settings, settings.sources[kb], question, limit=ss.graph_k, hops=ss.graph_hops,
-                            vector=vector, lexical_only=vector is None, q=q, timeout=timeout) for kb in graph_kbs}
+                            vector=vector, lexical_only=vector is None, q=q, timeout=timeout,
+                            history=scope["mode"] == "history", as_of=scope["day"] if scope.get("as_of") else None)
+            for kb in graph_kbs}
     for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"chunks": [], "skipped": _err(val)}
     return out
 
 
 def _visual_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], vector: list[float] | None,
-                  probe: dict[str, dict[str, Any]], hint: dict[str, Any] | None = None, *, until: float) -> dict[str, Any]:
+                  probe: dict[str, dict[str, Any]], hint: dict[str, Any] | None = None, *, until: float,
+                  excluded: dict[str, list[str]] | None = None) -> dict[str, Any]:
     """The visual channel (Q17) queries only the chosen knowledge bases; those already queried in the
-    probe stage (requests carrying an image) are reused directly; without a visual vector the whole
-    channel is skipped."""
+probe stage (requests carrying an image) are reused directly; without a visual vector the whole
+channel is skipped."""
     out: dict[str, Any] = {}
     if vector is None:
         return out
     pool = _pool(ss)
-    qfilter = channels.hint_filter(hint) if hint else None
     timeout = _left(ss.channel_timeout, until)
     jobs = {}
     for kb in kb_ids:
@@ -289,16 +312,19 @@ def _visual_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[s
             out[kb] = {"skipped": BUDGET_SPENT}
         else:
             jobs[kb] = pool.submit(channels.visual_channel, q, settings.sources[kb].collection, vector, limit=ss.visual_k, timeout=timeout,
-                                   query_filter=qfilter)
+                                   query_filter=_kb_filters(hint, (excluded or {}).get(kb))[0])
     for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"skipped": _err(val)}
     return out
 
 
-def _fuse(kb: str, probe: dict[str, Any], graph: dict[str, Any] | None, visual: Any, *, k: int) -> dict[str, Any]:
-    """RRF fusion of the channels within one knowledge base, together with per-channel stats and
-    degradation entries."""
+def _fuse(kb: str, probe: dict[str, Any], graph: dict[str, Any] | None, visual: Any, *, k: int,
+          excluded: list[str] | None = None) -> dict[str, Any]:
+    """一个库内各路 RRF 融合,连同各路统计与降级项。图路的候选没走召回过滤,按时间口径不给的文档(excluded)在这里再筛。"""
     results: dict[str, list[dict[str, Any]]] = {"text": probe["text"], "bm25": probe["bm25"]}
+    if excluded and graph is not None and not graph.get("skipped"):
+        drop = set(excluded)
+        graph = {**graph, "chunks": [c for c in graph.get("chunks") or [] if str(c.get("rel_path") or "") not in drop]}
     stats = dict(probe["channels"])
     degraded = list(probe["degraded"])
     if graph is not None:
@@ -393,7 +419,7 @@ def _detect_buckets(question: str, chosen: list[str], per_kb: dict[str, dict[str
             subj = str(sp.get("subject") or "").strip()
             if len(subj) >= 2 and subj.casefold() in q_fold and subj not in subjects:
                 subjects.append(subj)
-    # "WorkBuddy" and "WorkBuddy Enterprise" are the same thing in a question: a subject that is a
+    # "WorkWidget" and "WorkWidget Enterprise" are the same thing in a question: a subject that is a
     # substring of another does not get a bucket of its own
     subjects = [a for a in subjects if not any(a != b and a.casefold() in b.casefold() for b in subjects)]
     mode, keys = None, []
@@ -422,12 +448,21 @@ def _detect_buckets(question: str, chosen: list[str], per_kb: dict[str, dict[str
     return {"mode": mode, "keys": keys}
 
 
-def _groups(chosen: list[str], per_kb: dict[str, dict[str, Any]], buckets: dict[str, Any] | None, limit: int) -> list[list[dict[str, Any]]]:
+def _groups(chosen: list[str], per_kb: dict[str, dict[str, Any]], buckets: dict[str, Any] | None, limit: int, *,
+            visual_limit: int = 0) -> list[list[dict[str, Any]]]:
     """Groups for interleaved candidate selection: with buckets, one group per knowledge base per bucket
     (candidates outside any bucket form a group of their own); without, one group per knowledge base."""
     groups: list[list[dict[str, Any]]] = []
     for kb in chosen:
-        fused = per_kb[kb]["fused"][:limit * 2]
+        recalled = per_kb[kb]["fused"]
+        fused = recalled[:limit * (2 if buckets else 1)]
+        if visual_limit > 0:
+            # Keep a bounded image reserve before grouping truncates recall.
+            # _rank still enforces the shared candidate and image budgets.
+            images = [c for c in recalled if (c.get("payload") or {}).get("visual_ref")
+                      or "visual" in (c.get("recall_sources") or [])][:visual_limit]
+            present = {str(c["point_id"]) for c in fused}
+            fused = fused + [c for c in images if str(c["point_id"]) not in present]
         if buckets:
             for key in buckets["keys"]:
                 rows = [c for c in fused if c.get("bucket") == key]
@@ -437,60 +472,205 @@ def _groups(chosen: list[str], per_kb: dict[str, dict[str, Any]], buckets: dict[
             if rest:
                 groups.append(rest)
         else:
-            groups.append(fused[:limit])
+            groups.append(fused)
     return groups
 
 
 def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups: list[list[dict[str, Any]]],
           buckets: dict[str, Any] | None = None, *, until: float, image_query: bool = False,
-          hint: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Several groups: round-robin interleaving so every group gets a share; a single group: the top
-    rerank_n of the fusion order directly. After payload backfill, cross-encoder rerank with threshold
-    and floor (Q06 / Q19). Candidates carrying only an id get their text at backfill, so bucketing is
-    redone here once. In a request carrying an image, visual channel candidates are exempt from the
-    text threshold (Codex S02). Once the budget is spent there is no rerank, which is handled like an
-    unavailable rerank (fall back to the fusion order, record the degradation)."""
+          hint: dict[str, Any] | None = None, scope: dict[str, Any] | None = None,
+          image_bytes: bytes | None = None) -> dict[str, Any]:
+    """多组:轮询交错,每组都有名额;单组:直接取融合序前 rerank_n。回填负载后交叉编码器重排,带阈值与地板(Q06 / Q19)。
+    只带 id 的候选回填后才知道正文,分桶在这里补一次。带图的请求里视觉路候选不受文字阈值约束(Codex S02)。
+    预算用完时不再重排,按重排不可用处理(退回融合序、记降级)。"""
     if len(groups) > 1:
         cands = interleave(groups, limit=ss.rerank_n)
     else:
         cands = list(groups[0][:ss.rerank_n]) if groups else []
+    if visual_rerank_active(settings, ss):
+        # Reserve image candidates before truncation; retain the total budget and
+        # the caller's KB/document grouping. Images do not need a text rerank pass
+        # to qualify for pixel-based scoring.
+        visual_groups = [[c for c in group if (c.get("payload") or {}).get("visual_ref")
+                          or "visual" in (c.get("recall_sources") or [])] for group in groups]
+        reserved = interleave(visual_groups, limit=min(ss.visual_rerank_n, ss.rerank_n))
+        chosen = {str(c["point_id"]) for c in reserved}
+        cands = reserved + [c for c in cands if str(c["point_id"]) not in chosen][:max(0, ss.rerank_n - len(reserved))]
+        prior = {str(c["point_id"]): i for i, c in enumerate(interleave(groups, limit=sum(map(len, groups))))}
+        cands = [{**c, "_recall_order": prior[str(c["point_id"])]} for c in cands]
     degraded: list[str] = []
     cands = _backfill(q, settings, ss, cands, until=until, degraded=degraded)
+    if scope is not None:
+        checked = []
+        for cand in cands:
+            source = settings.sources.get(str(cand.get("kb_id") or ""))
+            rel = (cand.get("payload") or {}).get("rel_path") or cand.get("rel_path")
+            if source is not None and docstatus.allowed(settings, source, rel, scope):
+                checked.append(cand)
+            elif source is not None and docstatus.corrections_of(settings, source).get("errors"):
+                message = f"{source.kb_id}:invalid_corrections: current results withheld"
+                if message not in degraded:
+                    degraded.append(message)
+        cands = checked
     if hint:
-        cands = [c for c in cands if channels.hint_allows(hint, c.get("payload") or {})]   # candidates that bypassed the filter (graph channel etc.) are screened by the same constraints
+        cands = [c for c in cands if channels.hint_allows(hint, c.get("payload") or {})]   # Apply the same scope to candidates from channels without upstream filtering.
     if buckets:
         for c in cands:
             if c.get("bucket") is None:
                 c["bucket"] = _bucket_of(c, buckets["mode"], buckets["keys"])
+    if visual_rerank_active(settings, ss) and any((c.get("payload") or {}).get("visual_ref") for c in cands):
+        out = _rank_dual(settings, ss, question, cands, until=until, image_query=image_query,
+                         image_bytes=image_bytes, block_types=(hint or {}).get("block_types"))
+    else:
+        out = _rank_text(settings, ss, question, cands, until=until, image_query=image_query)
+        out["ranking"] = {"method": "text", "text": {"status": out["status"]},
+                          "visual": {"status": "no_candidates" if visual_rerank_active(settings, ss) else "disabled"}}
+    out["degraded"] = degraded + out.get("degraded", [])
+    return out
+
+
+def _text_relevance(cands: list[dict[str, Any]], ss: SearchSettings, *,
+                    image_query: bool = False) -> tuple[list[dict[str, Any]], str, float | None]:
+    """Apply text thresholds to an already-scored branch without another model call."""
+    ordered = sorted(cands, key=lambda c: -float(c.get("score_rerank") or 0.0))
+    status, floor = "ok", None
+    if ss.rerank_threshold > 0:
+        floor = ss.rerank_threshold
+        is_visual = lambda c: image_query and (c.get("scores") or {}).get("score_visual") is not None
+        kept = [c for c in ordered if float(c.get("score_rerank") or 0.0) >= floor or is_visual(c)]
+        if not kept:
+            floor *= 0.7
+            kept = [c for c in ordered if float(c.get("score_rerank") or 0.0) >= floor]
+            status = "floor_lowered" if kept else "below_threshold"
+        if kept:
+            ordered = kept
+    return ordered, status, floor
+
+
+def _rank_text(settings: Settings, ss: SearchSettings, question: str, cands: list[dict[str, Any]], *,
+               until: float, image_query: bool = False) -> dict[str, Any]:
+    """The original text-ranking path, also used unchanged when image ranking fails."""
     status, error, ordered, floor_used = "disabled", None, cands, None
     if rerank_active(settings, ss) and cands:
         try:
-            # When ranking again after widening, the candidates of the knowledge bases chosen in the first round
-            # already have scores (same question, same text): only new candidates are sent to be scored
+            # Reuse first-round scores when widening; score only new candidates.
             fresh = [c for c in cands if c.get("score_rerank") is None]
             if fresh:
                 timeout = _left(ss.rerank_timeout, until)
                 if timeout <= 0:
                     raise TimeoutError(BUDGET_SPENT)
-                scores = rerank(Reranker(settings.reranker_base_url, timeout=timeout), question, fresh,
+                scores = rerank(Reranker(settings.reranker_base_url, model_id=getattr(settings, "reranker_model_id", ""),
+                                        api_key=getattr(settings, "reranker_api_key", ""), timeout=timeout), question, fresh,
                                 window_tokens=ss.rerank_window_tokens, overlap_tokens=ss.rerank_overlap_tokens)
                 for c, s in zip(fresh, scores):
                     c["score_rerank"] = round(float(s), 4)
-            ordered = sorted(cands, key=lambda c: -float(c.get("score_rerank") or 0.0))
-            status = "ok"
-            if ss.rerank_threshold > 0:
-                floor_used = ss.rerank_threshold
-                is_visual = (lambda c: image_query and (c.get("scores") or {}).get("score_visual") is not None)
-                kept = [c for c in ordered if float(c.get("score_rerank") or 0.0) >= floor_used or is_visual(c)]
-                if not kept:
-                    floor_used *= 0.7
-                    kept = [c for c in ordered if float(c.get("score_rerank") or 0.0) >= floor_used]
-                    status = "floor_lowered" if kept else "below_threshold"
-                if kept:
-                    ordered = kept
+            ordered, status, floor_used = _text_relevance(cands, ss, image_query=image_query)
         except Exception as exc:
             status, error, ordered = "skipped", f"rerank: {type(exc).__name__}", cands
-    return {"cands": cands, "ordered": ordered, "status": status, "error": error, "floor": floor_used, "degraded": degraded}
+    return {"cands": cands, "ordered": ordered, "status": status, "error": error, "floor": floor_used, "degraded": []}
+
+
+def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: list[dict[str, Any]], *,
+               until: float, image_query: bool, image_bytes: bytes | None,
+               block_types: list[str] | None) -> dict[str, Any]:
+    """Parallel rankers, independent relevance gates, disjoint-list RRF.
+
+    The text model scores the shared pool as a fallback. Candidates with a valid
+    image score belong only to the image list, avoiding a double vote for the same
+    caption and image. A low image score is a rejection, not a model failure.
+    """
+    copies = [{**c, "scores": dict(c.get("scores") or {})} for c in cands]
+    for c in copies:
+        c.pop("ranking", None)
+    images = [c for c in cands if (c.get("payload") or {}).get("visual_ref")][:ss.visual_rerank_n]
+    started = time.time()
+    text_until = min(until, started + ss.rerank_timeout)
+    visual_until = min(until, started + ss.visual_rerank_timeout)
+    pool = _pool(ss)
+    text_job = pool.submit(_rank_text, settings, ss, question, copies, until=text_until, image_query=image_query)
+    visual_job = pool.submit(rerank_images, settings, question, images, image_bytes=image_bytes, until=visual_until)
+    text_ok, text_out = _collect({"text": text_job}, text_until)["text"]
+    visual_ok, visual_out = _collect({"visual": visual_job}, visual_until)["visual"]
+    if not text_ok:
+        # Do not touch copies owned by a worker that may still be finishing.
+        copies = [{**c, "scores": dict(c.get("scores") or {})} for c in cands]
+        text_out = {"cands": copies, "ordered": copies, "status": "skipped", "floor": None,
+                    "error": f"rerank: {type(text_out).__name__}", "degraded": []}
+    if not visual_ok:
+        visual_out = {"scores": {}, "errors": [type(visual_out).__name__], "requested": len(images)}
+    image_scores = visual_out["scores"]
+    issues = [f"visual_rerank:{x}" for x in visual_out["errors"]]
+    visual_status = ("partial" if issues else "ok") if image_scores else "skipped"
+    audit = {"method": "rrf" if image_scores else "text", "text": {"status": text_out["status"],
+             "scored": sum(c.get("score_rerank") is not None for c in text_out["cands"])},
+             "visual": {"status": visual_status, "requested": len(images), "scored": len(image_scores),
+                        "threshold": ss.visual_rerank_threshold}}
+    if not image_scores:
+        # An unavailable branch contributes no rank or relevance evidence.
+        text_out["degraded"].extend(issues or ["visual_rerank:unavailable"])
+        text_out["ranking"] = audit
+        return text_out
+    cands = text_out["cands"]
+    text_ranked = text_out["status"] in ("ok", "floor_lowered", "below_threshold")
+    floor = text_out["floor"]
+    if text_ranked:
+        # Scored images leave the text branch, including its threshold decision.
+        # Missing image scores remain in that branch for the existing fallback.
+        text_candidates = [c for c in cands if str(c["point_id"]) not in image_scores]
+        if text_candidates:
+            _, audit["text"]["status"], floor = _text_relevance(text_candidates, ss)
+        else:
+            audit["text"]["status"], floor = "no_candidates", None
+    text_rows, image_rows = [], []
+    for c in cands:
+        pid = str(c["point_id"])
+        if pid in image_scores:
+            c["score_rerank_visual"] = image_scores[pid]
+            c["accepted"] = image_scores[pid] >= ss.visual_rerank_threshold
+            c["ranking"] = {"branch": "visual"}
+            image_rows.append(c)
+        else:
+            c["accepted"] = (float(c.get("score_rerank") or 0) >= (floor or 0)) if text_ranked else None
+            c["ranking"] = {"branch": "text" if text_ranked else "unranked"}
+            text_rows.append(c)
+    # Apply existing text refinements inside that branch, before rank fusion.
+    for c in text_rows:
+        c.pop("ranking")
+    _final_scores(text_rows, ss, reranked=text_ranked, question=question, block_types=block_types)
+    for c in text_rows:
+        c["ranking"] = {"branch": "text" if text_ranked else "unranked"}
+    from .text import is_boilerplate
+
+    for c in image_rows:
+        payload = c.get("payload") or {}
+        c["boilerplate"] = is_boilerplate(payload)
+        factor = ss.boilerplate_factor if c["boilerplate"] else 1.0
+        if str(payload.get("visual_confidence") or "").lower() == "low":
+            factor *= ss.visual_low_confidence_factor
+        if block_types and str(payload.get("block_type") or "").casefold() in {str(t).casefold() for t in block_types}:
+            factor *= ss.hint_block_boost
+        c["_image_order"] = c["score_rerank_visual"] * factor
+    image_rows.sort(key=lambda c: (-c["_image_order"], str(c["point_id"])))
+    # Rejected/unknown evidence never gets promoted merely by a high list rank.
+    accepted = any(c.get("accepted") is True for c in cands)
+    lists = [text_rows, image_rows]
+    k = max(0, ss.rrf_k)
+    for rows in lists:
+        retained = [c for c in rows if c.get("accepted") is True] if accepted else rows
+        for rank, c in enumerate(retained, 1):
+            c["ranking"]["rank"] = rank
+            c["score_fusion"] = 1.0 / (k + rank)
+            c["score_final"] = round((k + 1) * c["score_fusion"], 6)
+    ordered = [c for c in cands if not accepted or c.get("accepted") is True]
+    # Equal ranks carry no cross-model relevance comparison. Retain the original
+    # recall order; only a request with pixels explicitly prefers the image lane.
+    ordered.sort(key=lambda c: (-float(c.get("score_fusion") or 0),
+                               bool(image_query and c["ranking"]["branch"] != "visual"),
+                               c.get("_recall_order", 0), str(c["point_id"])))
+    status = "ok" if accepted else ("skipped" if any(c.get("accepted") is None for c in cands) else "below_threshold")
+    audit["fusion"] = {"status": "ok", "constant": k, "accepted": sum(c.get("accepted") is True for c in cands)}
+    return {"cands": cands, "ordered": ordered, "status": status, "error": text_out["error"], "floor": floor,
+            "degraded": issues, "ranking": audit, "fusion_applied": True}
 
 
 def _final_scores(ordered: list[dict[str, Any]], ss: SearchSettings, *, reranked: bool, image_query: bool = False,
@@ -503,6 +683,17 @@ def _final_scores(ordered: list[dict[str, Any]], ss: SearchSettings, *, reranked
     similarity and rerank score (the text rerank cannot see the image, Codex S02); chunks matching
     hints.block_types are multiplied by the soft preference factor."""
     from .text import is_boilerplate, question_coverage
+
+    if ordered and all(c.get("ranking") for c in ordered):
+        # Both branches were refined before fusion. Never compare fused ranks
+        # with text logits or visual-vector similarity in this final stage.
+        wanted = {str(b).casefold() for b in (block_types or [])}
+        return {"boilerplate": sum(bool(c.get("boilerplate")) for c in ordered),
+                "visual_low": sum(bool((c.get("payload") or {}).get("visual_ref")) and
+                                  str((c.get("payload") or {}).get("visual_confidence") or "").lower() == "low"
+                                  for c in ordered),
+                "hinted_blocks": sum(str((c.get("payload") or {}).get("block_type") or "").casefold() in wanted
+                                     for c in ordered)}
 
     top_rrf = max((float(c.get("rrf") or 0.0) for c in ordered), default=0.0) or 1.0
     counts = {"boilerplate": 0, "visual_low": 0, "hinted_blocks": 0}
@@ -540,6 +731,10 @@ def _mark_accepted(ordered: list[dict[str, Any]], status: str, floor: float | No
     accepted basis; when all are below the floor they are diagnostic candidates and the whole package
     has evidence_state = diagnostic; without a rerank (down / off) the tag is None and evidence_state
     = unranked. In a request carrying an image, visual channel candidates are judged by visual score."""
+    if ordered and all(c.get("ranking") for c in ordered):
+        if any(c.get("accepted") is True for c in ordered):
+            return "accepted"
+        return "unranked" if any(c.get("accepted") is None for c in ordered) else "diagnostic"
     if status in ("ok", "floor_lowered", "below_threshold") and floor is not None:
         for c in ordered:
             vis = (c.get("scores") or {}).get("score_visual")
@@ -558,11 +753,17 @@ def _mark_accepted(ordered: list[dict[str, Any]], status: str, floor: float | No
 
 
 def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = None, hints: dict[str, Any] | None = None,
-           with_context: bool = True, explain: bool = False, image_bytes: bytes | None = None) -> dict[str, Any]:
+           with_context: bool = True, explain: bool = False, image_bytes: bytes | None = None, history: bool = False,
+           as_of: str | None = None) -> dict[str, Any]:
+    """history / as_of:时间口径(kb_pipeline.graph.currency.query_scope)。默认只用现行的:更正文件里标了被取代 / 归档 /
+    过了有效期的文档不进结果,关系与事实只给现行的;as_of 回看某一天;history 全给,非现行的标出来。"""
+    from kb_pipeline.graph.currency import query_scope
+
     t0 = time.time()
     question = str(question or "").strip()
     if not question:
         raise ValueError("question is empty")
+    scope = query_scope(history=history, as_of=as_of)
     settings, ss, q = runtime()
     until = t0 + float(ss.request_budget) if ss.request_budget > 0 else float("inf")
     image_query = bool(image_bytes)
@@ -570,7 +771,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     doc_hint = {k: v for k, v in hint_used.items() if k != "block_types"} or None
     timings: dict[str, int] = {}
     degraded: list[str] = []
-    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl)
+    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, driver=_graph_driver(settings))
     by_id = {e["kb_id"]: e for e in entries}
     stale = next((e["degraded"] for e in entries if e.get("degraded")), None)
     if stale:
@@ -596,9 +797,15 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         if not probed:
             raise ValueError("no knowledge base enrolled")
         routing = None
+    excluded: dict[str, list[str]] = {}
+    for kb in probed:
+        try:
+            excluded[kb] = docstatus.excluded_paths(settings, settings.sources[kb], scope)
+        except Exception as exc:          # 状态库锁住、更正文件读不了:这次不按文档状态筛,照实记一条降级
+            degraded.append(f"{kb}:doc_status: {type(exc).__name__}")
     t = time.time()
     probe, profile = _probe(settings, ss, q, probed, question, vector, identifiers, with_profile=routing is None, until=until,
-                            image_bytes=image_bytes, hint=doc_hint)
+                            image_bytes=image_bytes, hint=doc_hint, excluded=excluded)
     timings["probe_ms"] = int((time.time() - t) * 1000)
     if routing is None:
         routing = catalog_mod.route(catalog_mod.library_evidence(probe, profile.get("lexical")), max_kbs=ss.route_max_kbs,
@@ -616,14 +823,16 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     chosen = [k for k in routing["chosen"] if k in probe]
     # The graph / visual channels run only on the chosen knowledge bases, then fusion per knowledge base
     t = time.time()
-    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until)
-    visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint, until=until)
-    per_kb: dict[str, dict[str, Any]] = {kb: _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k) for kb in chosen}
+    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope)
+    visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint, until=until, excluded=excluded)
+    per_kb: dict[str, dict[str, Any]] = {kb: _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k, excluded=excluded.get(kb))
+                                         for kb in chosen}
     timings["recall_ms"] = int((time.time() - t) * 1000)
     buckets = _detect_buckets(question, chosen, per_kb, max_buckets=ss.quota_max_buckets)
     t = time.time()
-    ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n), buckets, until=until,
-                   image_query=image_query, hint=doc_hint)
+    visual_limit = min(ss.visual_rerank_n, ss.rerank_n) if visual_rerank_active(settings, ss) else 0
+    ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n, visual_limit=visual_limit),
+                   buckets, until=until, image_query=image_query, hint=hint_used or None, scope=scope, image_bytes=image_bytes)
     timings["rerank_ms"] = int((time.time() - t) * 1000)
     # Widening: the knowledge bases chosen by auto routing yield no decent evidence (no candidates, or
     # every rerank score below the floor) -> add the graph channel for the remaining knowledge bases,
@@ -638,13 +847,14 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             degraded.append("budget: widen skipped")
         else:
             t = time.time()
-            graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until))
-            visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint, until=until))
+            graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until, scope))
+            visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint, until=until,
+                                         excluded=excluded))
             for kb in rest:
-                per_kb[kb] = _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k)
+                per_kb[kb] = _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k, excluded=excluded.get(kb))
             wide_buckets = _detect_buckets(question, chosen + rest, per_kb, max_buckets=ss.quota_max_buckets)
-            wide = _rank(settings, ss, q, question, _groups(chosen + rest, per_kb, wide_buckets, ss.rerank_n), wide_buckets, until=until,
-                         image_query=image_query, hint=doc_hint)
+            wide = _rank(settings, ss, q, question, _groups(chosen + rest, per_kb, wide_buckets, ss.rerank_n, visual_limit=visual_limit), wide_buckets, until=until,
+                         image_query=image_query, hint=hint_used or None, scope=scope, image_bytes=image_bytes)
             if wide["error"] and ranked["status"] == "below_threshold":
                 # The rerank after widening did not happen (timeout, budget spent): the first round's "everything
                 # below the floor" conclusion still stands and must not be displaced by an unranked set of candidates
@@ -672,7 +882,8 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     k = int(top_k or ss.top_k)
     hits, selection = select_hits(ordered, k, buckets=buckets, min_hits=ss.quota_min_hits,
                                   mmr_lambda=ss.mmr_lambda if ss.mmr_enabled else None,
-                                  priority_key="score_visual" if image_query else None, priority_n=ss.visual_quota if image_query else 0)
+                                  priority_key="score_visual" if image_query and not ranked.get("fusion_applied") else None,
+                                  priority_n=ss.visual_quota if image_query and not ranked.get("fusion_applied") else 0)
     if not hits:
         recall_down = all("skipped" in (probe[kb]["channels"].get(name) or {}) for kb in probed for name in ("text", "bm25"))
         if recall_down or (not cands and any(":backfill:" in x for x in degraded)):
@@ -745,6 +956,16 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
                 degraded.append(f"{kb}:point_meta: {type(exc).__name__}")
     timings["verify_ms"] = int((time.time() - t) * 1000)
     point_active = {pid: bool(m.get("active")) for pid, m in meta.items()}
+    pages = [pg for pg in pages if docstatus.page_allowed(settings, settings.sources[pg["kb_id"]], pg, scope)]
+    # Source status is rechecked after hydration too, independently of prefilter limits.
+    for row in specs + entities + relations:
+        source = settings.sources[row["kb_id"]]
+        pids = list(row.get("point_ids") or [])
+        if pids and any(not docstatus.allowed(settings, source, meta.get(str(pid), {}).get("rel_path"), scope) for pid in pids):
+            row["_status_excluded"] = True
+    specs = [r for r in specs if not r.get("_status_excluded")]
+    entities = [r for r in entities if not r.get("_status_excluded")]
+    relations = [r for r in relations if not r.get("_status_excluded")]
     hints_scope: dict[str, int] = {}
     if doc_hint:
         # Constrained query (Codex R1): derived evidence follows the same document / path / version
@@ -818,7 +1039,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             try:
                 job = _pool(ss).submit(graphwalk.neighborhoods, settings, {kb: settings.sources[kb] for kb in graph_kbs},
                                        {kb: str(graph_versions[kb]) for kb in graph_kbs}, question, entities, limit=ss.neighborhoods,
-                                       driver=channels.shared_driver(settings), timeout=timeout)
+                                       driver=channels.shared_driver(settings), timeout=timeout, scope=scope)
                 ok, val = _collect({"*": job}, time.time() + timeout)["*"]
             except Exception as exc:
                 ok, val = False, exc
@@ -827,12 +1048,29 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             else:
                 degraded.append(f"neighborhoods: {type(val).__name__}")
         timings["neighborhood_ms"] = int((time.time() - t) * 1000)
+    # 来源的文档日期与(回看、history 时)文档状态:调用方据此判断说法的新旧;取不回来只记降级
+    t = time.time()
+    doc_marked = docstatus.annotate(settings, sources, scope)
+    timeout = _left(ss.channel_timeout, until)
+    if sources and timeout > 0:
+        try:
+            dates = docstatus.document_dates(settings, sources, graph_versions,
+                                             driver=channels.shared_driver(settings) if graph_versions else None, timeout=timeout)
+            for r in sources:
+                d = dates.get((str(r.get("kb_id") or ""), str(r.get("doc_id") or "")))
+                if d:
+                    r["doc_date"] = d
+        except Exception as exc:
+            degraded.append(f"doc_dates: {type(exc).__name__}")
+    timings["doc_status_ms"] = int((time.time() - t) * 1000)
     rerank_max = max((float(c.get("score_rerank") or 0.0) for c in cands), default=0.0) if reranked else None
     summary = {
         "kbs": chosen, "routing": routing, "identifiers": identifiers, "image_query": image_query,
         "channels": {kb: per_kb[kb]["channels"] for kb in chosen}, "graph_versions": graph_versions,
-        "merged": merged_n, "reranked": len(cands) if reranked else 0,
+        "merged": merged_n, "reranked": sum(c.get("score_rerank") is not None or c.get("score_rerank_visual") is not None
+                                               for c in cands) if ranked.get("fusion_applied") else (len(cands) if reranked else 0),
         "rerank": rerank_status, "rerank_max": rerank_max, "rerank_floor": ranked.get("floor"), "visual": profile.get("visual"),
+        "ranking": ranked.get("ranking"),
         "buckets": buckets, "selection": selection, "downweighted": downweighted,
         "degraded": degraded,
         "evidence_state": evidence_state,
@@ -841,6 +1079,9 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         "sources": {**src_stats, "page_tokens": sum(int(r.get("_tokens") or 0) for r in pages)},
         "timings_ms": {**timings, "total_ms": int((time.time() - t0) * 1000)},
         "hints": hints or {}, "hints_applied": bool(hint_used), "hints_used": hint_used, "hints_ignored": hint_ignored, "hints_scope": hints_scope,
+        # 时间口径:按文档状态排除了几份文档(各库)、来源里有几条非现行文档(回看 / history 时)
+        "time": {"mode": scope["mode"], "day": scope["day"],
+                 "excluded_documents": {kb: len(v) for kb, v in excluded.items() if v}, "non_current_sources": doc_marked},
     }
     if not explain:
         for r in sources:
@@ -902,10 +1143,10 @@ def crop(kb_id: str, point_id: str, bbox: list[float], *, pad: int = 16) -> dict
 
 
 def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | None = None, limit: int = 20,
-                    types: list[str] | None = None, direction: str = "both") -> dict[str, Any]:
-    """Graph neighbourhood (for the agent to walk the graph itself): one entity's one-hop relations with
-    predicate, direction, weight, counterpart and evidence chunks; a knowledge base without a graph
-    answers 404."""
+                    types: list[str] | None = None, direction: str = "both", history: bool = False,
+                    as_of: str | None = None) -> dict[str, Any]:
+    """图谱邻域(agent 自己走图用):一个实体的一跳关系,带谓语、方向、权重、对端、时间与状态、证据切片;
+    默认只给现行的关系(history / as_of 见 currency.query_scope);没开图谱的库按 404 报。"""
     from . import graphwalk
 
     settings, ss, q = runtime()
@@ -914,35 +1155,88 @@ def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | N
     if not entity and not entity_id:
         raise ValueError("entity or entity_id is required")
     return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
-                               q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+                               history=history, as_of=as_of, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
-def graph_entities(kb_id: str, *, types: list[str] | None = None, parent_types: list[str] | None = None, name: str | None = None,
-                   limit: int = 50, offset: int = 0) -> dict[str, Any]:
-    """Entities by type / upper class / name ("all of them" questions), with a total and paging; a knowledge
-    base without a graph answers 404."""
+def graph_entities(kb_id: str, *, types: list[str] | None = None, uppers: list[str] | None = None, kind: str = "all",
+                   name: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """按类型(含子类型)/ 上层类 / 类与实例 / 名字列实体(「全部 / 所有」类问题):带总数与翻页;没开图谱的库按 404 报。"""
     from . import graphwalk
 
     settings, ss, q = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
-    return graphwalk.list_entities(settings, settings.sources[kb_id], types=types, parent_types=parent_types, name=name, limit=limit,
+    return graphwalk.list_entities(settings, settings.sources[kb_id], types=types, uppers=uppers, kind=kind, name=name, limit=limit,
                                    offset=offset, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
-# sources travel as each row's evidence, and there is no retrieval score here; each row also carries the entity it
-# hangs under, the document it came from and its concept key (needed when taking facts by document or comparing a
-# conflict group)
+def graph_schema(kb_id: str, *, version: str | None = None, fmt: str = "json") -> dict[str, Any]:
+    """这个库的模式(LinkML):默认取建现行这版图用的那个模式版本(之后切换了模式版本、还没重建时,它不是控制台里选中的那个),
+    没有图就取选中的;version 指定就取那一个。fmt=json 给解析好的 LinkML,yaml 给原文。另带一份概览(类型的上层类、
+    作用域、父类,关系的两端与单值 / 多值)。库里还没有模式版本 → 404。"""
+    from kb_pipeline import db, discovery
+    from kb_pipeline.ontology import dump_linkml, entry_model, model_summary
+
+    from . import graphwalk
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    if fmt not in ("json", "yaml"):
+        raise ValueError("format must be json or yaml")
+    with db.connect(settings.state_db) as con:
+        cfg = discovery.get_config(con, kb_id)
+    versions = [v for v in (cfg.get("graph_schema_versions") or []) if isinstance(v, dict)]
+    active = str(cfg.get("graph_schema_active") or "")
+    built = None
+    if not version:
+        try:
+            _, stats = graphwalk.version_stats(channels.shared_driver(settings), kb_id, timeout=ss.channel_timeout)
+            built = str(stats.get("schema_version_id") or "") or None
+        except Exception:
+            built = None              # 图库够不着:退回选中的模式版本,不让这一项拖垮
+    want = str(version or built or active or "")
+    entry = next((v for v in versions if str(v.get("id")) == want), None)
+    if entry is None:
+        raise KeyError(f"{kb_id} schema version {want or '(none)'}")
+    model = entry_model(entry) or {}
+    out: dict[str, Any] = {
+        "kb_id": kb_id, "kb_name": graphwalk.kb_name(settings.sources[kb_id]), "schema_id": entry.get("id"),
+        "active_schema_id": active or None, "graph_schema_id": built,
+        "origin": entry.get("origin"), "created_at": entry.get("created_at"), "domain": entry.get("domain") or "",
+        "persona": entry.get("persona") or "", "summary": model_summary(model),
+    }
+    if fmt == "yaml":
+        out["linkml_yaml"] = dump_linkml(entry.get("linkml") or {})
+    else:
+        out["linkml"] = entry.get("linkml") or {}
+    return out
+
+
+def graph_stats(kb_id: str) -> dict[str, Any]:
+    """现行这版图的统计(导入时算好的):类型覆盖(实体数、文档数、周数、最早 / 最晚)、谓词与端点组合、别名最多的实体、
+    兜底关系占比、类型表以外的类型、时间跨度、核心主体、事实的新旧与来源。没开图谱的库按 404 报。"""
+    from . import graphwalk
+
+    settings, ss, q = runtime()
+    if kb_id not in settings.sources:
+        raise KeyError(kb_id)
+    gv, stats = graphwalk.version_stats(channels.shared_driver(settings), kb_id, timeout=ss.channel_timeout)
+    if not gv:
+        raise KeyError(f"{kb_id} has no active graph")
+    return {"kb_id": kb_id, "kb_name": graphwalk.kb_name(settings.sources[kb_id]), "graph_version": gv, "stats": stats}
+
+
+# 来源走每行的 evidence,这里没有检索分;另带挂在哪个实体下、出自哪份文档、概念键(按文档取事实、对冲突组时要用)
 FACT_FIELDS = tuple(f for f in SPEC_FIELDS if f not in ("sources", "score")) + ("subject_id", "doc_id", "concept_key")
 
 
 def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | None = None, prop: str | None = None,
                 match: str = "auto", doc_id: str | None = None, rel_path: str | None = None, conflict_only: bool = False,
-                limit: int = 50, offset: int = 0) -> dict[str, Any]:
-    """Qualified facts by subject / property / document / conflict: rows shaped like the specs of /search, with a
-    total and paging; at least one of subject, property, document and conflict_only is required (with none of
-    them it would be every fact of the knowledge base, which a listing with clearer paging should serve).
-    rel_path is turned into a doc_id through the state database (graph facts record only doc_id)."""
+                history: bool = False, as_of: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """按主体 / 属性 / 文档 / 冲突查限定事实:行结构与 /search 的 specs 相同,带总数与翻页;
+    主体、属性、文档、conflict_only 至少给一个(什么都不给就是整库的事实,该走翻页更明确的列法)。
+    rel_path 经状态库换成 doc_id(图谱里的事实只记 doc_id)。"""
     from . import graphwalk, library
 
     settings, ss, q = runtime()
@@ -956,15 +1250,15 @@ def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | Non
         raise ValueError("subject, subject_id, property, doc_id, rel_path or conflict_only is required")
     doc_id = library.resolve_doc(settings, kb_id, doc_id=doc_id, rel_path=rel_path)
     return graphwalk.list_facts(settings, settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
-                                doc_id=doc_id, conflict_only=conflict_only, limit=limit, offset=offset, fields=FACT_FIELDS, q=q,
-                                driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+                                doc_id=doc_id, conflict_only=conflict_only, history=history, as_of=as_of, limit=limit, offset=offset,
+                                fields=FACT_FIELDS, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
 def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None, page_id: str | None = None, entity_id: str | None = None,
                 doc_id: str | None = None, rel_path: str | None = None, with_text: bool = True, limit: int = 20,
-                offset: int = 0) -> dict[str, Any]:
+                offset: int = 0, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     """The list and full text of compiled pages, filtered by kind / title / page id / entity / document; no page
-    collection (no graph) is reported as 404, an unreachable main store as 503."""
+collection (no graph) is reported as 404, an unreachable main store as 503."""
     from . import graphwalk, library
 
     settings, ss, q = runtime()
@@ -974,7 +1268,7 @@ def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None
     paths = library.doc_paths(settings, kb_id)
     try:
         return graphwalk.list_pages(settings, settings.sources[kb_id], kind=kind, title=title, page_id=page_id, entity_id=entity_id,
-                                    doc_id=doc_id, with_text=with_text, limit=limit, offset=offset, paths=paths, q=q)
+                                    doc_id=doc_id, with_text=with_text, limit=limit, offset=offset, paths=paths, q=q, history=history, as_of=as_of)
     except (KeyError, ValueError):
         raise
     except Exception as exc:

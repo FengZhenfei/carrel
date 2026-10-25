@@ -1,7 +1,6 @@
 """Chunking: blocks -> chunks of at most max_tokens.
 
-Overhaul after the 2026-09-05 sampling audit (plan: the chunking-logic optimization document in the
-2026-09-05 chunk-sampling folder on the Desktop):
+Overhaul after the 2026-09-05 sampling audit:
   · Tables are split by row and every chunk carries the header (TITLE/CAPTION, SHEET/ROWS/HEADER lines,
     and for markdown tables the header row + separator row); a row over the budget is split by cell, each
     cell carrying its column name (such chunks no longer carry the header lines that spell out the column
@@ -248,7 +247,7 @@ def split_table_text(text: str, max_tokens: int) -> list[str]:
     # Every non-table line before the table is header context: besides TITLE / CAPTION there is the second
     # line of a MinerU table note ("operator: xxx reviewer: xxx"). This used to collect only prefixed lines
     # and stopped at such a lead-in line, so the header rows never made it into the later chunks
-    # (2026-09-07 health KB sampling: lab report continuation chunks were all numeric rows without column
+    # (2026-09-07 sampling: table continuation chunks were numeric rows without column
     # names). When the lead-in is too long, keep only the prefixed lines and put the rest into the first
     # chunk as body lines.
     first_table = next((k for k, l in enumerate(lines) if _TABLE_LINE_RE.match(l)), len(lines))

@@ -46,7 +46,7 @@ from typing import Any
 from .limits import (
     GRAPH_MAX_GLEANINGS_DEFAULT, GRAPH_TUNE_SAMPLE_DEFAULT, GRAPH_UNIT_CHUNKS_DEFAULT,
     normalize_entity_types, normalize_examples, normalize_parent_types, normalize_predicates,
-    normalize_profile, normalize_type_definitions,
+    normalize_profile, normalize_type_definitions, normalize_type_parents, normalize_type_scopes,
 )
 from .models import GraphRebuildPolicy, KBSource
 
@@ -63,18 +63,19 @@ DEFAULTS = {
     "graph_language": None,
     "graph_predicates": (),
     "graph_parent_types": {},
+    "graph_type_parents": {},
+    "graph_type_scopes": {},
     "graph_type_definitions": {},
     "graph_examples": "",
     "graph_profile": {},
-    # Historical versions of the entity labels (newest first, ≤3) and the id of the version currently in
-    # effect. The effective values are still graph_entity_types / graph_language -- the graph build reads
-    # only those two; this is only about "being able to roll back".
+    # 模式的历史版本(最新在前,≤3,每条存一份 LinkML)与当前生效的那一版的 id。生效值是上面那些
+    # graph_* 模式字段 —— 建图只读它们,版本环只管「能看见、能回退」。
     "graph_schema_versions": (),
     "graph_schema_active": None,
-    "graph_tune_sample_size": 8,
-    # The persistent intent left by "pause graph build". It is distinct from graph_enabled: the latter is
-    # "whether to build at all from now on", this one is "stop for now". See the comment in
-    # graph/build.py::evaluate_rebuild for why they are not merged.
+    "graph_tune_sample_size": GRAPH_TUNE_SAMPLE_DEFAULT,
+    # 「暂停建图」留下的持久意图。它与 graph_enabled 是两件事:后者是
+    # 「以后还建不建」,这个是「现在先停一下」。不合并的理由见
+    # graph/build.py::evaluate_rebuild 里的那段注释。
     "graph_paused": False,
     # New / changed documents are automatically appended to the current graph (checked every 30 minutes); a
     # full rebuild still follows the policy conditions below.
@@ -83,19 +84,8 @@ DEFAULTS = {
     # endpoint ledger and activates it before building (2026-09-08); when off, build with the current version
     "graph_rebuild_resuggest": True,
 }
-# Convenience presets applied at first enrollment (then stored in config_json
-# and fully editable in the console). Keyed by DIRECTORY NAME -- ids are
-# per-enrollment sequence numbers and carry no meaning.
-DIR_DEFAULTS: dict[str, dict[str, Any]] = {
-    "图书馆": {"max_tokens": 800, "overlap_tokens": 120},
-    "library": {"max_tokens": 800, "overlap_tokens": 120},
-    # graph_enabled is never preset: enabling the knowledge graph must be an explicit user action in the
-    # console; only the automatic rebuild policy is prefilled here so it is ready once the user enables it.
-    "产品资料": {"graph_rebuild_interval": "1m",
-               "graph_rebuild_new_chunk_pct": "20%", "graph_rebuild_operator": "and"},
-    "products": {"graph_rebuild_interval": "1m",
-                 "graph_rebuild_new_chunk_pct": "20%", "graph_rebuild_operator": "and"},
-}
+# Every folder starts with the same defaults; its saved configuration takes precedence.
+DIR_DEFAULTS: dict[str, dict[str, Any]] = {}
 
 # Keys the web console may write into config_json.
 CONFIG_KEYS = {
@@ -107,10 +97,10 @@ CONFIG_KEYS = {
     "graph_auto_append",
     "graph_rebuild_resuggest",
     "graph_llm",  # {"extract"|"summarize"|"tune": name} -> llm_registry
-    # Extraction constraints that the console's "extract / re-extract labels" induces with the LLM (derived
-    # data, cleared when the graph is deleted), plus that step's own sample size.
+    # 控制台「立即/重新抽取标签」用 LLM 归纳出来的抽图约束(派生数据,删图时清空),
+    # graph_tune_sample_size 仅为兼容旧客户端保留,不再参与实际采样。
     "graph_entity_types", "graph_language", "graph_tune_sample_size",
-    "graph_predicates", "graph_parent_types",
+    "graph_predicates", "graph_parent_types", "graph_type_parents", "graph_type_scopes",
     "graph_type_definitions", "graph_examples", "graph_profile",
     "graph_schema_versions", "graph_schema_active",
     # Server-side only: written by "pause graph build", cleared by "build / rebuild graph now" and "enable
@@ -224,6 +214,8 @@ def build_source(
         graph_language=str(cfg.get("graph_language") or "").strip() or None,
         graph_predicates=normalize_predicates(cfg.get("graph_predicates")),
         graph_parent_types=normalize_parent_types(cfg.get("graph_parent_types")),
+        graph_type_parents=normalize_type_parents(cfg.get("graph_type_parents")),
+        graph_type_scopes=normalize_type_scopes(cfg.get("graph_type_scopes")),
         graph_type_definitions=normalize_type_definitions(cfg.get("graph_type_definitions")),
         graph_examples=normalize_examples(cfg.get("graph_examples")),
         graph_profile=normalize_profile(cfg.get("graph_profile")),
@@ -363,9 +355,13 @@ def enroll(con: sqlite3.Connection, mirror_root: Path, name: str) -> tuple[KBSou
     outcome = "already" if str(row["status"]) == "active" else "reactivated"
     con.execute(
         "UPDATE kb_sources SET status='active', last_seen_at=?, inactive_at=NULL, inactive_reason=NULL "
-        "WHERE kb_id=?",
+        "WHERE kb_id=? AND COALESCE(inactive_reason, '') NOT IN ('deleting','delete_failed')",
         (ts, kb_id),
     )
+    fresh = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+    if fresh is None:
+        raise ValueError("knowledge base was deleted; refresh before enrolling")
+    _refuse_half_deleted(fresh)
     return source_from_row(mirror_root, con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()), outcome
 
 

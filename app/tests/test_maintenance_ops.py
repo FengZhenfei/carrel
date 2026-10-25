@@ -702,7 +702,11 @@ class StateBackupTests(unittest.TestCase):
         (base / "config" / "knowledge-base.env").write_text("A=1\n", encoding="utf-8")
         (base / "deployment" / "compose" / ".env").write_text("B=2\n", encoding="utf-8")
         (base / "runtime" / "eval" / "gold.json").write_text("{}", encoding="utf-8")
-        settings = SimpleNamespace(state_db=state, env_file=base / "config" / "knowledge-base.env", runtime_dir=base / "runtime")
+        (base / "config" / "corrections" / "orphaned").mkdir(parents=True)
+        (base / "config" / "corrections" / "kb_002.yaml").write_text("documents: []\n", encoding="utf-8")
+        (base / "config" / "corrections" / "orphaned" / "kb_001-20260101-000000.yaml").write_text("{}", encoding="utf-8")
+        settings = SimpleNamespace(state_db=state, env_file=base / "config" / "knowledge-base.env", runtime_dir=base / "runtime",
+                                   corrections_dir=base / "config" / "corrections")
         return base, settings
 
     def test_backup_copies_state_env_and_eval_and_keeps_n(self) -> None:
@@ -713,15 +717,17 @@ class StateBackupTests(unittest.TestCase):
             stamps = iter(("20251231-000000", "20260101-000000", "20260102-000000", "20260103-000000"))   # the dry run takes one too
             with patch.object(maintenance, "ts", side_effect=lambda: next(stamps)):
                 dry = maintenance.backup_state(settings, base_dir=base, keep=2, dry_run=True)
-                self.assertFalse((base / "backups").exists())                        # a dry run writes nothing
-                self.assertEqual(dry["files"], ["knowledge-base.env", "deployment-compose.env", "eval/gold.json"])
+                self.assertFalse((base / "backups").exists())                        # 预演不落盘
+                self.assertEqual(dry["files"], ["knowledge-base.env", "deployment-compose.env", "eval/gold.json",
+                                                "corrections/kb_002.yaml"])          # 挪开的旧文件不备
                 first = maintenance.backup_state(settings, base_dir=base, keep=2)
                 second = maintenance.backup_state(settings, base_dir=base, keep=2)
                 third = maintenance.backup_state(settings, base_dir=base, keep=2)
             target = Path(third["backup_dir"])                                        # the first copy is already pruned (keep=2)
             self.assertEqual(sorted(p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()),
-                             ["deployment-compose.env", "eval/gold.json", "kb-pipeline.db", "knowledge-base.env"])
-            with db.connect(target / "kb-pipeline.db") as con:                       # the online backup opens as a consistent snapshot
+                             ["corrections/kb_002.yaml", "deployment-compose.env", "eval/gold.json", "kb-pipeline.db",
+                              "knowledge-base.env"])
+            with db.connect(target / "kb-pipeline.db") as con:                       # 在线备份是可打开的一致快照
                 self.assertEqual(tuple(con.execute("SELECT name, api_key FROM llm_registry").fetchone()), ("m", "k"))
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
             self.assertEqual((target / "eval").stat().st_mode & 0o777, 0o700)                # subdirectories tightened too
@@ -1443,19 +1449,26 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
                 discovery.mark_inactive(con, b.kb_id, reason="directory_missing")  # the directory went missing once
                 con.execute("UPDATE kb_sources SET inactive_at = ?", (int(time.time()) - 30 * 86400,))
                 con.commit()
-            stub = SimpleNamespace(state_db=state, mirror_root=mirror,
+            stub = SimpleNamespace(state_db=state, mirror_root=mirror, runtime_dir=root / "runtime",
                                    qdrant_url="http://q", qdrant_api_key="",
                                    opensearch_url="http://o", cache_dir=root / "cache",
-                                   graph_work_dir=root / "gw")
+                                   graph_work_dir=root / "gw", corrections_dir=root / "corrections")
+            stub.corrections_dir.mkdir()
+            (stub.corrections_dir / "kb_099.yaml").write_text("documents: []\n", encoding="utf-8")   # 登记表里没有的库
             with mock.patch.object(maintenance, "service_busy", return_value=(False, [])), \
                     mock.patch.object(maintenance, "_hard_delete_kb",
                                       side_effect=lambda *a, **k: {"forgotten": True}) as hard_delete:
+                self.assertEqual(maintenance.kb_sources_gc(stub, retention_days=7, dry_run=True)["corrections"], {})
+                self.assertTrue((stub.corrections_dir / "kb_099.yaml").exists())                       # 预演不动文件
                 result = maintenance.kb_sources_gc(stub, retention_days=7)
             dropped = {entry["kb_id"] for entry in result["dropped"]}
-            self.assertEqual(dropped, {a.kb_id})            # the closed KB is deleted once retention expires
-            self.assertEqual(hard_delete.call_count, 1)
-            # a directory-missing deactivation whose directory exists is still skipped (the scan reactivates it)
+            self.assertEqual(dropped, {a.kb_id})            # 关闭的库到期被删
+            self.assertEqual(hard_delete.call_count, 1)     # 预演不删
+            # 目录还在的「消失型」失活仍然跳过(它会被扫描重新激活)
             self.assertNotIn(b.kb_id, dropped)
+            # 更正文件对账:这里替身没真删登记行,两个库都还登记着,补上模板;登记表里没有的挪进 orphaned/
+            self.assertEqual(result["corrections"]["created"], [b.kb_id])
+            self.assertEqual([Path(p).name.split("-")[0] for p in result["corrections"]["orphaned"]], ["kb_099"])
 
     def test_failed_external_delete_keeps_the_registry_row(self) -> None:
         """S4: the registry row is the only lead back to the collection / Neo4j projection. If any side fails
@@ -1470,7 +1483,7 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
             with db.connect(state) as con:
                 src, _ = discovery.enroll(con, mirror, "库X")
                 con.commit()
-            stub = SimpleNamespace(state_db=state, mirror_root=mirror,
+            stub = SimpleNamespace(state_db=state, mirror_root=mirror, runtime_dir=root / "runtime",
                                    qdrant_url="http://q", qdrant_api_key="",
                                    opensearch_url="http://o", cache_dir=root / "cache",
                                    graph_work_dir=root / "gw", neo4j_password="")
@@ -1534,7 +1547,7 @@ class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSup
                 con.execute("UPDATE kb_sources SET status='inactive', inactive_reason='delete_failed', inactive_at=? WHERE kb_id=?",
                             (int(time.time()) - 30 * 86400, a.kb_id))
                 con.commit()
-            stub = SimpleNamespace(state_db=state, mirror_root=mirror, qdrant_url="http://q", qdrant_api_key="",
+            stub = SimpleNamespace(state_db=state, mirror_root=mirror, runtime_dir=root / "runtime", qdrant_url="http://q", qdrant_api_key="",
                                    opensearch_url="http://o", cache_dir=root / "cache", graph_work_dir=root / "gw")
             with mock.patch.object(maintenance, "service_busy", return_value=(False, [])), \
                     mock.patch.object(maintenance, "_hard_delete_kb", side_effect=lambda *a, **k: {"forgotten": True}) as hard_delete:

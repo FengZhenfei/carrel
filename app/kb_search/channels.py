@@ -237,11 +237,9 @@ _driver: dict[str, Any] = {"key": None, "driver": None}
 
 
 def shared_driver(settings: Settings) -> Any:
-    """The Neo4j driver shared by the search process (thread-safe, with its own connection pool): the
-    graph channel no longer creates, verifies and closes a driver on every query. A connection idle for
-    more than a few seconds is probed before use, so dead connections left in the pool by a Neo4j restart
-    are not used to run queries; when the connection details change the driver is replaced."""
-    from neo4j import GraphDatabase
+    """检索进程共用的 Neo4j driver(线程安全、自带连接池):图路不再每次查询新建、验连通、再关掉。
+    空闲超过几秒的连接取用前先探活,Neo4j 重启后留在池里的死连接不会被拿去跑查询;连接信息变了就换一个。"""
+    from neo4j import GraphDatabase, NotificationDisabledCategory
 
     key = (settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     with _driver_lock:
@@ -250,8 +248,11 @@ def shared_driver(settings: Settings) -> Any:
         if not settings.neo4j_password:
             raise RuntimeError("Neo4j password is not configured. Set NEO4J_PASSWORD in config/knowledge-base.env.")
         old = _driver["driver"]
+        # 不要「属性名不存在」这类提示:现行过滤引用的 superseded_by / doc_status 在没出现过被取代或归档的库里
+        # 本来就没有,每次查询都回一条 UnknownPropertyKeyWarning 只会刷满日志
         _driver["driver"] = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password),
-                                                 liveness_check_timeout=NEO4J_IDLE_CHECK_SECONDS)
+                                                 liveness_check_timeout=NEO4J_IDLE_CHECK_SECONDS,
+                                                 notifications_disabled_categories=[NotificationDisabledCategory.UNRECOGNIZED])
         _driver["key"] = key
         if old is not None:
             old.close()
@@ -260,22 +261,19 @@ def shared_driver(settings: Settings) -> Any:
 
 def graph_channel(settings: Settings, source: KBSource, question: str, *, limit: int, hops: int,
                   vector: list[float] | None = None, lexical_only: bool = False, q: Any = None,
-                  timeout: float | None = None) -> dict[str, Any]:
-    """Graph channel as candidate expansion (Q04): calls graph_query and takes only chunk ids and graph
-    scores as features; entities / relations / facts / pages are brought back separately for the
-    evidence tables. Any failure (alias version mismatch, Neo4j unreachable, graph collection missing)
-    only skips the graph channel and the query proceeds as usual. vector: pass the question vector in
-    if already computed (saves one embedding); lexical_only: the embedding service is down, use
-    lexical seeds only (Q19). q: the Qdrant client shared by the service (creating one each time starts
-    a compatibility-check thread and builds an SSL context, a cost multiplied under concurrency).
-    timeout: transaction timeout of each Neo4j query; the database terminates it when time is up, so an
-    abandoned job does not keep holding a thread."""
+                  timeout: float | None = None, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+    """图路作候选扩展(Q04):调 graph_query,只取切片 id 与图分作特征;实体 / 关系 / 事实 / 页面另外带回来给证据表。
+    任何失败(别名版本不一致、Neo4j 不可达、图集合不存在)都只跳过图路,整次查询照常。
+    vector:问题向量已经算过就传进来(省一次嵌入);lexical_only:嵌入服务挂了,只用词法种子(Q19)。
+    q:服务共用的 Qdrant 客户端(每次现建一个要起兼容检查线程、建 SSL 上下文,并发时这笔开销成倍放大)。
+    timeout:每条 Neo4j 查询的事务超时,到点由数据库终止,被放弃的作业不会一直占着线程。
+    history / as_of:关系与事实的时间口径(kb_pipeline.graph.currency.query_scope)。"""
     from kb_pipeline.graph.recall import graph_query
 
     try:
         res = graph_query(settings, source, question, hops=int(hops), chunk_limit=int(limit), candidate_limit=int(limit),
                           with_text=True, vector=vector, lexical_only=lexical_only, q=q, driver=shared_driver(settings),
-                          timeout=timeout)
+                          timeout=timeout, history=history, as_of=as_of)
     except Exception as exc:
         return {"chunks": [], "skipped": f"{type(exc).__name__}: {str(exc)[:160]}"}
     chunks = [{"point_id": str(c.get("point_id")), "score": float(c.get("graph_score") or c.get("score") or 0.0),
@@ -284,7 +282,7 @@ def graph_channel(settings: Settings, source: KBSource, question: str, *, limit:
               for c in res.get("chunks") or [] if c.get("point_id")]
     return {"chunks": chunks, "entities": res.get("entities") or [], "relations": res.get("relations") or [],
             "specs": res.get("specs") or [], "pages": res.get("pages") or [], "graph_version": res.get("graph_version"),
-            "window": res.get("window"), "seeds": res.get("seeds") or {}}
+            "window": res.get("window"), "time": res.get("time"), "seeds": res.get("seeds") or {}}
 
 
 def _visual_data_url(image_bytes: bytes) -> str:

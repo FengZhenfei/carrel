@@ -37,7 +37,7 @@ class GraphEntityTypesTests(unittest.TestCase):
         from kb_pipeline.limits import validate_graph_tune_config
 
         self.assertEqual(validate_graph_tune_config(None, None), [])
-        self.assertTrue(validate_graph_tune_config(None, 0))
+        self.assertEqual(validate_graph_tune_config(None, 0), [])
 
     def test_no_undefined_global_names_in_pipeline_and_server(self) -> None:
         import builtins
@@ -149,7 +149,7 @@ class GraphEntityTypesTests(unittest.TestCase):
     def test_extraction_schema_uses_kb_list_or_falls_back_to_default(self) -> None:
         from kb_pipeline import discovery
         from kb_pipeline.graph.build import extraction_schema_for
-        from kb_pipeline.limits import GRAPH_ENTITY_TYPES_DEFAULT
+        from kb_pipeline.ontology import DEFAULT_TYPES
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -158,14 +158,24 @@ class GraphEntityTypesTests(unittest.TestCase):
             def schema_for(config):
                 return extraction_schema_for(discovery.build_source(root / "mirror", "半导体", config, kb_id="kb_003"))
 
-            self.assertEqual(schema_for({}).entity_types, tuple(GRAPH_ENTITY_TYPES_DEFAULT))
+            fallback = schema_for({})
+            self.assertEqual(fallback.entity_types, tuple(n for n, _, _ in DEFAULT_TYPES))
+            self.assertEqual((fallback.parent_types["person"], fallback.parent_types["meeting"]), ("agent", "event"))
+            self.assertIn("precedes", fallback.predicate_names)              # 兜底模式有事件类型,带上事件核心关系
             mine = schema_for({"graph_entity_types": ["Memory Device", "Pin", "电压轨"],
-                               "graph_predicates": [{"name": "has_pin", "source_parents": ["component"], "target_parents": ["interface"]}],
-                               "graph_parent_types": {"Pin": "interface"}, "graph_language": "Chinese"})
+                               "graph_predicates": [{"name": "has_pin", "source_parents": ["entity"], "target_parents": ["part"]}],
+                               "graph_parent_types": {"Pin": "part", "Memory Device": "entity"},
+                               "graph_type_parents": {"Pin": "part", "Memory Device": "entity"},
+                               "graph_type_scopes": {"Pin": "document"}, "graph_language": "Chinese"})
             self.assertEqual(mine.entity_types, ("Memory Device", "Pin", "电压轨"))
             self.assertEqual(mine.predicate_names, ("has_pin",))
-            self.assertEqual(mine.allowed_ends()["has_pin"], ({"component"}, {"interface"}))
-            self.assertEqual((mine.language, mine.parent_types), ("Chinese", {"Pin": "interface"}))
+            self.assertEqual(mine.allowed_ends()["has_pin"], ({"entity"}, {"part"}))
+            self.assertEqual((mine.language, mine.parent_types), ("Chinese", {"Pin": "part", "Memory Device": "entity"}))
+            self.assertEqual((mine.type_scopes, mine.type_path("Pin")), ({"Pin": "document"}, ["pin", "part"]))
+            self.assertTrue(mine.endpoint_ok("Pin", {"part"}) and not mine.endpoint_ok("Memory Device", {"part"}))
+            # 父类表里写的不是上层类:生效字段只认八个上层类
+            odd = schema_for({"graph_entity_types": ["Pin"], "graph_parent_types": {"Pin": "interface", "X": "??"}})
+            self.assertEqual(odd.parent_types, {"Pin": "part"})
 
 
 class SchemaVersionRingTests(unittest.TestCase):
@@ -236,9 +246,10 @@ class SchemaSamplingTests(unittest.TestCase):
             {"name": "Has Pin", "description": "d", "source_parents": ["Component"], "target_parents": ["interface"]},
             {"name": "related_to"}, {"name": "has-pin"}, "part_of"]})
         self.assertEqual([p["name"] for p in preds], ["has_pin", "part_of"])
-        self.assertEqual(preds[0]["source_parents"], ["component"])
+        self.assertEqual(preds[0]["source_parents"], ["Component"])    # 原样留着,规范化模式时再对齐到上层类或类型名
+        self.assertTrue(all(p["multivalued"] for p in preds))
         parents = graph_schema.normalize_parent_types({"parent_types": {"Pin": "Interface", "ghost": "x"}}, ["pin"])
-        self.assertEqual(parents, {"pin": "part"})     # the invented parent type interface → one of the six upper classes
+        self.assertEqual(parents, {"pin": "part"})     # 同义的父类名 interface → 上层类 part
 
     def test_suggest_runs_the_six_calls(self) -> None:
         answers = ["Semiconductor datasheets", "English", "You are an expert.",
@@ -248,10 +259,12 @@ class SchemaSamplingTests(unittest.TestCase):
         client = _client(list(answers))
         out = graph_schema.suggest(client, ["sample text"])
         self.assertEqual(out["domain"], "Semiconductor datasheets")
-        self.assertEqual(out["entity_types"], ["memory device", "pin"])
-        self.assertEqual(out["parent_types"], {"memory device": "entity", "pin": "part"})
-        self.assertEqual(out["predicates"][0]["name"], "has_pin")
-        self.assertNotIn("competency_questions", out)     # capability questions withdrawn 2026-09-06
+        model = out["model"]
+        self.assertEqual([t["name"] for t in model["types"]], ["memory device", "pin"])
+        self.assertEqual({t["name"]: t["is_a"] for t in model["types"]}, {"memory device": "part", "pin": "part"})
+        self.assertEqual([p["name"] for p in model["predicates"]], ["has_pin"])
+        self.assertEqual((model["predicates"][0]["source_parents"], model["predicates"][0]["target_parents"]), (["part"], ["part"]))
+        self.assertNotIn("competency_questions", out)     # 能力问题 2026-09-06 撤掉
         self.assertEqual(client.stats["calls"], 6)
 
 
@@ -315,7 +328,7 @@ class SamplingStratificationTests(unittest.TestCase):
 
 class ExampleSelectionTests(unittest.TestCase):
     """Corpus example selection (4a): endpoint constraints follow the pipeline's relaxation rules and the hard
-    threshold became a ranking; the health KB previously kept no passage at all."""
+    threshold became a ranking; one evaluation corpus previously kept no passage at all."""
 
     def _schema(self):
         from kb_pipeline.graph.extract import ExtractionSchema
@@ -375,7 +388,7 @@ class ExampleSelectionTests(unittest.TestCase):
         from kb_pipeline import db
         from kb_server import service
 
-        graph = {"resolution_log": [{"kept": "a", "merged": "b", "kept_title": "FDE", "merged_title": "FDE (Forward-Deployed Engineer)", "source": "auto", "category": "identifier"}],
+        graph = {"resolution_log": [{"kept": "a", "merged": "b", "kept_title": "DSE", "merged_title": "DSE (Data-Systems Engineer)", "source": "auto", "category": "identifier"}],
                  "resolution_rejected": [{"a": "c", "b": "d", "a_title": "Demo", "b_title": "Demo阶段", "source": "lexical", "category": "alias", "reason": "recheck"}],
                  "stats": {"resolution": {"candidates": 3, "yes": 1, "rechecked": 1, "recheck_dropped": 1, "entities_before": 10, "entities_after": 9, "secret": 1}}}
         with tempfile.TemporaryDirectory() as tmp:
@@ -392,7 +405,7 @@ class ExampleSelectionTests(unittest.TestCase):
             with mock.patch.object(service, "settings", lambda: cfg), mock.patch("kb_pipeline.graph.build.graph_paths", lambda *a, **k: paths):
                 out = service.graph_merges("kb_1")
                 self.assertEqual((out["version"], out["totals"], out["merges"][0]["merged_title"], out["rejected"][0]["reason"]),
-                                 ("v1", {"merges": 1, "rejected": 1}, "FDE (Forward-Deployed Engineer)", "recheck"))
+                                 ("v1", {"merges": 1, "rejected": 1}, "DSE (Data-Systems Engineer)", "recheck"))
                 self.assertNotIn("secret", out["stats"])
                 with self.assertRaises(KeyError):
                     service.graph_merges("kb_x")
@@ -437,7 +450,7 @@ class SchemaFeedbackTests(unittest.TestCase):
         units = [_unit("u1")]
         ext = {"u1": _ext([("Northwind", "organization", "maker"), ("SRAM", "memory device", "chip")],
                           [("Northwind", "SRAM", "produces", "makes it", 8)])}
-        kw = dict(entity_types=("organization", "memory device"), parent_types={"organization": "entity", "memory device": "part"},
+        kw = dict(entity_types=("organization", "memory device"), upper_parents={"organization": "entity", "memory device": "part"},
                   allowed_ends={"produces": ({"entity"}, {"process"})})
         plain = merge_extractions(units, ext, **kw)
         self.assertTrue(plain["relations"][0]["type_violation"])                         # part is not in the target constraint
@@ -465,7 +478,7 @@ class SchemaFeedbackTests(unittest.TestCase):
         units = [_unit("u1")]
         ext = {"u1": _ext([("Northwind", "organization", "maker"), ("Gizmo", "gadget", "a thing"), ("Widget", "gadget", "another")],
                           [("Northwind", "Gizmo", "produces", "makes it", 8)])}
-        out = merge_extractions(units, ext, entity_types=("organization",), parent_types={"organization": "entity"})
+        out = merge_extractions(units, ext, entity_types=("organization",), upper_parents={"organization": "entity"})
         acct = out["stats"]["endpoint_observed"]
         self.assertEqual(acct["unknown_types"], {"gadget": 2})
         self.assertEqual(acct["type_counts"], {"gadget": 2, "organization": 1})
@@ -586,8 +599,10 @@ class SchemaFeedbackTests(unittest.TestCase):
         self.assertIn("used by 60 edges", seen[5])
         self.assertIn("previous version of this schema described the corpus", seen[7])
         self.assertEqual(out["guard"], {"kept_predicates": ["calls"], "widened": ["requires_skill.target_parents+standard"]})
-        self.assertEqual({p["name"] for p in out["predicates"]}, {"requires_skill", "calls"})
-        # No prior: the prompts lack these passages and the guard is empty
+        self.assertEqual({p["name"] for p in out["model"]["predicates"]}, {"requires_skill", "calls"})
+        ends = {p["name"]: p["target_parents"] for p in out["model"]["predicates"]}
+        self.assertEqual(ends["requires_skill"], ["property", "standard"])        # 账里确认过的端点保住(standard 是本库的类型名)
+        # 没有 prior:提示词里没有这些段,guard 为空
         seen.clear(); answers[:] = list(self.ANSWERS)
         out2 = graph_schema.suggest(_client(reply), ["sample text"], examples=False)
         self.assertNotIn("previous version", seen[3]); self.assertNotIn("previous version", seen[5])
@@ -627,6 +642,15 @@ class SchemaFeedbackTests(unittest.TestCase):
         graph_schema.suggest(_client(reply), ["sample text"], examples=False, prior=self.PRIOR)
         self.assertNotIn("each type:", seen[3]); self.assertNotIn("fall outside", seen[5]); self.assertNotIn("declared too narrowly", seen[5])
         self.assertIn("used by 60 edges", seen[5])
+
+    def test_upper_named_prior_types_are_asked_to_be_replaced(self) -> None:
+        """10-24 真机:上一版里的 concept / document / event 只从名单里删掉时,模型照抄上一版,那些实体没有类型可去。
+        这些旧类型不列进「保留」,单独说明装了多少实体、要换成更具体的类型。"""
+        prior = {"entity_types": ["concept", "technique", "document"], "observed": {"type_counts": {"concept": 5336, "technique": 2116}}}
+        text = graph_schema._prior_types_text(prior)
+        self.assertIn("used these entity types: technique. Keep", text)
+        self.assertIn("top-level class names as types: concept (5336 entities), document. Those are not allowed", text)
+        self.assertIn("each type: technique (2116)", text)
 
     def _state(self, tmp: str, config: dict):
         from kb_pipeline import discovery
@@ -833,9 +857,8 @@ class SchemaFeedbackTests(unittest.TestCase):
                     schema_flow.suggest_schema_version(settings, source, origin=schema_flow.ORIGIN_MANUAL, adopt=False,
                                                        client=_client([]), docs=["sample"])
             self.assertIsNone(schema_flow.suggest_in_progress(settings, "kb_x"))
-        # On the console side: refuse to extract again when the mark is seen
-        svc = (Path(__file__).resolve().parents[1] / "kb_server" / "service.py").read_text(encoding="utf-8")
-        self.assertIn("if suggest_in_progress(cfg, kb_id) is not None:", svc)
+        # Console duplicate submissions now reuse the persisted task; the claim
+        # still prevents a second worker (covered by test_schema_tasks).
 
     def test_default_graph_llm_fallback(self) -> None:
         from kb_pipeline.graph.build import DEFAULT_GRAPH_LLM, llm_ready, resolve_llm_specs
@@ -979,12 +1002,187 @@ class SchemaFeedbackTests(unittest.TestCase):
                     stolen["token"] = schema_flow.claim_suggest(settings, "kb_x", "auto_rebuild") or ""
                 return answers.pop(0)
 
-            with self.assertRaises(schema_flow.SuggestBusy) as ctx:
+            from kb_pipeline.graph.llm import LLMInterrupted
+            with self.assertRaises(LLMInterrupted) as ctx:
                 schema_flow.suggest_schema_version(settings, source, origin=schema_flow.ORIGIN_MANUAL, adopt=True,
                                                    client=_client(chat), docs=["sample"], sample={"chunks_total": 3, "documents": 1})
-            self.assertEqual(str(ctx.exception), schema_flow.SUGGEST_SUPERSEDED_MESSAGE)
+            self.assertIn("cancelled or superseded", str(ctx.exception))
             self.assertTrue(stolen["token"])
             with db.connect(settings.state_db) as con:
                 cfg = discovery.get_config(con, "kb_x")
             self.assertEqual((cfg.get("graph_schema_versions") or [], cfg.get("graph_schema_active")), ([], None))
             self.assertEqual(schema_flow.suggest_owner(settings, "kb_x"), stolen["token"])
+
+
+class OntologyLinkMLTests(unittest.TestCase):
+    """2026-10-24 破坏性改版:八个上层类固定,模式以 LinkML 子集为原生格式(类型 = class + is_a,关系 = slot +
+    domain / range / any_of,作用域、语言、画像放 annotations)。导出的文件已用 LinkML 1.9 工具链实测能加载、
+    能生成 OWL / SHACL / JSON Schema;这里钉住 Carrel 自己读写的那一半。"""
+
+    RAW = {
+        "language": "Chinese",
+        "types": [
+            {"name": "person", "is_a": "agent", "description": "a named person"},
+            {"name": "product", "is_a": "entity", "description": "a product"},
+            {"name": "software product", "is_a": "product"},
+            {"name": "meeting", "is_a": "event", "scope": "global"},
+            {"name": "artifact", "is_a": "entity", "abstract": True},
+            {"name": "document", "is_a": "", "description": "a referenced document"},
+        ],
+        "predicates": [
+            {"name": "reports_to", "source_parents": ["agent"], "target_parents": ["agent"], "multivalued": False},
+            {"name": "uses", "source_parents": ["agent", "process"], "target_parents": ["product"]},
+            {"name": "follows", "core": True, "source_parents": ["event"], "target_parents": ["event"]},
+        ],
+        "profile": {"axis": "date", "subject_types": ["person"]},
+    }
+
+    def test_normalize_expand_and_round_trip(self) -> None:
+        from kb_pipeline import ontology
+
+        model, warnings = ontology.normalize_model(self.RAW)
+        self.assertEqual(warnings, [])
+        types = {t["name"]: t for t in model["types"]}
+        self.assertEqual(types["document"]["is_a"], "document")                 # 上层类直接当类型用
+        self.assertEqual((types["software product"]["scope"], types["meeting"]["scope"]), ("global", "global"))
+        preds = {p["name"]: p for p in model["predicates"]}
+        self.assertIn("precedes", preds)                                         # follows 归一成 precedes,其余事件核心关系补上
+        self.assertNotIn("follows", preds)
+        self.assertEqual(preds["uses"]["target_parents"], ["product"])           # 端点可以是类型名
+        eff = ontology.expand_model(model)
+        self.assertNotIn("artifact", eff["graph_entity_types"])                  # abstract 不进抽取菜单
+        self.assertEqual(eff["graph_parent_types"]["software product"], "entity")
+        self.assertEqual(eff["graph_type_parents"]["software product"], "product")
+        self.assertEqual(ontology.type_paths(eff["graph_type_parents"])["software product"], ["software product", "product", "entity"])
+        self.assertEqual(ontology.descendants(["product"], eff["graph_type_parents"]), {"product", "software product"})
+        self.assertEqual(ontology.descendants(["entity"], eff["graph_type_parents"]), {"entity", "product", "software product", "artifact"})
+        doc = ontology.to_linkml(model, name="kb_t", version="v1")
+        self.assertEqual(doc["classes"]["software product"]["is_a"], "product")
+        self.assertNotIn("abstract", doc["classes"]["document"])                 # 用作类型的上层类不再是 abstract
+        self.assertTrue(doc["classes"]["agent"]["abstract"])
+        self.assertIn("reports_to", doc["classes"]["agent"]["slots"])            # 关系挂在来源端的类上
+        self.assertFalse(doc["slots"]["reports_to"]["multivalued"])
+        back, w2 = ontology.from_linkml(ontology.load_linkml(ontology.dump_linkml(doc)))
+        self.assertEqual((back, w2), (model, []))
+
+    def test_reads_plain_linkml_written_elsewhere(self) -> None:
+        """插件或人手写的 LinkML 不一定带 Carrel 的注解:domain / range / any_of、类上的 slots 与 attributes 都要读得懂,
+        没写 multivalued 的关系按多值;基本类型取值的 slot 是属性,跳过并给警告。"""
+        from kb_pipeline import ontology
+
+        text = """
+id: https://example.org/acme
+name: acme
+classes:
+  Agent: {is_a: thing}
+  Employee:
+    is_a: Agent
+    slots: [works_on]
+    attributes:
+      manages: {range: Employee}
+      age: {range: integer}
+  Project: {is_a: entity, annotations: {carrel_scope: global}}
+  Milestone: {is_a: Event}
+slots:
+  works_on:
+    any_of: [{range: Project}, {range: Milestone}]
+  due: {range: date}
+enums:
+  Status: {permissible_values: {open: {}, closed: {}}}
+"""
+        model, warnings = ontology.from_linkml(ontology.load_linkml(text))
+        types = {t["name"]: t for t in model["types"]}
+        self.assertEqual(set(types), {"Employee", "Project", "Milestone"})
+        self.assertEqual((types["Employee"]["is_a"], types["Milestone"]["is_a"]), ("agent", "event"))
+        preds = {p["name"]: p for p in model["predicates"]}
+        self.assertEqual((preds["works_on"]["source_parents"], preds["works_on"]["target_parents"]), (["Employee"], ["Project", "Milestone"]))
+        self.assertEqual((preds["manages"]["source_parents"], preds["manages"]["target_parents"]), (["Employee"], ["Employee"]))
+        self.assertTrue(preds["works_on"]["multivalued"])
+        self.assertNotIn("age", preds)
+        self.assertNotIn("due", preds)
+        self.assertTrue(any("enums" in w for w in warnings))
+        self.assertTrue(any("age" in w for w in warnings) and any("due" in w for w in warnings))
+
+    def test_invalid_schemas_are_rejected_with_every_error(self) -> None:
+        from kb_pipeline import ontology
+
+        with self.assertRaises(ontology.SchemaError) as ctx:
+            ontology.normalize_model({"types": [{"name": "a", "is_a": "b"}, {"name": "b", "is_a": "a"}]})
+        self.assertTrue(any("成环" in e for e in ctx.exception.errors))
+        with self.assertRaises(ontology.SchemaError) as ctx:
+            ontology.normalize_model({"types": [{"name": f"t{i}"} for i in range(ontology.MAX_MENU_TYPES + 1)]})
+        self.assertIn("可抽取的类型最多", ctx.exception.errors[0])
+        with self.assertRaises(ontology.SchemaError):
+            ontology.normalize_model({"types": [{"name": "x", "abstract": True}]})
+        with self.assertRaises(ontology.SchemaError):
+            ontology.load_linkml("- just\n- a list\n")
+        model, warnings = ontology.normalize_model({"types": [{"name": "x", "is_a": "nowhere"}, {"name": "thing"}]})
+        self.assertEqual(model["types"][0]["is_a"], "entity")
+        self.assertEqual(len(warnings), 2)                                       # 父类认不出、根类名保留
+
+    def test_upload_registers_a_version_and_inherits_the_account(self) -> None:
+        from kb_pipeline import discovery, ontology
+        from kb_pipeline.graph import schema_flow
+        from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID  # noqa: F401  (placeholder id stays importable)
+
+        model, _ = ontology.normalize_model(self.RAW)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "s.db"
+            db.init_db(state)
+            prior = {"id": "v1", "linkml": ontology.to_linkml(model, name="kb_x", version="v1"), "examples": "E",
+                     "observed": {"edges": {"uses": 30}, "confirmed": [{"predicate": "uses", "source_parent": "agent",
+                                                                       "target_parent": "entity", "count": 30}]}}
+            config = {"graph_schema_versions": [prior], "graph_schema_active": "v1"}
+            with db.connect(state) as con:
+                con.execute("INSERT INTO kb_sources(kb_id, collection, source_root, status, first_seen_at, last_seen_at, config_json) "
+                            "VALUES ('kb_x', 'kb_x', '库', 'active', 1, 1, ?)", (json.dumps(config, ensure_ascii=False),))
+                con.commit()
+            settings = SimpleNamespace(state_db=state, mirror_root=Path(tmp))
+            source = discovery.build_source(Path(tmp), "库", config, kb_id="kb_x", collection="kb_x")
+            text = "classes:\n  customer: {is_a: agent}\n  order: {is_a: event}\nslots:\n  places: {domain: customer, range: order}\n  price: {range: decimal}\n"
+            out = schema_flow.register_uploaded_schema(settings, source, text, adopt=False)
+            self.assertEqual((out["origin"], out["adopted"], out["entity_types"]), ("upload", False, ["customer", "order"]))
+            self.assertTrue(any("price" in w for w in out["warnings"]))
+            with db.connect(state) as con:
+                cfg = discovery.get_config(con, "kb_x")
+            self.assertEqual(cfg["graph_schema_active"], "v1")                    # 没生效:要人选中保存
+            entry = cfg["graph_schema_versions"][0]
+            self.assertEqual((entry["origin"], entry["prior_id"], entry["examples"]), ("upload", "v1", ""))
+            self.assertEqual(entry["observed"]["inherited_from"], "v1")
+            self.assertEqual(entry["upload"]["warnings"], out["warnings"][:50])
+            adopted = schema_flow.register_uploaded_schema(settings, source, text, adopt=True)
+            with db.connect(state) as con:
+                cfg = discovery.get_config(con, "kb_x")
+            self.assertEqual(cfg["graph_schema_active"], adopted["version_id"])
+            self.assertEqual(cfg["graph_entity_types"], ["customer", "order"])
+            self.assertIn("precedes", [p["name"] for p in cfg["graph_predicates"]])
+            with self.assertRaises(ontology.SchemaError):
+                schema_flow.register_uploaded_schema(settings, source, "classes: {}\n")
+
+
+class SchemaOutputCleanupTests(unittest.TestCase):
+    """模式采样里两处模型输出的规整(10-24 改版上线后真机抽模式时看到的,与库无关):领域回成一段带 Markdown 的说明;
+    类型名把两种叫法用「 / 」拼成一个类型。"""
+
+    def test_domain_is_one_short_phrase(self) -> None:
+        self.assertEqual(graph_schema.clean_domain("**Domain: Enterprise AI Delivery**\n\nThis text covers ..."), "Enterprise AI Delivery")
+        self.assertEqual(graph_schema.clean_domain('"Medical science"'), "Medical science")
+        self.assertEqual(graph_schema.clean_domain("领域：半导体器件。"), "半导体器件")
+        self.assertEqual(len(graph_schema.clean_domain("x" * 300)), 80)
+        self.assertEqual(graph_schema.clean_domain("\n\n"), "")
+        self.assertIn("Reply ONLY with the domain", prompts.GENERATE_DOMAIN_PROMPT)
+
+    def test_compound_type_names_keep_the_first_name(self) -> None:
+        self.assertEqual(graph_schema.parse_entity_types({"entity_types": ["vendor / service provider", "Vendor", "I/O pin", "TCP/IP stack"]}),
+                         ["vendor", "I/O pin", "TCP/IP stack"])                  # 词内斜杠不动,拆出来的与已有的重名就并掉
+        self.assertEqual(graph_schema.parse_entity_types('{"entity_types": ["a / b", "c"]} trailing'), ["a", "c"])
+        self.assertIn('do not join two kinds or two names into one type', prompts.ENTITY_TYPE_GENERATION_PROMPT)
+
+    def test_upper_class_names_are_not_leaf_types(self) -> None:
+        """10-24 评估:一组样本归纳出的类型表里有 concept / document / event,1.9 万个实体里 5 千多个类型就叫 concept。
+        上层类本来就挂在每个实体上,叶子再叫同名没有信息量;提示词的示例也不再拿 concept 当类型。"""
+        self.assertEqual(graph_schema.parse_entity_types({"entity_types": ["Concept", "research paper", "document", "事件", "person",
+                                                                           "product", "thing", "Ｅｖｅｎｔ"]}),
+                         ["research paper", "person", "product"])
+        self.assertIn("Do not use the top-level classes themselves", prompts.ENTITY_TYPE_GENERATION_PROMPT)
+        self.assertNotIn('"concept"', prompts.ENTITY_TYPE_GENERATION_PROMPT)

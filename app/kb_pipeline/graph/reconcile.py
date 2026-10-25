@@ -1,11 +1,12 @@
-"""Cross-document fact reconciliation (plan 5.A): facts with the same subject, concept, conditions and unit are
-ordered along the axis into a series; only facts with the same axis value (or none at all) and different
-values are recorded as conflicts. Annotation only, values are never changed (the record shape of Semantica's
-conflicts, without its adjudication). Age 30 and 31 from two reports two years apart are a series, not a
-contradiction.
+"""跨文档事实对账(方案 5.A):同主体、同概念、同条件、同单位的事实按轴排成序列;
+轴相同(或都没有轴)而值不同的才记冲突。只标注,不改值(Semantica conflicts 的记录形状,
+不要它的裁决)。年龄 30 与 31 来自两年的两份报告,是序列不是矛盾。
 
-The output is written back into the facts (series_key / series_len / series_index / conflict_group), and the
-conflict list and stats are returned for the timeline pages and the health-check panel.
+「同条件」保守采用所有非时期条件。跨文档不同条件不能仅因每篇只有一个值就被忽略;
+上下文归类需要显式语义,不从样本频率推断。
+
+产出写回事实(series_key / series_len / series_index / conflict_group / superseded_by / superseded_on),
+并返回冲突清单与统计,时间线页与体检面板用;序列里最新那一档是现行值,更早的标被取代(检索默认只给现行值)。
 """
 from __future__ import annotations
 
@@ -41,10 +42,31 @@ def _concept(fact: dict[str, Any]) -> str:
 
 
 def group_key(fact: dict[str, Any]) -> tuple[str, str, str]:
-    """The group key excludes the unit: unit-less facts ("total cholesterol elevated" in an abnormality summary)
-    must join the measurement series that carries a unit; a group is only split by unit when several units occur
-    in it (see split_by_unit)."""
+    """分组键不含单位:没单位的事实(异常汇总里的「总胆固醇 增高」)要并进带单位的测量序列;
+    同一组里出现多个单位才按单位拆开(见 split_by_unit)。条件只算全部条件,真正参与分组的是 qualifier_keys 挑出来的那几个。"""
     return (_subject_norm(fact), _concept(fact), _conditions_norm(fact.get("conditions")))
+
+
+def _condition_items(fact: dict[str, Any]) -> dict[str, str]:
+    from .facts import _PERIOD_KEY_RE
+
+    return {str(k).casefold().strip(): unicodedata.normalize("NFKC", str(v)).casefold().replace(" ", "")
+            for k, v in (fact.get("conditions") or {}).items() if not _PERIOD_KEY_RE.search(str(k))}
+
+
+def qualifier_keys(rows: list[dict[str, Any]]) -> set[str]:
+    """Until context has explicit semantics, every non-period condition qualifies identity.
+
+    Observing only one temperature per document does not make temperature report metadata.
+    Missing conditions also remain distinct from an explicitly qualified measurement.
+    """
+    return {key for row in rows for key in _condition_items(row)}
+
+
+
+def _qualified(fact: dict[str, Any], keys: set[str]) -> str:
+    items = _condition_items(fact)
+    return json.dumps(sorted((k, items.get(k, "")) for k in keys), ensure_ascii=False)
 
 
 def unit_of(fact: dict[str, Any]) -> str:
@@ -105,16 +127,24 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
     raw_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     skipped_conflict = 0
     for f in facts:
+        for key in ("superseded_by", "superseded_on", "series_key", "series_len", "series_index", "conflict_group"):
+            f.pop(key, None)
+    for f in facts:
         if not (f.get("subject") and (f.get("property") or f.get("symbol"))):
             continue
         if f.get("evidence_conflict"):
             skipped_conflict += 1          # image text vs estimated reading conflicted: no series, no conflict check (Codex review F01); the fact is kept
             continue
-        raw_groups.setdefault(group_key(f), []).append(f)
+        raw_groups.setdefault((_subject_norm(f), _concept(f), ""), []).append(f)
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
-    for key, rows in raw_groups.items():
-        for unit, part in split_by_unit(rows):
-            groups[(*key, unit)] = part
+    for (subj, concept, _), rows in raw_groups.items():
+        keys = qualifier_keys(rows)
+        by_cond: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_cond.setdefault(_qualified(r, keys), []).append(r)
+        for cond, part in by_cond.items():
+            for unit, unit_rows in split_by_unit(part):
+                groups[(subj, concept, cond, unit)] = unit_rows
     stats = {"groups": len(groups), "multi_doc_groups": 0, "series": 0, "series_facts": 0, "conflicts": 0, "conflict_facts": 0,
              "same_document_variants": 0, "evidence_conflict_skipped": skipped_conflict}
     conflicts: list[dict[str, Any]] = []
@@ -145,6 +175,13 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
                     r["series_len"] = len(ordered)
                     r["series_index"] = idx
                     stats["series_facts"] += 1
+            # 新旧(方案第 7 条):序列里最新那一档是现行值,更早的每一档被它后面那一档取代(沿 superseded_by 能一路走到现行值)
+            for idx, axis in enumerate(ordered[:-1]):
+                newer = ordered[idx + 1]
+                for r in by_axis[axis]:
+                    r["superseded_by"] = by_axis[newer][0].get("id")
+                    r["superseded_on"] = newer
+                    stats["superseded_facts"] = stats.get("superseded_facts", 0) + 1
         for axis, same in by_axis.items():
             if len(same) < 2:
                 continue
@@ -158,7 +195,7 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
                 # two values within one document: in the same unit it is mostly a two-column table whose condition
                 # was not extracted; in different paragraphs the same property was measured once per occasion (two
                 # heart rates in a checkup, a parameter given in two manual sections). Neither is a cross-document
-                # conflict, so they are only counted (2026-09-08: all 7 groups of the health KB were of this kind)
+                # conflict, so they are only counted (2026-09-08: all 7 groups in one evaluation corpus were of this kind)
                 stats["same_document_variants"] += 1
                 continue
             ckey = "x" + hashlib.sha256(f"{'|'.join(key)}|{axis}".encode("utf-8")).hexdigest()[:16]

@@ -45,26 +45,24 @@ class KBSource:
     # Gleaning rounds: how many "what else was missed" follow-ups per unit after the first extraction; 0–2,
     # default 1 (always two calls).
     graph_max_gleanings: int = 1
-    # Extraction constraints the console's "extract / re-extract labels" induces with the LLM from this
-    # KB's chunks. All derived data, not hand-written configuration: empty falls back to
-    # limits.GRAPH_ENTITY_TYPES_DEFAULT / no language constraint, and they are cleared together with the
-    # graph data when the graph is deleted (see maintenance._drop_graph_data).
+    # 模式字段:由现行模式版本(LinkML,见 kb_pipeline/ontology.py)展开出来的派生数据,
+    # 不是你手写的配置:留空即回退到 ontology.default_model / 不加语言约束,
+    # 删图时随图谱数据一并清空(见 maintenance._drop_graph_data)。
+    # graph_entity_types 是抽取菜单(非 abstract 的类型);graph_parent_types 是每个类型的上层类;
+    # graph_type_parents 是类型树(直接父类);graph_type_scopes 是逐类型判定的作用域。
     graph_entity_types: tuple[str, ...] = ()
     graph_language: str | None = None
-    # Schema layer (plan 4.10): the per-KB sampled relation predicate table (each entry with its allowed
-    # endpoint parent types) and the type → parent type mapping, derived data like the type table. (The
-    # capability questions were removed on 2026-09-06)
     graph_predicates: tuple[dict[str, Any], ...] = ()
     graph_parent_types: dict[str, str] = field(default_factory=dict)
-    # 2026-09-07 schema layer completion (also derived data, taking effect with the label version): type
-    # definitions (the one-liner in the extraction menu), few-shot examples generated from this KB's
-    # corpus, and the scenario profile (subject types / axis / conclusion headings / extension predicates)
+    graph_type_parents: dict[str, str] = field(default_factory=dict)
+    graph_type_scopes: dict[str, str] = field(default_factory=dict)
+    # 2026-09-07 模式层补齐(同样是派生数据,随标签版本一起生效):类型定义(抽取菜单里的一句话)、
+    # 从本库语料生成的 few-shot、场景画像(主体类型 / 轴 / 结论段标题 / 延伸谓词)
     graph_type_definitions: dict[str, str] = field(default_factory=dict)
     graph_examples: str = ""
     graph_profile: dict[str, Any] = field(default_factory=dict)
-    # How many passages "extract / re-extract labels" samples for the LLM. Selection is fixed to random and
-    # not configurable.
-    graph_tune_sample_size: int = 8
+    # 「立即/重新抽取标签」采样多少个片段喂给 LLM。选取方式固定为 random,不开放配置。
+    graph_tune_sample_size: int = 0
     graph_rebuild_policy: GraphRebuildPolicy = field(default_factory=GraphRebuildPolicy)
 
     @property

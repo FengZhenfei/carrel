@@ -8,7 +8,7 @@ import sys
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import service
 
@@ -30,6 +30,11 @@ def require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="KB_SEARCH_TOKEN is not configured; only loopback requests are accepted")
 
 
+# 时间口径(关系、事实、文档状态共用,见 kb_pipeline.graph.currency):默认只给现行的;as_of 回看某一天
+# (YYYY / YYYY-MM / YYYY-MM-DD,只给年或月就是那段时间的最后一天);history 全给,每行标 status
+AS_OF_PATTERN = r"^\d{4}(-\d{1,2}(-\d{1,2})?)?$"
+
+
 class SearchRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     kbs: list[str] | None = None
@@ -37,7 +42,9 @@ class SearchRequest(BaseModel):
     hints: dict[str, Any] | None = None
     context: bool = True
     explain: bool = False
-    image_b64: str | None = Field(default=None, max_length=12_000_000)   # image-to-image (Q17): the caller supplies an image, base64 or data URL
+    image_b64: str | None = Field(default=None, max_length=12_000_000)   # 图→图(Q17):调用方给图片,base64 或 data URL
+    history: bool = False                                                 # 被取代 / 归档的文档、旧的说法也要
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)        # 回看某一天
 
 
 class ContextRequest(BaseModel):
@@ -55,32 +62,52 @@ class NeighborsRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
     types: list[str] | None = None                                 # only these predicates
     direction: str = Field(default="both", pattern="^(both|out|in)$")
+    history: bool = False                                          # 被取代 / 过期的关系也要
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
 
 
 class EntitiesRequest(BaseModel):
+    # 改版前的 parent_types 已经去掉:带着它来的请求直接 422,不悄悄忽略、列出一份没按上层类筛的清单
+    model_config = ConfigDict(extra="forbid")
+
     kb_id: str
-    types: list[str] | None = None                                 # only these entity types (case-insensitive; the types a knowledge base has are in /catalog and in the first page's types)
-    parent_types: list[str] | None = None                          # or by upper class: entity / part / property / process / standard / document
-    name: str | None = Field(default=None, max_length=200)         # a piece of text contained in the title or an alias
+    types: list[str] | None = None                                 # 只要这些实体类型及其子类型(不分大小写;库里有哪些类型见 /catalog 或 /graph/schema)
+    uppers: list[str] | None = None                                # 或按上层类:agent / entity / part / property / process / event / concept / document
+    kind: str = Field(default="all", pattern="^(instance|class|all)$")        # 都要(默认)/ 只要具体的 / 只要类别名
+    name: str | None = Field(default=None, max_length=200)         # 标题、别名或外部编号里包含这段文字
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class FactsRequest(BaseModel):
     kb_id: str
-    subject: str | None = Field(default=None, max_length=200)      # the subject's title or alias (case-insensitive)
-    subject_id: str | None = Field(default=None, max_length=200)   # or the entity id directly
-    prop: str | None = Field(default=None, max_length=200, alias="property")   # property name / symbol / canonical concept name
-    match: str = Field(default="auto", pattern="^(auto|exact|contains)$")      # auto: exact first, containment only when nothing matched
-    doc_id: str | None = Field(default=None, max_length=200)       # only the facts drawn from this document
-    rel_path: str | None = Field(default=None, max_length=1000)    # or the document by its path inside the knowledge base
-    conflict_only: bool = False                                    # only facts in a cross-document conflict group; at least one of subject, property, document and this
+    subject: str | None = Field(default=None, max_length=200)      # 主体的标题或别名(不分大小写)
+    subject_id: str | None = Field(default=None, max_length=200)   # 或直接给实体 id
+    prop: str | None = Field(default=None, max_length=200, alias="property")   # 属性名 / 符号 / 规范概念名
+    match: str = Field(default="auto", pattern="^(auto|exact|contains)$")      # auto:先精确,一条都没有再按包含
+    doc_id: str | None = Field(default=None, max_length=200)       # 只要出自这份文档的事实
+    rel_path: str | None = Field(default=None, max_length=1000)    # 或按库内路径指定文档
+    conflict_only: bool = False                                    # 只要带跨文档冲突组的事实;主体、属性、文档、本项至少给一个
+    history: bool = False                                          # 序列里更早的档位、被取代 / 过期的也要
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0, le=1_000_000)
 
 
+class SchemaRequest(BaseModel):
+    kb_id: str
+    version: str | None = Field(default=None, max_length=100)      # 模式版本 id;不给就是建现行这版图用的那个
+    format: str = Field(default="json", pattern="^(json|yaml)$")
+
+
+class StatsRequest(BaseModel):
+    kb_id: str
+
+
 class PagesRequest(BaseModel):
     kb_id: str
+    history: bool = False
+    as_of: str | None = Field(default=None, max_length=20)
     kind: str | None = Field(default=None, pattern="^(subject|timeline|source|index)$")
     title: str | None = Field(default=None, max_length=200)        # the title contains this text (case-insensitive, whitespace ignored)
     id: str | None = Field(default=None, max_length=200)           # page id
@@ -177,8 +204,8 @@ def catalog(refresh: bool = False) -> dict[str, Any]:
 def _log_search(out: dict[str, Any]) -> None:
     """Every search that returns a result leaves one line on the server: timings, degraded entries, widening
     and rerank state. If degradation were only written into the response, the degradation rate and slow
-    requests could not be traced afterwards. The question text is not logged (in a health knowledge base the
-    question itself is private); degraded entries hold only knowledge base names, channel names and
+    requests could not be traced afterwards. The question text is not logged (questions can themselves contain
+    private information); degraded entries hold only knowledge base names, channel names and
     exception types. The whole line is written at once (written in two parts, the lines of concurrent
     requests would run together); failing to write the log must not fail a search that is already done."""
     try:
@@ -186,6 +213,8 @@ def _log_search(out: dict[str, Any]) -> None:
         line = {"timings_ms": s.get("timings_ms"), "kbs": len(s.get("kbs") or []), "widened": (s.get("routing") or {}).get("widened"),
                 "rerank": s.get("rerank"), "evidence_state": s.get("evidence_state"), "hits": (s.get("sources") or {}).get("hits"),
                 "image_query": s.get("image_query"), "degraded": s.get("degraded") or []}
+        if s.get("ranking"):
+            line["ranking"] = s["ranking"]
         sys.stdout.write("[search.request] " + json.dumps(line, ensure_ascii=False, default=str) + "\n")
         sys.stdout.flush()
     except Exception:
@@ -195,7 +224,7 @@ def _log_search(out: dict[str, Any]) -> None:
 @router.post("/search", dependencies=[Depends(require_token)])
 def search(req: SearchRequest) -> dict[str, Any]:
     out = _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context,
-                explain=req.explain, image_bytes=_decode_image(req.image_b64))
+                explain=req.explain, image_bytes=_decode_image(req.image_b64), history=req.history, as_of=req.as_of)
     _log_search(out)
     return out
 
@@ -218,25 +247,36 @@ def crop(req: CropRequest) -> Response:
 @router.post("/graph/neighbors", dependencies=[Depends(require_token)])
 def graph_neighbors(req: NeighborsRequest) -> dict[str, Any]:
     return _wrap(service.graph_neighbors, req.kb_id, entity=req.entity, entity_id=req.entity_id, limit=req.limit, types=req.types,
-                 direction=req.direction)
+                 direction=req.direction, history=req.history, as_of=req.as_of)
 
 
 @router.post("/graph/entities", dependencies=[Depends(require_token)])
 def graph_entities(req: EntitiesRequest) -> dict[str, Any]:
-    return _wrap(service.graph_entities, req.kb_id, types=req.types, parent_types=req.parent_types, name=req.name, limit=req.limit,
+    return _wrap(service.graph_entities, req.kb_id, types=req.types, uppers=req.uppers, kind=req.kind, name=req.name, limit=req.limit,
                  offset=req.offset)
 
 
 @router.post("/graph/facts", dependencies=[Depends(require_token)])
 def graph_facts(req: FactsRequest) -> dict[str, Any]:
     return _wrap(service.graph_facts, req.kb_id, subject=req.subject, subject_id=req.subject_id, prop=req.prop, match=req.match,
-                 doc_id=req.doc_id, rel_path=req.rel_path, conflict_only=req.conflict_only, limit=req.limit, offset=req.offset)
+                 doc_id=req.doc_id, rel_path=req.rel_path, conflict_only=req.conflict_only, history=req.history, as_of=req.as_of,
+                 limit=req.limit, offset=req.offset)
+
+
+@router.post("/graph/schema", dependencies=[Depends(require_token)])
+def graph_schema(req: SchemaRequest) -> dict[str, Any]:
+    return _wrap(service.graph_schema, req.kb_id, version=req.version, fmt=req.format)
+
+
+@router.post("/graph/stats", dependencies=[Depends(require_token)])
+def graph_stats(req: StatsRequest) -> dict[str, Any]:
+    return _wrap(service.graph_stats, req.kb_id)
 
 
 @router.post("/graph/pages", dependencies=[Depends(require_token)])
 def graph_pages(req: PagesRequest) -> dict[str, Any]:
     return _wrap(service.graph_pages, req.kb_id, kind=req.kind, title=req.title, page_id=req.id, entity_id=req.entity_id, doc_id=req.doc_id,
-                 rel_path=req.rel_path, with_text=req.with_text, limit=req.limit, offset=req.offset)
+                 rel_path=req.rel_path, with_text=req.with_text, limit=req.limit, offset=req.offset, history=req.history, as_of=req.as_of)
 
 
 # POST /docs shares its path with FastAPI's own API documentation page (GET /docs) under a different method; the

@@ -132,11 +132,11 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                 if not value:
                     continue
                 # Fill vertically, not horizontally. Every **row** covered by the merged range gets
-                # the value, because a category label such as "WPS AI" spanning 54 rows is exactly what
+                # the value, because a category label such as "示例模块" spanning 54 rows is exactly what
                 # gives each row chunk its ownership; but the other columns of the same row are not
                 # filled -- that would only copy the same value N times within one row.
                 #
-                # Measured on the "instructions" sheet of a product feature list workbook: one 7x4
+                # Measured on an instruction sheet in a workbook: one 7x4
                 # merged block poured the same note into 28 cells, rendering as note|note|note|note
                 # repeated over 7 rows, which chunked into dozens of verbatim-identical chunks -- the
                 # same vector stored dozens of times, surfacing in clusters at retrieval. 9.2% of all
@@ -178,13 +178,12 @@ def read_xlsx_rows_via_xml(path: Path) -> list[tuple[str, list[tuple[int, list[s
     with zipfile.ZipFile(str(path), "r") as archive:
         shared = _xlsx_parse_shared_strings(archive)
         for sheet_name, sheet_path in _xlsx_sheet_targets(archive):
-            try:
-                rows = _xlsx_parse_sheet_rows(archive, sheet_path, shared)
-            except Exception as exc:
-                print(f"[XLSX XML WARN] parse sheet failed: {path} {sheet_name} {sheet_path} -> {exc!r}", flush=True)
-                continue
+            rows = _xlsx_parse_sheet_rows(archive, sheet_path, shared)
+            root = ET.fromstring(archive.read(sheet_path))
+            from openpyxl.utils.cell import range_boundaries
+            spans = vertical_spans(range_boundaries(x.attrib["ref"]) for x in _xml_findall(root, ".//mergeCell", _xml_namespace(root)))
             if rows:
-                output.append((sheet_name or "Sheet", rows, {}))
+                output.append((sheet_name or "Sheet", rows, spans))
     return output
 
 
@@ -218,8 +217,8 @@ def _xlsx_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     try:
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
         rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-    except KeyError:
-        return _xlsx_guess_sheet_targets(archive)
+    except KeyError as exc:
+        raise ValueError("Cannot safely recover XLSX visibility without workbook metadata") from exc
 
     workbook_ns = _xml_namespace(workbook)
     rels_ns = _xml_namespace(rels)
@@ -231,6 +230,8 @@ def _xlsx_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
             rel_targets[rel_id] = target
 
     for sheet in _xml_findall(workbook, ".//sheets/sheet", workbook_ns):
+        if sheet.attrib.get("state", "visible") != "visible":
+            continue
         name = sheet.attrib.get("name") or "Sheet"
         rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") or sheet.attrib.get("r:id")
         target = rel_targets.get(rel_id or "")
@@ -238,7 +239,7 @@ def _xlsx_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
             target = target.lstrip("/")
             sheet_path = target if target.startswith("xl/") else f"xl/{target}"
             output.append((name, sheet_path))
-    return output or _xlsx_guess_sheet_targets(archive)
+    return output
 
 
 def _xlsx_guess_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
@@ -262,27 +263,60 @@ def _xlsx_parse_sheet_rows(
 ) -> list[tuple[int, list[str]]]:
     root = ET.fromstring(archive.read(sheet_path))
     ns = _xml_namespace(root)
-    rows: list[tuple[int, list[str]]] = []
+    from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format, is_timedelta_format
+    from openpyxl.utils.datetime import from_excel, from_ISO8601, CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900
+    from openpyxl.utils.cell import range_boundaries
+    formats = ["General"]
+    if "xl/styles.xml" in archive.namelist():
+        styles = ET.fromstring(archive.read("xl/styles.xml"))
+        sns = _xml_namespace(styles)
+        custom = {int(x.attrib["numFmtId"]): x.attrib["formatCode"] for x in _xml_findall(styles, ".//numFmt", sns)}
+        formats = [custom.get(int(x.attrib.get("numFmtId", 0)), BUILTIN_FORMATS.get(int(x.attrib.get("numFmtId", 0))))
+                   for x in _xml_findall(styles, "cellXfs/xf", sns)] or ["General"]
+    wb = ET.fromstring(archive.read("xl/workbook.xml"))
+    props = _xml_find(wb, "workbookPr", _xml_namespace(wb))
+    epoch = CALENDAR_MAC_1904 if props is not None and props.attrib.get("date1904") in ("1", "true") else CALENDAR_WINDOWS_1900
+    values = {}
+    hidden = set()
+    used_row = used_col = 0
     for row_el in _xml_findall(root, ".//sheetData/row", ns):
-        row_no = int(row_el.attrib.get("r") or len(rows) + 1)
-        values_by_col: dict[int, str] = {}
-        max_col = 0
+        row_no = int(row_el.attrib.get("r") or 1)
+        used_row = max(used_row, row_no)
+        if row_el.attrib.get("hidden") in ("1", "true"):
+            hidden.add(row_no)
         for cell in _xml_findall(row_el, "c", ns):
-            ref = cell.attrib.get("r", "")
-            match = re.match(r"^([A-Z]+)", ref)
+            match = re.match(r"^([A-Z]+)", cell.attrib.get("r", ""))
             if not match:
                 continue
-            col_idx = _xlsx_col_to_index(match.group(1))
-            value = normalize_cell(_xlsx_cell_value(cell, shared_strings, ns))
+            col = _xlsx_col_to_index(match.group(1))
+            fmt = formats[int(cell.attrib.get("s", 0))]
+            if fmt is None:
+                raise ValueError(f"Cannot safely recover XLSX number format for {sheet_path}:{cell.attrib.get('r')}")
+            raw = _xlsx_cell_value(cell, shared_strings, ns)
+            typ = cell.attrib.get("t", "n")
+            if raw != "" and typ == "n":
+                raw = float(raw) if any(x in str(raw).lower() for x in (".", "e")) else int(raw)
+                if is_date_format(fmt):
+                    raw = from_excel(raw, epoch=epoch, timedelta=is_timedelta_format(fmt))
+            elif typ == "b":
+                raw = raw == "1"
+            elif typ == "d" and raw:
+                raw = from_ISO8601(raw)
+            value = normalize_cell(raw, fmt)
             if value:
-                values_by_col[col_idx] = value
-                max_col = max(max_col, col_idx)
-        if not values_by_col:
-            continue
-        values = ["" for _ in range(max_col)]
-        for col_idx, value in values_by_col.items():
-            values[col_idx - 1] = value
-        rows.append((row_no, values))
+                values[(row_no, col)] = value
+                used_col = max(used_col, col)
+    for merged in _xml_findall(root, ".//mergeCell", ns):
+        min_col, min_row, max_col, max_row = range_boundaries(merged.attrib["ref"])
+        value = values.get((min_row, min_col))
+        if value:
+            for row_no in range(min_row, min(max_row, used_row) + 1):
+                values.setdefault((row_no, min_col), value)
+    rows = []
+    for row_no in sorted({r for r, _ in values} - hidden):
+        row = [values.get((row_no, col), "") for col in range(1, used_col + 1)]
+        if any(row):
+            rows.append((row_no, row))
     return rows
 
 
@@ -740,7 +774,7 @@ _CELL_WS_RE = re.compile(r"\s+")
 def flat_cell(value: str | None) -> str:
     """Flatten a cell to one line: newlines inside the cell become spaces and runs of
     whitespace collapse. A spot check found in-cell newlines ("Session list<LF>@owner",
-    header "WPS Collab<LF>public") splitting one record over two or three lines, so neither
+    header "Demo Collab<LF>public") splitting one record over two or three lines, so neither
     readers nor the model could line values up with columns."""
     return _CELL_WS_RE.sub(" ", value or "").strip()
 

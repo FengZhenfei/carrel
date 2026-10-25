@@ -688,14 +688,14 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
             <div id="cfg-tune">
               <div class="form-grid">
                 <div><label class="f">实体标签模型</label><select id="cfg-gt"></select></div>
-                <div><label class="f">采样数量</label>
-                  <input type="number" id="cfg-gss" min="1" max="32" step="1" value="8">
-                  <div class="hint" id="cfg-gss-hint"></div></div>
                 <div><label class="f">&nbsp;</label>
-                  <button id="cfg-gtune" style="width:100%">立即/重新抽取标签</button></div>
-                <!-- Output language, entity labels, parent types and predicates are extracted, derived results,
-                     shown read-only; to change them, extract again. Competency questions are maintained by
-                     hand and editable. -->
+                  <div style="display:flex;gap:6px"><button id="cfg-gtune" style="flex:1">立即/重新抽取标签</button>
+                    <button id="cfg-gtune-cancel" class="ghost" hidden>取消</button></div>
+                  <div id="cfg-gtune-status" class="hint" hidden></div></div>
+                <div><label class="f">采样数量</label>
+                  <div class="ro empty" id="cfg-gss">尚未计算</div></div>
+                <!-- 输出语言、实体标签、父类与谓词都是抽取出来的派生结果,只展示不可编辑;
+                     要改就重抽一次。能力问题是人维护的,可编辑。 -->
                 <div><label class="f">输出语言</label>
                   <div class="ro empty" id="cfg-glang">尚未抽取</div></div>
               </div>
@@ -707,13 +707,19 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
                   <div class="ver-row">
                     <select id="cfg-gver"></select>
                     <button class="danger" id="cfg-gvdel" title="删除选中的这一版标签" disabled>删除</button>
+                  </div>
+                  <!-- 模式以 LinkML 存:下载选中的这一版,或上传一份(插件审定的本体、手写的模式),上传后同样要选中保存才生效 -->
+                  <div class="ver-row" style="margin-top:6px">
+                    <button id="cfg-gvdl" title="下载选中这一版的 LinkML 模式文件" disabled>下载 LinkML</button>
+                    <button id="cfg-gvup" title="上传一份 LinkML 模式文件,入环后选中保存才生效">上传 LinkML</button>
+                    <input type="file" id="cfg-gvfile" accept=".yaml,.yml,application/yaml,text/yaml" hidden>
                   </div></div>
                 <div><label class="f">实体标签</label>
                   <div class="chips" id="cfg-get"></div>
                   <div class="hint" id="cfg-get-hint"></div></div>
               </div>
               <div class="form-grid one" style="margin-top:12px">
-                <div><label class="f">类型父类(端点约束用)</label>
+                <div><label class="f">类型层级(上层类 · 父类 · 作用域)</label>
                   <div class="chips" id="cfg-gparents"></div></div>
               </div>
               <div class="form-grid one" style="margin-top:12px">

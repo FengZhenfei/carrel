@@ -1381,7 +1381,7 @@ class ChunkingFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestC
     def test_one_term_per_line_pages_stay_within_budget(self) -> None:
         """Pages with one term per line, such as a glossary index / TOC: the budget used to be the sum of the
         sentence tokens, ignoring the newlines between sentences, so a block of 261 "sentences" produced a
-        783-token chunk (budget 600, 2026-09-11, the library KB). The real token count must stay within budget."""
+        783-token chunk (budget 600, 2026-09-11 evaluation). The real token count must stay within budget."""
         from kb_pipeline.chunking.chunker import chunk_text
         from kb_pipeline.utils import count_tokens
 

@@ -27,22 +27,22 @@ from .extract import ExtractionResult
 from .facts import fact_id, normalize_fact
 from .units import Unit
 
-VERSION = "det-v7"
+VERSION = "det-v8"
 
 TYPES = ("module", "class", "function", "method", "constant", "package", "repository", "skill", "instructions", "readme",
          "config_file", "document")
 UPPER = {
     "module": "entity", "class": "part", "function": "part", "method": "part", "constant": "property",
-    "package": "standard", "repository": "entity", "skill": "entity", "instructions": "document", "readme": "document",
+    "package": "concept", "repository": "entity", "skill": "entity", "instructions": "document", "readme": "document",
     "config_file": "document", "document": "document",
 }
 PREDICATES = [
     {"name": "defines", "description": "a module defines a class, function or constant", "source_parents": ["entity"], "target_parents": ["part", "property"]},
     {"name": "has_method", "description": "a class has a method", "source_parents": ["part"], "target_parents": ["part"]},
     {"name": "calls", "description": "a function, method or module-level code calls a function, method or class", "source_parents": ["part", "entity"], "target_parents": ["part"]},
-    {"name": "imports", "description": "a module imports another module or package", "source_parents": ["entity"], "target_parents": ["entity", "standard"]},
+    {"name": "imports", "description": "a module imports another module or package", "source_parents": ["entity"], "target_parents": ["entity", "concept"]},
     {"name": "inherits", "description": "a class inherits from a base class", "source_parents": ["part"], "target_parents": ["part"]},
-    {"name": "depends_on", "description": "a repository depends on a package", "source_parents": ["entity"], "target_parents": ["standard"]},
+    {"name": "depends_on", "description": "a repository depends on a package", "source_parents": ["entity"], "target_parents": ["concept"]},
     {"name": "references", "description": "a document references a file, module or document", "source_parents": ["entity", "document"], "target_parents": ["entity", "document", "part"]},
 ]
 ALLOWED_ENDS = {p["name"]: (set(p["source_parents"]), set(p["target_parents"])) for p in PREDICATES}

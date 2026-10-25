@@ -39,12 +39,14 @@ command points at it with `--ref <call id>:<label>` instead of retyping IDs:
 `show 3fa2c1:F2` prints an entry in full. `--json` prints the complete
 response instead.
 
-The skill answers from one search: the answer, then the files it rests on as
-plain-text paths from each knowledge base's top-level folder, then a few
-numbered follow-ups drawn from the graph leads. When the user replies with a
-number, the agent walks one hop along the graph from that lead and answers
-again. Looking further is the user's choice, so the first answer does not wait
-for a multi-hop exploration.
+The skill starts with one search and answers from the evidence, followed by
+reference files and useful graph follow-ups. A specific evidence gap may prompt
+one targeted fact or neighbourhood lookup. Original images can accompany an
+answer after inspection, with their document and figure/page in the caption.
+Low-confidence or conflicting readings are checked against the source; historical
+series summaries remain leads until their individual values are verified.
+Whole-document reads serve explicit, complete item-by-item requests; summaries
+and scope comparisons use the retrieved evidence and focused context.
 
 How long an answer takes depends mostly on the agent's reasoning effort, not on
 the service: retrieval returns within seconds and the rest is the agent
@@ -64,6 +66,19 @@ The running service rereads the `KB_SEARCH_*` keys of
 effect within a minute without a restart, and a replaced token stops working.
 The listen address and port still require a restart, and keys set explicitly
 in the service's own environment take precedence over the file.
+
+## Time and schema queries
+
+`/search`, `/graph/neighbors`, `/graph/facts`, and `/graph/pages` default to
+current evidence. Use `history: true` to include superseded or expired records,
+or `as_of: "2025-06-30"` for a date. A year or month means its last day. Results
+carry time scope and status so historical statements remain distinguishable.
+
+`POST /graph/schema` takes `kb_id`, an optional `version`, and `format`
+(`json` or `yaml`). `POST /graph/stats` takes `kb_id` and returns graph coverage
+and type statistics. `/catalog` also summarizes types, predicates, subjects,
+and time coverage. The bundled client exposes `schema`, `stats`, `--history`,
+and `--as-of`.
 
 ## HTTP endpoints
 
@@ -92,6 +107,34 @@ store cannot be read for a knowledge base while the catalog is built (a
 collection that does not exist yet counts as empty), its entry reports `chunks`
 and `has_graph` as `null` with a `degraded` note, searches still try its graph,
 and the catalog is rebuilt after about 15 seconds.
+
+### Text and image reranking
+
+Configuring `VISUAL_RERANKER_BASE_URL` adds image reranking to the normal search
+flow. `KB_SEARCH_RERANK` controls both branches; no separate enable switch is
+needed. With no image endpoint or image candidates, the text path remains in use.
+
+- Both branches share 64 candidates by default (`KB_SEARCH_RERANK_N`), reserving
+  up to 8 image positions (`KB_SEARCH_VISUAL_RERANK_N`) before truncation.
+  Document status and explicit scope are checked before reading cached images.
+- Text and image scoring run in parallel. The image model sees cached pixels,
+  bounded source text and, for an image query, the query image. Requests use a
+  multimodal `/v1/rerank` endpoint, in batches of at most four images. The image
+  stage has a 15-second budget within the whole request's deadline.
+- Each branch decides relevance independently. Images use their own threshold
+  (0.5 by default); thresholds should be checked when changing models. An image
+  scored successfully belongs only to the image branch. Each accepted branch
+  rank contributes `1 / (KB_SEARCH_RRF_K + rank)`; equal ranks retain recall
+  order, with images preferred for queries containing an image. Document and
+  subject quotas, deduplication, MMR and context budgets still apply.
+- Missing images, timeouts or invalid model scores fall back to text and report
+  degradation. Low image relevance is a rejection, not a reason to restore a
+  high vector score. Block-type preferences apply inside each branch before fusion.
+
+`retrieval_summary.ranking` reports branch status and counts; each source's
+`ranking` reports its branch and rank. Fusion scores are rank scores, not
+confidence probabilities. These retrieval changes reuse existing parsed content,
+indexes and graphs. For image retrieval and display, see the image endpoints below.
 
 ### Search
 
@@ -220,9 +263,10 @@ Use these two endpoints when a question asks for everything of a kind ("all
 products", "every parameter of this device"). Ordinary questions are answered
 by `/search` alone.
 
-`POST /graph/entities` accepts `kb_id` and optional `types`, `parent_types`
-(the upper classes `entity`, `part`, `property`, `process`, `standard`,
-`document`), `name` (text contained in the title or an alias), `limit`
+`POST /graph/entities` accepts `kb_id` and optional `types`, `uppers`
+(the upper classes `agent`, `entity`, `part`, `property`, `process`, `event`,
+`concept`, `document`), `kind` (`all`, `instance`, or `class`), and `name`
+(text contained in the title, an alias, or an external identifier), `limit`
 (50 by default, at most 200), and `offset`. Entities are ordered by
 importance, and each carries `docs` (the documents that mention it most) and
 `doc_count`. The first page also returns `types`: the number of entities per
@@ -372,7 +416,8 @@ re-parsed, the graph catches up only with its next version. Until then,
 current grounds, such facts carry no hint, and such pages carry no body text.
 Items whose sources could not be checked are left unmarked. Conflict indicators
 identify differing records. Compare measurements using their subject, unit,
-date, and conditions. Series group the facts included in the current result.
+date, and conditions. Series include recorded time positions matching the requested time scope,
+including positions outside the ranked fact hits.
 
 `text_truncated` means more source text may be needed. `stitched.pieces`
 identifies the positions used in joined passages. Source text is bounded by

@@ -80,6 +80,10 @@ class LLMInputRejected(LLMCallError):
     ratio."""
 
 
+class LLMInputBudgetExceeded(LLMInputRejected):
+    """Local sampling input budget rejected the request before it was sent."""
+
+
 class LLMTransientResponse(RuntimeError):
     """HTTP succeeded, but the server says this generation was interrupted (DeepSeek's official
     finish_reason=insufficient_system_resource / aborted): the body may be empty or cut short, neither is usable,
@@ -111,6 +115,7 @@ class LLMSpec:
     api_key: str
     model_id: str
     protocol: str = "openai"
+    max_input_tokens: int | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "LLMSpec":
@@ -122,6 +127,7 @@ class LLMSpec:
             api_key=str(row["api_key"] or ""),
             model_id=str(row["model_id"]),
             protocol=protocol,
+            max_input_tokens=int(row["max_input_tokens"]) if "max_input_tokens" in keys and row["max_input_tokens"] else None,
         )
 
 
@@ -497,8 +503,12 @@ class ChatClient:
         chat: Callable[..., str] = chat_once,
         backoff_base: float = BACKOFF_BASE,
         backoff_max: float = BACKOFF_MAX,
+        input_token_limit: int | None = None,
+        connect_timeout: int | None = None,
     ) -> None:
         self.spec = spec
+        self.input_token_limit = input_token_limit
+        self.connect_timeout = connect_timeout
         self.cache = cache or LLMCache(None)
         self.timeout = int(timeout if timeout is not None else env_int("KB_GRAPH_LLM_TIMEOUT", DEFAULT_TIMEOUT))
         self.attempts = max(1, int(attempts))
@@ -558,6 +568,7 @@ class ChatClient:
         max_tokens = self.max_tokens if max_tokens is None else int(max_tokens)
         temperature = self.temperature if temperature is None else float(temperature)
         key = cache_key(self.spec, messages, self._params(max_tokens, temperature))
+        self._check_input_budget(messages)
         if use_cache:
             hit = self.cache.get(key)
             if hit is not None and validate is not None and not validate(hit):
@@ -579,8 +590,10 @@ class ChatClient:
             if self.stop.is_set():
                 raise LLMInterrupted("stop requested")
             try:
+                self._check_input_budget(nudged or messages)
                 content = self._chat(
-                    self.spec, nudged or messages, timeout=self.timeout, max_tokens=max_tokens,
+                    self.spec, nudged or messages,
+                    timeout=(self.connect_timeout, self.timeout) if self.connect_timeout else self.timeout, max_tokens=max_tokens,
                     temperature=temperature, session=self._session, meta=meta,
                 )
             except LLMInterrupted:
@@ -640,6 +653,15 @@ class ChatClient:
             self.stop.set()
             raise LLMCircuitOpen(self.circuit_reason)
         raise LLMCallError(f"{self.spec.name}: {last!r}") from last
+
+    def _check_input_budget(self, messages: list[dict[str, str]]) -> None:
+        if self.input_token_limit is not None:
+            # Shared conservative estimate includes message framing and retry history.
+            from .sampling_budget import estimate_messages
+            estimated = estimate_messages(messages)
+            if estimated > self.input_token_limit:
+                raise LLMInputBudgetExceeded(
+                    f"{self.spec.name}: estimated input {estimated} tokens exceeds sampling budget {self.input_token_limit}")
 
     def run_parallel(
         self,

@@ -93,6 +93,9 @@ async function api(path, opts = {}) {
       if (Array.isArray(d)) {
         // FastAPI's 422 validation errors are an array; naive string concatenation gives [object Object]
         detail = d.map(x => x?.msg || JSON.stringify(x)).join("；");
+      } else if (d?.code === "schema_invalid" && Array.isArray(d.errors)) {
+        const lang = document.documentElement.lang.startsWith("en") ? "en" : "zh";
+        detail = d.errors.map(x => x.message?.[lang] || x.code).join("; ");
       } else if (typeof d === "string" && d) {
         detail = d;
       }
@@ -614,11 +617,11 @@ async function renderConfig() {
   const key = `${kb.dir}|${draft ? "draft" : kb.state}`;
   if (state.cfgKey !== key) {
     state.cfgKey = key;
-    // When the same enabled KB re-fetches its config the form still holds its own content; for another KB or
-    // state the form only counts once it is filled below
+    schemaResultApplied = "";
+    setSampleCount(null);
+    // 同一个已开启库重拉配置时表单里还是它自己的内容;换了库或状态,表单要等下面填好才算数
     if (!(active && formBase && formBase.dir === kb.dir)) formBase = null;
     $("#cfg-note").style.display = "none";
-    if (!active) refreshCorpusHint(null);   // the previous KB's "N documents, M chunks" must not linger under this KB's name
     if (active) {
       try {
         const [cfg, llms] = await Promise.all([api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`), api("/llms")]);
@@ -650,7 +653,6 @@ async function renderConfig() {
           ? { note: state.graphSchema.note, dirty: true,
               kbId: kb.kb_id, active: state.graphSchema.active }
           : { kbId: kb.kb_id });
-        $("#cfg-gss").value = c.graph_tune_sample_size ?? 8;
         const ri = splitInterval(c.graph_rebuild_interval);
         $("#cfg-ri-n").value = ri.n;
         $("#cfg-ri-u").value = ri.u;
@@ -665,8 +667,7 @@ async function renderConfig() {
           $("#cfg-note").textContent = t("有未保存的修改");
           $("#cfg-note").style.display = "inline-block";   // .note is hidden by default in the stylesheet
         }
-        refreshCorpusHint(kb);  // no await: a slow count must not block the form
-        refreshTab();           // draw once more when the form is ready: the graph tab's mode label reads the form
+        refreshTab();           // 表单就绪后再画一次:图谱 tab 的方式标签读的是表单
       } catch (e) {
         toast(t("配置载入失败: ") + t(e.message));
         state.cfgKey = null;   // let the next round retry instead of treating the previous KB's values as this one's
@@ -693,7 +694,6 @@ async function renderConfig() {
       // A draft KB has no indexed chunks yet, so no labels can be extracted: empty falls back to the global
       // default
       setSchemaView(null);
-      $("#cfg-gss").value = dd.graph_tune_sample_size ?? 8;
       const ri = splitInterval(dd.graph_rebuild_interval);
       $("#cfg-ri-n").value = ri.n;
       $("#cfg-ri-u").value = ri.u;
@@ -708,10 +708,14 @@ async function renderConfig() {
       $("#cfg-graph").checked = false; $("#cfg-prompt").value = "";
       $("#cfg-ri-n").value = ""; $("#cfg-ri-u").value = "d";
       $("#cfg-rp-n").value = ""; $("#cfg-rp-u").value = "p"; $("#cfg-ro").value = "or";
-      setSchemaView(null); $("#cfg-gss").value = 8;
+      setSchemaView(null);
       $("#cfg-guc").value = "3"; $("#cfg-ggl").value = "1";
       $("#graph-fields").disabled = true;
     }
+  }
+  if (selectedEntry()?.kb_id === kb.kb_id) {
+    syncTuneButton(kb);
+    refreshSchemaTaskResult(kb);
   }
 }
 
@@ -764,10 +768,8 @@ $("#cfg-graph").addEventListener("change", async ev => {
   $("#graph-fields").disabled = !on;
   $("#cfg-gbuild").disabled = !(activeKb && on);
   $("#cfg-gsave").disabled = !(activeKb && (on || savedOn));
-  // Only compute when switching on. When switching off leave the hint alone for now -- a confirm dialog
-  // follows, and if it is cancelled nothing happened, so the hint must not be cleared; it is cleared later
-  // once the switch-off really succeeded.
-  if (on) refreshCorpusHint(kb);
+  // 只在拨开时算。拨关时先不动这句提示 —— 下面还有确认框,取消了的话什么都
+  // 没发生,提示不该被清掉;真关成了在后面清。
 
   // Turning on and off are deliberately asymmetric:
   //
@@ -808,8 +810,7 @@ $("#cfg-graph").addEventListener("change", async ev => {
     });
     toast(building ? t("已关闭知识图谱并停止建图;进度与缓存保留,下次建图从断点继续")
       : t("已关闭知识图谱;已建好的图谱数据保留,只是不再自动重建"));
-    state.cfgKey = null;   // force the next round to re-fetch the config instead of refilling old values
-    refreshCorpusHint(null);
+    state.cfgKey = null;   // 强制下一轮重新拉配置,别拿旧值回填
   } catch (e) {
     // If persisting failed (e.g. refused by the backend during a build), flip the switch back so the UI
     // does not lie
@@ -967,6 +968,7 @@ function collectInterval() {
 }
 
 function collectGraphConfig() {
+  if (!formBase || formBase.dir !== selectedEntry()?.dir) throw new Error(t("载入中…"));
   return {
     graph_enabled: $("#cfg-graph").checked,
     graph_unit_chunks: requireInt("#cfg-guc", t("每单元合并切片数")),
@@ -982,9 +984,8 @@ function collectGraphConfig() {
       summarize: $("#cfg-gs").value || null,
       tune: $("#cfg-gt").value || null,
     },
-    graph_tune_sample_size: requireInt("#cfg-gss", t("采样数量")),
-    // Entity labels and the output language are **never sent by the console**: they are derived values,
-    // expanded server-side from the selected label version. The console only expresses "which version".
+    // 实体标签与输出语言**永远不由控制台发送**:它们是派生值,由服务端从选中的
+    // 标签版本展开。控制台只表达「用哪一版」。
     //
     // Previously these two values were sent unconditionally from the frontend's in-memory state, and any
     // path that emptied it (switching to a draft KB, a failed config request, an early return in a race)
@@ -1081,7 +1082,7 @@ $("#cfg-gbuild").addEventListener("click", async () => {
     // at the saved config. Submit this section's draft first, then trigger, to avoid "button clickable but
     // the backend says the graph is off" or "building with the old model".
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectGraphConfig() });
-    markGraphConfigSaved();
+    if (selectedEntry()?.kb_id === kb.kb_id) markGraphConfigSaved();
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_build`, { method: "POST", body: {} });
     toast(t("图谱配置已保存,建图已启动"));
   } catch (e) { toast(t("建图启动失败: ") + t(e.message)); }
@@ -1139,74 +1140,151 @@ $("#cfg-gvdel").addEventListener("click", async () => {
   }
 });
 
-$("#cfg-gtune").addEventListener("click", async ev => {
+$("#cfg-gvdl").addEventListener("click", async () => {
+  const kb = selectedEntry();
+  const chosen = activeVersion();
+  if (!kb || !chosen) return;
+  try {
+    const res = await fetch(`/api/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema/${encodeURIComponent(chosen.id)}/linkml`, { headers: authHeaders() });
+    if (!res.ok) {
+      let detail = res.statusText || `HTTP ${res.status}`;
+      try { const body = await res.json(); if (typeof body.detail === "string") detail = body.detail; } catch {}
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const name = (/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "") || [])[1] || `${kb.kb_id}-${chosen.id}.linkml.yaml`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { toast(t("下载失败: ") + t(e.message)); }
+});
+
+$("#cfg-gvup").addEventListener("click", () => {
   const kb = selectedEntry();
   if (!kb || kb.state !== "active") return;
-  // While parsing runs, ready documents are still landing; sampling would see half a corpus. Same gate as
-  // the build.
+  $("#cfg-gvfile").value = "";
+  $("#cfg-gvfile").click();
+});
+
+$("#cfg-gvfile").addEventListener("change", async ev => {
+  const kb = selectedEntry();
+  const file = ev.target.files && ev.target.files[0];
+  if (!kb || !file) return;
+  try {
+    const text = await file.text();
+    const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema/upload`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: { linkml: text } });
+    const warn = (r.warnings || []).length ? t(" · {0} 处没读进来(属性型 slot、enums 等)", r.warnings.length) : "";
+    setSchemaView(r.schema, { note: t("上传:{0}", file.name) + warn, dirty: true, kbId: kb.kb_id });
+    toast(t("已上传 {0} 个类型、{1} 个关系,确认后点「保存配置」", (r.entity_types || []).length, (r.predicates || []).length));
+  } catch (e) { toast(t("上传失败: ") + t(e.message)); }
+});
+
+let tuneInFlight = null;
+let schemaResultApplied = "";
+let schemaResultLoading = "";
+const schemaNotified = new Set();
+const suggestSeen = {};
+const SCHEMA_PHASES = {
+  sampling: "选择样本", domain: "识别领域", language: "识别语言", persona: "准备归纳",
+  types: "归纳实体标签", parents: "归纳类型层级", predicates: "归纳关系谓词",
+  definitions: "归纳类型定义", profile: "归纳场景画像", examples: "验证语料示例", saving: "保存标签版本",
+};
+
+$("#cfg-gtune").addEventListener("click", async () => {
+  const kb = selectedEntry();
+  if (!kb || kb.state !== "active") return;
   if ((kb.jobs_active || 0) > 0) { await noticeDialog(PARSE_BUSY_MSG); return; }
-  // The button's "extracting" state is no longer just text changed by this click: tuneInFlight and the
-  // schema_suggest mark from the overview decide together (syncTuneButton), so switching KBs / tabs or
-  // reloading shows the truth
   tuneInFlight = kb.kb_id;
+  setSampleCount(null, "计算中…");
   syncTuneButton(kb);
   try {
-    // Submit this section's draft first: this step uses the **saved** label extraction model and sample
-    // size; without saving it would run with the old model or report "no model selected". Same reasoning
-    // as cfg-gbuild.
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectGraphConfig() });
-    markGraphConfigSaved();
-    const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema`, { method: "POST", body: {} });
-    const nTypes = (r.entity_types || []).length, nPreds = (r.predicates || []).length;
-    if (selectedEntry()?.kb_id !== kb.kb_id) {
-      // Switched to another KB during extraction: the result is already in the server's version ring, and
-      // KB A's labels must not be filled into KB B's form
-      toast(t("「{0}」已抽出 {1} 个实体标签、{2} 个谓词,切回该库查看并保存", kb.dir, nTypes, nPreds));
-      return;
-    }
-    const domain = domainSummary(r.domain, 60);
-    // Spell out both "chunks" and "documents": a chunk count alone is easily read as a document count
-    // Sampling details (health check D1): documents covered, boilerplate chunks excluded, whether
-    // representatives were picked by vector
-    const s = r.sample || {};
-    const note = t("采样 {0}/{1} 片段(覆盖 {2}/{3} 份文档", r.sampled, r.chunks_total, s.documents_covered ?? "?", r.documents)
-      + (s.excluded_boilerplate ? t(",排除样板 {0} 片", s.excluded_boilerplate) : "")
-      + (s.method === "vectors" ? t(",按向量挑代表") : "") + ")"
-      + (r.truncated ? t("（触及 token 预算）") : "")
-      + (domain ? t(" · 领域:{0}", domain) : "");
-    // The version is already stored in the ring by the backend (it will not be lost by an unrelated save),
-    // but is **not in effect yet** -- that still needs you to select it and save.
-    setSchemaView(r.schema, { note, dirty: true, kbId: kb.kb_id });
-    toast(t("已抽出 {0} 个实体标签、{1} 个谓词,确认后点「保存配置」", nTypes, nPreds));
+    if (selectedEntry()?.kb_id === kb.kb_id) markGraphConfigSaved();
+    const task = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema`, { method: "POST", body: {} });
+    kb.schema_task = task;
+    if (selectedEntry()?.kb_id !== kb.kb_id) return;
+    schemaResultApplied = "";
+    syncTuneButton(kb);
   } catch (e) {
     toast(t("抽取失败: ") + t(e.message));
+    if (selectedEntry()?.kb_id === kb.kb_id) setSampleCount(null, "计算失败");
   } finally {
     tuneInFlight = null;
-    syncTuneButton(selectedEntry());
+    await refreshOverview();
   }
 });
 
-// State of the "Extract labels" button: when an extraction is running for this KB (your own click,
-// tuneInFlight, or the server-side schema_suggest mark in the overview -- console-triggered and automatic
-// pre-build ones alike) it shows "extracting" and is disabled, the same after switching KBs / tabs or
-// reloading; when the mark disappears the extraction is done, so the config is re-fetched once so the new
-// version enters the dropdown (your own click fills it back in the click handler, no re-fetch).
-let tuneInFlight = null;
-const suggestSeen = {};
+$("#cfg-gtune-cancel").addEventListener("click", async () => {
+  const kb = selectedEntry(), task = kb?.schema_task;
+  if (!task || task.status !== "running") return;
+  try {
+    await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema/cancel`, {
+      method: "POST", body: { task_id: task.task_id },
+    });
+    await refreshOverview();
+  } catch (e) { toast(t(e.message)); }
+});
+
 function syncTuneButton(kb) {
-  const btn = document.getElementById("cfg-gtune");
-  if (!btn) return;
-  const active = !!kb && kb.state === "active";
-  const remote = active && kb.schema_suggest ? kb.schema_suggest : null;
-  const running = active && (remote != null || tuneInFlight === kb.kb_id);
+  const btn = $("#cfg-gtune"), cancel = $("#cfg-gtune-cancel"), status = $("#cfg-gtune-status");
+  const remote = kb?.state === "active" ? kb.schema_suggest : null;
+  const task = kb?.schema_task;
+  const running = !!remote || task?.status === "running" || tuneInFlight === kb?.kb_id;
   btn.disabled = running;
-  btn.textContent = running ? t("抽取中…") : t("立即/重新抽取标签");     // no elapsed time shown (2026-09-12, user decision)
-  if (!kb || !kb.kb_id) return;
-  const key = String(kb.kb_id);
-  if (remote) suggestSeen[key] = remote.started_at;
-  else if (suggestSeen[key] != null && tuneInFlight !== kb.kb_id) {
-    delete suggestSeen[key];
-    state.cfgKey = null;          // extraction done: the next renderConfig re-fetches the config so the new version shows up under "Label version"
+  if (running) {
+    $("#cfg-gbuild").disabled = true;
+    $("#cfg-gappend").disabled = true;
+  }
+  btn.textContent = running ? t("抽取中…") : t("立即/重新抽取标签");
+  cancel.hidden = !(task?.status === "running");
+  if (Number.isInteger(remote?.sampled ?? task?.sampled)) setSampleCount(remote?.sampled ?? task.sampled);
+  else if (running) setSampleCount(null, "计算中…");
+  status.textContent = running ? t(SCHEMA_PHASES[remote?.phase || task?.phase] || "选择样本")
+    : task?.status === "failed" ? t("抽取失败: ") + t(task.error || "")
+    : task?.status === "interrupted" ? t("任务已中断,重新抽取可复用缓存")
+    : task?.status === "cancelled" ? t("已取消,重新抽取可复用缓存") : "";
+  status.hidden = !status.textContent;
+  if (!kb?.kb_id) return;
+  if (remote) suggestSeen[kb.kb_id] = remote.task_id || remote.started_at;
+  else if (suggestSeen[kb.kb_id] != null && !running) {
+    delete suggestSeen[kb.kb_id];
+    state.cfgKey = null;
+  }
+}
+
+async function refreshSchemaTaskResult(kb) {
+  const task = kb?.schema_task;
+  if (task?.status !== "completed" || kb.schema_suggest) return;
+  const key = `${kb.kb_id}|${task.task_id}`;
+  if (schemaResultApplied === key || schemaResultLoading === key) return;
+  schemaResultLoading = key;
+  try {
+    const current = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_schema`);
+    if (selectedEntry()?.kb_id !== kb.kb_id || selectedEntry()?.schema_task?.task_id !== task.task_id
+        || current.task_id !== task.task_id || current.status !== "completed") return;
+    const r = current.result;
+    setSampleCount(r.sampled);
+    const s = r.sample || {};
+    const note = t("采样 {0}/{1} 片段(覆盖 {2}/{3} 份文档", r.sampled, r.chunks_total, s.documents_covered ?? "?", r.documents)
+      + (s.excluded_boilerplate ? t(",排除样板 {0} 片", s.excluded_boilerplate) : "")
+      + (s.method === "vectors" ? t(",按向量挑代表") : "") + ")";
+    // Keep an explicit user selection. Otherwise restore the pending result
+    // after navigation/reload, while keeping savedActive tied to the server.
+    const pending = r.pending && !state.graphSchema.dirty;
+    setSchemaView(r.schema, { note, kbId: kb.kb_id,
+      active: state.graphSchema.dirty ? state.graphSchema.active : (pending ? r.version_id : ""),
+      dirty: state.graphSchema.dirty || pending });
+    schemaResultApplied = key;
+    if (!schemaNotified.has(key)) {
+      schemaNotified.add(key);
+      if (r.pending) toast(t("已抽出 {0} 个实体标签、{1} 个谓词,确认后点「保存配置」", (r.entity_types || []).length, (r.predicates || []).length));
+    }
+  } catch (e) {
+    // A failed poll leaves the task intact; the next ordinary overview retries.
+  } finally {
+    if (schemaResultLoading === key) schemaResultLoading = "";
   }
 }
 
@@ -2003,9 +2081,9 @@ function gpColor(upper, palette) {
   const i = palette.indexOf(upper);
   return GP_COLORS[(i >= 0 ? i : palette.length) % GP_COLORS.length];
 }
-// Chinese names of the upper ontology classes: legend, cluster labels and tooltip all use "Chinese +
-// English name"; the English name matches the parent types on the config page
-const UPPER_ZH = { entity: "事物", part: "部件", property: "属性", process: "过程", standard: "标准", document: "文档", substance: "物质" };
+// 六类上层本体的中文名:图例、分区标签、提示框都用「中文 + 英文名」,英文名和配置页的父类对得上
+// 固定的八个上层类(kb_pipeline/ontology.py UPPER_CLASSES)
+const UPPER_ZH = { agent: "人员与组织", entity: "实体", part: "部件", property: "属性", process: "过程", event: "事件", concept: "概念", document: "文档" };
 function gpUpperZh(u) { return UPPER_ZH[u] || ""; }
 // The English UI shows only the English class name (capitalized), without repeating the English code
 function gpUpperText(u) { const zh = gpUpperZh(u); if (!u) return t("未分类"); if (!zh) return u; return I18N.lang === "en" ? t(zh) : `${zh} ${u}`; }
@@ -2656,13 +2734,16 @@ function normalizeTypes(list) {
 }
 
 function setSchemaView(view, { note = "", dirty = false, kbId = "", active = "" } = {}) {
-  const versions = ((view && view.versions) || []).map(v => ({
-    ...v, entity_types: normalizeTypes(v.entity_types),
-    predicates: Array.isArray(v.predicates) ? v.predicates : [],
-    parent_types: v.parent_types && typeof v.parent_types === "object" ? v.parent_types : {},
-  }));
-  // The active argument wins over the view's: when loading the config it preserves the "just extracted,
-  // not yet saved" selection.
+  // 服务端给的是从 LinkML 展开的形状:types[{name, is_a, upper, scope, abstract, description}]、predicates[…]
+  const versions = ((view && view.versions) || []).map(v => {
+    const types = Array.isArray(v.types) ? v.types : [];
+    return {
+      ...v, types,
+      entity_types: normalizeTypes(types.filter(x => !x.abstract).map(x => x.name)),
+      predicates: Array.isArray(v.predicates) ? v.predicates : [],
+    };
+  });
+  // active 参数优先于视图里的:载入配置时用它保住「刚抽好、还没保存」的那个选择。
   const wanted = String(active || (view && view.active) || "");
   state.graphSchema = {
     versions,
@@ -2685,14 +2766,12 @@ function activeVersion() {
 }
 
 function versionLabel(v) {
-  // Date · model · sample · label count. The fallback entry of a legacy KB has no metadata; say unknown
-  // honestly.
-  if (v.legacy) return t("当前(无版本信息) · {0} 个标签", v.entity_types.length);
+  // 日期 · 模型 · 采样 · 标签数
   const when = v.created_at
     ? new Date(v.created_at * 1000).toLocaleString(I18N.locale,
         { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
     : t("时间未知");
-  const parts = [when, v.model || t("模型未知")];
+  const parts = [when, v.origin === "upload" ? t("上传") : (v.model || t("模型未知"))];
   if (v.sample_size != null) parts.push(t("采样 {0}", v.sample_size));
   parts.push(t("{0} 个标签", v.entity_types.length));
   if (v.predicates && v.predicates.length) parts.push(t("{0} 个谓词", v.predicates.length));
@@ -2732,18 +2811,17 @@ function renderGraphSchema() {
   }
 
   const del = $("#cfg-gvdel");
+  const chosen = versions.find(v => String(v.id) === active);
   if (del) {
-    // The synthesized "current (no version info)" entry is never persisted and cannot be deleted; the
-    // version in effect cannot be deleted either.
-    const chosen = versions.find(v => String(v.id) === active);
-    const blocked = !chosen || chosen.legacy
-      || String(chosen.id) === state.graphSchema.savedActive;
+    // 正在生效的那一版不给删
+    const blocked = !chosen || String(chosen.id) === state.graphSchema.savedActive;
     del.disabled = blocked;
     del.title = !chosen ? t("尚未抽取标签")
-      : chosen.legacy ? t("这一条只是当前生效标签的只读视图,不是保存下来的版本")
       : blocked ? t("正在生效的那一版不能删:图就是按它建的")
       : t("删除选中的这一版标签");
   }
+  const dl = $("#cfg-gvdl");
+  if (dl) dl.disabled = !chosen;
 
   const lang = $("#cfg-glang");
   if (lang) {
@@ -2779,25 +2857,30 @@ function renderGraphSchema() {
     hint.textContent = bits.join(" · ");
   }
 
-  // Parent types: the server stores {type: parent} (the limits.normalize_parent_types shape); shown here
-  // grouped by parent as "parent -> subtypes...". Old versions without parent types show empty, and the
-  // endpoint gating does nothing at build time.
+  // 类型层级:按上层类分组,每个类型后面写父类型(多层时)与作用域(文档内的标出来);abstract 的中间层只用来按祖先查询
   const parents = $("#cfg-gparents");
   if (parents) {
     parents.innerHTML = "";
-    const groups = groupParentTypes(current ? current.parent_types : {});
+    const groups = groupTypesByUpper(current ? current.types : []);
     const names = Object.keys(groups);
     if (!names.length) {
       const ph = document.createElement("span");
       ph.className = "empty";
-      ph.textContent = types.length ? t("这一版没有父类信息(重抽一次会补上);没有父类就不做端点类型检查") : t("尚未抽取");
+      ph.textContent = t("尚未抽取");
       parents.appendChild(ph);
     } else {
       for (const name of names) {
         const chip = document.createElement("span");
         chip.className = "chip-p";
-        const b = document.createElement("b"); b.textContent = name;
-        const sp = document.createElement("span"); sp.textContent = groups[name].join(t("、"));
+        const b = document.createElement("b"); b.textContent = gpUpperText(name);
+        const sp = document.createElement("span");
+        sp.textContent = groups[name].map(ty => {
+          const bits = [];
+          if (ty.is_a && ty.is_a !== ty.upper && ty.is_a !== ty.name) bits.push(t("属于 {0}", ty.is_a));
+          if (ty.scope === "document") bits.push(t("文档内"));
+          if (ty.abstract) bits.push(t("只用于查询"));
+          return bits.length ? `${ty.name}(${bits.join(t("、"))})` : ty.name;
+        }).join(t("、"));
         chip.append(b, sp);
         parents.appendChild(chip);
       }
@@ -2811,10 +2894,8 @@ function renderGraphSchema() {
     if (!list.length) {
       preds.innerHTML = `<div class="empty-state" style="padding:12px">${types.length ? t("这一版没有谓词表:关系一律记为 related_to(重抽一次会补上)") : t("尚未抽取")}</div>`;
     } else {
-      const ends = v => Array.isArray(v) ? v.join(t("、")) : String(v || "");
-      // Endpoint ledger (written back into this version when the build finished): endpoint combinations
-      // with at least 20 edges and 5% of the predicate. Passed directly at the next resolution and preserved
-      // by rule at the next label extraction, no manual edits needed.
+      // 端点账(建图结束写回这一版):数据里够 20 条、占谓词 5% 以上的端点组合。下次归并直接放行,
+      // 下次重抽标签时由规则保住,不用人改。
       const observed = (current && current.observed) || {};
       const confirmed = {};
       for (const row of (observed.confirmed || [])) {
@@ -2830,22 +2911,21 @@ function renderGraphSchema() {
       const accountHead = observed.graph_version
         ? `<th title="${t("建图 {0} 结束时写回的端点账:这个谓词实际用了多少条边;够 20 条且占 5% 以上的端点组合列在这里,下次归并直接放行、重抽标签时规则保住", esc(observed.graph_version))}">${t("数据放行")}</th>`
         : `<th title="${t("这一版还没建过图,没有端点账")}">${t("数据放行")}</th>`;
-      preds.innerHTML = `<table class="pred-table"><thead><tr><th>${t("谓词")}</th><th>${t("起点父类")}</th><th>${t("终点父类")}</th>${accountHead}<th>${t("说明")}</th></tr></thead><tbody>`
-        + list.map(pr => `<tr><td class="mono">${esc(pr.name)}</td><td class="muted">${esc(ends(pr.source_parents) || t("任意"))}</td><td class="muted">${esc(ends(pr.target_parents) || t("任意"))}</td><td class="muted">${account(pr)}</td><td>${esc(pr.description || "")}</td></tr>`).join("")
+      const endText = v => (Array.isArray(v) ? v : [v]).map(x => x === "*" ? t("任意") : (UPPER_ZH[x] ? gpUpperText(x) : String(x || ""))).join(t("、"));
+      // 单值:同一个起点同一时间只有一个终点(新说法取代旧说法);事件核心关系是固定带上的
+      const marks = pr => [pr.multivalued === false ? t("单值") : "", pr.core ? t("核心") : ""].filter(Boolean).join(" · ");
+      preds.innerHTML = `<table class="pred-table"><thead><tr><th>${t("谓词")}</th><th>${t("起点")}</th><th>${t("终点")}</th>${accountHead}<th>${t("说明")}</th></tr></thead><tbody>`
+        + list.map(pr => `<tr><td class="mono">${esc(pr.name)}${marks(pr) ? `<br><span class="muted">${esc(marks(pr))}</span>` : ""}</td><td class="muted">${esc(endText(pr.source_parents) || t("任意"))}</td><td class="muted">${esc(endText(pr.target_parents) || t("任意"))}</td><td class="muted">${account(pr)}</td><td>${esc(pr.description || "")}</td></tr>`).join("")
         + `</tbody></table>`;
     }
   }
 }
-// {type: parent} -> {parent: [types...]} (parents in order of first appearance). The old shape with array
-// values is accepted too.
-function groupParentTypes(map) {
+// [{name, upper, …}] → {上层类: [类型…]}(上层类按八类的固定顺序)
+function groupTypesByUpper(types) {
   const groups = {};
-  for (const [key, value] of Object.entries(map || {})) {
-    if (Array.isArray(value)) {
-      (groups[key] ||= []).push(...value.map(String));
-    } else if (value != null && String(value).trim()) {
-      (groups[String(value)] ||= []).push(key);
-    }
+  for (const key of Object.keys(UPPER_ZH)) {
+    const rows = (types || []).filter(ty => (ty.upper || "entity") === key);
+    if (rows.length) groups[key] = rows;
   }
   return groups;
 }
@@ -2856,30 +2936,15 @@ function domainSummary(text, max) {
   return clean.length > max ? clean.slice(0, max) + "…" : clean;
 }
 
-// The hint under the sample size: shows how many chunks this KB actually has to sample from. Range and
-// default are not written here -- the input carries its own min/max, and the prefilled value is the
-// default 8 when empty.
-// Fetched only while the knowledge graph is on: one computation feeds the whole KB's text to the
-// tokenizer, and the server caches by directory fingerprint.
-async function refreshCorpusHint(kb) {
-  const el = $("#cfg-gss-hint");
-  if (!el) return;
-  if (!kb || kb.kb_id == null || kb.state !== "active" || !$("#cfg-graph").checked) {
-    el.textContent = "";
-    return;
-  }
-  const key = state.cfgKey;
-  el.textContent = t("统计中…");
-  try {
-    const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_corpus`);
-    if (state.cfgKey !== key) return;   // the KB was switched meanwhile; do not write KB A's numbers under KB B's name
-    el.textContent = r.documents
-      ? t("{0} 份文档共 {1} 个采样片段", r.documents, fmtNum(r.chunks))
-      : t("该库还没有入库切片");
-  } catch (e) {
-    if (state.cfgKey === key) el.textContent = "";
-  }
+// 数量由系统自动决定;点击抽取后展示本次实际采样量。
+function setSampleCount(value, label = "尚未计算") {
+  const el = $("#cfg-gss");
+  el.textContent = value == null ? t(label) : fmtNum(value);
+  el.dataset.calculated = value == null ? "" : "1";
+  el.classList.toggle("empty", value == null);
 }
+
+$("#cfg-gt").addEventListener("change", () => setSampleCount(null));
 
 function setOverlapHint() {
   // The overlap bound is not a fixed number: it is constrained both by the model's remaining budget and by
@@ -3108,7 +3173,8 @@ function renderLlmView(div, m) {
         <button class="sm ghost c-del" style="color:var(--red-text)">${t("删除")}</button>
       </span>
     </div>
-    <div class="llm-meta">${esc(m.model_id || "")}<br>${esc(m.base_url || "")}${m.protocol === "anthropic" ? " · anthropic" : ""}</div>`;
+    <div class="llm-meta">${esc(m.model_id || "")}<br>${esc(m.base_url || "")}${m.protocol === "anthropic" ? " · anthropic" : ""}<br>
+      ${t("最大输入")}: ${m.max_input_tokens ? fmtNum(m.max_input_tokens) + " tokens" : t("未设置")}</div>`;
   scheduleNameMarquee(div);
   div.querySelector(".c-edit").addEventListener("click", () => {
     renderLlmForm(div, m);
@@ -3147,6 +3213,9 @@ function renderLlmForm(div, m) {
       <input type="text" class="c-base mono" placeholder="http://127.0.0.1:8000/v1" value="${m ? esc(m.base_url) : ""}"></div>
     <div class="fld"><label class="f">Model ID</label>
       <input type="text" class="c-model mono" placeholder="${t("如 deepseek-chat")}" value="${m ? esc(m.model_id) : ""}"></div>
+    <div class="fld"><label class="f">${t("最大输入")}</label>
+      <input type="number" class="c-max-input mono" aria-label="${t("最大输入")}" min="1" max="2147483647" step="1" required placeholder="1048576" value="${m?.max_input_tokens || ""}">
+      <div class="hint">${t("单位:tokens。标签抽取的单次输入预算为此值的 30%。")}</div></div>
     <div class="fld"><label class="f">API Key</label>
       <input class="c-key mono" type="password" autocomplete="new-password" placeholder="${m && m.has_api_key ? t("已配置,留空保持不变") : t("本地服务可留空")}"></div>
     <div class="c-actions">
@@ -3169,10 +3238,13 @@ function renderLlmForm(div, m) {
     ev.target.disabled = true;
     ev.target.textContent = t("测试连通性…");
     try {
+      const maxInput = div.querySelector(".c-max-input");
+      if (!maxInput.reportValidity()) throw new Error(t("最大输入必须是正整数(tokens)"));
       await api("/llms", { method: "POST", body: {
         name: div.querySelector(".c-name").value,
         base_url: div.querySelector(".c-base").value,
         model_id: div.querySelector(".c-model").value,
+        max_input_tokens: Number(div.querySelector(".c-max-input").value),
         api_key: div.querySelector(".c-key").value,
         protocol: div.querySelector(".c-proto").value,
       } });

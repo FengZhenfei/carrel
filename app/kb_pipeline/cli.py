@@ -61,6 +61,9 @@ def cmd_config(args: argparse.Namespace) -> int:
         "embedding_retry": settings.embedding_retry,
         "embedding_sleep_seconds": settings.embedding_sleep_seconds,
         "embedding_api_key": "***" if settings.embedding_api_key else "",
+        "reranker_base_url": settings.reranker_base_url,
+        "reranker_model_id": settings.reranker_model_id,
+        "reranker_api_key": "***" if settings.reranker_api_key else "",
         "visual_embedding_enabled": settings.visual_embedding_enabled,
         "visual_embedding_base_url": settings.visual_embedding_base_url,
         "visual_embedding_model_id": settings.visual_embedding_model_id,
@@ -785,10 +788,17 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     else:
         raise ValueError(f"unknown cleanup command: {args.cleanup_command}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if isinstance(result, dict) and result.get("errors"):
-        # This used to exit 0 whether or not errors was empty, so systemd always showed success and an
-        # undeletable collection / projection gave no signal at all.
-        print(f"[cleanup] finished with {len(result['errors'])} failed step(s)", file=sys.stderr, flush=True)
+    def cleanup_errors(value):
+        if isinstance(value, dict):
+            return list(value.get("errors") or []) + [e for k, v in value.items() if k != "errors" for e in cleanup_errors(v)]
+        if isinstance(value, list):
+            return [e for v in value for e in cleanup_errors(v)]
+        return []
+    failures = cleanup_errors(result)
+    if failures:
+        # 过去无论 errors 是否为空都 exit 0,systemd 永远显示成功,
+        # 删不掉的 collection / 投影没有任何信号。
+        print(f"[cleanup] 完成但有 {len(failures)} 项失败", file=sys.stderr, flush=True)
         return 1
     if isinstance(result, dict) and result.get("skipped") and result.get("yielded_to") == "graph_build":
         # The graph-version safety net yields to a running build: that build's own clean-up covers this round

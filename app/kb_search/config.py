@@ -64,7 +64,7 @@ class SearchSettings:
     rerank_enabled: bool
     # Rerank score floor (Q06). Calibrated on 2026-09-15 with the local qwen3-reranker-0.6b: score
     # histogram (0.0-0.1 ... 0.9-1.0) of 64 candidates for each of 15 real questions =
-    # [124, 6, 10, 14, 14, 21, 27, 33, 56, 628], 10 cross-document questions on the health knowledge base =
+    # [124, 6, 10, 14, 14, 21, 27, 33, 56, 628], 10 cross-document questions in evaluation set E =
     # [418, 36, 32, 20, 8, 16, 13, 12, 6, 11] (top scores 0.32-0.98), 8 out-of-corpus questions =
     # [494, 0, 0, 0, 0, 0, 0, 1, 3, 0] (top score <= 0.043, the sole exception being one question that
     # happened to have matching content at 0.85). The valley is at 0.1-0.2: 0.1 is used, floor x0.7 =
@@ -78,11 +78,14 @@ class SearchSettings:
     rerank_window_tokens: int     # windowed scoring of long chunks (Q06: about 480 tokens, 32 overlap)
     rerank_overlap_tokens: int
     rerank_timeout: float
+    visual_rerank_n: int          # image positions within the shared candidate budget
+    visual_rerank_timeout: float
+    visual_rerank_threshold: float
     context_tokens: int           # token budget of answer_context (Q07)
     neighbor_span: int            # neighbourhood backfill: how many chunks before and after each hit (Q07)
     graph_hops: int               # graph channel expansion hops. Q27 comparison on 2026-09-16 (seven question sets, auto routing): 0 / 1 / 2 hops
-                                  # gave identical hit@k, expect, cross-document and negative results and differed only in latency (products
-                                  # 1071 / 1219 / 1279 ms, library 1535 / 1604 / 1755 ms); 1 is used: the entity / relation tables keep one-hop
+                                  # gave identical hit@k, expect, cross-document and negative results and differed only in latency (set A
+                                  # 1071 / 1219 / 1279 ms, set C 1535 / 1604 / 1755 ms); 1 is used: the entity / relation tables keep one-hop
                                   # neighbours, and it saves a tenth of the time compared with 2 hops
     route_max_kbs: int            # maximum number of knowledge bases auto routing selects (Q20)
     route_gap: float              # knowledge bases whose evidence score (0-1 relative) is within this gap of the top score are queried together (Q20)
@@ -103,17 +106,17 @@ class SearchSettings:
     embed_timeout: float          # request timeout for embedding the question (seconds), not the build client's 120 s (Codex S06)
     query_instruction: str        # query-side task instruction (the Qwen3-Embedding model card form "Instruct: ...\nQuery: ..."); empty = embed the question verbatim.
                                   # The "document name > section path" content prefix carried by corpus vectors is a different thing. Ablation on 2026-09-16
-                                  # (seven question sets, auto routing): with vs without the instruction, chunk hit@5 products 5/15=5/15, reports 3/4=3/4,
-                                  # library 10/15 vs 11/15, projects 8/15=8/15, expect 14/13, 4/4, 14/15, 14/12, negatives 8/8=8/8, health / report
+                                  # (seven question sets, auto routing): with vs without the instruction, chunk hit@5 set A 5/15=5/15, set B 3/4=3/4,
+                                  # set C 10/15 vs 11/15, set D 8/15=8/15, expect 14/13, 4/4, 14/15, 14/12, negatives 8/8=8/8, sets E / F
                                   # cross-document all pass; one or two questions swap either way, latency identical, no consistent gain, so the
                                   # default stays empty.
     hint_block_boost: float       # chunks matching hints.block_types have their final score multiplied by it (soft preference, no filtering)
     final_lex_weight: float       # weight of question token coverage in the final score (RAGFlow-style tkweight): in table-heavy knowledge bases the rerank
                                   # score saturates at 0.99 across whole runs, and "how many of the question's concrete words land in this chunk" tells the
                                   # rows of one table apart. Grid on 2026-09-16 (chunk hit@5 / MRR, auto routing):
-                                  # weight 0: products 6/15 0.32, reports 3/4 0.29, library 11/15 0.69, projects 10/15 0.40;
+                                  # weight 0: set A 6/15 0.32, set B 3/4 0.29, set C 11/15 0.69, set D 10/15 0.40;
                                   # 0.1: 10/15 0.63, 4/4 1.0, 15/15 0.95, 12/15 0.80; 0.2: 11/15 0.70, 4/4 1.0, 14/15 0.94, 12/15 0.80;
-                                  # 0.3: 12/15 0.72, 4/4 1.0, 14/15 0.94, 12/15 0.80; negatives and the health / report cross-document sets identical at
+                                  # 0.3: 12/15 0.72, 4/4 1.0, 14/15 0.94, 12/15 0.80; negatives and the sets E / F cross-document sets identical at
                                   # every level. 0.2 is used: most of the gain while the rerank still carries eighty percent (synthetic questions are
                                   # naturally close to the source wording, and a higher weight risks a bias towards that kind of question)
     pool_workers: int             # cap of the thread pool shared by the whole service (Codex S06: thread count does not grow with requests)
@@ -152,6 +155,9 @@ def load_search_settings(env: Mapping[str, str] | None = None) -> SearchSettings
         rerank_window_tokens=_int(env, "KB_SEARCH_RERANK_WINDOW_TOKENS", 480),
         rerank_overlap_tokens=_int(env, "KB_SEARCH_RERANK_OVERLAP_TOKENS", 32),
         rerank_timeout=_float(env, "KB_SEARCH_RERANK_TIMEOUT", 20.0),
+        visual_rerank_n=max(1, min(32, _int(env, "KB_SEARCH_VISUAL_RERANK_N", 8))),
+        visual_rerank_timeout=max(0.1, min(30.0, _float(env, "KB_SEARCH_VISUAL_RERANK_TIMEOUT", 15.0))),
+        visual_rerank_threshold=max(0.0, min(1.0, _float(env, "KB_SEARCH_VISUAL_RERANK_THRESHOLD", 0.5))),
         context_tokens=_int(env, "KB_SEARCH_CONTEXT_TOKENS", 6000),
         neighbor_span=_int(env, "KB_SEARCH_NEIGHBOR_SPAN", 1),
         graph_hops=_int(env, "KB_SEARCH_GRAPH_HOPS", 1),

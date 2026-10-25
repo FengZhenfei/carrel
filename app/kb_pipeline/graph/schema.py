@@ -1,15 +1,10 @@
-"""Schema sampling (the console's "extract / re-extract labels now"): sample chunks from this KB and let the
-LLM induce the domain, output language, entity type list, type parents and relation predicate list, then
-draft a set of capability questions.
+"""模式采样(控制台「立即/重新抽取标签」、空白图建图前的自动归纳):从本库切片里采样,用 LLM 归纳出
+领域、输出语言、实体类型表、类型父类(八个上层类之一或表内另一个类型)、关系谓词表(带两端、单值与否)、
+类型定义与作用域、场景画像,再从本库语料生成 few-shot。
 
-The prompts of the first four steps come from the upstream prompt_tune (domain -> language -> persona ->
-entity_types); the sampling logic and task constraints are kept as they were: fixed-seed random sampling
-with a fallback cap on the total token count. The last three steps are local (schema layer, section 4.10).
-7 calls in total, all through ChatClient (cached: clicking "re-extract" again on the same sample returns
-instantly).
-
-The output structure matches the old script (domain / language / entity_types / sampled / documents /
-chunks_total / truncated) plus parent_types / predicates; the version-ring code needs no change.
+前四段的提示词取自上游 prompt_tune(domain → language → persona → entity_types),采样逻辑与任务约束
+原样保留:固定种子、按 token 总量兜底。后面几段是本地的。全部走 ChatClient(带缓存:同一份样本再点一次
+「重新抽取」秒回)。产物用 ontology.normalize_model 规范化成模式字典,由 schema_flow 存成 LinkML 版本。
 """
 from __future__ import annotations
 
@@ -21,15 +16,14 @@ from typing import Any, Iterable
 from ..utils import count_tokens
 from . import prompts
 from .extract import normalize_predicate
-from .llm import ChatClient
+from .llm import ChatClient, LLMInputBudgetExceeded, LLMInterrupted
+from .sampling_budget import estimate_text
 from .units import classify_unit_text
 
 SAMPLE_TOKEN_BUDGET = 80_000
 SAMPLE_SEED = 20260823
-# Candidate pool cap: first take this many chunks stratified by document, then pick representatives from them
-# (GraphRAG prompt-tune's n_subset_max is 300 as well)
+# 候选池基础规模;自动模式随预算和文档数扩大,不再把后面的文档排除在 300 片之外。
 SAMPLE_POOL_MAX = 300
-MAX_PARENT_TYPES = 6
 MIN_PREDICATES = 8
 MAX_PREDICATES = 20
 MAX_ENTITY_TYPES = 30            # the type menu with definitions goes into the extraction prompt; kb_001 once induced 82 types
@@ -85,7 +79,8 @@ def _spread(items: list[Any], k: int) -> list[Any]:
     return out
 
 
-def _farthest_point(pool: list[dict[str, Any]], vectors: dict[str, list[float]], size: int) -> list[dict[str, Any]]:
+def _farthest_point(pool: list[dict[str, Any]], vectors: dict[str, list[float]], size: int,
+                    *, cover_documents: bool = False, coverage_budget: int | None = None) -> list[dict[str, Any]]:
     """Pick the size candidates (among those with vectors) that are least alike: start from the chunk closest to
     the centroid, then repeatedly add the chunk whose cosine similarity to its nearest chosen chunk is lowest.
     Deterministic, O(size x pool)."""
@@ -93,38 +88,55 @@ def _farthest_point(pool: list[dict[str, Any]], vectors: dict[str, list[float]],
     if not keyed:
         return []
 
-    def unit(v: list[float]) -> list[float]:
-        norm = sum(x * x for x in v) ** 0.5 or 1.0
-        return [x / norm for x in v]
+    import numpy as np
 
-    vecs = [unit(v) for _, v in keyed]
-    dim = len(vecs[0])
-    centroid = unit([sum(v[i] for v in vecs) / len(vecs) for i in range(dim)])
-    dot = lambda a, b: sum(x * y for x, y in zip(a, b))
-    first = max(range(len(vecs)), key=lambda i: (dot(vecs[i], centroid), -i))
-    chosen = [first]
-    nearest = [dot(vecs[i], vecs[first]) for i in range(len(vecs))]
+    vecs = np.asarray([v for _, v in keyed], dtype=np.float64)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vecs = vecs / np.where(norms > 0, norms, 1)
+    centroid = vecs.mean(axis=0)
+    chosen: list[int] = []
+    if cover_documents:
+        by_doc: dict[str, list[int]] = {}
+        for i, (c, _) in enumerate(keyed):
+            by_doc.setdefault(str(c.get("doc_id") or ""), []).append(i)
+        # One central representative per document before semantic expansion.
+        for ids in by_doc.values():
+            local = vecs[ids].mean(axis=0)
+            chosen.append(max(ids, key=lambda i: (float(np.dot(vecs[i], local)), -i)))
+        if coverage_budget is not None:
+            costs = [estimate_text(str(c.get("text") or "")) + 2 for c, _ in keyed]
+            if sum(costs[i] for i in chosen) > coverage_budget:
+                # Prefer coverage to a few long representatives when context is
+                # tight; semantic diversity expands the set after this seed.
+                chosen = [min(ids, key=lambda i: (costs[i], i)) for ids in by_doc.values()]
+        random.Random(SAMPLE_SEED).shuffle(chosen)
+        chosen = chosen[:size]
+    if not chosen:
+        chosen = [int(np.argmax(vecs @ centroid))]
+    nearest = np.full(len(vecs), -np.inf)
+    selected = np.zeros(len(vecs), dtype=bool)
+    for i in chosen:
+        nearest = np.maximum(nearest, np.einsum("ij,j->i", vecs, vecs[i]))
+        selected[i] = True
     while len(chosen) < min(size, len(vecs)):
-        nxt = min((i for i in range(len(vecs)) if i not in chosen), key=lambda i: (nearest[i], i))
+        nxt = int(np.argmin(np.where(selected, np.inf, nearest)))
         chosen.append(nxt)
-        for i in range(len(vecs)):
-            nearest[i] = max(nearest[i], dot(vecs[i], vecs[nxt]))
+        selected[nxt] = True
+        nearest = np.maximum(nearest, np.einsum("ij,j->i", vecs, vecs[nxt]))
     return [keyed[i][0] for i in chosen]
 
 
 def sample_chunks(chunks: list[dict[str, Any]], size: int, *, seed: int = SAMPLE_SEED,
                   budget: int = SAMPLE_TOKEN_BUDGET, pool_max: int = SAMPLE_POOL_MAX,
                   fetch_vectors=None) -> dict[str, Any]:
-    """The sample for label extraction (health check D1, replacing the old uniform random sample over the KB):
-    1. structural rules (units.classify_unit_text, zero calls) exclude boilerplate chunks such as TOC / revision
-       history / legal notices;
-    2. a candidate pool stratified by document: slots allocated by sqrt(chunk count), at least one chunk per
-       document, evenly spaced within a document;
-    3. with vectors (fetch_vectors reads the ready-made text vectors from the main collection), farthest-point
-       sampling picks the size chunks of the pool that are least alike; without vectors, fixed-seed random;
-    4. then truncate to the token budget.
-    chunks carry at least text; optionally doc_id / chunk_index / chunk_uid / point_id / section. Sampling the
-    same corpus twice gives the same result (sorting + fixed seed). Returns texts / truncated plus sampling stats."""
+    """抽标签用的样本;size=0 按模型预算自动确定数量(生产入口只使用自动模式):
+    1. 结构规则(units.classify_unit_text,零调用)排除目录 / 修订记录 / 法律声明这类样板片;
+    2. 按文档分层取候选池:名额按 sqrt(切片数) 分配,每份文档至少一片,文档内等距取;
+    3. 有向量(fetch_vectors 取主库里现成的 text 向量)就在池里做最远点采样挑彼此最不像的
+       size 片;取不到向量就固定种子随机;
+    4. 按含估算余量的 token 预算选择完整片段,跳过超长片段,不截断正文。
+    chunks 至少带 text;可带 doc_id / chunk_index / chunk_uid / point_id / section。同一份语料
+    两次采样结果一样(排序 + 固定种子)。返回 texts / truncated 与采样统计。"""
     ordered = sorted(chunks, key=lambda c: (str(c.get("doc_id") or ""), int(c.get("chunk_index") or 0), str(c.get("chunk_uid") or "")))
     ordered = [c for c in ordered if str(c.get("text") or "").strip()]
     empty = {"texts": [], "truncated": False, "picked": [], "pool": 0, "documents_covered": 0, "documents_total": 0,
@@ -134,14 +146,19 @@ def sample_chunks(chunks: list[dict[str, Any]], size: int, *, seed: int = SAMPLE
     kept = [c for c in ordered
             if classify_unit_text(str(c.get("text") or ""), [str(c.get("section") or "")]) != "boilerplate"]
     excluded = len(ordered) - len(kept)
-    if len(kept) < max(1, size):
-        kept = ordered          # almost all boilerplate (e.g. only a TOC): exclude nothing, sample whatever there is
+    if not kept:
+        kept = ordered          # 几乎全是样板(比如只有一份目录):不排除,有什么采什么
         excluded = 0
     by_doc: dict[str, list[dict[str, Any]]] = {}
     for c in kept:
         by_doc.setdefault(str(c.get("doc_id") or ""), []).append(c)
     docs = list(by_doc)
-    pool_n = min(len(kept), max(size, pool_max))
+    automatic = size == 0
+    costs = {id(c): estimate_text(str(c.get("text") or "")) + 2 for c in kept}
+    if automatic:
+        average = sum(costs.values()) / len(kept)
+        size = min(len(kept), max(len(docs), int(budget / max(1, average))))
+    pool_n = min(len(kept), max(size * 2 if automatic else size, pool_max, len(docs)))
     quotas = _allocate([len(by_doc[d]) for d in docs], pool_n)
     pool: list[dict[str, Any]] = []
     for d, q in zip(docs, quotas):
@@ -153,29 +170,49 @@ def sample_chunks(chunks: list[dict[str, Any]], size: int, *, seed: int = SAMPLE
         except Exception as exc:     # main collection unreachable: fall back to stratified random rather than failing label extraction
             print(f"[schema] sample vectors unavailable, falling back to stratified random: {exc!r}", flush=True)
             vectors = {}
-    picked = _farthest_point(pool, vectors, size) if len(vectors) >= min(size, len(pool)) else []
+    picked = _farthest_point(pool, vectors, size, cover_documents=automatic,
+                             coverage_budget=budget if automatic else None) if len(vectors) >= len(pool) else []
     method = "vectors"
     if not picked:
         method = "stratified"
         rng = random.Random(seed)
         shuffled = list(pool)
         rng.shuffle(shuffled)
+        if automatic:
+            # Without vectors retain document coverage rather than letting a
+            # long document dominate. Stable input + seed gives reproducibility.
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for c in shuffled:
+                grouped.setdefault(str(c.get("doc_id") or ""), []).append(c)
+            shuffled = [cs[i] for i in range(max(map(len, grouped.values())))
+                        for cs in grouped.values() if i < len(cs)]
         picked = shuffled[:size]
+    if automatic:
+        seen = {id(c) for c in picked}
+        # Estimated average determines the diverse core, not a hard count cap.
+        # Fill remaining budget with stratified candidates, never just a prefix.
+        remaining = [c for c in pool if id(c) not in seen]
+        random.Random(seed).shuffle(remaining)
+        picked.extend(remaining)
     texts: list[str] = []
+    used: list[dict[str, Any]] = []
     total = 0
     truncated = False
     for c in picked:
         text = str(c.get("text") or "")
-        n = count_tokens(text)
-        if texts and total + n > budget:
+        n = costs[id(c)]
+        if total + n > budget:
             truncated = True
-            break
+            continue
         texts.append(text)
+        used.append(c)
         total += n
-    used = picked[:len(texts)]
     return {"texts": texts, "truncated": truncated, "picked": used, "pool": len(pool),
             "documents_covered": len({str(c.get("doc_id") or "") for c in used}), "documents_total": len(by_doc),
-            "excluded_boilerplate": excluded, "method": method}
+            "excluded_boilerplate": excluded, "method": method,
+            "estimated_tokens": total, "token_budget": budget,
+            "algorithm": "model-budget-diverse-v1" if automatic else "manual-legacy",
+            "stop_reason": "token_budget" if truncated else ("corpus_covered" if len(used) == len(kept) else "candidate_pool")}
 
 
 def sample_texts(chunks: list[dict[str, Any]], size: int, *, seed: int = SAMPLE_SEED,
@@ -246,27 +283,51 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return {}
 
 
+_TYPE_ALTERNATIVES_RE = re.compile(r"\s+/\s+")
+
+
+def entity_type_name(value: Any) -> str:
+    """模型给的类型名规整成一个类型:「vendor / service provider」这种把两种叫法用前后带空格的斜杠拼在一起的,
+    取前一个(类型定义里两种说法都会写到);「I/O pin」「TCP/IP」这种词内斜杠不动。"""
+    name = " ".join(str(value or "").strip().strip("\"'` ").split())
+    head = _TYPE_ALTERNATIVES_RE.split(name, maxsplit=1)[0].strip()
+    return head or name
+
+
+def clean_domain(value: Any, *, limit: int = 80) -> str:
+    """领域只要一个短语:模型偶尔回一段带 Markdown 的说明,取第一行非空的,去掉加粗 / 标题符号、引号和「Domain:」前缀,
+    截到 limit 个字符。"""
+    for line in str(value or "").splitlines():
+        line = re.sub(r"[*#`]+", "", line).strip().strip("\"'“”「」 ")
+        line = re.sub(r"^(domain|领域)\s*[:：]\s*", "", line, flags=re.I).strip()
+        if line:
+            return line.rstrip("。.").strip()[:limit]
+    return ""
+
+
 def parse_entity_types(value: Any, *, limit: int = MAX_ENTITY_TYPES) -> list[str]:
+    """归纳出的类型名单;与上层类同名的不要(ontology.UPPER_NAMES)。"""
+    from ..ontology import is_upper_name
+
     if isinstance(value, dict):
         value = value.get("entity_types") or value.get("entities")
     if isinstance(value, (list, tuple)):
-        out: list[str] = []
-        for v in value:
-            name = str(v).strip()
-            if name and name.casefold() not in {o.casefold() for o in out}:
-                out.append(name)
-        return out[:limit]
-    text = str(value or "")
-    m = re.search(r"\[(.*?)\]", text, re.S)
-    body = m.group(1) if m else text
-    items = re.split(r"[,\n]", body)
-    return [i.strip().strip("\"'` ") for i in items if i.strip().strip("\"'` ")]
+        items = [str(v) for v in value]
+    else:
+        text = str(value or "")
+        m = re.search(r"\[(.*?)\]", text, re.S)
+        items = re.split(r"[,\n]", m.group(1) if m else text)
+    out: list[str] = []
+    for item in items:
+        name = entity_type_name(item)
+        if name and not is_upper_name(name) and name.casefold() not in {o.casefold() for o in out}:
+            out.append(name)
+    return out[:limit]
 
 
 def normalize_parent_types(value: Any, entity_types: list[str]) -> dict[str, str]:
-    """{type: parent type}; parents are restricted to the six upper-ontology classes (limits.UPPER_PARENTS);
-    unrecognised ones are mapped by legacy name, else default to entity."""
-    from ..limits import upper_parent_of
+    """{类型: 父类}:父类是八个上层类之一(含同义词)或表内另一个类型(多层);都认不出的按 entity。"""
+    from ..ontology import upper_of_name
 
     mapping = value.get("parent_types") if isinstance(value, dict) and "parent_types" in value else value
     out: dict[str, str] = {}
@@ -275,36 +336,21 @@ def normalize_parent_types(value: Any, entity_types: list[str]) -> dict[str, str
     lookup = {t.casefold(): t for t in entity_types}
     for k, v in mapping.items():
         key = lookup.get(str(k).strip().casefold())
-        parent = upper_parent_of(v) or ("entity" if str(v or "").strip() else "")
-        if key and parent:
-            out[key] = parent
+        raw = str(v or "").strip()
+        if not key or not raw:
+            continue
+        other = lookup.get(raw.casefold())
+        if other and other != key:
+            out[key] = other
+        else:
+            out[key] = upper_of_name(raw) or "entity"
     return out
 
 
 def upper_parents_text() -> str:
-    from ..limits import UPPER_PARENT_DESCRIPTIONS
+    from ..ontology import UPPER_DESCRIPTIONS
 
-    return "\n".join(f"- {name}: {desc}" for name, desc in UPPER_PARENT_DESCRIPTIONS.items())
-
-
-def map_types_to_upper(client: ChatClient, entity_types: list[str], parent_types: dict[str, str] | None = None) -> dict[str, str]:
-    """Old schema versions (parents are made-up names) -> the six upper classes, in one call; on failure or for
-    missing items fall back to the legacy-name mapping, else entity."""
-    from ..limits import DOCUMENT_SCOPED_PARENTS, UPPER_PARENTS, upper_parent_of  # noqa: F401
-
-    parent_types = parent_types or {}
-    listed = "\n".join(f"- {t}" + (f" (author's category: {parent_types[t]})" if parent_types.get(t) else "") for t in entity_types)
-    mapped: dict[str, str] = {}
-    try:
-        raw = client.chat(prompts.UPPER_MAPPING_PROMPT.format(entity_types=listed, upper_parents=upper_parents_text()),
-                          max_tokens=1024)
-        mapped = normalize_parent_types(parse_json_object(raw), list(entity_types))
-    except Exception as exc:
-        print(f"[graph] upper mapping call failed, falling back to legacy names: {exc!r}", flush=True)
-    out: dict[str, str] = {}
-    for t in entity_types:
-        out[t] = mapped.get(t) or upper_parent_of(parent_types.get(t)) or "entity"
-    return out
+    return "\n".join(f"- {name}: {desc}" for name, desc in UPPER_DESCRIPTIONS.items())
 
 
 def normalize_predicates(value: Any, *, limit: int = MAX_PREDICATES) -> list[dict[str, Any]]:
@@ -322,22 +368,39 @@ def normalize_predicates(value: Any, *, limit: int = MAX_PREDICATES) -> list[dic
         if not name or name == prompts.DEFAULT_PREDICATE or name in seen:
             continue
         seen.add(name)
+        single = item.get("single_valued")
+        if "multivalued" in item and single is None:
+            single = item.get("multivalued") is False
         out.append({
             "name": name,
             "description": str(item.get("description") or "").strip()[:200],
-            "source_parents": [str(s).strip().lower() for s in (item.get("source_parents") or []) if str(s).strip()][:8],
-            "target_parents": [str(s).strip().lower() for s in (item.get("target_parents") or []) if str(s).strip()][:8],
+            "source_parents": [str(s).strip() for s in (item.get("source_parents") or []) if str(s).strip()][:8],
+            "target_parents": [str(s).strip() for s in (item.get("target_parents") or []) if str(s).strip()][:8],
+            "multivalued": not (single is True or str(single).strip().lower() == "true"),
         })
         if len(out) >= limit:
             break
     return out
 
 
-def normalize_definitions(value: Any, entity_types: list[str]) -> dict[str, str]:
-    from ..limits import normalize_type_definitions
+def normalize_definitions(value: Any, entity_types: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """TYPE_DEFINITIONS_PROMPT 的回答 → ({类型: 定义}, {类型: 作用域})。也认只有定义的旧形状 {"definitions": {...}}。"""
+    from ..limits import normalize_type_definitions, normalize_type_scopes
 
+    if isinstance(value, dict) and isinstance(value.get("types"), dict):
+        defs: dict[str, Any] = {}
+        scopes: dict[str, Any] = {}
+        for k, v in value["types"].items():
+            if isinstance(v, dict):
+                defs[k] = v.get("definition") or v.get("description") or ""
+                scopes[k] = v.get("scope") or ""
+            else:
+                defs[k] = v
+        lookup = {t.casefold(): t for t in entity_types}
+        scoped = {lookup[str(k).strip().casefold()]: v for k, v in scopes.items() if str(k).strip().casefold() in lookup}
+        return normalize_type_definitions(defs, entity_types), normalize_type_scopes(scoped)
     mapping = value.get("definitions") if isinstance(value, dict) and "definitions" in value else value
-    return normalize_type_definitions(mapping, entity_types)
+    return normalize_type_definitions(mapping, entity_types), {}
 
 
 def normalize_profile_suggestion(value: Any, *, entity_types: list[str], predicates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -369,7 +432,6 @@ def score_example(ents: list[dict[str, Any]], rels: list[dict[str, Any]], schema
     in this sample violate the ends, the constraint is wrong rather than the extraction, and the whole predicate
     is let through; otherwise only the violating relations are removed."""
     allowed = schema.allowed_ends()
-    parent_of = {t.casefold(): str(p).casefold() for t, p in (schema.parent_types or {}).items()}
     names = {str(e["name"]).casefold(): str(e["type"]) for e in ents}
     well_formed = [r for r in rels if str(r["source"]).casefold() in names and str(r["target"]).casefold() in names]
     uses: dict[str, int] = {}
@@ -381,9 +443,7 @@ def score_example(ents: list[dict[str, Any]], rels: list[dict[str, Any]], schema
         if ends is None:
             continue
         src_t, tgt_t = names[str(r["source"]).casefold()], names[str(r["target"]).casefold()]
-        src_ok = not ends[0] or "*" in ends[0] or parent_of.get(src_t.casefold(), "") in ends[0] or src_t.casefold() in ends[0]
-        tgt_ok = not ends[1] or "*" in ends[1] or parent_of.get(tgt_t.casefold(), "") in ends[1] or tgt_t.casefold() in ends[1]
-        if not (src_ok and tgt_ok):
+        if not (schema.endpoint_ok(src_t, ends[0]) and schema.endpoint_ok(tgt_t, ends[1])):
             bad.setdefault(pred, []).append(idx)
     relaxed = {p for p, idxs in bad.items() if len(idxs) / max(1, uses[p]) > EXAMPLE_RELAX_RATIO}
     drop = {i for p, idxs in bad.items() if p not in relaxed for i in idxs}
@@ -400,7 +460,7 @@ def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_
     from this corpus beats a news example), and only reject samples that yield no relations at all. Returns
     (example text, stats). Returns an empty string when no sample survives (extraction then uses the generic
     examples).
-    2026-09-08: the health KB used to keep no sample at all -- short chunks (mostly < 200 characters), the endpoint
+    2026-09-08: one evaluation corpus used to keep no sample at all -- short chunks (mostly < 200 characters), the endpoint
     constraints removed 12 of 12 relations, and the rest were all related_to; now the length floor is 120, the
     endpoint constraints follow the pipeline's relaxation rule, and the hard threshold became a ranking."""
     from . import prompts
@@ -416,6 +476,8 @@ def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_
         prompt = render_extract_prompt(sample, section="(sample)", schema=schema, document="(sample)", unit_kind="body")
         try:
             raw = client.chat(prompt, max_tokens=2048)
+        except (LLMInputBudgetExceeded, LLMInterrupted):
+            raise
         except Exception as exc:
             print(f"[schema] example extraction failed: {exc!r}", flush=True)
             continue
@@ -442,33 +504,42 @@ def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_
     for _, sample, ents, kept_rels in chosen:
         records = ['("unit"<|>body<|>sample from this corpus)']
         for e in ents[:12]:
-            records.append(f'("entity"<|>{e["name"]}<|>{e["type"]}<|>{e["description"]})')
+            records.append(f'("entity"<|>{e["name"]}<|>{e["type"]}<|>{e["description"]}<|>{e.get("kind") or "instance"})')
         for r in kept_rels[:12]:
-            records.append(f'("relationship"<|>{r["source"]}<|>{r["target"]}<|>{r["predicate"]}<|>{r["description"]}<|>{int(r.get("strength") or 5)})')
+            period = f'{r.get("valid_from") or ""}..{r.get("valid_until") or ""}' if (r.get("valid_from") or r.get("valid_until")) else ""
+            records.append(f'("relationship"<|>{r["source"]}<|>{r["target"]}<|>{r["predicate"]}<|>{r["description"]}'
+                           f'<|>{int(r.get("strength") or 5)}<|>{period})')
         body = "\n##\n".join(records) + "\n" + prompts.COMPLETION_DELIMITER
         # the menus in the examples list names only: the main prompt already carries the full menu with definitions,
         # and repeating it in every example would add ten thousand characters of duplication
         blocks.append(
             f"Example {len(blocks) + 1}:\nEntity_types: {type_names}\nPredicates: {predicate_names}\n"
-            f"Document: (sample)\nSection: (sample)\nText:\n{sample}\n######################\nOutput:\n{body}")
+            f"Document: (sample)\nDocument date: (unknown)\nSection: (sample)\nText:\n{sample}\n######################\nOutput:\n{body}")
         stats["kept"] += 1
     return "\n\n######################\n".join(blocks), stats
 
 
 def _prior_types_text(prior: dict[str, Any] | None) -> str:
-    """The previous version's type list plus the observation counts from the ledger (entity count per type, type
-    names outside the list that showed up during extraction). Without prior returns an empty string: the prompt
-    of a first label extraction does not change by a single character."""
-    types = [str(t) for t in ((prior or {}).get("entity_types") or []) if str(t).strip()]
-    if not types:
+    """上一版类型表 + 账里的体检数(每类实体数、抽取时冒出来的表外类型名)。没有 prior 就返回空串:
+    首次抽标签的提示词一个字都不变。上一版里与上层类同名的类型不列进「保留」,单独说明它们装了多少实体、要换成
+    更具体的类型(只是从名单里删掉的话,模型照抄上一版,那些实体就被硬塞进最接近的别的类型)。"""
+    from ..ontology import is_upper_name
+
+    named = [str(t) for t in ((prior or {}).get("entity_types") or []) if str(t).strip()]
+    types = [t for t in named if not is_upper_name(t)]
+    upper_named = [t for t in named if is_upper_name(t)]
+    if not named:
         return ""
+    observed = (prior or {}).get("observed") or {}
+    lookup = {str(k).casefold(): int(v or 0) for k, v in (observed.get("type_counts") or {}).items()}
     text = ("\nThe previous version of this schema used these entity types: " + ", ".join(types)
             + ". Keep every name that still fits this corpus (renaming a type invalidates the existing graph), "
-            "drop only types that do not occur in the corpus, and add what is missing.")
-    observed = (prior or {}).get("observed") or {}
-    counts = observed.get("type_counts") or {}
-    if counts:
-        lookup = {str(k).casefold(): int(v or 0) for k, v in counts.items()}
+            "drop only types that do not occur in the corpus, and add what is missing.") if types else ""
+    if upper_named:
+        text += ("\nIt also used top-level class names as types: "
+                 + ", ".join(f"{t} ({lookup[t.casefold()]} entities)" if t.casefold() in lookup else t for t in upper_named)
+                 + ". Those are not allowed as types; add the more specific kinds of thing those entities are.")
+    if lookup and types:
         text += ("\nHow many entities the current graph holds under each type: "
                  + ", ".join(f"{t} ({lookup.get(t.casefold(), 0)})" for t in types)
                  + ". A type with no entities is not used by this corpus; a type holding most of the graph may be too broad.")
@@ -571,80 +642,126 @@ def apply_observed_guard(predicates: Iterable[dict[str, Any]], prior: dict[str, 
 
 
 def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, examples: bool = True,
-            prior: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Nine calls: domain -> language -> persona -> type list -> parents -> predicates -> type definitions ->
-    scenario profile -> corpus examples (one call for each of <= 2 samples).
-    (Capability questions were removed 2026-09-06: self-check questions for acceptance; neither the build nor
-    retrieval depends on them.)
-    prior: the active schema version (type list, predicates, profile, endpoint ledger); when given, the model
-    revises on that basis; endpoint pairs confirmed in the ledger are kept by rule in apply_observed_guard,
-    regardless of whether the model complies."""
+            prior: dict[str, Any] | None = None, progress=None) -> dict[str, Any]:
+    """九次调用:领域 → 语言 → 人设 → 类型表 → 父类 → 谓词 → 类型定义与作用域 → 场景画像 → 语料示例(≤2 段各一次)。
+    prior:现行模式版本(类型表、谓词表、画像、端点账),给了就让模型在它基础上修订;账里确认过的端点组合由
+    apply_observed_guard 按规则保住,不依赖模型听不听话。
+    返回 model(ontology.normalize_model 规范化过的模式字典)与领域、人设、语料示例等。"""
+    from ..ontology import SchemaError, normalize_model
+
+    progress = progress or (lambda phase: None)
     joined = " ".join(docs)
+    progress("domain")
     if not domain:
-        domain = client.chat(prompts.GENERATE_DOMAIN_PROMPT.format(input_text=joined), max_tokens=256).strip().strip('"')
+        domain = clean_domain(client.chat(prompts.GENERATE_DOMAIN_PROMPT.format(input_text=joined), max_tokens=256))
+    progress("language")
     language = client.chat(prompts.DETECT_LANGUAGE_PROMPT.format(input_text=joined), max_tokens=64).strip().strip('".')
     task = prompts.ENTITY_TYPE_TASK.format(domain=domain) + _prior_types_text(prior)
+    progress("persona")
     persona = client.chat(prompts.GENERATE_PERSONA_PROMPT.format(sample_task=task), max_tokens=512).strip()
+    progress("types")
     raw_types = client.chat(
         [{"role": "system", "content": persona},
          {"role": "user", "content": prompts.ENTITY_TYPE_GENERATION_PROMPT.format(task=task, input_text=joined)}],
         max_tokens=1024,
+        validate=lambda text: bool(parse_entity_types(parse_json_object(text) or text)),
     )
     entity_types = parse_entity_types(parse_json_object(raw_types) or raw_types)
     parent_types: dict[str, str] = {}
     predicates: list[dict[str, Any]] = []
     guard: dict[str, Any] = {}
     if entity_types:
+        progress("parents")
         raw_parents = client.chat(prompts.PARENT_TYPES_PROMPT.format(upper_parents=upper_parents_text(),
-            persona=persona, domain=domain, entity_types="\n".join(f"- {t}" for t in entity_types),
-            max_parents=MAX_PARENT_TYPES), max_tokens=1024)
+            persona=persona, domain=domain, entity_types="\n".join(f"- {t}" for t in entity_types)), max_tokens=1024)
         parent_types = normalize_parent_types(parse_json_object(raw_parents), entity_types)
+        uppers = _uppers_of(entity_types, parent_types)
         parents_text = "\n".join(
-            f"- {parent}: {', '.join(t for t, p in parent_types.items() if p == parent)}"
-            for parent in dict.fromkeys(parent_types.values())
+            f"- {upper}: {', '.join(t for t in entity_types if uppers.get(t) == upper)}"
+            for upper in dict.fromkeys(uppers[t] for t in entity_types)
         ) or "\n".join(f"- {t}" for t in entity_types)
         parents_text += _prior_predicates_text(prior)
-        # the predicate list is half of the extraction constraints; a response with no parseable predicates is not
-        # cached and is requested again with a correction prompt (ChatClient.validate)
+        # 谓词表是抽取约束的一半;解析不出谓词的响应不进缓存、带纠正提示再要一次(ChatClient.validate)
+        progress("predicates")
         raw_predicates = client.chat(prompts.PREDICATES_PROMPT.format(
             persona=persona, domain=domain, parent_types=parents_text, input_text=joined,
             min_predicates=MIN_PREDICATES, max_predicates=MAX_PREDICATES), max_tokens=4096,
             validate=lambda t: bool(normalize_predicates(parse_json_object(t))))
         predicates, guard = apply_observed_guard(normalize_predicates(parse_json_object(raw_predicates)), prior)
     type_definitions: dict[str, str] = {}
+    type_scopes: dict[str, str] = {}
     profile: dict[str, Any] = {}
     example_text = ""
     example_stats: dict[str, int] = {}
+    model: dict[str, Any] = {}
     if entity_types:
-        typed = "\n".join(f"- {t} (parent: {parent_types.get(t, '')})" for t in entity_types)
+        typed = "\n".join(f"- {t} (parent: {parent_types.get(t, 'entity')})" for t in entity_types)
         try:
+            progress("definitions")
             raw_defs = client.chat(prompts.TYPE_DEFINITIONS_PROMPT.format(
-                persona=persona, domain=domain, entity_types=typed, input_text=joined[:20000]), max_tokens=4096,
-                validate=lambda t: bool(normalize_definitions(parse_json_object(t), entity_types)))
-            type_definitions = normalize_definitions(parse_json_object(raw_defs), entity_types)
+                persona=persona, domain=domain, entity_types=typed, input_text=joined), max_tokens=4096,
+                validate=lambda t: bool(normalize_definitions(parse_json_object(t), entity_types)[0]))
+            type_definitions, type_scopes = normalize_definitions(parse_json_object(raw_defs), entity_types)
+        except (LLMInputBudgetExceeded, LLMInterrupted):
+            raise
         except Exception as exc:
             print(f"[schema] type definitions call failed: {exc!r}", flush=True)
         try:
+            progress("profile")
             raw_profile = client.chat(prompts.PROFILE_PROMPT.format(
                 persona=persona, domain=domain, entity_types=typed,
                 predicates=("\n".join(f"- {p['name']}: {p.get('description') or ''}" for p in predicates) or "- (none)")
                 + _prior_profile_text(prior),
-                input_text=joined[:20000]), max_tokens=1024,
+                input_text=joined), max_tokens=1024,
                 validate=lambda t: "axis" in parse_json_object(t))
             profile = normalize_profile_suggestion(parse_json_object(raw_profile), entity_types=entity_types, predicates=predicates)
+        except (LLMInputBudgetExceeded, LLMInterrupted):
+            raise
         except Exception as exc:
             print(f"[schema] profile call failed: {exc!r}", flush=True)
+        try:
+            model, warnings = normalize_model({
+                "language": language,
+                "types": [{"name": t, "is_a": parent_types.get(t, "entity"), "description": type_definitions.get(t, ""),
+                           "scope": type_scopes.get(t, "")} for t in entity_types],
+                "predicates": predicates, "profile": profile})
+        except SchemaError as exc:
+            # 归纳结果不合规(父类成环、类型太多):类型表截到上限、父类一律拉平到上层类再规范化一次,不让整轮抽取作废
+            print(f"[schema] induced schema rejected ({exc}); retrying flattened and trimmed", flush=True)
+            from ..ontology import MAX_MENU_TYPES
+
+            kept = entity_types[:MAX_MENU_TYPES]
+            flat = _uppers_of(entity_types, {t: p for t, p in parent_types.items() if p not in entity_types})
+            model, warnings = normalize_model({
+                "language": language,
+                "types": [{"name": t, "is_a": flat.get(t, "entity"), "description": type_definitions.get(t, ""),
+                           "scope": type_scopes.get(t, "")} for t in kept],
+                "predicates": predicates, "profile": profile})
+        if warnings:
+            print(f"[schema] normalized with warnings: {warnings}", flush=True)
         if examples:
             from .extract import ExtractionSchema
 
-            schema = ExtractionSchema(entity_types=tuple(entity_types), predicates=tuple(predicates), language=language,
-                                      parent_types=dict(parent_types), type_definitions=dict(type_definitions))
+            schema = ExtractionSchema.from_model(model)
+            progress("examples")
             example_text, example_stats = generate_examples(client, docs, schema)
     return {
         "domain": domain, "language": language, "persona": persona,
-        "entity_types": entity_types, "parent_types": parent_types,
-        "predicates": predicates,
-        "type_definitions": type_definitions, "profile": profile,
+        "model": model,
         "examples": example_text, "example_stats": example_stats,
         "guard": guard,
     }
+
+
+def _uppers_of(entity_types: list[str], parent_types: dict[str, str]) -> dict[str, str]:
+    """父类可能是表内另一个类型:沿链走到上层类(谓词提示词按上层类分组)。"""
+    from ..ontology import UPPER_CLASSES
+
+    out: dict[str, str] = {}
+    for t in entity_types:
+        cur, hops = t, 0
+        while cur not in UPPER_CLASSES and hops <= len(entity_types):
+            cur = parent_types.get(cur) or "entity"
+            hops += 1
+        out[t] = cur if cur in UPPER_CLASSES else "entity"
+    return out

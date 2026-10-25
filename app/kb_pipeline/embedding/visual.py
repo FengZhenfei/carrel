@@ -126,15 +126,16 @@ class VisualEmbeddingClient:
                     allow_redirects=False,      # a request carrying the key does not follow redirects
                 )
                 if response.status_code in (408, 429):
-                    # A full queue / rate limit is transient: this used to fall into "the picture itself is
-                    # the problem", so the image was skipped permanently (no cache written, the job succeeded
-                    # as usual, never filled in later).
-                    raise RuntimeError(f"HTTP {response.status_code} (transient): {response.text[:200]}")
-                if 400 <= response.status_code < 500:
+                    # 排队满 / 限流是暂时的:过去也落进「图片本身有问题」,于是
+                    # 这张图被永久跳过(不写缓存、任务照常成功、以后不再补)。
+                    raise RuntimeError(f"HTTP {response.status_code}(暂时性): {response.text[:200]}")
+                if response.status_code in (413, 415) or (
+                        response.status_code in (400, 422) and any(term in response.text.lower() for term in
+                            ("invalid image", "image too", "image size", "image dimensions", "cannot identify image", "unsupported image", "decode image"))):
                     raise VisualEmbedContentError(
                         f"HTTP {response.status_code} for {image_path.name}: {response.text[:300]}"
                     )
-                if response.status_code >= 500:
+                if response.status_code >= 400:
                     raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
                 data = response.json()
                 items = data.get("data") or []
@@ -170,7 +171,7 @@ class VisualEmbeddingClient:
         Transport failures raise after per-image retries -- a missing visual
         vector must fail the parse job into the worker's retry schedule, not
         pass silently. A deterministic rejection (VisualEmbedContentError,
-        HTTP 4xx) yields None for that image instead: one poison picture must
+        explicit image-content rejection) yields None for that image instead: one poison picture must
         not make the whole document unindexable."""
         if not jobs:
             return []

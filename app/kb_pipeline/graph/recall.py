@@ -9,6 +9,7 @@ scores so the layer above can treat it as one recall route and fuse it with vect
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -46,10 +47,10 @@ def evidence_weight(relation_score: float, *, df: int, n_chunks: int) -> float:
 
 
 # ── Second stage: re-rank candidate chunks by "question ↔ chunk text" ───────────────────────────────────
-# The graph score only gathers the candidates (for kb_003's 26 answerable capability questions the top 60
+# The graph score only gathers the candidates (for an evaluation set of 26 answerable questions the top 60
 # candidates always contain the answer chunk); ranking is left to the chunk's own similarity to the question +
 # lexical overlap: hit@5 was 11/26 ordered by graph score and 20/26 after re-ranking, against 17/26 for vector
-# search alone and 15/26 for BM25. See section seven of the desktop report.
+# search alone and 15/26 for BM25.
 CANDIDATE_LIMIT = 60
 TEXT_VECTOR_NAME = "text"     # name of the text vector in the main collection (two named vectors: text + visual)
 LEX_WEIGHT = 0.3
@@ -77,6 +78,55 @@ def lexical_overlap(question: str, text: str) -> float:
     a = len(qa & ta) / len(qa) if qa else 0.0
     c = len(qc & tc) / len(qc) if qc else 0.0
     return 2.0 * a + c
+
+
+EXPAND_FETCH_FACTOR = 4         # 第一跳:每个实体先按关系强度取几倍邻边,再按与问题的相关度留 per_node 条(后面的跳数不多取)
+EXPAND_RELEVANCE_WEIGHT = 3.0   # 没有问题向量时的退路:相关度系数 = 1 + 3 × 词重合,封顶 3
+EXPAND_RELEVANCE_MAX = 3.0
+# Relevance selects neighbours without multiplying their retrieval scores.
+
+
+def expansion_relevance(question: str, anchor: str, neighbour: dict[str, Any]) -> float:
+    """一跳邻边与问题的相关度系数(1–3):问题里去掉起点自己的名字,剩下的记号在「对端名字 + 关系类型 + 关系描述」里
+    出现的比例。中心实体的每条边都带着它自己的名字,不去掉的话条条都算相关;问题只点了实体名时系数都是 1,
+    排序和只按强度一样(强度高的边不一定与本次问题相关)。"""
+    q = re.sub(re.escape(anchor), " ", question, flags=re.IGNORECASE) if anchor else question
+    text = f"{neighbour.get('title') or ''} {neighbour.get('type') or ''} {neighbour.get('description') or ''}"
+    return min(EXPAND_RELEVANCE_MAX, 1.0 + EXPAND_RELEVANCE_WEIGHT * lexical_overlap(q, text))
+
+
+def relation_cosines(q: Any, relation_collection: str, graph_version: str, vector: list[float] | None,
+                     rids: list[str]) -> dict[str, float]:
+    """候选邻边与问题的余弦:关系向量建图时已经写进图集合,点编号由版本和关系编号算出来,一次取回;取不到就是空。"""
+    if vector is None or not rids:
+        return {}
+    from .vectors import point_id_for
+
+    ids = {point_id_for(graph_version, rid): rid for rid in dict.fromkeys(rids)}
+    try:
+        points = q.retrieve(collection_name=relation_collection, ids=list(ids), with_payload=False, with_vectors=True)
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for p in points or []:
+        vec = p.vector
+        if isinstance(vec, dict):
+            vec = next(iter(vec.values()), None)
+        rid = ids.get(str(p.id))
+        if rid and vec is not None:
+            out[rid] = _cosine(vector, list(vec))
+    return out
+
+
+def pick_neighbours(neighbours: list[dict[str, Any]], per_node: int, cosines: dict[str, float], question: str,
+                    anchor: str) -> list[dict[str, Any]]:
+    """一个实体留哪 per_node 条邻边:有关系向量时按与问题的余弦挑(平局按强度);没有(只走词法、向量取不回来)
+    就按「强度 × 词重合系数」(expansion_relevance)。候选本来就是按强度取的前几倍,强度的先验已经在里面。"""
+    if cosines:
+        ranked = sorted(neighbours, key=lambda nb: (-cosines.get(str(nb.get("rid") or ""), -1.0), -float(nb.get("weight") or 1.0)))
+    else:
+        ranked = sorted(neighbours, key=lambda nb: -expansion_relevance(question, anchor, nb) * float(nb.get("weight") or 1.0))
+    return ranked[: max(0, int(per_node))]
 
 
 def rerank_score(cos: float, lex: float, graph_rank: int) -> float:
@@ -147,23 +197,29 @@ def lexical_tokens(question: str) -> list[str]:
 
 
 def lexical_seeds(q: Any, entity_collection: str, relation_collection: str, question: str, *,
-                  per_token: int = LEXICAL_PER_TOKEN) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Exact seed lookup by the question's symbols (entities with equal title / alias, relations with equal
-    endpoints), covering the weakness of dense seeds: a short symbol like "tAS" carries almost no weight in the
-    vector of a Chinese question, and the dense top 20 is taken entirely by device names and ordering codes
-    (kb_003 Q15), yet it is exactly the entity that pins down the AC table chunk."""
+                  per_token: int = LEXICAL_PER_TOKEN, scope: dict[str, Any] | None = None,
+                  vector: list[float] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按问题中的记号精确找种子(标题、别名、外部编号以及关系端点),补充稠密召回。
+    短记号在向量中可能分量不足,但对定位相关证据很重要。关系按时间口径筛(scope,默认现行)。
+    端点匹配的关系在有问题向量时按语义相关度取前几条;否则按存储顺序取。
+    这样中心实体有很多边时,仍能优先选中与问题有关的关系。分数口径保持 LEXICAL_SEED_SCORE。"""
     from qdrant_client.http import models as qm
 
+    from .currency import in_scope, query_scope
+
+    scope = scope or query_scope()
     tokens = lexical_tokens(question)
     if not tokens:
         return [], []
     exclude = seed_filter().must_not
+    rel_must = relation_filter(scope).must
     entities: dict[str, dict[str, Any]] = {}
     relations: dict[str, dict[str, Any]] = {}
     for tok in tokens:
         variants = identifier_variants(tok)
         e_filter = qm.Filter(should=[qm.FieldCondition(key="title", match=qm.MatchAny(any=variants)),
-                                     qm.FieldCondition(key="aliases", match=qm.MatchAny(any=variants))],
+                                     qm.FieldCondition(key="aliases", match=qm.MatchAny(any=variants)),
+                                     qm.FieldCondition(key="external_ids", match=qm.MatchAny(any=variants))],
                              must_not=exclude)
         points, _ = q.scroll(collection_name=entity_collection, scroll_filter=e_filter, limit=per_token,
                              with_payload=True, with_vectors=False)
@@ -179,16 +235,23 @@ def lexical_seeds(q: Any, entity_collection: str, relation_collection: str, ques
             entities[eid] = payload
         r_filter = qm.Filter(should=[qm.FieldCondition(key="source", match=qm.MatchAny(any=variants)),
                                      qm.FieldCondition(key="target", match=qm.MatchAny(any=variants))],
-                             must_not=exclude)
-        points, _ = q.scroll(collection_name=relation_collection, scroll_filter=r_filter, limit=per_token * 2,
-                             with_payload=True, with_vectors=False)
-        for p in points:
-            payload = dict(p.payload or {})
+                             must=rel_must, must_not=exclude)
+        found = None
+        if vector is not None:
+            try:
+                found = _query_points(q, relation_collection, vector, per_token * 2, r_filter)
+            except Exception:
+                found = None
+        if found is None:
+            points, _ = q.scroll(collection_name=relation_collection, scroll_filter=r_filter, limit=per_token * 2,
+                                 with_payload=True, with_vectors=False)
+            found = [{**dict(p.payload or {}), "_point_id": str(p.id)} for p in points]
+        for row in found:
+            payload = dict(row)
             rid = str(payload.get("gr_id") or "")
-            if not rid or rid in relations:
+            if not rid or rid in relations or not in_scope(payload, scope):
                 continue
             payload["_score"] = LEXICAL_SEED_SCORE["relation"]
-            payload["_point_id"] = str(p.id)
             payload["_token"] = tok
             relations[rid] = payload
     return list(entities.values()), list(relations.values())
@@ -199,7 +262,7 @@ WINDOW_IN_BOOST = 1.1
 WINDOW_OUT_PENALTY = 0.8
 
 
-def _spec_dense_rows(q: Any, spec_collection: str, vector: list[float], limit: int) -> list[dict[str, Any]]:
+def _spec_dense_rows(q: Any, spec_collection: str, vector: list[float], limit: int, query_filter: Any = None) -> list[dict[str, Any]]:
     """Dense hits in the facts collection: new collections have three named vectors text / property / value,
     queried separately and merged (the same fact takes its highest score, plus a small bonus when both the property
     and the value side hit); old collections have a single vector, queried as the unnamed vector."""
@@ -207,7 +270,7 @@ def _spec_dense_rows(q: Any, spec_collection: str, vector: list[float], limit: i
     named_ok = False
     for name in SPEC_VECTOR_NAMES:
         try:
-            rows = _query_points(q, spec_collection, vector, limit, using=name)
+            rows = _query_points(q, spec_collection, vector, limit, query_filter, using=name)
         except Exception:
             break
         named_ok = True
@@ -226,7 +289,7 @@ def _spec_dense_rows(q: Any, spec_collection: str, vector: list[float], limit: i
                     cur["_score"] = float(r["_score"])
                     cur["_via"] = f"vector:{name}"
     if not named_ok:
-        rows = _query_points(q, spec_collection, vector, limit)
+        rows = _query_points(q, spec_collection, vector, limit, query_filter)
         for r in rows:
             sid = str(r.get("gr_id") or "")
             if sid:
@@ -269,30 +332,70 @@ def greedy_cover(seeds: list[dict[str, Any]], question: str, *, limit: int) -> l
     return (chosen + rest)[:max(limit, len(chosen))]
 
 
+def fact_content_key(row: dict[str, Any]) -> tuple:
+    """一条事实说的内容:主体、属性(有概念键用概念键)、取值、时间,加上真正起区分作用的条件 ——
+    条件值已经写在主体或属性名里的(「位点名称: rs0000111」配属性「GENE_A rs0000111 …」)不算区别。"""
+    subject = str(row.get("subject_id") or row.get("subject") or "").casefold()
+    concept = str(row.get("concept_key") or row.get("property") or "").casefold()
+    named = f"{row.get('subject') or ''} {row.get('property') or ''} {row.get('symbol') or ''}".casefold()
+    conditions = row.get("conditions") or {}
+    if isinstance(conditions, str):
+        try:
+            conditions = json.loads(conditions)
+        except ValueError:
+            conditions = {"_": conditions}
+    kept = tuple(sorted((str(k).casefold(), str(v).casefold()) for k, v in dict(conditions).items()
+                        if str(v).strip() and str(v).casefold() not in named))
+    values = tuple(str(row.get(k) or "").strip().casefold() for k in ("value", "min", "typ", "max", "unit"))
+    return subject, concept, values, str(row.get("valid_from") or row.get("axis") or ""), kept
+
+
+def collapse_duplicate_facts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """内容相同的几条事实(同一行在报告里重复列了几次、两份报告各抄了一遍)只留排在最前的一条,来源切片并进去、
+    记下重复了几条。rows 已按分数从高到低排(10-24 评估:同一个事实在证据里占了 12 条里的 8 条)。"""
+    out: list[dict[str, Any]] = []
+    first: dict[tuple, dict[str, Any]] = {}
+    for r in rows:
+        key = fact_content_key(r)
+        keep = first.get(key)
+        if keep is None:
+            first[key] = r
+            out.append(r)
+            continue
+        keep["point_ids"] = list(dict.fromkeys([*(keep.get("point_ids") or []), *(r.get("point_ids") or [])]))
+        keep["_duplicates"] = int(keep.get("_duplicates") or 0) + 1
+    return out
+
+
 def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, question: str, *, limit: int = 12,
-               per_token: int = LEXICAL_PER_TOKEN, window: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    """Qualified-fact seeds: dense retrieval (property side / value side / whole sentence) + exact symbol matching
-    (subject / symbol / property) + time window weighting + greedy cover. Returns empty when the collection does
-    not exist (old graphs)."""
+               per_token: int = LEXICAL_PER_TOKEN, window: dict[str, str] | None = None,
+               scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """限定事实种子:稠密检索(属性侧 / 值侧 / 整句)+ 记号精确匹配(主体 / 符号 / 属性)+ 时间窗加权 + 贪心覆盖。
+    按时间口径筛(scope,默认现行:序列里更早的档位、来源文档被取代或归档的、过了有效期的不作种子)。
+    集合不存在(旧图)就返回空。"""
     from qdrant_client.http import models as qm
 
+    from .currency import in_scope, query_scope
     from .temporal import in_window
 
+    scope = scope or query_scope()
+    flt_status = relation_filter(scope)
     try:
-        rows = _spec_dense_rows(q, spec_collection, vector, limit) if vector is not None else []
+        rows = _spec_dense_rows(q, spec_collection, vector, limit, flt_status) if vector is not None else []
     except Exception:
         return []
     seeds: dict[str, dict[str, Any]] = {}
     for r in rows:
         sid = str(r.get("gr_id") or "")
-        if sid:
+        if sid and in_scope(r, scope):
             seeds[sid] = r
     # Lexical lookup by symbol / property name only: a subject name (some product) would hit all of its facts,
     # which is no relevance evidence and only counts as a bonus
     for tok in lexical_tokens(question):
         variants = identifier_variants(tok)
         flt = qm.Filter(should=[qm.FieldCondition(key="symbol", match=qm.MatchAny(any=variants)),
-                                qm.FieldCondition(key="property", match=qm.MatchAny(any=variants))])
+                                qm.FieldCondition(key="property", match=qm.MatchAny(any=variants))],
+                        must=flt_status.must)
         try:
             points, _ = q.scroll(collection_name=spec_collection, scroll_filter=flt, limit=per_token * 4,
                                  with_payload=True, with_vectors=False)
@@ -301,7 +404,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
         for p in points:
             payload = dict(p.payload or {})
             sid = str(payload.get("gr_id") or "")
-            if not sid:
+            if not sid or not in_scope(payload, scope):
                 continue
             score = LEXICAL_SEED_SCORE["title"]
             cur = seeds.get(sid)
@@ -328,7 +431,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
         if window:
             when = str(r.get("valid_from") or r.get("axis") or "")
             r["_score"] = float(r["_score"]) * (WINDOW_IN_BOOST if in_window(when, window) else WINDOW_OUT_PENALTY)
-    ranked = sorted(seeds.values(), key=lambda r: -float(r["_score"]))
+    ranked = collapse_duplicate_facts(sorted(seeds.values(), key=lambda r: -float(r["_score"])))
     return greedy_cover(ranked[: limit * 2], question, limit=limit)
 
 
@@ -386,6 +489,18 @@ def seed_filter() -> Any:
     ])
 
 
+def relation_filter(scope: dict[str, Any] | None = None) -> Any:
+    """关系 / 事实种子:在 seed_filter 之上按时间口径先在 Qdrant 里筛掉被取代的、来源文档标了状态的(现行口径);
+    回看某一天与 history 不在这里筛,取回来按 currency.in_scope 判。"""
+    from qdrant_client.http import models as qm
+
+    from .currency import qdrant_current_conditions
+
+    base = seed_filter()
+    must = qdrant_current_conditions() if (scope or {"mode": "current"})["mode"] == "current" else None
+    return qm.Filter(must=must, must_not=base.must_not)
+
+
 def _query_points(q: Any, collection: str, vector: list[float], limit: int, query_filter: Any = None,
                   using: str | None = None) -> list[dict[str, Any]]:
     """using: the name of a named vector (text / property / value of the facts collection); None queries the
@@ -408,6 +523,9 @@ def _query_points(q: Any, collection: str, vector: list[float], limit: int, quer
 
 
 SOURCE_SAMPLE = 16
+SERIES_MEMBERS_MAX = 40
+RELATION_TIME_KEYS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
+                      "lapses")
 
 
 def spread(items: list[Any], limit: int) -> list[Any]:
@@ -445,6 +563,9 @@ def spec_result_row(sp: dict[str, Any]) -> dict[str, Any]:
         "evidence_conflict": sp.get("evidence_conflict"), "comparable": sp.get("comparable"), "confidence": sp.get("confidence"),
         "series_index": sp.get("series_index"), "series_len": sp.get("series_len"), "axis": sp.get("axis"), "values_text": sp.get("values_text"),
         "rel_path": sp.get("rel_path"), "section": sp.get("section"), "point_ids": list(sp.get("point_ids") or []),
+        # 时间与状态(方案附录第 3 条):观察时间、被哪条取代、来源文档状态、出自表格 / 叙述
+        "observed": sp.get("observed"), "superseded_by": sp.get("superseded_by"), "superseded_on": sp.get("superseded_on"),
+        "doc_status": sp.get("doc_status"), "source_kind": sp.get("source_kind"), "lapses": sp.get("lapses"),
     }
 
 
@@ -509,17 +630,21 @@ def graph_query(
     q: Any = None,
     driver: Any = None,
     timeout: float | None = None,
+    history: bool = False,
+    as_of: str | None = None,
 ) -> dict[str, Any]:
-    """vector: the question vector the caller already computed (the search service embeds once and shares it across
-    three routes); lexical_only: when the embedding service is unavailable, use lexical seeds only (exact symbol
-    matches on entities / relations / facts' symbols and properties), with dense seeds, pages and the cosine term
-    all empty (Q19).
-    q / driver: the resident search service passes in its shared Qdrant client and Neo4j driver; when absent
-    (command line) they are created here and closed afterwards.
-    timeout: the transaction timeout (seconds) of each Neo4j query of the graph route, except the point lookup of
-    the active version number; no limit when absent. On the Qdrant side the timeout is that of the client passed in."""
+    """history / as_of:关系与事实的时间口径(currency.query_scope;默认现行)。实体没有时间,不受影响。
+    vector:调用方已经算好的问题向量(检索服务里一次嵌入三路共用);lexical_only:嵌入服务不可用时
+    只走词法种子(记号精确匹配实体 / 关系 / 事实的符号与属性),稠密种子、页面与余弦项全部为空(Q19)。
+    q / driver:常驻的检索服务把自己共用的 Qdrant 客户端和 Neo4j driver 传进来;不传(命令行)就现建、用完关掉。
+    timeout:图路各条 Neo4j 查询的事务超时(秒),查现行版本号的那一条点查除外;不传不限时。Qdrant 那边的超时跟着传进来的客户端走。"""
+    from .currency import cypher_in_scope, in_scope, mark_status, query_scope
     from .temporal import question_time_window
 
+    scope = query_scope(history=history, as_of=as_of)
+    from kb_search import docstatus
+    if scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source):
+        return {"kb_id": source.kb_id, "degraded": ["graph_refresh_pending"], "entities": [], "relations": [], "specs": [], "pages": [], "chunks": []}
     if vector is None and not lexical_only:
         embedder = EmbeddingClient(
             base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
@@ -534,12 +659,11 @@ def graph_query(
     window = question_time_window(question)
     if vector is not None:
         entity_seeds = _query_points(q, entity_alias, vector, top_entities, seeds_only)
-        relation_seeds = _query_points(q, relation_alias, vector, top_relations, seeds_only)
+        relation_seeds = [r for r in _query_points(q, relation_alias, vector, top_relations, relation_filter(scope)) if in_scope(r, scope)]
     else:
         entity_seeds, relation_seeds = [], []
-    # Lexical seeds: entities / relations hit exactly by name from the question's symbols, merged with the dense
-    # seeds (same id keeps the higher score)
-    lex_entities, lex_relations = lexical_seeds(q, entity_alias, relation_alias, question)
+    # 词法种子:问题里的记号按名字精确命中的实体 / 关系,与稠密种子合并(同 id 取高分)
+    lex_entities, lex_relations = lexical_seeds(q, entity_alias, relation_alias, question, scope=scope, vector=vector)
     dense_e = {str(s.get("gr_id")): s for s in entity_seeds}
     for s in lex_entities:
         cur = dense_e.get(str(s.get("gr_id")))
@@ -554,9 +678,10 @@ def graph_query(
             s["_via"] = "lexical"
             dense_r[str(s.get("gr_id"))] = s
     relation_seeds = list(dense_r.values())
-    specs = spec_seeds(q, collections["spec"], vector, question, limit=top_relations, window=window)
+    specs = spec_seeds(q, collections["spec"], vector, question, limit=top_relations, window=window, scope=scope)
     pages = page_seeds(q, collections["page"], vector, question) if vector is not None else []
-    doc_paths: dict[str, str] = {}          # page doc_ids -> file paths; evaluation uses it to tell which document a subject page is from
+    doc_paths: dict[str, str] = {}          # 页面 doc_ids -> 文件路径;评测按它判主体页出自哪份文档
+    series_of: dict[str, list[dict[str, Any]]] = {}      # 事实序列键 -> 全部档位(不按时间口径筛)
     seed_summary = {"entities": len(entity_seeds), "relations": len(relation_seeds), "specs": len(specs), "pages": len(pages),
                     "lexical_entities": sum(1 for s in entity_seeds if s.get("_via") == "lexical"), "lexical_only": vector is None}
 
@@ -576,6 +701,7 @@ def graph_query(
             if not eid:
                 continue
             entity_scores[eid] = {"id": eid, "title": seed.get("title"), "type": seed.get("type"),
+                                  "upper": seed.get("upper"), "kind": seed.get("kind"),
                                   "description": seed.get("description"), "scope": seed.get("scope"),
                                   "score": seed["_score"], "hop": 0, "via": seed.get("_via") or "vector"}
         relation_scores: dict[str, dict[str, Any]] = {}
@@ -584,7 +710,8 @@ def graph_query(
             if rid:
                 relation_scores[rid] = {"id": rid, "source": seed.get("source"), "target": seed.get("target"),
                                         "type": seed.get("type"), "description": seed.get("description"),
-                                        "score": seed["_score"], "hop": 0, "via": seed.get("_via") or "vector"}
+                                        "score": seed["_score"], "hop": 0, "via": seed.get("_via") or "vector",
+                                        **{k: seed.get(k) for k in RELATION_TIME_KEYS if seed.get(k)}}
                 for end in (seed.get("source_id"), seed.get("target_id")):
                     end = str(end or "")
                     if end and end not in entity_scores:
@@ -606,18 +733,26 @@ def graph_query(
                     UNWIND $ids AS eid
                     MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[r:RELATED_TO]-(n:Entity)
                     WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
+                      AND """ + cypher_in_scope("r", observed="observed_first", scope=scope) + """
                     WITH eid, r, n ORDER BY r.weight DESC
                     WITH eid, collect({rid: r.id, type: r.type, weight: r.weight, description: r.description,
-                                       nid: n.id, title: n.title, ntype: n.type, scope: n.scope, pagerank: n.pagerank,
-                                       degree: n.degree})[0..$k] AS neighbours
+                                       valid_from: r.valid_from, valid_until: r.valid_until, observed_first: r.observed_first,
+                                       observed_last: r.observed_last, superseded_by: r.superseded_by, superseded_on: r.superseded_on,
+                                       doc_status: r.doc_status, lapses: r.lapses,
+                                       nid: n.id, title: n.title, ntype: n.type, nupper: n.upper, nkind: n.kind, scope: n.scope,
+                                       pagerank: n.pagerank, degree: n.degree})[0..$k] AS neighbours
                     RETURN eid, neighbours
                     """,
-                    ids=frontier, kb=source.kb_id, gv=gv, k=int(per_node),
+                    ids=frontier, kb=source.kb_id, gv=gv, k=int(per_node) * (EXPAND_FETCH_FACTOR if hop == 1 else 1), day=scope["day"],
                 ).data()
                 next_frontier: list[str] = []
+                cosines = relation_cosines(q, relation_alias, gv, vector,
+                                           [str(nb.get("rid") or "") for row in rows for nb in row["neighbours"] or [] if nb.get("rid")]) \
+                    if hop == 1 and EXPAND_FETCH_FACTOR > 1 else {}
                 for row in rows:
                     base = entity_scores.get(str(row["eid"]), {}).get("score", 0.0)
-                    for nb in row["neighbours"] or []:
+                    anchor = str(entity_scores.get(str(row["eid"]), {}).get("title") or "")
+                    for nb in pick_neighbours(list(row["neighbours"] or []), per_node, cosines, question, anchor):
                         nid = str(nb["nid"])
                         rank = float(nb.get("pagerank") or 0.0) / max_rank
                         degree = int(nb.get("degree") or 0)
@@ -628,6 +763,7 @@ def graph_query(
                             if slot is None:
                                 next_frontier.append(nid)
                             entity_scores[nid] = {"id": nid, "title": nb.get("title"), "type": nb.get("ntype"),
+                                                  "upper": nb.get("nupper"), "kind": nb.get("nkind"),
                                                   "scope": nb.get("scope"), "score": score, "hop": hop, "via": "expand"}
                         rid = str(nb.get("rid") or "")
                         if rid:
@@ -637,16 +773,19 @@ def graph_query(
                             if rslot is None or rscore > rslot["score"]:
                                 relation_scores[rid] = {"id": rid, "source": None, "target": None,
                                                         "type": nb.get("type"), "description": nb.get("description"),
-                                                        "score": rscore, "hop": hop, "via": "expand"}
+                                                        "score": rscore, "hop": hop, "via": "expand",
+                                                        **{k: nb.get(k) for k in RELATION_TIME_KEYS if nb.get(k)}}
                 frontier = next_frontier
             # Fill in missing titles
             missing = [eid for eid, s in entity_scores.items() if not s.get("title")]
             if missing:
                 for row in session.run(
                     "UNWIND $ids AS eid MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid}) "
-                    "RETURN eid, e.title AS title, e.type AS type, e.scope AS scope", ids=missing, kb=source.kb_id, gv=gv,
+                    "RETURN eid, e.title AS title, e.type AS type, e.upper AS upper, e.kind AS kind, e.scope AS scope",
+                    ids=missing, kb=source.kb_id, gv=gv,
                 ).data():
-                    entity_scores[str(row["eid"])].update({"title": row["title"], "type": row["type"], "scope": row.get("scope")})
+                    entity_scores[str(row["eid"])].update({"title": row["title"], "type": row["type"], "upper": row.get("upper"),
+                                                           "kind": row.get("kind"), "scope": row.get("scope")})
             rel_missing = [rid for rid, s in relation_scores.items() if not s.get("source")]
             if rel_missing:
                 for row in session.run(
@@ -654,6 +793,21 @@ def graph_query(
                     "RETURN rid, r.source AS source, r.target AS target", ids=rel_missing, kb=source.kb_id, gv=gv,
                 ).data():
                     relation_scores[str(row["rid"])].update({"source": row["source"], "target": row["target"]})
+            # 事实序列的全部档位:现行口径下更早的档位不作种子,现行那一条的 series_text 里仍要看得到它们
+            series_keys = sorted({str(sp.get("series_key")) for sp in specs[:top_relations] if sp.get("series_key")})
+            if series_keys:
+                for row in session.run(
+                    "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys "
+                    "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, "
+                    "f.unit AS unit, f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.axis AS axis, "
+                    "f.series_index AS series_index ORDER BY series_key, coalesce(f.series_index, 0), f.id",
+                    kb=source.kb_id, gv=gv, keys=series_keys,
+                ).data():
+                    members = series_of.setdefault(str(row["series_key"]), [])
+                    if len(members) < SERIES_MEMBERS_MAX:
+                        members.append({**{k: row.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical",
+                                                                    "valid_from", "series_index")},
+                                        "when": row.get("valid_from") or row.get("axis")})
             page_doc_ids = sorted({str(d) for pg in pages for d in (pg.get("doc_ids") or [])})
             if page_doc_ids:
                 for row in session.run(
@@ -801,8 +955,13 @@ def graph_query(
     for c in chunks:
         c["entities"] = sorted({e for e in c["entities"] if e})[:8]
         c["relations"] = sorted(set(c["relations"]))[:6]
-    spec_rows = [{**spec_result_row(sp), "score": round(float(sp.get("_score") or 0), 4), "via": sp.get("_via"), "hits": sp.get("_hits", 0)}
-                 for sp in specs[:top_relations]]
+    spec_rows = [mark_status({**spec_result_row(sp), "score": round(float(sp.get("_score") or 0), 4), "via": sp.get("_via"),
+                              "hits": sp.get("_hits", 0), **({"series_members": series_of[str(sp["series_key"])]}
+                                                             if sp.get("series_key") and series_of.get(str(sp["series_key"])) else {})},
+                             scope) for sp in specs[:top_relations]]
+    for r in relation_scores.values():
+        mark_status(r, scope)
+    pages = [pg for pg in pages if docstatus.page_allowed(settings, source, pg, scope, paths=doc_paths)]
     page_rows = [{
         "id": pg.get("gr_id"), "kind": pg.get("kind"), "title": pg.get("title"), "score": round(float(pg.get("_score") or 0), 4),
         "summary": pg.get("description"), "text": str(pg.get("text") or "")[:PAGE_TEXT_LIMIT] if with_text else None,
@@ -810,11 +969,12 @@ def graph_query(
         "doc_ids": list(pg.get("doc_ids") or []), "spec_ids": list(pg.get("spec_ids") or [])[:32],
         "docs": sorted({doc_paths[str(d)] for d in (pg.get("doc_ids") or []) if doc_paths.get(str(d))}),
         "entity_keys": list(pg.get("entity_keys") or [])[:16], "point_ids": spread(list(pg.get("point_ids") or []), SOURCE_SAMPLE),
-        "path": pg.get("path"),
+        "path": pg.get("path"), "source_paths": pg.get("source_paths"),
+        "compiled_day": pg.get("compiled_day"), "time_mode": pg.get("time_mode"),
     } for pg in pages]
     return {
         "question": question, "kb_id": source.kb_id, "graph_version": gv,
-        "window": window,
+        "window": window, "time": {"mode": scope["mode"], "day": scope["day"]},
         "entities": sorted(entity_scores.values(), key=lambda e: -e["score"])[:top_entities * 2],
         "relations": sorted(relation_scores.values(), key=lambda r: -r["score"])[:top_relations * 2],
         "specs": spec_rows,

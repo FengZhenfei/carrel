@@ -38,8 +38,9 @@ from ..vector.qdrant import (
     graph_version_timestamp,
 )
 from .build import GraphBuildLock, graph_paths
+from .stats import document_dates, entity_coverage, graph_stats
 from .units import read_units
-from .vectors import entity_id, relation_id
+from .vectors import entity_id, entity_ids, external_id_strings, relation_id
 
 NODE_LABELS = (
     "GraphVersion",
@@ -120,6 +121,7 @@ def import_graph_to_neo4j(
         upsert_kb_and_graph_version(
             driver, source_key=source_key, source=source, graph_version=graph_version,
             graph_version_uid=graph_version_uid, output_dir=output_dir, build=resolved, activate=False,
+            stats=bundle.get("stats"),
         )
         result["steps"].append("upsert_graph_version")
 
@@ -393,6 +395,7 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
     # combined unit kinds (structural rules + model verdict, see merge.combine_unit_kind); older bundles lack them,
     # so fall back to the unit's own kind
     unit_kinds = {str(k): str(v) for k, v in (graph.get("unit_kinds") or {}).items()}
+    doc_dates = document_dates(units)
 
     documents: dict[str, dict[str, Any]] = {}
     text_units: list[dict[str, Any]] = []
@@ -409,6 +412,8 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
                 "id": unit.doc_id, "doc_id": unit.doc_id, "title": unit.rel_path or unit.doc_id,
                 "rel_path": unit.rel_path, "filename": Path(unit.rel_path).name if unit.rel_path else None,
                 "source_collection": source.collection, "units": 0,
+                # 文档日期(文件名 / 正文开头定下的):关系的观察时间、类型覆盖的周数都从它来
+                "date": doc_dates.get(unit.doc_id) or None,
             }))
             documents[doc_uid] = props
         documents[doc_uid]["units"] = int(documents[doc_uid].get("units") or 0) + 1
@@ -449,13 +454,17 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
         entity_uid_by_key[e["key"]] = uid
         props = common_props(source, gv, "Entity", eid)
         props.update(clean_props({
-            "id": eid, "title": e.get("title"), "type": e.get("type"), "parent_type": e.get("parent_type") or None,
+            "id": eid, "title": e.get("title"), "type": e.get("type"),
+            "type_path": list(e.get("type_path") or [])[:8] or None, "kind": e.get("kind") or "instance",
+            "ids": entity_ids(e), "external_ids": external_id_strings(e) or None,
             "description": e.get("description"), "frequency": e.get("frequency"), "degree": e.get("degree"),
             "pagerank": e.get("pagerank"), "aliases": list(e.get("aliases") or [])[:16],
             "unit_count": len(e.get("unit_ids") or []),
             "boilerplate": bool(e.get("boilerplate")), "reference": bool(e.get("reference")),
             "evidence_kind": e.get("evidence_kind") or "body",
             "scope": e.get("scope") or None, "upper": e.get("upper") or None,
+            # 覆盖面:出现在几份文档、几个周,最早 / 最晚的文档日期(负载里的来源只存前 16 个,这里是全数)
+            **entity_coverage(e, doc_dates),
         }))
         entities.append(props)
 
@@ -489,6 +498,10 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "type_violation": bool(r.get("type_violation")),
             "boilerplate": bool(r.get("boilerplate")), "reference": bool(r.get("reference")),
             "evidence_kind": r.get("evidence_kind") or "body",
+            "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
+            "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+            "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
+            "doc_status": r.get("doc_status") or None, "lapses": bool(r.get("lapses")),
         }))
         relations.append(props)
         relation_entity_edges.append({
@@ -500,6 +513,11 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
                 "directed": bool(r.get("directed")), "type_violation": bool(r.get("type_violation")),
                 "boilerplate": bool(r.get("boilerplate")), "reference": bool(r.get("reference")),
                 "evidence_kind": r.get("evidence_kind") or "body",
+                # 关系的时间与新旧:检索默认只走现行的边,回看某一天按起止、观察时间与被取代的时间判(currency.cypher_in_effect)
+                "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
+                "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+                "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
+                "doc_status": r.get("doc_status") or None, "lapses": bool(r.get("lapses")),
             }),
         })
         for unit_id in r.get("unit_ids") or []:
@@ -552,8 +570,10 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "period_text": f.get("period_text") or None,
             "series_key": f.get("series_key") or None, "series_len": f.get("series_len"), "series_index": f.get("series_index"),
             "conflict_group": f.get("conflict_group") or None,
-            # quality state (Codex re-review N02): low confidence, image-text conflict, comparators, whether it is
-            # numerically comparable; consistent with the Qdrant projection
+            "superseded_by": f.get("superseded_by") or None, "superseded_on": f.get("superseded_on") or None,
+            "observed": f.get("observed") or None, "source_kind": f.get("source_kind") or None,
+            "doc_status": f.get("doc_status") or None, "lapses": bool(f.get("lapses")),
+            # 质量状态(Codex 复审 N02):低置信、图文冲突、比较符、能不能当数比,和 Qdrant 投影一致
             "confidence": f.get("confidence") or None,
             "evidence_conflict": json.dumps(f["evidence_conflict"], ensure_ascii=False, sort_keys=True) if f.get("evidence_conflict") else None,
             "cmps": json.dumps(f["cmps"], ensure_ascii=False, sort_keys=True) if f.get("cmps") else None,
@@ -588,6 +608,8 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
         "contributes_to_edges": contributes_to, "mentions_edges": mentions, "evidences_edges": evidences,
         "relation_entity_edges": relation_entity_edges, "mentioned_in_edges": mentioned_in,
         "expected_counts": expected_counts,
+        # 整版统计(类型覆盖、谓词与端点组合、别名、兜底关系、时间跨度、核心主体),写在 GraphVersion 上
+        "stats": graph_stats(graph, units),
     }
 
 
@@ -645,6 +667,8 @@ def ensure_constraints(driver) -> None:
         # seconds and two hops 5-10 seconds.
         "CREATE INDEX ak_entity_id IF NOT EXISTS FOR (n:Entity) ON (n.kb_id, n.graph_version, n.id)",
         "CREATE INDEX ak_relation_id IF NOT EXISTS FOR (n:Relation) ON (n.kb_id, n.graph_version, n.id)",
+        # 事实序列的全部档位(检索时现行那一条旁边带上更早的值):按序列键取
+        "CREATE INDEX ak_spec_series IF NOT EXISTS FOR (n:Spec) ON (n.kb_id, n.graph_version, n.series_key)",
     ]
     with driver.session() as session:
         for statement in statements:
@@ -653,7 +677,7 @@ def ensure_constraints(driver) -> None:
 
 def upsert_kb_and_graph_version(
     driver, *, source_key: str, source: KBSource, graph_version: str, graph_version_uid: str,
-    output_dir: Path, build: dict[str, Any], activate: bool,
+    output_dir: Path, build: dict[str, Any], activate: bool, stats: dict[str, Any] | None = None,
 ) -> None:
     props = clean_props({
         "uid": graph_version_uid, "kb_id": source.kb_id, "source_key": source_key,
@@ -662,6 +686,7 @@ def upsert_kb_and_graph_version(
         "input_rows": build.get("input_rows"), "active_chunk_count": build.get("active_chunk_count"),
         "active_doc_count": build.get("active_doc_count"), "source_content_hash": build.get("source_content_hash"),
         "output_dir": str(output_dir), "imported_at": int(time.time()), "mode": "entity_graph",
+        "stats_json": json.dumps(stats, ensure_ascii=False, sort_keys=True) if stats else None,
     })
     with driver.session() as session:
         session.run(

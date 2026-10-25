@@ -35,7 +35,13 @@
 | `GET` / `POST /api/llms`；`DELETE /api/llms/{name}` | 模型注册表（密钥只写不读） |
 | `POST /api/services/{key}/restart`、`restart_all`、`stop_all` | 对 `KB_CONSOLE_SERVICES` 列出的服务行做重启与停止 |
 
+`POST /api/kbs/{kb_id}/graph_schema` 返回 202 和任务 ID，标签抽取在后台执行；同一路由的 `GET` 查询进度，`POST .../graph_schema/cancel` 携带 `task_id` 取消任务。`POST .../graph_schema/upload?adopt=true` 上传并选用 LinkML YAML，`GET .../graph_schema/{version_id}/linkml` 下载模式版本。
+
+删除图谱会清空标签模式和图谱产出，保留解析结果、RAG 索引和该库的更正规则；删除知识库同时清理其更正文件。状态备份包含更正规则 YAML。
+
 ## 部署与服务
+
+已有 0.2 安装可按 [0.3.0 升级步骤](releases/0.3.0.zh-CN.md) 更新。
 
 | 命令 | 作用 |
 |---|---|
@@ -132,7 +138,7 @@ systemctl --user start --no-block carrel-worker.service
 
 ## 开发与测试
 
-`deploy.sh` 按 `app/requirements.lock` 安装测试过的那套版本（含 pytest）；手动安装等价于 `app/.venv/bin/pip install -r app/requirements.lock -e app`。依赖有变动时，在测试过的虚拟环境里用 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml > app/requirements.lock` 重新生成锁文件。安装应用和测试依赖后执行：
+`deploy.sh` 按 `app/requirements.lock` 安装测试过的那套版本（含 pytest）；手动安装等价于 `app/.venv/bin/pip install -r app/requirements.lock -e app`。依赖有变动时，在测试过的虚拟环境里用 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml --output app/requirements.lock` 重新生成锁文件。安装应用和测试依赖后执行：
 
 ```bash
 cd app

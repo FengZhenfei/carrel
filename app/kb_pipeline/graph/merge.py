@@ -1,27 +1,21 @@
-"""Merging, filtering, weights and chunk attribution: all local computation, no LLM calls (description
-summaries live in summarize.py).
+"""合并、过滤、权重、切片归属 —— 全是本地计算,不调 LLM(描述摘要在 summarize.py)。
 
-· Entity key = canonical name (NFKC, whitespace folded, case-insensitive); type by majority vote; descriptions
-  deduplicated in order; frequency = sum of mentions across units; unit_ids unioned.
-· Relations: controlled predicates are directed (HAS_PIN is A → B), the fallback predicate related_to is
-  undirected (sorted endpoints). Same (source, target, predicate) merges: strength_sum summed, evidence = number
-  of units, descriptions deduplicated.
-· Filtering: self-loops, orphan endpoints, negated descriptions ("no clear relationship" and its Chinese
-  equivalents …).
-· Endpoint type gate (4.10): edges whose endpoint parent types do not satisfy the predicate's allowed pairs are
-  flagged type_violation, not deleted.
-· Weights: degree (undirected distinct neighbours), combined_degree, edge-weighted pagerank, cooccur (units
-  where both endpoints appear), NPMI (all three probabilities over the unit total as denominator, negatives
-  kept), final weight = 1 + 9 × (a·norm(strength_sum) + b·norm(cooccur) + c·(npmi+1)/2).
-· MENTIONED_IN: look for the entity name in the text of each chunk the unit covers (and in the chunk's
-  section_path), attach it to the chunks that hit with a count; an entity that hits no chunk is attached to all
-  of the unit's chunks (count=0, meaning inferred rather than matched).
-· Noise reduction (2026-09-04, plan in the desktop document on graph build noise reduction): unit kind
-  composition (structural rules + model judgement), discounted strength for boilerplate / listing units with a
-  boilerplate flag on relations and entities; values (1.3V, 667 MHz) do not become nodes but fold into attribute
-  descriptions of the endpoint entity; references (Figure 5, 001-79553) are flagged reference; compound names
-  (A/B) are split into their parts; the type health check demotes types dominated by references / boilerplate
-  to reference as a whole.
+· 实体键 = 规范名(NFKC、空白折叠、大小写不敏感),按文档隔开的类型前面加 doc_id::,同名不同上层类拆开的
+  第二个节点后面加 ||上层类(规则见 merge_extractions);类型取众数;描述去重保序;
+  frequency = 各单元提及次数之和;unit_ids 并集。
+· 关系:受控谓词有方向(HAS_PIN 是 A → B),兜底谓词 related_to 无向(sorted 端点)。
+  同 (源, 目标, 谓词) 合并:strength_sum 求和、evidence = 单元数、描述去重。
+· 过滤:自环、孤儿端点、否定描述(「无明确关系」「no clear relationship」…)。
+· 端点类型门(4.10):谓词允许的端点父类对不符合的标 type_violation,不删。
+· 权重:degree(无向去重邻居数)、combined_degree、带边权 pagerank、cooccur
+  (两端共同出现的单元数)、NPMI(三个概率统一以单元总数为分母、保留负值)、
+  最终 weight = 1 + 9 × (a·norm(strength_sum) + b·norm(cooccur) + c·(npmi+1)/2)。
+· MENTIONED_IN:在单元覆盖的各切片文本(与切片的 section_path)里查实体名,命中哪片
+  挂哪片并计数;一片都没命中的挂单元全部切片(count=0,表示推断而非命中)。
+· 降噪(2026-09-04):单元类型合成(结构规则 + 模型判断)、
+  样板 / 罗列单元的 strength 打折并给关系与实体打 boilerplate 标记;值(1.3V、667 MHz)
+  不成节点、折成端点实体的属性描述;编号(Figure 5、001-79553)标 reference;合写名字
+  (A/B)拆到各段;类型体检把编号 / 样板占大头的类型整体降为 reference。
 """
 from __future__ import annotations
 
@@ -35,7 +29,6 @@ from typing import Any, Iterable
 
 from . import prompts
 from .resolution import is_identifier_like
-from ..limits import DOCUMENT_SCOPED_PARENTS
 from .extract import entity_key, normalize_name
 from .units import UNIT_KINDS, Unit
 
@@ -118,25 +111,62 @@ def merge_extractions(
     extractions: dict[str, dict[str, Any]],
     *,
     entity_types: Iterable[str] = (),
-    parent_types: dict[str, str] | None = None,
+    upper_parents: dict[str, str] | None = None,
+    type_parents: dict[str, str] | None = None,
+    type_scopes: dict[str, str] | None = None,
     allowed_ends: dict[str, tuple[set[str], set[str]]] | None = None,
     unit_kinds: dict[str, str] | None = None,
-    upper_parents: dict[str, str] | None = None,
     prior_pairs: Iterable[tuple[str, str, str]] = (),
+    exact_types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Combine the per-unit extraction results into one graph. Returns {"entities": [...], "relations": [...],
-    "stats": {...}}.
-    prior_pairs: endpoint combinations (predicate, source parent, target parent) already confirmed in the previous
-    schema version's account, passed directly this version (see relax_prior_pairs).
-    unit_kinds: the combined unit kinds (see combine_unit_kind); defaults to each unit's own structural kind.
-    upper_parents: {type: upper class}; entities of part / property / process types are scoped to the document
-    (the key carries doc_id), so tAS in two manuals is two nodes. Without it everything is global (old
-    behaviour)."""
-    parent_types = {str(k).casefold(): str(v) for k, v in (parent_types or {}).items()}
+    """把各单元的抽取结果合成一张图。返回 {"entities": [...], "relations": [...], "stats": {...}}。
+
+    实体身份(2026-10-24 改版,方案附录第 4 条):
+    · 先收齐一个名字在全库的所有提及,按类型众数定作用域(type_scopes 逐类型判定,没判定的按上层类默认;
+      单字符一类的符号名、按文档隔开的类型 → 每份文档一个节点)。
+      以前按每个单元自己的类型定,同一个名字在一份文档里能同时成为全局节点和文档内节点。
+    · 事件按名字定:名字里带日期(年份、年月、月日)的跨文档认同一个(「2026-03-14 设计评审」在纪要和周报里是同一场);
+      不带日期的事件出现在几份日期不同的文档里,多半是同名的几次(每年的「健康体检」、每周的「例会」),每份文档各一个节点,
+      不管类型的作用域判的是什么(例如不同年份的同名事件,不能并成一次发生)。
+    · 全局的名字,如果有另一组上层类的提及占到 UPPER_SPLIT_MIN_SHARE、且来自至少 UPPER_SPLIT_MIN_DOCS 份文档,
+      认定是同名的两样东西(公司与它的同名产品),拆成两个节点,第二个的键带「||上层类」。组见 UPPER_GROUPS:
+      同组里的分歧(一个病名这里算病症、那里算风险因素;一项检测这里算过程、那里算指标)是同一个东西的类型噪声,
+      照旧按众数归到一个节点。
+    · 规则抽取的实体(代码、配置)保持各自的作用域(跨文件引用由 scope_doc 指到被引用的文件)。
+    upper_parents:{类型: 上层类};type_parents:{类型: 直接父类}(类型树,端点约束按整条链判);
+    prior_pairs:上一版模式版本账里已确认的端点组合 (谓词, 起点上层类, 终点上层类),这一版直接放行;
+    unit_kinds:合成后的单元类型(见 combine_unit_kind);没给就用单元自己的结构类型;
+    exact_types:规则抽取自己的类型 → 上层类(deterministic.UPPER),只用于规则抽取的实体 —— 模式里同名的类型
+    (产品的 module、报价里的 package)不受它影响。"""
+    from ..ontology import DEFAULT_SCOPE, UPPER_CLASSES, type_paths, upper_of_name
+
     allowed_ends = allowed_ends or {}
     known_types = {str(t).casefold() for t in entity_types}
-    scoped_types = {str(t).casefold() for t, up in (upper_parents or {}).items() if str(up) in DOCUMENT_SCOPED_PARENTS}
-    upper_of = {str(t).casefold(): str(up) for t, up in (upper_parents or {}).items()}
+    upper_of_type = {str(t).casefold(): str(up) for t, up in (upper_parents or {}).items()}
+    tree = {str(k): str(v) for k, v in (type_parents or {}).items()}
+    for t, up in (upper_parents or {}).items():
+        tree.setdefault(str(t), str(up))
+    paths = type_paths(tree)
+    scope_of_type = {str(t).casefold(): str(s) for t, s in (type_scopes or {}).items()}
+
+    def upper_for(etype: str) -> str:
+        """类型 → 上层类:按类型表;类型表外的名字(模型说不出具体类型时退回写上层类名,或写了 standard、method
+        这类同义词)按本体认,认不出才算实体(10-24 真机:表外的 concept 全被当成了实体)。"""
+        key = str(etype or "").casefold()
+        return upper_of_type.get(key) or (paths.get(key) or [None])[-1] or upper_of_name(key) or "entity"
+
+    def path_for(etype: str) -> list[str]:
+        key = str(etype or "").casefold()
+        if not key:
+            return ["entity"]
+        return paths.get(key) or ([key] if key in UPPER_CLASSES else [key, upper_for(etype)])
+
+    def scope_for(etype: str) -> str:
+        key = str(etype or "").casefold()
+        return scope_of_type.get(key) or DEFAULT_SCOPE.get(upper_for(etype), "global")
+
+    exact_upper = {str(t).casefold(): str(u) for t, u in (exact_types or {}).items()}
+
     kind_of = {u.unit_id: str((unit_kinds or {}).get(u.unit_id) or u.kind or "body") for u in units}
     entities: dict[str, dict[str, Any]] = {}
     relations: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -145,7 +175,7 @@ def merge_extractions(
         "schema_drift_types", "schema_drift_predicates", "type_violations",
         "boilerplate_units", "listing_units", "boilerplate_relations", "boilerplate_entities",
         "value_entities_dropped", "value_relations_folded", "reference_entities", "reference_relations",
-        "combined_names_split", "demoted_types")})
+        "combined_names_split", "demoted_types", "homonyms_split")})
     unit_order = {u.unit_id: u.order for u in units}
     # Source label of each description (file name + axis value): the summary prompt gets JSON lines, and claims
     # from different sources / times must be attributed side by side
@@ -157,43 +187,118 @@ def merge_extractions(
         elif kind == "listing":
             stats["listing_units"] += 1
 
+    # ── 第一遍:收齐每个名字的提及(模型抽取的按名字分组;规则抽取的各自定键)──
+    present: list[tuple[Unit, dict[str, Any]]] = []
+    votes: dict[str, Counter] = {}
+    surfaces: dict[str, Counter] = {}
+    upper_docs: dict[str, dict[str, set[str]]] = {}
+    doc_dates: dict[str, set[str]] = {}         # 名字 → 提到它的文档的日期(判不带日期的事件是不是同名的几次)
     for unit in units:
         result = extractions.get(unit.unit_id)
         if not result:
             stats["units_without_extraction"] += 1
             continue
+        present.append((unit, result))
+        for e in result.get("entities") or []:
+            if e.get("exact"):
+                continue
+            base = entity_key(str(e.get("name") or ""))
+            if not base:
+                continue
+            n = int(e.get("mentions") or 1)
+            surfaces.setdefault(base, Counter())[normalize_name(str(e.get("name") or ""))] += n
+            if getattr(unit, "doc_date", ""):
+                doc_dates.setdefault(base, set()).add(str(unit.doc_date))
+            for t, c in (e.get("types") or {str(e.get("type") or ""): 1}).items():
+                if t:
+                    votes.setdefault(base, Counter())[str(t)] += int(c) if e.get("types") else n
+                    upper_docs.setdefault(base, {}).setdefault(upper_for(str(t)), set()).add(unit.doc_id)
+
+    decided: dict[str, dict[str, Any]] = {}
+    for base, counter in votes.items():
+        etype = _majority(counter, known_types)
+        upper = upper_for(etype)
+        name = surfaces[base].most_common(1)[0][0] if surfaces.get(base) else base     # 符号名的判定看写法(AA 全局、aa 文档内)
+        scope = "document" if symbol_like_name(name) else scope_for(etype)
+        if upper == "event":
+            if _DATED_NAME_RE.search(name):
+                scope = "global"
+            elif len(doc_dates.get(base, ())) > 1:
+                scope = "document"
+        split: set[str] = set()
+        if scope == "global":
+            total = sum(counter.values()) or 1
+            by_group: Counter = Counter()
+            first_upper: dict[str, str] = {}
+            for t, c in counter.most_common():
+                up = upper_for(t)
+                by_group[UPPER_GROUP.get(up, up)] += c
+                first_upper.setdefault(UPPER_GROUP.get(up, up), up)
+            own = UPPER_GROUP.get(upper, upper)
+            for group, c in by_group.items():
+                up = first_upper[group]
+                docs = set().union(*(upper_docs.get(base, {}).get(u, set()) for u in UPPER_GROUP_MEMBERS.get(group, (group,))))
+                if group != own and c / total >= UPPER_SPLIT_MIN_SHARE and len(docs) >= UPPER_SPLIT_MIN_DOCS:
+                    split.add(up)
+        if split:
+            stats["homonyms_split"] += len(split)
+        decided[base] = {"scope": scope, "upper": upper, "split": split}
+
+    def key_for(base: str, etype: str, doc_id: str) -> tuple[str, str]:
+        """(键, 作用域 doc_id 或 "")。"""
+        d = decided.get(base)
+        if d is None:
+            return base, ""
+        if d["scope"] == "document":
+            return scoped_key(base, doc_id), doc_id
+        up = upper_for(etype) if etype else d["upper"]
+        for other in d["split"]:
+            if UPPER_GROUP.get(up, up) == UPPER_GROUP.get(other, other):
+                return f"{base}{UPPER_KEY_SEPARATOR}{other}", ""
+        return base, ""
+
+    # ── 第二遍:按定好的键合并 ──
+    for unit, result in present:
         kind = kind_of.get(unit.unit_id, "body")
         # Keys (with scope) of this unit's names; relation endpoints use the same table so both sides agree on keys
         keys_in_unit: dict[str, str] = {}
-
-        def key_for(name: str, etype: str, scope_doc: str | None = None) -> str:
-            # scope_doc: an entity referenced across files in deterministic extraction (file A calls a function of
-            # file B) belongs to file B's scope
-            base = entity_key(name)
-            if not base:
-                return ""
-            if str(etype or "").casefold() in scoped_types or symbol_like_name(name):
-                return scoped_key(base, scope_doc or unit.doc_id)
-            return base
-
+        ambiguous_keys: set[str] = set()
+        refs_in_unit: dict[tuple[str, str], str] = {}
         for e in result.get("entities") or []:
             # Keys are recomputed from the name rather than read from the stored extraction: once the
             # normalize_name rules change (e.g. LaTeX restoration), stored extractions still merge under the new
             # rules without re-extraction
             name = str(e.get("name") or "")
             etype = str(e.get("type") or "")
-            scope_doc = str(e.get("scope_doc") or "") or None
-            key = key_for(name, etype, scope_doc) or str(e.get("key") or "")
+            base = entity_key(name)
+            if e.get("exact"):
+                # 规则抽取:按自己的类型定作用域;跨文件引用的实体属于被引用的那份文件
+                scope_doc = str(e.get("scope_doc") or "") or unit.doc_id
+                up = exact_upper.get(etype.casefold()) or upper_for(etype)
+                if base and (DEFAULT_SCOPE.get(up, "global") == "document" or symbol_like_name(name)):
+                    key, scope = scoped_key(base, scope_doc), scope_doc
+                else:
+                    key, scope = base, ""
+            elif base and e.get("identity"):
+                # 表格里同名不同编号的行(两个叫张三的员工):按编号各成一个节点,只写名字的提及不并进任何一个
+                key, scope = f"{base}{UPPER_KEY_SEPARATOR}{e['identity']}", ""
+            elif base:
+                key, scope = key_for(base, etype, unit.doc_id)
+            else:
+                key, scope = str(e.get("key") or ""), ""
             if not key:
                 continue
-            keys_in_unit[entity_key(name)] = key
+            if base in keys_in_unit and keys_in_unit[base] != key:
+                ambiguous_keys.add(base)
+            keys_in_unit[base] = key
+            if e.get("record_ref"):
+                refs_in_unit[(base, str(e["record_ref"]))] = key
             slot = entities.get(key)
             if slot is None:
                 slot = entities[key] = {
                     "key": key, "surface": Counter(), "types": Counter(), "descriptions": [], "description_sources": [],
-                    "frequency": 0, "unit_ids": [], "doc_ids": [], "kinds": Counter(),
-                    "scope": key.rsplit(SCOPE_SEPARATOR, 1)[0] if SCOPE_SEPARATOR in key else "",
-                    "exact": False, "aliases": [],
+                    "frequency": 0, "unit_ids": [], "doc_ids": [], "kinds": Counter(), "scope": scope,
+                    "exact": False, "aliases": [], "kind_votes": Counter(), "external_ids": [],
                 }
             if e.get("exact"):
                 slot["exact"] = True
@@ -201,11 +306,17 @@ def merge_extractions(
                 a = normalize_name(str(a))
                 if a and a not in slot["aliases"]:
                     slot["aliases"].append(a)
+            for x in e.get("external_ids") or []:
+                if isinstance(x, dict) and x.get("value") and x not in slot["external_ids"]:
+                    slot["external_ids"].append({"scheme": str(x.get("scheme") or ""), "value": str(x["value"])})
             slot["kinds"][kind] += 1
-            slot["surface"][normalize_name(str(e.get("name") or ""))] += int(e.get("mentions") or 1)
-            for t, n in (e.get("types") or {str(e.get("type") or ""): 1}).items():
+            slot["surface"][normalize_name(name)] += int(e.get("mentions") or 1)
+            for t, n in (e.get("types") or {etype: 1}).items():
                 if t:
                     slot["types"][str(t)] += int(n)
+            ek = str(e.get("kind") or "").strip().lower()
+            if ek in ENTITY_KINDS:
+                slot["kind_votes"][ek] += int(e.get("mentions") or 1)
             for d in e.get("descriptions") or ([e["description"]] if e.get("description") else []):
                 d = str(d).strip()
                 if d and d not in slot["descriptions"]:
@@ -218,8 +329,14 @@ def merge_extractions(
                 slot["doc_ids"].append(unit.doc_id)
         for r in result.get("relations") or []:
             sb, tb = entity_key(str(r.get("source") or "")), entity_key(str(r.get("target") or ""))
-            sk = keys_in_unit.get(sb) or sb or str(r.get("source_key") or "")
-            tk = keys_in_unit.get(tb) or tb or str(r.get("target_key") or "")
+            def endpoint(base, field):
+                ref = str(r.get(field + "_ref") or "")
+                if ref:
+                    return refs_in_unit.get((base, ref), "")
+                if base in ambiguous_keys:
+                    return ""  # An ambiguous name is not an identity.
+                return keys_in_unit.get(base) or (key_for(base, "", unit.doc_id)[0] if base else "") or str(r.get(field + "_key") or "")
+            sk, tk = endpoint(sb, "source"), endpoint(tb, "target")
             predicate = str(r.get("predicate") or prompts.DEFAULT_PREDICATE)
             if not sk or not tk:
                 continue
@@ -239,16 +356,20 @@ def merge_extractions(
                     "source_key": sk, "target_key": tk, "predicate": predicate,
                     "directed": predicate != prompts.DEFAULT_PREDICATE,
                     "descriptions": [], "description_sources": [], "strength_sum": 0.0, "evidence": 0, "unit_ids": [],
-                    "predicate_raw": Counter(), "kinds": Counter(),
+                    "predicate_raw": Counter(), "kinds": Counter(), "doc_ids": [], "periods": Counter(),
                 }
             slot["kinds"][kind] += 1
             slot["strength_sum"] += float(r.get("strength") or 1.0) * UNIT_KIND_STRENGTH.get(kind, 1.0)
             if unit.unit_id not in slot["unit_ids"]:
                 slot["unit_ids"].append(unit.unit_id)
                 slot["evidence"] += 1
+            if unit.doc_id not in slot["doc_ids"]:
+                slot["doc_ids"].append(unit.doc_id)
             raw = str(r.get("predicate_raw") or "")
             if raw:
                 slot["predicate_raw"][raw] += 1
+            if r.get("valid_from") or r.get("valid_until"):
+                slot["periods"][(str(r.get("valid_from") or ""), str(r.get("valid_until") or ""))] += 1
             for d in descriptions:
                 if d not in slot["descriptions"]:
                     slot["descriptions"].append(d)
@@ -268,15 +389,23 @@ def merge_extractions(
         etype = _majority(slot["types"], known_types)
         if etype and etype.casefold() not in known_types and known_types:
             stats["schema_drift_types"] += 1
-        parent = parent_types.get(etype.casefold(), "") if etype else ""
         kinds = slot["kinds"]
         boilerplate_only = bool(kinds) and all(k == "boilerplate" for k in kinds)
         if boilerplate_only:
             stats["boilerplate_entities"] += 1
+        kv = slot["kind_votes"]
+        if slot.get("exact") and etype.casefold() in exact_upper:
+            upper, tpath = exact_upper[etype.casefold()], [etype.casefold(), exact_upper[etype.casefold()]]
+        else:
+            upper, tpath = (upper_for(etype), path_for(etype)) if etype else ("entity", ["entity"])
         entity_rows.append({
-            "key": key, "title": title, "type": etype, "parent_type": parent,
-            "upper": upper_of.get(etype.casefold(), "") if etype else "",
+            "key": key, "title": title, "type": etype,
+            "upper": upper,
+            "type_path": tpath,
             "scope": slot.get("scope") or "",
+            # 类与实例(方案第 13 条):提及里多数说是泛指的类别名才算 class,平手按实例
+            "kind": "class" if kv and kv.get("class", 0) > kv.get("instance", 0) else "instance",
+            "external_ids": slot["external_ids"],
             "descriptions": slot["descriptions"], "description_sources": slot["description_sources"], "description": "",
             "frequency": int(slot["frequency"]),
             "unit_ids": sorted(slot["unit_ids"], key=lambda u: unit_order.get(u, 0)),
@@ -296,8 +425,8 @@ def merge_extractions(
         violation = False
         ends = allowed_ends.get(rel["predicate"])
         if ends is not None:
-            src_ok = not ends[0] or "*" in ends[0] or (src["parent_type"] or "").casefold() in ends[0] or (src["type"] or "").casefold() in ends[0]
-            tgt_ok = not ends[1] or "*" in ends[1] or (tgt["parent_type"] or "").casefold() in ends[1] or (tgt["type"] or "").casefold() in ends[1]
+            src_ok = not ends[0] or "*" in ends[0] or any(t in ends[0] for t in src["type_path"])
+            tgt_ok = not ends[1] or "*" in ends[1] or any(t in ends[1] for t in tgt["type_path"])
             violation = not (src_ok and tgt_ok)
             if violation:
                 stats["type_violations"] += 1
@@ -308,6 +437,7 @@ def merge_extractions(
         boilerplate_only = bool(kinds) and all(k == "boilerplate" for k in kinds)
         if boilerplate_only:
             stats["boilerplate_relations"] += 1
+        period = rel["periods"].most_common(1)[0][0] if rel["periods"] else ("", "")
         relation_rows.append({
             "source_key": rel["source_key"], "target_key": rel["target_key"],
             "source": src["title"], "target": tgt["title"],
@@ -315,6 +445,9 @@ def merge_extractions(
             "descriptions": rel["descriptions"], "description_sources": rel["description_sources"], "description": "",
             "strength_sum": round(float(rel["strength_sum"]), 3), "evidence": int(rel["evidence"]),
             "unit_ids": sorted(rel["unit_ids"], key=lambda u: unit_order.get(u, 0)),
+            "doc_ids": list(rel["doc_ids"]),
+            # 关系的时间(方案附录第 3 条):原文写明的起止(抽取时按文档日期换算过);观察时间在 temporal 阶段按文档补
+            "valid_from": period[0], "valid_until": period[1],
             "type_violation": violation,
             "predicate_raw": _majority(raw) if raw else "",
             "boilerplate": boilerplate_only,
@@ -346,7 +479,7 @@ def merge_extractions(
     out_stats["demoted_type_names"] = []
     out_stats["noisy_type_names"] = demoted      # just a hint: these types have a high reference / boilerplate share, worth a look
     # Endpoint constraint self-healing: when more than half of a predicate's edges are "violations", the
-    # constraint itself is wrong (health KB: recommends 527/527 violations); flagging them is meaningless and drags
+    # constraint itself is wrong (evaluation: 527/527 violations under one predicate); flagging them is meaningless and drags
     # scores down, so this version relaxes it and notes it in the report
     # Check the account first: endpoint combinations confirmed by a previous build pass directly, without having to
     # reach the threshold again every version (the same for appends, small KBs and corpus jitter); it runs before
@@ -360,8 +493,7 @@ def merge_extractions(
     if relaxed:
         out_stats["endpoints_relaxed"] = relaxed
         print(f"[graph] predicate endpoint constraints relaxed (violation ratio > {RELAX_ENDPOINTS_RATIO:.0%}): {relaxed}", flush=True)
-    # Then relax per "predicate × endpoint parent pair": below the half mark, but one endpoint pair concentrates
-    # the violations (entity → property under associated_with)
+    # 再按「谓词 × 端点上层类对」放行:没过半、但某一对端点集中越界的(associated_with 的 entity → property)
     relaxed_pairs = relax_bad_endpoint_pairs(relation_rows, entity_rows)
     if relaxed_pairs:
         out_stats["endpoint_pairs_relaxed"] = relaxed_pairs
@@ -377,10 +509,58 @@ def merge_extractions(
     out_stats["endpoint_observed"] = endpoint_observation(relation_rows, entity_rows, relaxed=relaxed, relaxed_pairs=all_pairs,
                                                           known_types=known_types)
     out_stats["scoped_entities"] = sum(1 for e in entity_rows if e.get("scope"))
+    out_stats["class_entities"] = sum(1 for e in entity_rows if e.get("kind") == "class")
     return {"entities": entity_rows, "relations": relation_rows, "stats": out_stats}
 
 
+def _linkable_id(value: str) -> bool:
+    """能拿来对正文提及的外部编号:带数字,且带字母或至少四位(R04、F12、CUST-0091、10086);纯短数字不认。"""
+    v = str(value or "").strip()
+    return 2 <= len(v) <= 40 and any(ch.isdigit() for ch in v) and (any(ch.isalpha() for ch in v) or len(v) >= 4)
+
+
+def link_external_ids(entities: list[dict[str, Any]], relations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """正文或别的表里直接写编号的提及(「关联场景:R04、R08」)并到带这个编号的实体上:名字或别名与某个外部编号完全相同、
+    且全库只有一个实体带这个编号才并(两个实体同号就不知道指谁)。规则,不调模型;编号不同的绝不合并由
+    resolution.merge_entities 保证。"""
+    from .resolution import merge_entities
+
+    by_value: dict[str, list[int]] = {}
+    for i, e in enumerate(entities):
+        for x in e.get("external_ids") or []:
+            v = str((x or {}).get("value") or "").strip()
+            if _linkable_id(v):
+                by_value.setdefault(v.casefold(), [])
+                if i not in by_value[v.casefold()]:
+                    by_value[v.casefold()].append(i)
+    pairs: list[tuple[int, int]] = []
+    for j, e in enumerate(entities):
+        if e.get("external_ids") or e.get("exact"):
+            continue
+        for n in [str(e.get("title") or "")] + [str(a) for a in (e.get("aliases") or [])]:
+            hits = by_value.get(n.strip().casefold())
+            if hits and len(hits) == 1 and hits[0] != j:
+                pairs.append((hits[0], j))
+                break
+    if not pairs:
+        return entities, relations, {"external_id_mentions_linked": 0}
+    merged, rels, _ = merge_entities(entities, relations, pairs)
+    return merged, rels, {"external_id_mentions_linked": len(pairs)}
+
+
 SCOPE_SEPARATOR = "::"
+# 同名不同上层类拆开时,第二个节点的键:规范名 + 分隔符 + 上层类(规范名里几乎不会出现 ||)
+UPPER_KEY_SEPARATOR = "||"
+UPPER_SPLIT_MIN_SHARE = 0.2
+UPPER_SPLIT_MIN_DOCS = 2
+# 判同名两样东西时的上层类分组:人员与组织、具体的东西(实体 / 部件 / 文档)、抽象的东西(概念 / 属性 / 过程 / 事件)。
+# 组与组之间的分歧是真的两样东西(公司与同名产品、产品与同名概念),组内的分歧是同一个东西的类型噪声
+UPPER_GROUP_MEMBERS = {"agent": ("agent",), "thing": ("entity", "part", "document"),
+                       "abstract": ("concept", "property", "process", "event")}
+UPPER_GROUP = {u: g for g, members in UPPER_GROUP_MEMBERS.items() for u in members}
+ENTITY_KINDS = ("instance", "class")
+# 名字里带日期:单独的年份(2024 年体检、2024 Q3 review)、2026-03-14、2026/3/14、2026.03、2026年3月14日、3月14日
+_DATED_NAME_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)|\d{1,2}\s*月\s*\d{1,2}\s*日")
 
 
 _SYMBOL_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
@@ -389,7 +569,7 @@ _SYMBOL_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 def symbol_like_name(name: str) -> bool:
     """A single non-CJK character (variables A, r, σ), or two characters including a lower-case letter / digit /
     symbol (x0, r1, σ2): such names are not the same thing in two books, so they only become nodes within a
-    document (2026-09-12 library KB: A, C, r, N were merged into global entities across four subject
+    document (2026-09-12 evaluation: A, C, r, N were merged into global entities across four subject
     directories). Two-letter upper-case abbreviations (OA, IM, WB) stay global."""
     text = normalize_name(str(name or ""))
     if not text or _SYMBOL_CJK_RE.search(text):
@@ -469,10 +649,10 @@ RELAX_ENDPOINTS_RATIO = 0.5
 RELAX_ENDPOINTS_MIN_EDGES = 20
 # Relax per "predicate × endpoint parent pair": when one pair of endpoint parents accumulates enough violating
 # edges under a predicate, and a non-trivial share of that predicate's edges, it is stable usage rather than a
-# sporadic error (health KB: 119 entity → property edges under associated_with); the constraint was too narrow,
+# sporadic error (evaluation: 119 entity → property edges under one predicate); the constraint was too narrow,
 # so that pair is released
 RELAX_PAIR_MIN_EDGES = 20
-RELAX_PAIR_RATIO = 0.05      # 20 edges is the main bar; the ratio only guards fragments under big predicates (health KB: process → process 38/407 under part_of is stable usage too)
+RELAX_PAIR_RATIO = 0.05      # 20 edges is the main bar; the ratio only guards fragments under big predicates (evaluation: process → process 38/407 under one predicate is stable usage too)
 
 
 def relax_bad_endpoints(relations: list[dict[str, Any]], *, ratio: float = RELAX_ENDPOINTS_RATIO,
@@ -497,7 +677,8 @@ def relax_bad_endpoints(relations: list[dict[str, Any]], *, ratio: float = RELAX
 
 
 def _parent_of(entities: list[dict[str, Any]]) -> dict[str, str]:
-    return {e["key"]: (str(e.get("parent_type") or e.get("upper") or "").casefold() or "-") for e in entities}
+    """端点账与放行按上层类记(八个固定的类,跨版本可比);谓词约束里写的是上层类。"""
+    return {e["key"]: (str(e.get("upper") or "").casefold() or "-") for e in entities}
 
 
 def relax_bad_endpoint_pairs(relations: list[dict[str, Any]], entities: list[dict[str, Any]], *,
@@ -745,8 +926,11 @@ def admit_entities(entities: list[dict[str, Any]], relations: list[dict[str, Any
 
 def dissolve_combined_names(entities: list[dict[str, Any]], relations: list[dict[str, Any]]
                             ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-    """Compound names like "A/B" get no combined node when both parts are already entities: relations attach to
-    each part, and mentions and descriptions merge into them."""
+    """同类实体的「A/B」并列名可拆开;类型不同的前缀/名称不能据斜杠推定为并列。
+
+    例如组织/产品、作者/作品:把后者的描述和关系复制给前者会制造错误别名。
+    不确定的合写名保留,交给后续实体归并判断,不丢掉原始证据。
+    """
     by_key = {e["key"]: e for e in entities}
     split: dict[str, list[str]] = {}
     for e in entities:
@@ -756,7 +940,12 @@ def dissolve_combined_names(entities: list[dict[str, Any]], relations: list[dict
         parts = [p.strip() for p in title.split("/")]
         scope = str(e.get("scope") or "")
         keys = [scoped_key(entity_key(p), scope) if scope else entity_key(p) for p in parts]
-        if len(parts) >= 2 and all(len(p) >= 3 for p in parts) and all(k in by_key and k != e["key"] for k in keys):
+        # 拆成同名异类的那一个(键带 ||上层类)也认:合写名的上层类与它一致时
+        keys = [k if k in by_key else f"{k}{UPPER_KEY_SEPARATOR}{e.get('upper')}" for k in keys]
+        if (len(parts) >= 2 and all(len(p) >= 3 for p in parts)
+                and all(k in by_key and k != e["key"] for k in keys)
+                and all((by_key[k].get("type"), by_key[k].get("upper"), by_key[k].get("scope"))
+                        == (e.get("type"), e.get("upper"), e.get("scope")) for k in keys)):
             split[e["key"]] = keys
     if not split:
         return entities, relations, 0

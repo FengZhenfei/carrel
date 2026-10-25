@@ -58,6 +58,51 @@ class ExtractionSchema:
     # subject types from the scenario profile (what a document is "about"); unused by extraction itself, used by
     # the view layer after the build
     subject_types: tuple[str, ...] = ()
+    # 类型树({类型: 直接父类},父类是上层类或另一个类型)与逐类型作用域(global / document)
+    type_parents: dict[str, str] = field(default_factory=dict)
+    type_scopes: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_model(cls, model: dict[str, Any], *, examples: str = "") -> "ExtractionSchema":
+        """ontology 的模式字典 → 抽取用的 schema(模式阶段生成示例、测试用;建图走 build.extraction_schema_for)。"""
+        from ..ontology import expand_model
+
+        eff = expand_model(model or {})
+        return cls(entity_types=tuple(eff["graph_entity_types"] or ()), predicates=tuple(eff["graph_predicates"] or ()),
+                   language=str(eff["graph_language"] or "English"), parent_types=dict(eff["graph_parent_types"] or {}),
+                   type_definitions=dict(eff["graph_type_definitions"] or {}), examples=examples,
+                   subject_types=tuple((eff["graph_profile"] or {}).get("subject_types") or ()),
+                   type_parents=dict(eff["graph_type_parents"] or {}), type_scopes=dict(eff["graph_type_scopes"] or {}))
+
+    def type_path(self, type_name: str) -> list[str]:
+        """[类型, 父类, …, 上层类](casefold):端点约束、按祖先查询都按这条链判。表外的类型只有它自己 + entity。"""
+        from ..ontology import UPPER_CLASSES
+
+        key = str(type_name or "").strip().casefold()
+        paths = self._paths()
+        if key in paths:
+            return paths[key]
+        upper = str((self.parent_types or {}).get(type_name) or "").casefold()
+        tail = [upper] if upper in UPPER_CLASSES else ["entity"]
+        return [key] + [t for t in tail if t != key]
+
+    def _paths(self) -> dict[str, list[str]]:
+        cached = self.__dict__.get("_paths_cache")
+        if cached is None:
+            from ..ontology import type_paths
+
+            tree = dict(self.type_parents or {})
+            for t, upper in (self.parent_types or {}).items():
+                tree.setdefault(t, upper)
+            cached = type_paths(tree)
+            object.__setattr__(self, "_paths_cache", cached)
+        return cached
+
+    def endpoint_ok(self, type_name: str, ends: set[str]) -> bool:
+        """端点约束:没有约束、"*"、或者类型链上任何一级(类型本身、父类、上层类)在允许的集合里。"""
+        if not ends or "*" in ends:
+            return True
+        return any(t in ends for t in self.type_path(type_name))
 
     @property
     def predicate_names(self) -> tuple[str, ...]:
@@ -166,8 +211,8 @@ def entity_key(name: str) -> str:
     return normalize_name(name).casefold()
 
 
-# ── Entity-name validity gate (2026-09-12 spot check of five KBs: the library KB turned formula fragments, SQL
-#    statements and whole questionnaire sentences into entity names) ──
+# ── Entity-name validity gate: code fragments, equations and whole questions
+# are not entity names. The gate checks form rather than topic. ──
 _NAME_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _NAME_WORD_RE = re.compile(r"[\w\u4e00-\u9fff]")
 _CODE_STMT_RE = re.compile(r"^(select|insert|update|delete|create|alter|drop|with)\b", re.IGNORECASE)
@@ -285,7 +330,9 @@ def type_menu(schema: ExtractionSchema) -> str:
     items: list[str] = []
     for t in schema.entity_types:
         definition = str((schema.type_definitions or {}).get(t) or "").strip().rstrip(".")
-        parent = str((schema.parent_types or {}).get(t) or "").strip()
+        parent = str((schema.type_parents or {}).get(t) or (schema.parent_types or {}).get(t) or "").strip()
+        if parent == t:
+            parent = ""                      # 上层类直接当类型用:没有更上一层
         head = f"{t}: {definition}" if definition else t
         items.append(f"{head} (parent: {parent})" if parent else head)
     return "; ".join(items)
@@ -300,7 +347,7 @@ def record_caps(unit_kind: str | None, *, has_table: bool = False) -> tuple[int,
 
 
 def render_extract_prompt(unit_text: str, *, section: str, schema: ExtractionSchema, document: str = "",
-                          unit_kind: str | None = None, has_table: bool = False) -> str:
+                          unit_kind: str | None = None, has_table: bool = False, document_date: str = "") -> str:
     total, entities = record_caps(unit_kind, has_table=has_table)
     return prompts.GRAPH_EXTRACTION_PROMPT.format(
         entity_types=type_menu(schema),
@@ -308,6 +355,8 @@ def render_extract_prompt(unit_text: str, *, section: str, schema: ExtractionSch
         language=schema.language or "English",
         examples=(schema.examples or "").strip() or prompts.DEFAULT_EXAMPLES,
         document=document or "(unknown)",
+        # 文档日期(方案第 6 条):「下周」「月底」、缺年份的日期按它换算,事件名字带上日期
+        document_date=document_date or "(unknown)",
         section=section or "(no section)",
         max_records=int(total), max_entities=int(entities),
         input_text=unit_text,
@@ -324,6 +373,34 @@ def _split_records(text: str) -> list[str]:
         m = RECORD_RE.match(raw)
         records.append(m.group(1) if m else raw)
     return records
+
+
+ENTITY_KINDS = ("instance", "class")
+# 关系的起止:start..end,两边各是 YYYY / YYYY-MM / YYYY-MM-DD,可以缺一边;只写一个日期当起点
+_PERIOD_SPLIT_RE = re.compile(r"\s*(?:\.\.|…|～|~|至|到|—|–|\bto\b)\s*", re.IGNORECASE)
+
+
+def parse_period(value: str) -> tuple[str, str] | None:
+    """关系记录的最后一段 → (valid_from, valid_until);看不出是时间段返回 None(那一段是描述的一部分)。空串是「没写时间」。"""
+    from .temporal import parse_date
+
+    text = str(value or "").strip().strip("\"'“”‘’")
+    if text in ("", "-", "—", "none", "None", "null", "N/A", "n/a"):
+        return ("", "")
+    parts = _PERIOD_SPLIT_RE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        a, b = parts
+        start = parse_date(a) if a.strip() else ""
+        end = parse_date(b) if b.strip() else ""
+        if (a.strip() and not start) or (b.strip() and not end) or not (start or end):
+            return None
+        if start and end and start > end:
+            start, end = end, start
+        return (start or "", end or "")
+    only = parse_date(text)
+    if only and len(text) <= 12:
+        return (only, "")
+    return None
 
 
 def _strength(value: str) -> float:
@@ -388,9 +465,14 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
             if canonical is None:
                 stats["unknown_types"] += 1
                 canonical = raw_type.lower()
+            rest = fields[3:]
+            kind_value = ""
+            if len(rest) >= 2 and rest[-1].strip().strip("\"'“”‘’").lower() in ENTITY_KINDS:
+                kind_value = rest[-1].strip().strip("\"'“”‘’").lower()
+                rest = rest[:-1]
             entities.append({
                 "name": name, "type": canonical, "type_raw": raw_type,
-                "description": " ".join(fields[3:]).strip(),
+                "description": " ".join(rest).strip(), "kind": kind_value or "instance",
             })
         elif kind == "relationship":
             if len(fields) < 5:
@@ -398,10 +480,17 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                 continue
             source = normalize_name(fields[1])
             target = normalize_name(fields[2])
-            if len(fields) >= 6:
+            period = None
+            if len(fields) >= 7 and _STRENGTH_RE.fullmatch(fields[-2].strip() or "x"):
+                period = parse_period(fields[-1])
+            if period is not None:
+                # 新格式:… 描述 <|> 强度 <|> 起止
+                predicate_raw, description, strength = fields[3], " ".join(fields[4:-2]).strip(), fields[-2]
+            elif len(fields) >= 6:
                 predicate_raw, description, strength = fields[3], " ".join(fields[4:-1]).strip(), fields[-1]
             else:
                 predicate_raw, description, strength = "", fields[3], fields[4]
+            valid_from, valid_until = period or ("", "")
             if not source or not target:
                 stats["malformed"] += 1
                 continue
@@ -418,10 +507,17 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                         predicate = normalize_predicate(predicates[predicate])
             else:
                 predicate = prompts.DEFAULT_PREDICATE
+            from ..ontology import INVERSE_PREDICATES
+
+            inverse = INVERSE_PREDICATES.get(normalize_predicate(predicate_raw))
+            if inverse and (not predicates or inverse in predicates):
+                # follows(A, B) = precedes(B, A):事件关系只留一个方向
+                source, target, predicate = target, source, inverse
             relations.append({
                 "source": source, "target": target, "predicate": predicate,
                 "predicate_raw": normalize_predicate(predicate_raw),
                 "description": description, "strength": _strength(strength),
+                "valid_from": valid_from, "valid_until": valid_until,
             })
         else:
             stats["malformed"] += 1
@@ -438,10 +534,13 @@ def consolidate(entities: list[dict[str, Any]], relations: list[dict[str, Any]])
         if slot is None:
             slot = by_key[key] = {
                 "name": e["name"], "key": key, "type": e["type"], "descriptions": [], "mentions": 0,
-                "types": {},
+                "types": {}, "kinds": {},
             }
         slot["mentions"] += 1
         slot["types"][e["type"]] = slot["types"].get(e["type"], 0) + 1
+        kind = str(e.get("kind") or "instance")
+        slot["kinds"][kind] = slot["kinds"].get(kind, 0) + 1
+        slot["kind"] = "class" if slot["kinds"].get("class", 0) > slot["kinds"].get("instance", 0) else "instance"
         desc = str(e.get("description") or "").strip()
         if desc:
             _absorb_description(slot["descriptions"], desc)
@@ -457,8 +556,14 @@ def consolidate(entities: list[dict[str, Any]], relations: list[dict[str, Any]])
                 "source": r["source"], "target": r["target"], "source_key": sk, "target_key": tk,
                 "predicate": r["predicate"], "predicate_raw": r.get("predicate_raw", ""),
                 "descriptions": [], "strength": float(r.get("strength") or 1.0),
+                "valid_from": "", "valid_until": "",
             }
         slot["strength"] = max(slot["strength"], float(r.get("strength") or 1.0))
+        # 同一单元里重复的关系:起止取写明了的那条(补漏轮常补上首轮没写的时间)
+        if not slot["valid_from"] and r.get("valid_from"):
+            slot["valid_from"] = str(r["valid_from"])
+        if not slot["valid_until"] and r.get("valid_until"):
+            slot["valid_until"] = str(r["valid_until"])
         desc = str(r.get("description") or "").strip()
         if desc:
             _absorb_description(slot["descriptions"], desc)
@@ -486,14 +591,12 @@ def prompt_hash() -> str:
 
 
 def extraction_fingerprint(spec: LLMSpec, schema: ExtractionSchema, *, max_gleanings: int) -> str:
-    # the type menu (with definitions and parents), the KB's few-shot examples and the per-kind caps all go into
-    # the fingerprint -- they are all in the prompt, so changing them invalidates the cache; the predicate menu is
-    # still hashed in its full prompt form (name + description + endpoints).
-    # The version label follows the stored output: from extract-v6 on, names are only restored when they are
-    # recognisably LaTeX
+    # 类型菜单(含定义与父类)、本库 few-shot、按单元类型的上限都进指纹 —— 它们都在提示词里,
+    # 改了缓存就失效;谓词清单仍按提示词里的完整形态(名字 + 描述 + 端点)算。
+    # 版本标签跟着落库的产出走:extract-v6 起名字只在看得出是 LaTeX 时才还原;extract-v7 起实体带类与实例、关系带起止
     caps = ",".join(f"{k}={v[0]}/{v[1]}" for k, v in sorted(RECORD_CAPS.items())) + f",table={RECORD_CAPS_TABLE_BODY[0]}/{RECORD_CAPS_TABLE_BODY[1]}"
     raw = "|".join([
-        "extract-v6", spec.model_id, spec.protocol,
+        "extract-v7", spec.model_id, spec.protocol,
         type_menu(schema), predicate_menu(schema), schema.language or "",
         hashlib.sha256((schema.examples or "").encode("utf-8")).hexdigest()[:16], caps,
         str(int(max_gleanings)), str(GLEANING_MIN_TOKENS), prompt_hash(),
@@ -535,7 +638,8 @@ class GraphExtractor:
         has_table = any(str(b).lower() == "table" for b in (unit.block_types or []))
         # wide tables are shown to the model as "column: value" pairs (tabletext): the model miscounts columns in rows of a dozen cells
         prompt = render_extract_prompt(expand_wide_tables(unit.text) or unit.text, section=unit.section_label, schema=self.schema,
-                                       document=unit.document_label, unit_kind=unit.kind, has_table=has_table)
+                                       document=unit.document_label, unit_kind=unit.kind, has_table=has_table,
+                                       document_date=str(getattr(unit, "doc_date", "") or ""))
         messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
         entities: list[dict[str, Any]] = []
         relations: list[dict[str, Any]] = []

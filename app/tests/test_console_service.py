@@ -14,7 +14,7 @@ from kb_pipeline import db
 from kb_pipeline.graph.llm import LLMCache
 from kb_pipeline.models import KBSource
 
-from _support import _CodexFinalTestsSupport, _repo_file
+from _support import _CodexFinalTestsSupport, _repo_file, _schema_entry
 
 
 class StopSemanticsTests(unittest.TestCase):
@@ -160,8 +160,8 @@ class SchemaVersionSelectionTests(unittest.TestCase):
 
     def _current(self):
         return {"graph_schema_versions": [
-            {"id": "v2", "entity_types": ["alpha", "beta"], "language": "English"},
-            {"id": "v1", "entity_types": ["甲"], "language": "Chinese"},
+            _schema_entry("v2", ["alpha", "beta"], language="English"),
+            _schema_entry("v1", [("甲", "agent"), ("乙", "甲")], language="Chinese"),
         ]}
 
     def test_selecting_a_version_expands_to_the_effective_values(self) -> None:
@@ -169,13 +169,23 @@ class SchemaVersionSelectionTests(unittest.TestCase):
 
         updates = {"graph_schema_active": "v1"}
         _apply_schema_version(self._current(), updates)
-        self.assertEqual(updates["graph_entity_types"], ["甲"])
+        self.assertEqual(updates["graph_entity_types"], ["甲", "乙"])
         self.assertEqual(updates["graph_language"], "Chinese")
+        self.assertEqual(updates["graph_parent_types"], {"甲": "agent", "乙": "agent"})    # 多层:乙属于甲,上层类沿链取
+        self.assertEqual(updates["graph_type_parents"], {"甲": "agent", "乙": "甲"})
         self.assertEqual(updates["graph_schema_active"], "v1")
 
-    def test_the_legacy_placeholder_changes_nothing(self) -> None:
-        """The fallback entry for legacy knowledge bases is not a real selection: saving it must be a complete
-        no-op, otherwise merely opening the config page and clicking save would rewrite the labels."""
+    def test_a_version_whose_linkml_is_broken_is_refused(self) -> None:
+        from kb_server.service import _apply_schema_version
+
+        with self.assertRaises(ValueError) as ctx:
+            _apply_schema_version({"graph_schema_versions": [{"id": "v9", "linkml": {"classes": {"a": {"is_a": "b"}, "b": {"is_a": "a"}}}}]},
+                                  {"graph_schema_active": "v9"})
+        self.assertIn("v9", str(ctx.exception))
+
+    def test_the_noop_selection_changes_nothing(self) -> None:
+        """CURRENT_SCHEMA_VERSION_ID 是「维持现状」:保存它必须是彻底的 no-op,
+        否则光是打开配置页再点保存就会重写模式。"""
         from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID
         from kb_server.service import _apply_schema_version
 
@@ -198,70 +208,6 @@ class SchemaVersionSelectionTests(unittest.TestCase):
         self.assertEqual(updates, {"graph_tune_sample_size": 20})
 
 
-class LegacyLabelsSurviveFirstExtractionTests(unittest.TestCase):
-    """The first extraction must not push out the labels that predate version management.
-
-    Those labels live only in graph_entity_types; the fallback entry the view gives them is read-only and never
-    stored. On 2026-08-24 kb_003 lost them exactly this way: the 14 labels the graph build actually used were
-    replaced by 10 freshly extracted ones, and could only be reconstructed from the web access log plus the
-    entity type distribution in Neo4j. Yet that was precisely the version most worth keeping -- the graph that
-    already existed was built with it.
-    """
-
-    def test_pre_version_labels_are_materialised_before_the_new_one_lands(self) -> None:
-        from kb_pipeline.limits import LEGACY_SCHEMA_VERSION_ID, push_schema_version
-        from kb_pipeline.graph.schema_flow import ring_with_legacy
-
-        stored = {"graph_entity_types": ["organization", "signal"], "graph_language": "Chinese"}
-        ring = ring_with_legacy(stored)
-        self.assertEqual(len(ring), 1)
-        self.assertEqual(ring[0]["id"], LEGACY_SCHEMA_VERSION_ID)
-        self.assertEqual(ring[0]["entity_types"], ["organization", "signal"])
-        self.assertEqual(ring[0]["language"], "Chinese")
-        # After a new version enters the ring, the old one is still there and can be selected again
-        after = push_schema_version(ring, {"id": "v2", "entity_types": ["x"]})
-        self.assertEqual([v["id"] for v in after], ["v2", LEGACY_SCHEMA_VERSION_ID])
-
-    def test_the_materialised_id_is_selectable_not_the_readonly_placeholder(self) -> None:
-        """The id used to materialise must be a real id. The placeholder id is treated on the save path as a
-        "keep as is" no-op -- materialising with it would put a version in the dropdown that does nothing
-        when selected."""
-        from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID, LEGACY_SCHEMA_VERSION_ID
-        from kb_pipeline.graph.schema_flow import ring_with_legacy
-        from kb_server.service import _apply_schema_version
-
-        self.assertNotEqual(LEGACY_SCHEMA_VERSION_ID, CURRENT_SCHEMA_VERSION_ID)
-        ring = ring_with_legacy({"graph_entity_types": ["signal"], "graph_language": "Chinese"})
-        updates = {"graph_schema_active": LEGACY_SCHEMA_VERSION_ID}
-        _apply_schema_version({"graph_schema_versions": ring}, updates)
-        self.assertEqual(updates["graph_entity_types"], ["signal"])
-        self.assertEqual(updates["graph_language"], "Chinese")
-
-    def test_metadata_is_left_blank_rather_than_invented(self) -> None:
-        """Nothing was recorded at the time. Inventing a plausible timestamp would make the whole version record
-        untrustworthy -- and the entire value of rolling back a version rests on it being trustworthy."""
-        from kb_pipeline.graph.schema_flow import ring_with_legacy
-
-        entry = ring_with_legacy({"graph_entity_types": ["signal"]})[0]
-        self.assertIsNone(entry["created_at"])
-        self.assertIsNone(entry["model"])
-        self.assertIsNone(entry["sample_size"])
-        self.assertTrue(entry["legacy"])
-
-    def test_an_existing_ring_is_left_alone(self) -> None:
-        from kb_pipeline.graph.schema_flow import ring_with_legacy
-
-        ring = [{"id": "v1", "entity_types": ["a"]}]
-        self.assertEqual(ring_with_legacy(
-            {"graph_schema_versions": ring, "graph_entity_types": ["b"]}), ring)
-
-    def test_a_kb_that_never_had_labels_gets_no_phantom_version(self) -> None:
-        from kb_pipeline.graph.schema_flow import ring_with_legacy
-
-        self.assertEqual(ring_with_legacy({}), [])
-        self.assertEqual(ring_with_legacy({"graph_entity_types": []}), [])
-
-
 class SchemaVersionContractTests(unittest.TestCase):
     def test_clients_cannot_write_the_version_ring(self) -> None:
         """The version ring is maintained by the server during extraction. If clients could write it, "when this
@@ -276,7 +222,12 @@ class SchemaVersionContractTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 422)
         with self.assertRaises(HTTPException):
             _reject_bad_config({"graph_schema_active": ["not", "a", "string"]})
-        _reject_bad_config({"graph_schema_active": "v1"})          # a normal value passes
+        _reject_bad_config({"graph_schema_active": "v1"})          # 正常值放行
+        # 模式字段是版本展开出来的派生值,不能绕过版本直接写
+        for key in ("graph_entity_types", "graph_parent_types", "graph_type_scopes", "graph_predicates", "graph_profile"):
+            with self.assertRaises(HTTPException) as ctx:
+                _reject_bad_config({key: ["x"]})
+                self.assertIn("is derived from", ctx.exception.detail)
 
     def test_labels_row_spans_the_right_grid_columns(self) -> None:
         """The dropdown takes column 1 (aligned with "Label extraction model"); the label box spans columns 2-4
@@ -289,14 +240,17 @@ class SchemaVersionContractTests(unittest.TestCase):
         self.assertIn('id="cfg-gver"', markup)
 
     def test_deleting_the_graph_also_clears_the_version_ring(self) -> None:
-        """Versions, like labels, are induced from this version of the corpus. Once the graph is deleted the
-        basis is gone; keeping a ring of old versions would only let someone pick a set of constraints of
-        unknown origin back from the dropdown."""
+        """版本和标签一样,都是从这一版语料归纳出来的。图删了依据就不在了,
+        留着一环旧版本只会让人从下拉框里选回一份来历不明的约束。"""
+        from kb_pipeline.limits import SCHEMA_EFFECTIVE_KEYS
+
         source = _repo_file("app/kb_pipeline/maintenance.py")
         body = source.split("def _drop_graph_data", 1)[1].split("\ndef ", 1)[0]
-        for key in ("graph_entity_types", "graph_language",
-                    "graph_schema_versions", "graph_schema_active"):
+        self.assertIn("**{key: None for key in SCHEMA_EFFECTIVE_KEYS}", body)
+        for key in ("graph_schema_versions", "graph_schema_active"):
             self.assertIn(f'"{key}": None', body, key)
+        for key in ("graph_entity_types", "graph_language", "graph_type_parents", "graph_type_scopes"):
+            self.assertIn(key, SCHEMA_EFFECTIVE_KEYS)
 
 
 class RebuildGateScopeTests(unittest.TestCase):
@@ -753,13 +707,12 @@ class SchemaVersionDeleteTests(unittest.TestCase):
     def _kb(self, tmp: str):
         from kb_pipeline import discovery
 
-        root = Path(tmp); (root / "产品资料").mkdir()
+        root = Path(tmp); (root / "Catalog Library").mkdir()
         state = root / "s.db"
         db.init_db(state)
-        ring = [{"id": f"v{n}", "created_at": n, "model": "M", "sample_size": 8,
-                 "language": "Chinese", "entity_types": [f"t{n}"]} for n in (3, 2, 1)]
+        ring = [_schema_entry(f"v{n}", [f"t{n}"], language="Chinese", created_at=n, model="M", sample_size=8) for n in (3, 2, 1)]
         with db.connect(state) as con:
-            src, _ = discovery.enroll(con, root, "产品资料")
+            src, _ = discovery.enroll(con, root, "Catalog Library")
             discovery.set_config(con, src.kb_id, {
                 "graph_entity_types": ["t3"], "graph_language": "Chinese",
                 "graph_schema_versions": ring, "graph_schema_active": "v3",
@@ -789,17 +742,6 @@ class SchemaVersionDeleteTests(unittest.TestCase):
                 self._call(state, kb_id, "v3")
             self.assertIn("version in effect", str(ctx.exception))
             self.assertEqual(len(self._ring(state, kb_id)), 3, "拒绝之后环不能被动过")
-
-    def test_the_readonly_placeholder_cannot_be_deleted(self) -> None:
-        """schema_versions_view fabricates a __current__ entry on the fly for old KBs without version records;
-        it is never stored -- deleting it would delete something that does not exist."""
-        from kb_pipeline.limits import CURRENT_SCHEMA_VERSION_ID
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state, kb_id = self._kb(tmp)
-            with self.assertRaises(ValueError) as ctx:
-                self._call(state, kb_id, CURRENT_SCHEMA_VERSION_ID)
-            self.assertIn("read-only view", str(ctx.exception))
 
     def test_unknown_id_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -869,7 +811,7 @@ class LlmDeletionDecouplingTests(unittest.TestCase):
     def _kb(self, tmp: str, graph_enabled: bool):
         from kb_pipeline import discovery
 
-        root = Path(tmp); (root / "产品资料").mkdir(exist_ok=True)
+        root = Path(tmp); (root / "Catalog Library").mkdir(exist_ok=True)
         state = root / "s.db"
         if not state.exists():
             db.init_db(state)
@@ -877,7 +819,7 @@ class LlmDeletionDecouplingTests(unittest.TestCase):
             for name in ("甲模型", "乙模型"):
                 db.upsert_llm(con, name=name, base_url="http://x/v1",
                               api_key="k", model_id=name)
-            src, _ = discovery.enroll(con, root, "产品资料")
+            src, _ = discovery.enroll(con, root, "Catalog Library")
             discovery.set_config(con, src.kb_id, {
                 "graph_enabled": graph_enabled,
                 "graph_llm": {"extract": "甲模型", "summarize": "乙模型", "tune": "甲模型"},
@@ -1186,9 +1128,9 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             state_db = root / "state.sqlite3"
             dbm.init_db(state_db)
             mirror = root / "mirror"
-            (mirror / "产品资料").mkdir(parents=True)
+            (mirror / "Catalog Library").mkdir(parents=True)
             with dbm.connect(state_db) as con:
-                source, outcome = discovery.enroll(con, mirror, "产品资料")
+                source, outcome = discovery.enroll(con, mirror, "Catalog Library")
                 con.commit()
             self.assertEqual(outcome, "new")
 
@@ -1201,10 +1143,9 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             with mock.patch.object(service, "settings", return_value=stub), \
                     mock.patch.object(service, "chunk_limits", return_value=limits):
                 got = service.get_kb_config(source.kb_id)
-                # The product-docs directory preset (auto rebuild 1m AND 20%) shows up in effective;
-                # graph_enabled has no preset, enabling the graph must be an explicit action
+                # Folder names do not supply a rebuild policy or enable graphs.
                 self.assertFalse(got["effective"]["graph_enabled"])
-                self.assertEqual(got["effective"]["graph_rebuild_interval"], "1m")
+                self.assertIsNone(got["effective"].get("graph_rebuild_interval"))
 
                 saved = service.update_kb_config(source.kb_id, {
                     "graph_rebuild_interval": "2w",
@@ -1213,12 +1154,11 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 })
                 self.assertEqual(saved["config"]["graph_rebuild_interval"], "2w")
 
-                # After clearing the key, effective falls back to the directory preset, matching the layering
-                # in build_source
+                # Clearing the interval returns to the same defaults for every folder.
                 service.update_kb_config(source.kb_id, {"graph_rebuild_interval": None})
                 got2 = service.get_kb_config(source.kb_id)
                 self.assertNotIn("graph_rebuild_interval", got2["config"])
-                self.assertEqual(got2["effective"]["graph_rebuild_interval"], "1m")
+                self.assertIsNone(got2["effective"].get("graph_rebuild_interval"))
 
                 with self.assertRaises(ValueError):
                     service.update_kb_config(source.kb_id, {"graph_rebuild_interval": "abc"})
@@ -1358,6 +1298,10 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             stub = mock.Mock()
             stub.state_db = state_db
             stub.mirror_root = mirror
+            stub.corrections_dir = root / "corrections"
+            # 整库初始化之前留下的同编号文件:新编号第一次开库时先挪开,不能套到新库上
+            stub.corrections_dir.mkdir()
+            (stub.corrections_dir / "kb_001.yaml").write_text("entities:\n  reject: [旧库的噪声]\n", encoding="utf-8")
             limits = {"embedding_max_model_len": 4096, "effective_max_model_len": 4096,
                       "max_tokens_cap": 3276, "max_tokens_min": 128, "cap_ratio": 0.8,
                       "overlap_rule": "", "live": False}
@@ -1380,6 +1324,17 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     saved = discovery.get_config(con, r["kb_id"])
                 self.assertEqual(saved["max_tokens"], 600)
                 self.assertEqual(saved["overlap_tokens"], 90)
+                # 开库即有这个库的更正文件模板;旧文件挪进了 orphaned/
+                template = (stub.corrections_dir / f"{r['kb_id']}.yaml").read_text(encoding="utf-8")
+                self.assertEqual(r["kb_id"], "kb_001")
+                self.assertIn("id: kb_001", template)
+                self.assertNotIn("旧库的噪声", template)
+                self.assertEqual(len(list((stub.corrections_dir / "orphaned").glob("kb_001-*.yaml"))), 1)
+                # 已开启的库再保存一次:手写的内容原样保留
+                (stub.corrections_dir / "kb_001.yaml").write_text("kb:\n  id: kb_001\nentities:\n  reject: [噪声]\n",
+                                                                  encoding="utf-8")
+                self.assertEqual(service.enroll("新目录", {"max_tokens": 600, "overlap_tokens": 90})["outcome"], "already")
+                self.assertIn("噪声", (stub.corrections_dir / "kb_001.yaml").read_text(encoding="utf-8"))
 
     def test_console_delete_kb_drops_everything(self) -> None:
         from unittest import mock
@@ -1414,6 +1369,9 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             stub.runtime_dir = root / "rt"
             stub.graph_work_dir = gw
             stub.cache_dir = root / "cache"
+            stub.corrections_dir = root / "corrections"
+            stub.corrections_dir.mkdir()
+            (stub.corrections_dir / f"{source.kb_id}.yaml").write_text("documents: []\n", encoding="utf-8")
             with mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()), \
                     mock.patch("kb_pipeline.vector.qdrant.delete_collection", return_value={"deleted": True}), \
                     mock.patch("kb_pipeline.search_fts.delete_collection", return_value={"deleted": True}), \
@@ -1445,8 +1403,10 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 entry = maintenance.delete_kb_now(stub, kb_id=source.kb_id)
                 self.assertTrue(entry["forgotten"])
                 self.assertEqual(entry["errors"], [])
-                self.assertFalse((gw / "work" / short).exists())               # graph work directory cleared
-                self.assertFalse((gw / "cache" / f"{short}.sqlite").exists())   # graph build cache cleared
+                self.assertFalse((gw / "work" / short).exists())               # 建图工作目录已清
+                self.assertFalse((gw / "cache" / f"{short}.sqlite").exists())   # 建图缓存已清
+                self.assertFalse((stub.corrections_dir / f"{source.kb_id}.yaml").exists())    # 更正文件随库删掉
+                self.assertEqual(entry["corrections_removed"], str(stub.corrections_dir / f"{source.kb_id}.yaml"))
                 with dbm.connect(state_db) as con:
                     self.assertEqual(len(discovery.known_sources(con)), 0)   # row forgotten
                     left = con.execute("SELECT COUNT(*) FROM jobs WHERE kb_id=?", (source.kb_id,)).fetchone()[0]
@@ -1464,35 +1424,35 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             state_db = root / "state.sqlite3"
             dbm.init_db(state_db)
             mirror = root / "mirror"
-            (mirror / "产品资料").mkdir(parents=True)   # directory preset: graph enabled
+            (mirror / "Catalog Library").mkdir(parents=True)   # directory preset: graph enabled
             (mirror / "普通库").mkdir()
             with dbm.connect(state_db) as con:
-                s1, _ = discovery.enroll(con, mirror, "产品资料")
+                s1, _ = discovery.enroll(con, mirror, "Catalog Library")
                 s2, _ = discovery.enroll(con, mirror, "普通库")
                 # The directory preset does not enable the graph by itself: a freshly opened KB reports the
                 # graph status as disabled
                 self.assertEqual(
-                    service._graph_status(con, s1.kb_id, "产品资料", discovery.get_config(con, s1.kb_id)),
+                    service._graph_status(con, s1.kb_id, "Catalog Library", discovery.get_config(con, s1.kb_id)),
                     "disabled")
                 discovery.set_config(con, s1.kb_id, {"graph_enabled": True})
                 cfg1 = discovery.get_config(con, s1.kb_id)
                 self.assertEqual(service._graph_status(con, s2.kb_id, "普通库", {}), "disabled")
-                self.assertEqual(service._graph_status(con, s1.kb_id, "产品资料", cfg1), "pending")
+                self.assertEqual(service._graph_status(con, s1.kb_id, "Catalog Library", cfg1), "pending")
                 con.execute(
                     "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, started_at) "
                     "VALUES('g1', ?, ?, ?, 'v1', 'running', 1)", (s1.kb_id, s1.kb_id, s1.collection))
-                self.assertEqual(service._graph_status(con, s1.kb_id, "产品资料", cfg1), "running")
+                self.assertEqual(service._graph_status(con, s1.kb_id, "Catalog Library", cfg1), "running")
                 con.execute("UPDATE graph_builds SET status='failed' WHERE graph_build_id='g1'")
-                self.assertEqual(service._graph_status(con, s1.kb_id, "产品资料", cfg1), "failed")
+                self.assertEqual(service._graph_status(con, s1.kb_id, "Catalog Library", cfg1), "failed")
                 con.execute(
                     "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, graph_version, status, started_at) "
                     "VALUES('g2', ?, ?, ?, 'v2', 'done', 2)", (s1.kb_id, s1.kb_id, s1.collection))
-                self.assertEqual(service._graph_status(con, s1.kb_id, "产品资料", cfg1), "ok")
+                self.assertEqual(service._graph_status(con, s1.kb_id, "Catalog Library", cfg1), "ok")
                 # Stage check-in chain: begin -> set_graph_build_stage -> visible on the status panel
                 bid = dbm.begin_graph_build(con, source_key=s1.kb_id, kb_id=s1.kb_id,
                                             source_collection=s1.collection, graph_version="v3")
                 dbm.set_graph_build_stage(con, bid, "GraphRAG 索引")
-                self.assertEqual(service._graph_status(con, s1.kb_id, "产品资料", cfg1), "running")
+                self.assertEqual(service._graph_status(con, s1.kb_id, "Catalog Library", cfg1), "running")
                 info = service._graph_build_info(con, s1.kb_id)
                 self.assertEqual(info["stage"], "GraphRAG 索引")
 
@@ -1589,6 +1549,10 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             stub.state_db = state_db
             stub.graph_work_dir = gw
             stub.runtime_dir = root
+            stub.corrections_dir = root / "corrections"
+            stub.corrections_dir.mkdir()
+            kept = stub.corrections_dir / f"{s.kb_id}.yaml"
+            kept.write_text("entities:\n  reject: [噪声]\n", encoding="utf-8")
             with mock.patch("kb_pipeline.vector.qdrant.client", return_value=mock.Mock()), \
                     mock.patch.object(maintenance, "_drop_graph_artifacts", return_value={}), \
                     mock.patch.object(maintenance, "_drop_neo4j_projection", return_value={}):
@@ -1600,7 +1564,8 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             self.assertTrue(entry["build_stopped"]["stopped"])
             self.assertEqual(entry["errors"], [])
             self.assertTrue(entry["graph_enabled_cleared"])
-            self.assertFalse((gw / "work" / short).exists())          # graph workspace cleared
+            self.assertFalse((gw / "work" / short).exists())          # 建图工作区已清
+            self.assertIn("噪声", kept.read_text(encoding="utf-8"))    # 更正文件跟着库走,删图谱不碰,重建照样用
             with dbm.connect(state_db) as con:
                 self.assertEqual(len(discovery.known_sources(con)), 1)  # the knowledge base itself stays
                 left = con.execute("SELECT COUNT(*) FROM graph_builds WHERE kb_id=?", (s.kb_id,)).fetchone()[0]

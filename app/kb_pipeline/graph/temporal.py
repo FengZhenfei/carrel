@@ -73,6 +73,41 @@ def parse_date(text: Any) -> str | None:
     return _iso(m.group("y")) if m else None
 
 
+# 文件名里的日期比正文更严:夹在字母数字中间的四位数是编号(ZX8C2048KV17 不是 2048 年)、晚于明年的不是文档日期
+_NAME_COMPACT_RE = re.compile(r"(?<![A-Za-z\d])(?P<y>(?:19|20)\d{2})(?P<m>0[1-9]|1[0-2])(?P<d>0[1-9]|[12]\d|3[01])(?![A-Za-z\d])")
+_NAME_YEAR_RE = re.compile(r"(?<![A-Za-z\d.])(?P<y>(?:19|20)\d{2})(?![A-Za-z\d])")
+_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,6}$")
+
+
+def name_date(name: Any, *, today: date | None = None) -> str | None:
+    """文件名里的日期:先去掉扩展名;ISO、紧凑写法、中文年月日、英文月份,最后才是单独的年份;
+    编号里夹着的四位数、晚于明年的年份都不算。"""
+    stem = _EXT_RE.sub("", str(name or ""))
+    limit = (today or date.today()).year + 1
+
+    def ok(value: str | None) -> str | None:
+        return value if value and int(value[:4]) <= limit else None
+
+    for rx in (_ISO_RE, _NAME_COMPACT_RE, _CJK_RE):
+        for m in rx.finditer(stem):
+            if rx is _ISO_RE and ((m.start() and stem[m.start() - 1].isalpha()) or (m.end() < len(stem) and stem[m.end()].isalpha())):
+                continue
+            out = ok(_iso(m.group("y"), m.group("m"), m.group("d")))
+            if out:
+                return out
+    for rx in (_EN_MDY_RE, _EN_DMY_RE, _EN_MY_RE):
+        m = rx.search(stem)
+        if m and m.group("mon").lower() in _MONTHS:
+            out = ok(_iso(m.group("y"), str(_MONTHS[m.group("mon").lower()]), m.groupdict().get("d")))
+            if out:
+                return out
+    for m in _NAME_YEAR_RE.finditer(stem):
+        out = ok(_iso(m.group("y")))
+        if out:
+            return out
+    return None
+
+
 def find_dates(text: Any) -> list[str]:
     """All normalisable dates in a text (deduplicated, order kept); bare-year matches count too."""
     s = str(text or "")
@@ -117,23 +152,22 @@ def find_versions(text: Any) -> list[str]:
 
 
 def document_axis(rel_path: str, head_text: str = "", *, kind: str = "auto") -> dict[str, str]:
-    """The document's axis value. Returns {"kind": date|version|none, "value": ..., "date": ..., "version": ...}.
-    Date: the one in the file name ("2024 checkup report" -> 2024) takes precedence over the first page (when
-    the first page gives a more precise date, it completes the file-name date); the first-page text only counts
-    dates written to the month or day: a lone four-digit number there (1920 pixels, 2048 tokens, 2023 employees,
-    "from 1988 to 2023") is mostly not the document's date, and taking it would make it the validity of every
-    fact in the document, so an empty value is better; version: the Rev / Version at the start of the first
-    page; with kind=auto a date wins when present, a version is used when only it exists, and none is recorded
-    when neither is found."""
+    """文档的轴值。返回 {"kind": date|version|none, "value": ..., "date": ..., "version": ...}。
+    日期:文件名里的(2024体检报告 → 2024;料号里夹着的四位数不算,见 name_date)优先于首页里的
+    (首页给出更精确的日期时用首页的补全);
+    首页正文只认写到月或日的日期 —— 正文里单独一个四位数(1920 像素、2048 个 token、2023 个员工、「从 1988 年到 2023 年」)
+    多半不是这份文档的日期,认了就成了全文事实的有效期,取不到宁可记空;
+    版本:首页开头的 Rev / Version;kind=auto 时有日期取日期,只有版本取版本,都没有记 none。"""
     name = str(rel_path or "").rsplit("/", 1)[-1]
     head = str(head_text or "")[:1500]
-    name_date = parse_date(name)
-    head_dates = [d for d in find_dates(head) if len(d) > 4]
+    from_name = name_date(name)
+    limit = date.today().year + 1
+    head_dates = [d for d in find_dates(head) if len(d) > 4 and int(d[:4]) <= limit]
     head_date = head_dates[0] if head_dates else None
-    date_value = name_date or ""
-    if name_date and head_date and head_date.startswith(name_date) and len(head_date) > len(name_date):
-        date_value = head_date          # the file name has only a year, the first page a full date of the same year
-    elif not name_date and head_date:
+    date_value = from_name or ""
+    if from_name and head_date and head_date.startswith(from_name) and len(head_date) > len(from_name):
+        date_value = head_date          # 文件名只有年份,首页有整日期,且是同一年
+    elif not from_name and head_date:
         date_value = head_date
     versions = find_versions(name) or find_versions(head)
     version_value = versions[0] if versions else ""

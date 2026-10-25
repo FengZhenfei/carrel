@@ -40,7 +40,7 @@ class StateRegressionTests(unittest.TestCase):
             "doc_id": "work_product:1",
             "content_version": "v1",
             "chunk_index": "7",
-            "source_path": "产品资料/x/a.pdf",
+            "source_path": "Catalog Library/x/a.pdf",
             "rel_path": "x/a.pdf",
             "filename": "a.pdf",
             "dir": "x",
@@ -364,25 +364,25 @@ class KBDiscoveryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name in ("产品资料", "半导体资料", "图书馆"):
+            for name in ("Catalog Library", "Components Library", "Reference Library"):
                 (root / name).mkdir()
             state = root / "s.db"; db.init_db(state)
             with db.connect(state) as con:
-                a, _ = discovery.enroll(con, root, "产品资料")
-                b, _ = discovery.enroll(con, root, "半导体资料")
+                a, _ = discovery.enroll(con, root, "Catalog Library")
+                b, _ = discovery.enroll(con, root, "Components Library")
                 self.assertEqual((a.kb_id, a.collection), ("kb_001", "kb_001"))
                 self.assertEqual((b.kb_id, b.collection), ("kb_002", "kb_002"))
                 # re-enrolling an existing row keeps its number
-                again, outcome = discovery.enroll(con, root, "产品资料")
+                again, outcome = discovery.enroll(con, root, "Catalog Library")
                 self.assertEqual((again.kb_id, outcome), ("kb_001", "already"))
                 # a forgotten (GC'd) directory starts over with a FRESH number
                 discovery.forget(con, "kb_002")
-                c, outcome = discovery.enroll(con, root, "半导体资料")
+                c, outcome = discovery.enroll(con, root, "Components Library")
                 self.assertEqual((c.kb_id, outcome), ("kb_003", "new"))
-                # directory-name presets apply at first enrollment
-                lib, _ = discovery.enroll(con, root, "图书馆")
-                self.assertEqual((lib.kb_id, lib.max_tokens), ("kb_004", 800))
-                self.assertEqual(lib.block_merge_tokens, 1600)   # derived: 2x max_tokens
+                # Folder names do not select domain-specific defaults.
+                lib, _ = discovery.enroll(con, root, "Reference Library")
+                self.assertEqual((lib.kb_id, lib.max_tokens), ("kb_004", a.max_tokens))
+                self.assertEqual(lib.block_merge_tokens, a.block_merge_tokens)
                 self.assertEqual(a.block_merge_tokens, 800)
                 self.assertFalse(a.graph_enabled)  # enabling the graph is an explicit action; directory presets no longer switch graph build on
 
@@ -391,20 +391,20 @@ class KBDiscoveryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "产品资料").mkdir(); (root / "新资料").mkdir()
+            (root / "Catalog Library").mkdir(); (root / "新资料").mkdir()
             (root / ".hidden").mkdir(); (root / "~tmp").mkdir()
             (root / "stray.txt").write_text("x", encoding="utf-8")
             state = Path(tmp) / "s.db"
             # every top-level dir is DISCOVERABLE...
-            self.assertEqual(discovery.discover_directories(root), ["产品资料", "新资料"])
+            self.assertEqual(discovery.discover_directories(root), ["Catalog Library", "新资料"])
             # ...but nothing is a pipeline source until enrolled
             self.assertEqual(discovery.enrolled_sources(state, root), {})
             db.init_db(state)
             with db.connect(state) as con:
-                src, outcome = discovery.enroll(con, root, "产品资料")
+                src, outcome = discovery.enroll(con, root, "Catalog Library")
                 self.assertEqual((src.kb_id, src.collection, outcome), ("kb_001", "kb_001", "new"))
                 self.assertEqual(src.max_tokens, 400)
-                self.assertTrue(discovery.enroll(con, root, "产品资料")[1] == "already")
+                self.assertTrue(discovery.enroll(con, root, "Catalog Library")[1] == "already")
                 with self.assertRaises(ValueError):
                     discovery.enroll(con, root, "不存在的目录")
             srcs = discovery.enrolled_sources(state, root)
@@ -989,19 +989,19 @@ class KbRenameTests(unittest.TestCase):
             root = Path(tmp)
             state = root / "s.db"
             src = self._seed(root, state)
-            (root / "半导体").rename(root / "半导体资料")
+            (root / "半导体").rename(root / "Components Library")
             with db.connect(state) as con:
                 discovery.mark_inactive(con, src.kb_id)          # what the scan does after finding the directory gone
                 found = discovery.find_renamed_directories(con, root)
-                self.assertEqual([(f["kb_id"], f["old_dir"], f["dir"]) for f in found], [(src.kb_id, "半导体", "半导体资料")])
+                self.assertEqual([(f["kb_id"], f["old_dir"], f["dir"]) for f in found], [(src.kb_id, "半导体", "Components Library")])
                 self.assertEqual((found[0]["matched"], found[0]["total"], found[0]["verified"]), (3, 3, 3))
-                adopted = discovery.adopt_directory(con, root, src.kb_id, "半导体资料")
-                self.assertEqual((adopted.kb_id, adopted.source_root, adopted.collection), (src.kb_id, "半导体资料", src.collection))
+                adopted = discovery.adopt_directory(con, root, src.kb_id, "Components Library")
+                self.assertEqual((adopted.kb_id, adopted.source_root, adopted.collection), (src.kb_id, "Components Library", src.collection))
                 row = con.execute("SELECT status, source_root, inactive_reason FROM kb_sources WHERE kb_id=?", (src.kb_id,)).fetchone()
-                self.assertEqual((row["status"], row["source_root"], row["inactive_reason"]), ("active", "半导体资料", None))
+                self.assertEqual((row["status"], row["source_root"], row["inactive_reason"]), ("active", "Components Library", None))
                 paths = {r["rel_path"]: (r["source_path"], r["physical_path"])
                          for r in con.execute("SELECT rel_path, source_path, physical_path FROM files WHERE kb_id=?", (src.kb_id,))}
-                self.assertEqual(paths["sub/b.md"], ("半导体资料/sub/b.md", str(root / "半导体资料" / "sub" / "b.md")))
+                self.assertEqual(paths["sub/b.md"], ("Components Library/sub/b.md", str(root / "Components Library" / "sub" / "b.md")))
                 # next scan round: files are recognised under the new path, content unchanged → metadata change only
                 # (metadata_update refreshes the path fields in the payload); none of them goes through parsing
                 changes = {f.rel_path: (c.change_type, c.job_type) for f in list_source_files(adopted, min_age_seconds=0, hash_content=True)
@@ -1030,11 +1030,11 @@ class KbRenameTests(unittest.TestCase):
                 self.assertEqual((report["matched"], report["total"]), (0, 3))
                 self.assertFalse(discovery.looks_like_rename(report))
                 # a KB the user closed (unenrolled) is not adopted automatically; left to the console, by hand
-                (root / "半导体").rename(root / "半导体资料")
+                (root / "半导体").rename(root / "Components Library")
                 discovery.mark_inactive(con, src.kb_id, reason="unenrolled")
                 self.assertEqual(discovery.find_renamed_directories(con, root), [])
-                adopted = discovery.adopt_directory(con, root, src.kb_id, "半导体资料")     # manual adoption still works
-                self.assertEqual(adopted.source_root, "半导体资料")
+                adopted = discovery.adopt_directory(con, root, src.kb_id, "Components Library")     # manual adoption still works
+                self.assertEqual(adopted.source_root, "Components Library")
                 # the new directory is already taken by another registry row
                 other, _ = discovery.enroll(con, root, "别的资料")
                 with self.assertRaises(ValueError):

@@ -1,21 +1,16 @@
-"""Automatic flow of schema versions (evening of 2026-09-08; the user wants the pipeline fully automatic, with
-nobody watching):
+"""模式版本的自动流转(2026-09-08 晚,用户要求管线全自动、不用人看):
 
-- when a graph build finishes, the endpoint ledger (merge.endpoint_observation) is written back into the active
-  schema version -- who declared the constraint and how the data actually uses it are recorded together;
-- the next merge consults the ledger first: endpoint pairs confirmed in the ledger pass directly, without
-  having to reach the threshold again in every version;
-- blank graph: when no schema version exists at build time, a label version is first extracted with the default
-  parameters (this KB's sample size, the model in the tune slot, DEFAULT_GRAPH_LLM if none is chosen), adopted
-  directly, and then the graph is built;
-- threshold-triggered full rebuild: a new version is first extracted on the basis of the active version and its
-  ledger (schema.suggest's prior), endpoints confirmed in the ledger are kept by rule
-  (schema.apply_observed_guard), it is adopted automatically, and then the graph is built.
+- 建图结束把端点账(merge.endpoint_observation)写回现行模式版本 —— 谁提的约束、数据实际怎么用的,记在一起;
+- 下一次归并先看账:账里确认过的端点组合直接放行,不必每一版重新凑够阈值;
+- 空白图:建图时没有任何模式版本,就用默认参数(本库采样量、tune 槽的模型,没选就是 DEFAULT_GRAPH_LLM)先抽一版
+  标签并直接生效,再建图;
+- 阈值触发的整库重建:先以现行版本和账为底重抽一版(schema.suggest 的 prior),账里确认过的端点由规则保住
+  (schema.apply_observed_guard),自动生效,再建图。
 
-Version entries gain three fields: origin (manual / auto_blank / auto_rebuild), prior_id (which version it was
-based on) and observed (the endpoint ledger, written after the build). The console's "extract / re-extract
-labels now" also goes through suggest_schema_version here, only with adopt=False (a person still selects and
-saves it).
+版本条目:id / created_at / model / 采样口径 / domain / persona / linkml(模式本体,ontology.to_linkml 的产物)/
+examples(语料示例,不进 LinkML)/ origin(manual / auto_blank / auto_rebuild / upload)/ prior_id(以哪一版为底)/
+observed(端点账,建图后写入)。控制台「立即/重新抽取标签」走的也是这里的 suggest_schema_version,只是
+adopt=False(仍由人选中并保存);上传 LinkML 走 register_uploaded_schema。
 """
 from __future__ import annotations
 
@@ -27,16 +22,14 @@ from typing import Any
 
 from .. import db, discovery
 from ..config import bool_value
-from ..limits import (
-    LEGACY_SCHEMA_VERSION_ID, apply_schema_version, normalize_entity_types, normalize_examples,
-    normalize_parent_types, normalize_predicates, normalize_profile, normalize_type_definitions,
-    push_schema_version,
-)
+from ..limits import apply_schema_version, normalize_examples, push_schema_version
 from ..models import KBSource
+from ..ontology import SchemaError, entry_model, from_linkml, load_linkml, to_linkml
 
 ORIGIN_MANUAL = "manual"
 ORIGIN_BLANK = "auto_blank"
 ORIGIN_REBUILD = "auto_rebuild"
+ORIGIN_UPLOAD = "upload"
 SUGGEST_TIMEOUT_SECONDS = 600
 # The "label extraction in progress" mark (state database app_config, key schema_suggest:<kb_id>): both the
 # console's manual extraction and the automatic one before a build set it, and whichever side sees it waits for
@@ -44,6 +37,7 @@ SUGGEST_TIMEOUT_SECONDS = 600
 # 02:09 kb_001: the timer and the user's click were 20 seconds apart and yielded two identical versions).
 # A killed process leaves the mark in the database: older than SUGGEST_MARK_FRESH_SECONDS counts as expired.
 SUGGEST_MARK_PREFIX = "schema_suggest:"
+SUGGEST_TASK_PREFIX = "schema_task:"  # Latest console task only; no queue/history service.
 SUGGEST_MARK_FRESH_SECONDS = SUGGEST_TIMEOUT_SECONDS + 120
 SUGGEST_WAIT_POLL_SECONDS = 3.0
 SUGGEST_RENEW_SECONDS = 60.0          # renew this often while extracting; slow models / retries can outlast the claim window (Codex re-review N08)
@@ -82,9 +76,8 @@ def active_schema_entry_for(settings: Any, kb_id: str) -> dict[str, Any] | None:
 
 
 def schema_missing(config: dict[str, Any]) -> bool:
-    """Neither an active version nor a legacy label list: the build would fall back to the global default type
-    list -- that is the "blank graph"."""
-    return not (config.get("graph_schema_active") or normalize_entity_types(config.get("graph_entity_types")))
+    """没有生效的模式版本:建图会退到兜底类型表 —— 这就是「空白图」。"""
+    return not config.get("graph_schema_active")
 
 
 def suggest_in_progress(settings: Any, kb_id: str) -> dict[str, Any] | None:
@@ -107,7 +100,8 @@ def claim_suggest(settings: Any, kb_id: str, origin: str) -> str | None:
     finished first would also clear the later claimant's mark.)"""
     token = uuid.uuid4().hex
     now = int(time.time())
-    mark = json.dumps({"origin": origin, "started_at": now, "token": token}, ensure_ascii=False)
+    mark = json.dumps({"origin": origin, "started_at": now, "created_at": now, "token": token,
+                       "phase": "sampling"}, ensure_ascii=False)
     with db.connect(settings.state_db) as con:
         cur = con.execute(
             "INSERT INTO app_config(key, value, updated_at) VALUES (?, ?, ?) "
@@ -168,14 +162,38 @@ def suggest_owner(settings: Any, kb_id: str) -> str | None:
     return str(mark.get("token")) if isinstance(mark, dict) and mark.get("token") else None
 
 
-def wait_for_suggest(settings: Any, kb_id: str, *, timeout: float | None = None) -> float:
+def wait_for_suggest(settings: Any, kb_id: str, *, timeout: float | None = None,
+                     stop: threading.Event | None = None) -> float:
     """If another place is extracting, wait until it finishes (the mark disappears or expires); returns the seconds
     waited."""
     started = time.time()
-    limit = SUGGEST_MARK_FRESH_SECONDS if timeout is None else timeout
-    while suggest_in_progress(settings, kb_id) is not None and time.time() - started < limit:
-        time.sleep(SUGGEST_WAIT_POLL_SECONDS)
+    # A renewed lease is live work, not a reason to time out after 12 minutes.
+    while suggest_in_progress(settings, kb_id) is not None:
+        if timeout is not None and time.time() - started >= timeout:
+            break
+        if stop is not None and stop.wait(SUGGEST_WAIT_POLL_SECONDS):
+            from .llm import LLMInterrupted
+            raise LLMInterrupted("stop requested")
+        if stop is None:
+            time.sleep(SUGGEST_WAIT_POLL_SECONDS)
     return round(time.time() - started, 1)
+
+
+def update_suggest_progress(settings: Any, kb_id: str, token: str, *, phase: str,
+                            sampled: int | None = None) -> bool:
+    now = int(time.time())
+    with db.connect(settings.state_db) as con:
+        cur = con.execute("UPDATE app_config SET value=json_set(value,'$.phase',?,'$.sampled',"
+                          "coalesce(?,json_extract(value,'$.sampled')),'$.started_at',?),updated_at=? "
+                          "WHERE key=? AND json_extract(value,'$.token')=?",
+                          (phase, sampled, now, now, SUGGEST_MARK_PREFIX + kb_id, token))
+        return cur.rowcount == 1
+
+
+def discard_suggest(con: Any, kb_id: str) -> None:
+    """Invalidate publication before graph deletion; late workers cannot recreate the task."""
+    con.execute("DELETE FROM app_config WHERE key IN (?,?)",
+                (SUGGEST_MARK_PREFIX + kb_id, SUGGEST_TASK_PREFIX + kb_id))
 
 
 def adopt_latest_schema_version(settings: Any, source: KBSource) -> dict[str, Any] | None:
@@ -183,7 +201,7 @@ def adopt_latest_schema_version(settings: Any, source: KBSource) -> dict[str, An
     latest one instead of extracting another; returns None when there is none."""
     with db.connect(settings.state_db) as con:
         stored = discovery.get_config(con, source.kb_id)
-        versions = ring_with_legacy(stored)
+        versions = [dict(v) for v in (stored.get("graph_schema_versions") or [])]
         if not versions or stored.get("graph_schema_active"):
             return None
         entry = versions[0]                       # newest first in the ring
@@ -191,35 +209,36 @@ def adopt_latest_schema_version(settings: Any, source: KBSource) -> dict[str, An
         apply_schema_version({"graph_schema_versions": versions}, updates)
         discovery.set_config(con, source.kb_id, updates)
         con.commit()
+    counts = entry_counts(entry)
     print(f"[schema] {source.kb_id}({source.source_root}) adopt existing: version {entry['id']} ({entry.get('origin')})"
-          f" types={len(entry.get('entity_types') or [])} predicates={len(entry.get('predicates') or [])}", flush=True)
+          f" types={counts['types']} predicates={counts['predicates']}", flush=True)
     return {"version_id": str(entry["id"]), "origin": entry.get("origin"), "adopted": True, "adopted_existing": True,
-            "entity_types": list(entry.get("entity_types") or []), "predicates": list(entry.get("predicates") or [])}
+            "entity_types": counts["type_names"], "predicates": counts["predicate_names"]}
 
 
-def ring_with_legacy(stored: dict[str, Any]) -> list[dict[str, Any]]:
-    """Before touching the ring, freeze the "labels from before version management" into a real version entry (see
-    the 2026-08-24 kb_003 lost-labels incident for why)."""
-    ring = [dict(v) for v in (stored.get("graph_schema_versions") or [])]
-    if ring:
-        return ring
-    legacy = list(normalize_entity_types(stored.get("graph_entity_types")))
-    if not legacy:
-        return ring
-    return [{
-        "id": LEGACY_SCHEMA_VERSION_ID,
-        "created_at": None, "model": None, "sample_size": None,
-        "language": stored.get("graph_language"),
-        "entity_types": legacy,
-        "legacy": True,
-    }]
+def entry_counts(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """版本条目里模式的规模(日志、控制台提示用)。"""
+    model = entry_model(entry) or {}
+    types = [t["name"] for t in model.get("types") or [] if not t.get("abstract")]
+    preds = [p["name"] for p in model.get("predicates") or []]
+    return {"types": len(types), "predicates": len(preds), "type_names": types, "predicate_names": preds}
 
 
 def prior_from_entry(entry: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not entry:
+    """现行版本 → 归纳提示词用的 prior(类型表、父类、谓词、定义、画像、端点账)。"""
+    model = entry_model(entry)
+    if not entry or model is None:
         return None
-    return {k: entry.get(k) for k in ("id", "domain", "language", "entity_types", "parent_types", "predicates",
-                                      "type_definitions", "profile", "observed")}
+    types = [t for t in model.get("types") or [] if not t.get("abstract")]
+    return {
+        "id": entry.get("id"), "domain": entry.get("domain"), "language": model.get("language"),
+        "entity_types": [t["name"] for t in types],
+        "parent_types": {t["name"]: t["is_a"] for t in types},
+        "predicates": [dict(p) for p in model.get("predicates") or [] if not p.get("core")],
+        "type_definitions": {t["name"]: t["description"] for t in types if t.get("description")},
+        "profile": dict(model.get("profile") or {}),
+        "observed": entry.get("observed"),
+    }
 
 
 def reload_source(settings: Any, source: KBSource) -> KBSource:
@@ -228,6 +247,19 @@ def reload_source(settings: Any, source: KBSource) -> KBSource:
     config = load_config(settings, source.kb_id)
     return discovery.build_source(settings.mirror_root, source.source_root, config,
                                   kb_id=source.kb_id, collection=source.collection)
+
+
+def protected_schema_ids(con, kb_id):
+    protected = set()
+    for row in con.execute("SELECT manifest_json FROM graph_builds WHERE kb_id=? AND status IN ('done','running','failed','cancelled')", (kb_id,)):
+        try:
+            manifest = json.loads(row[0] or "{}")
+        except ValueError:
+            continue
+        schema_id = manifest.get("schema_version_id") or (manifest.get("schema") or {}).get("version_id")
+        if schema_id:
+            protected.add(str(schema_id))
+    return protected
 
 
 def record_schema_observation(con, kb_id: str, *, version_id: str, observed: dict[str, Any],
@@ -245,13 +277,17 @@ def record_schema_observation(con, kb_id: str, *, version_id: str, observed: dic
     return False
 
 
-def sample_docs(settings: Any, source: KBSource, *, q: Any = None) -> dict[str, Any]:
+def sample_docs(settings: Any, source: KBSource, *, q: Any = None, spec: Any = None) -> dict[str, Any]:
     """The sample for label extraction: active chunk ledger -> payloads -> stratified + farthest-point sampling
     (schema.sample_chunks). Returns the sample and how it was drawn."""
     from ..vector.layout import TEXT_VECTOR
     from ..vector.qdrant import client as qdrant_client
     from . import schema as graph_schema
     from .units import fetch_chunk_payloads
+    from .build import tune_llm_spec
+    from .sampling_budget import sampling_budget
+
+    budget = sampling_budget(spec or tune_llm_spec(settings, source))
 
     with db.connect(settings.state_db) as con:
         ledger = db.active_chunk_refs(con, source.collection)
@@ -273,96 +309,103 @@ def sample_docs(settings: Any, source: KBSource, *, q: Any = None) -> dict[str, 
                     out[str(p.id)] = list(vec)
         return out
 
-    sample = graph_schema.sample_chunks(chunks, source.graph_tune_sample_size, fetch_vectors=fetch_vectors)
+    sample = graph_schema.sample_chunks(chunks, 0, budget=budget["sample_token_budget"], fetch_vectors=fetch_vectors)
     return {
         "texts": sample["texts"], "truncated": sample["truncated"],
         "chunks_total": len(chunks), "documents": len({c.doc_id for c in payloads}),
-        "sample": {k: sample[k] for k in ("pool", "documents_covered", "documents_total", "excluded_boilerplate", "method")},
+        "sample": {**budget, **{k: sample.get(k) for k in ("pool", "documents_covered", "documents_total",
+                   "excluded_boilerplate", "method", "algorithm", "estimated_tokens", "stop_reason")},
+                   "sampled": len(sample["texts"]),
+                   "chunk_ids": [c.get("chunk_uid") for c in sample["picked"]]},
     }
 
 
 def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adopt: bool, use_prior: bool = True,
                            client: Any = None, docs: list[str] | None = None, sample: dict[str, Any] | None = None,
-                           spec: Any = None, stop: threading.Event | None = None) -> dict[str, Any]:
-    """Extract one label version into the ring; with adopt=True it takes effect immediately (labels / language /
-    predicates / parents / definitions / examples / profile are expanded into the active values together).
-    With use_prior=True and an active version, the model revises on the basis of that version + its endpoint
-    ledger. client / docs are injection points for tests and callers; when absent, the tune model and the sample
-    are taken from this KB's configuration.
-    stop: the graph build's stop event; once it is set, model calls are neither retried nor started."""
+                           spec: Any = None, stop: threading.Event | None = None,
+                           claimed_token: str | None = None) -> dict[str, Any]:
+    """抽一版标签入环;adopt=True 时直接生效(标签 / 语言 / 谓词 / 父类 / 定义 / 示例 / 画像一起展开成生效值)。
+    use_prior=True 且有现行版本时,模型在现行版本 + 端点账的基础上修订。
+    client / docs 是给测试和调用方注入用的;不给就按本库配置取 tune 模型、采样。
+    stop:建图的停止事件,置位后模型调用不再重试、不再发起。"""
     from . import schema as graph_schema
 
     config = load_config(settings, source.kb_id)
     entry_prior = active_schema_entry(config) if use_prior else None
     prior = prior_from_entry(entry_prior)
-    token = claim_suggest(settings, source.kb_id, origin)      # atomic claim, held through sampling, model calls and saving; the other side waits / refuses
+    token = claimed_token or claim_suggest(settings, source.kb_id, origin)
     if token is None:
         raise SuggestBusy(SUGGEST_BUSY_MESSAGE)
+    from .llm import LLMInterrupted
+    stop = stop or threading.Event()
+    close = None
+    started = time.time()
+    stop_renewing = threading.Event()
+
+    def keep_claim() -> None:
+        while not stop_renewing.wait(SUGGEST_RENEW_SECONDS):
+            try:
+                if not renew_suggest(settings, source.kb_id, token):
+                    stop.set()
+                    return
+            except Exception:
+                pass  # Publication still checks ownership under the SQLite write lock.
+
+    def progress(phase: str, sampled: int | None = None) -> None:
+        if stop.is_set():
+            raise LLMInterrupted("stop requested")
+        if not update_suggest_progress(settings, source.kb_id, token, phase=phase, sampled=sampled):
+            raise LLMInterrupted("label extraction was cancelled or superseded")
+
+    renewer = threading.Thread(target=keep_claim, name=f"schema-claim-{source.kb_id}", daemon=True)
+    renewer.start()  # Covers payload loading and sample selection too.
     try:
+        progress("sampling")
+        if client is None:
+            from .build import tune_llm_spec
+            spec = spec or tune_llm_spec(settings, source)
         if docs is None:
-            sample = sample_docs(settings, source)
+            sample = sample_docs(settings, source, spec=spec)
             docs = list(sample["texts"])
             if not docs:
                 raise ValueError("The active chunks have no text to sample from")
         sample = dict(sample or {})
-        close = None
+        progress("domain", len(docs))
         if client is None:
             from .build import graph_paths, tune_llm_spec
-            from .llm import ChatClient, LLMCache
+            from .llm import ChatClient, LLMCache, env_int
+            from .sampling_budget import sampling_budget
 
             spec = spec or tune_llm_spec(settings, source)
             cache = LLMCache(graph_paths(settings, source).cache_file)
             close = cache.close
-            client = ChatClient(spec, cache=cache, timeout=min(SUGGEST_TIMEOUT_SECONDS, int(settings.graph_llm_timeout_seconds)),
-                                workers=1, circuit_fails=0, stop=stop)
-        started = time.time()
-        stop_renewing = threading.Event()
-
-        def keep_claim() -> None:           # renew the mark during the model calls; stops when extraction ends
-            while not stop_renewing.wait(SUGGEST_RENEW_SECONDS):
-                try:
-                    renew_suggest(settings, source.kb_id, token)
-                except Exception:
-                    pass
-
-        renewer = threading.Thread(target=keep_claim, name=f"schema-claim-{source.kb_id}", daemon=True)
-        renewer.start()
-        try:
-            result = graph_schema.suggest(client, docs, prior=prior)
-        finally:
-            stop_renewing.set()
-            renewer.join(timeout=5)
-            if close is not None:
-                close()
-        result["entity_types"] = list(normalize_entity_types(result.get("entity_types")))
-        result["predicates"] = list(normalize_predicates(result.get("predicates")))
-        result["parent_types"] = normalize_parent_types(result.get("parent_types"))
-        result["type_definitions"] = normalize_type_definitions(result.get("type_definitions"), result["entity_types"])
-        result["examples"] = normalize_examples(result.get("examples"))
-        result["profile"] = normalize_profile(result.get("profile"))
-        result.pop("persona", None)
+            client = ChatClient(spec, cache=cache, timeout=max(1, env_int("KB_SCHEMA_LLM_TIMEOUT", 900)),
+                                connect_timeout=10, attempts=3,
+                                workers=1, circuit_fails=0, stop=stop,
+                                input_token_limit=sampling_budget(spec)["input_token_limit"])
+        result = graph_schema.suggest(client, docs, prior=prior, progress=progress)
+        progress("saving")
+        model = result.get("model") or {}
+        if not model.get("types"):
+            raise ValueError("The model induced no entity types; this version was not added")
+        persona = str(result.pop("persona", "") or "").strip()
         model_name = getattr(spec, "name", None) or str((config.get("graph_llm") or {}).get("tune") or "") or None
-        taken = {str(v.get("id")) for v in (config.get("graph_schema_versions") or [])}
-        version_id = f"v{int(time.time())}"
-        while version_id in taken:          # two versions within one second (tests, scripts) must not collide on id: a collision evicts the earlier entry
-            version_id += "x"
+        version_id = new_version_id(config)
+        domain = str(result.get("domain") or "").strip() or None
         entry = {
             "id": version_id,
             "created_at": int(time.time()),
             "model": model_name,
-            "sample_size": int(source.graph_tune_sample_size),
+            "sample_size": len(docs),
+            "sampling": sample.get("sample") or {},
             "sampled": len(docs),
             "chunks_total": sample.get("chunks_total"),
             "documents": sample.get("documents"),
-            "language": result.get("language"),
-            "entity_types": result["entity_types"],
-            "domain": (str(result.get("domain") or "").strip() or None),
-            "parent_types": result["parent_types"],
-            "predicates": result["predicates"],
-            "type_definitions": result["type_definitions"],
-            "examples": result["examples"],
+            "domain": domain,
+            "persona": persona or None,
+            "linkml": to_linkml(model, name=source.kb_id, version=version_id, description=domain or ""),
+            "examples": normalize_examples(result.get("examples")),
             "example_stats": result.get("example_stats") or {},
-            "profile": result["profile"],
             "origin": origin,
             "prior_id": str(entry_prior.get("id")) if entry_prior else None,
             "guard": result.get("guard") or {},
@@ -375,31 +418,97 @@ def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adop
             # the mark was not renewed (hung process, clock jump) and someone else has claimed it: the result is only
             # logged, not published -- the token protects publishing, not just the release (Codex re-review N08)
             print(f"[schema] {source.kb_id}({source.source_root}) {origin}: claim lost before publishing, result discarded "
-                  f"types={len(entry['entity_types'])} predicates={len(entry['predicates'])}", flush=True)
+                  f"types={len(model['types'])} predicates={len(model['predicates'])}", flush=True)
             raise SuggestBusy(SUGGEST_SUPERSEDED_MESSAGE)
+        counts = entry_counts(entry)
+        result.update({"kb_id": source.kb_id, "sampled": len(docs), "documents": sample.get("documents"),
+                       "chunks_total": sample.get("chunks_total"), "truncated": bool(sample.get("truncated")),
+                       "sample": sample.get("sample") or {}, "version_id": entry["id"], "adopted": bool(adopt),
+                       "origin": origin, "prior_id": entry["prior_id"], "seconds": round(time.time() - started, 1),
+                       "entity_types": counts["type_names"], "predicates": counts["predicate_names"],
+                       "llm_stats": dict(getattr(client, "stats", {}) or {})})
+        result.pop("model", None)
         with db.connect(settings.state_db) as con:
+            con.execute("BEGIN IMMEDIATE")
+            mark = db.get_app_config(con, SUGGEST_MARK_PREFIX + source.kb_id)
+            if not isinstance(mark, dict) or mark.get("token") != token:
+                raise SuggestBusy(SUGGEST_SUPERSEDED_MESSAGE)
             stored = discovery.get_config(con, source.kb_id)
-            versions = push_schema_version(ring_with_legacy(stored), entry, active_id=stored.get("graph_schema_active"))
+            versions = push_schema_version(stored.get("graph_schema_versions") or [], entry,
+                                           active_id=stored.get("graph_schema_active"), protected_ids=protected_schema_ids(con, source.kb_id))
             updates: dict[str, Any] = {"graph_schema_versions": versions}
             if adopt:
                 updates["graph_schema_active"] = entry["id"]
                 apply_schema_version({"graph_schema_versions": versions}, updates)
             discovery.set_config(con, source.kb_id, updates)
+            task = db.get_app_config(con, SUGGEST_TASK_PREFIX + source.kb_id)
+            if isinstance(task, dict) and task.get("task_id") == token and task.get("status") == "running":
+                task.update(status="completed", finished_at=int(time.time()), result={**result,
+                            "sample": {k: v for k, v in result["sample"].items() if k != "chunk_ids"}})
+                db.set_app_config(con, SUGGEST_TASK_PREFIX + source.kb_id, task)
             con.commit()
-        result.update({
-            "kb_id": source.kb_id, "sampled": len(docs), "documents": sample.get("documents"),
-            "chunks_total": sample.get("chunks_total"), "truncated": bool(sample.get("truncated")),
-            "sample": sample.get("sample") or {},
-            "version_id": entry["id"], "adopted": bool(adopt), "origin": origin, "prior_id": entry["prior_id"],
-            "seconds": round(time.time() - started, 1),
-        })
         print(f"[schema] {source.kb_id}({source.source_root}) {origin}: version {entry['id']}"
-              f"{' adopted' if adopt else ''} types={len(entry['entity_types'])} predicates={len(entry['predicates'])}"
+              f"{' adopted' if adopt else ''} types={counts['types']} predicates={counts['predicates']}"
               f" prior={entry['prior_id']} guard={entry['guard']} seconds={result['seconds']}", flush=True)
         return result
 
     finally:
-        release_suggest(settings, source.kb_id, token)      # released only after the version is saved (or failed): no idle-looking window while still unpublished
+        stop_renewing.set()
+        renewer.join(timeout=5)
+        if close is not None:
+            close()
+        release_suggest(settings, source.kb_id, token)      # 版本已落库(或失败)才释放,不留「看着空闲其实还没发表」的窗口
+
+def new_version_id(config: dict[str, Any]) -> str:
+    taken = {str(v.get("id")) for v in (config.get("graph_schema_versions") or [])}
+    version_id = f"v{int(time.time())}"
+    while version_id in taken:          # 同一秒内入环两版(测试、脚本)不能撞 id:撞了会把上一条顶掉
+        version_id += "x"
+    return version_id
+
+
+def register_uploaded_schema(settings: Any, source: KBSource, text: str | bytes, *, adopt: bool = False) -> dict[str, Any]:
+    """人工上传的 LinkML(插件审定的本体、手写的模式)入环。校验不过抛 SchemaError(带全部错误);
+    读取时丢掉的部分(属性型 slot、enums 之类)作为警告返回。语料示例不在 LinkML 里,上传的版本没有示例,
+    抽取用通用示例。端点账沿用现行版本的:同名谓词上一版确认过的端点组合照样放行。"""
+    doc = load_linkml(text)
+    model, warnings = from_linkml(doc)
+    if not model.get("types"):
+        raise SchemaError(["模式里没有可抽取的类型"])
+    with db.connect(settings.state_db) as con:
+        stored = discovery.get_config(con, source.kb_id)
+        prior = active_schema_entry(stored)
+        version_id = new_version_id(stored)
+        entry = {
+            "id": version_id,
+            "created_at": int(time.time()),
+            "model": None,
+            "domain": str(doc.get("description") or "").strip()[:200] or (prior or {}).get("domain"),
+            "persona": (prior or {}).get("persona"),
+            "linkml": to_linkml(model, name=source.kb_id, version=version_id,
+                                title=str(doc.get("title") or ""), description=str(doc.get("description") or "")),
+            "examples": "",
+            "origin": ORIGIN_UPLOAD,
+            "prior_id": str(prior.get("id")) if prior else None,
+            "upload": {"name": str(doc.get("name") or ""), "id": str(doc.get("id") or ""),
+                       "version": str(doc.get("version") or ""), "warnings": warnings[:50]},
+        }
+        if prior and prior.get("observed"):
+            entry["observed"] = {**dict(prior["observed"]), "inherited_from": str(prior.get("id"))}
+        versions = push_schema_version(stored.get("graph_schema_versions") or [], entry,
+                                       active_id=stored.get("graph_schema_active"), protected_ids=protected_schema_ids(con, source.kb_id))
+        updates: dict[str, Any] = {"graph_schema_versions": versions}
+        if adopt:
+            updates["graph_schema_active"] = version_id
+            apply_schema_version({"graph_schema_versions": versions}, updates)
+        discovery.set_config(con, source.kb_id, updates)
+        con.commit()
+    counts = entry_counts(entry)
+    print(f"[schema] {source.kb_id}({source.source_root}) upload: version {version_id}{' adopted' if adopt else ''}"
+          f" types={counts['types']} predicates={counts['predicates']} warnings={len(warnings)}", flush=True)
+    return {"kb_id": source.kb_id, "version_id": version_id, "adopted": bool(adopt), "origin": ORIGIN_UPLOAD,
+            "warnings": warnings, "entity_types": counts["type_names"], "predicates": counts["predicate_names"]}
+
 
 def ensure_schema_before_build(settings: Any, source: KBSource, *,
                                stop: threading.Event | None = None) -> tuple[KBSource, dict[str, Any] | None]:
@@ -415,21 +524,20 @@ def ensure_schema_before_build(settings: Any, source: KBSource, *,
     # rather than extracting another
     mark = suggest_in_progress(settings, source.kb_id)
     if mark is not None:
-        print(f"[graph] {source.kb_id}({source.source_root}): label extraction already running elsewhere ({mark.get('origin')}); waiting for it", flush=True)
-        waited = wait_for_suggest(settings, source.kb_id)
-        print(f"[graph] {source.kb_id}({source.source_root}): waited {waited}s", flush=True)
-    # the ring holds an extracted but unsaved version (extracted in the console without saving, or the one just
-    # waited for above): adopt the latest
+        print(f"[graph] {source.kb_id}({source.source_root}): 另一处正在抽标签({mark.get('origin')}),等它抽完", flush=True)
+        waited = wait_for_suggest(settings, source.kb_id, stop=stop)
+        print(f"[graph] {source.kb_id}({source.source_root}): 等了 {waited}s", flush=True)
+    # 环里有抽过但没保存的版本(控制台抽了没点保存,或上面刚等到的那版):采用最新那版
     info = adopt_latest_schema_version(settings, source)
     if info is not None:
         return reload_source(settings, source), info
-    print(f"[graph] {source.kb_id}({source.source_root}): no schema version yet; extracting labels with default settings first"
-          f" (sample size {source.graph_tune_sample_size})", flush=True)
+    print(f"[graph] {source.kb_id}({source.source_root}): 没有模式版本,先用默认参数抽一版标签"
+          "(按模型输入预算自动采样)", flush=True)
     try:
         info = suggest_schema_version(settings, source, origin=ORIGIN_BLANK, adopt=True, use_prior=False, stop=stop)
     except SuggestBusy:
-        # someone (the console) started extracting between the wait and the claim: wait again and adopt their version
-        waited = wait_for_suggest(settings, source.kb_id)
+        # 等待和认领之间有人抢先开抽(控制台):再等它抽完,采用它那版
+        waited = wait_for_suggest(settings, source.kb_id, stop=stop)
         info = adopt_latest_schema_version(settings, source)
         if info is None:
             raise

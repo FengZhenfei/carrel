@@ -30,9 +30,10 @@ PAYLOAD_INDEX_FIELDS = {
 # The same rule for graph collections: only fields that a filter actually uses get an index. A graph collection
 # is created anew for every version, and each of its points has to maintain every index listed here
 GRAPH_PAYLOAD_INDEX_FIELDS = {
-    # Lexical seeds (recall.lexical_seeds): exact lookup by title / alias / relation endpoint
+    # 词法种子(recall.lexical_seeds):按标题 / 别名 / 外部编号 / 关系端点精确找
     "title": models.PayloadSchemaType.KEYWORD,
     "aliases": models.PayloadSchemaType.KEYWORD,
+    "external_ids": models.PayloadSchemaType.KEYWORD,
     "source": models.PayloadSchemaType.KEYWORD,
     "target": models.PayloadSchemaType.KEYWORD,
     # Structured-fact collection (recall.spec_seeds): exact lookup by symbol / property
@@ -42,6 +43,9 @@ GRAPH_PAYLOAD_INDEX_FIELDS = {
     # are not used as seeds
     "boilerplate": models.PayloadSchemaType.BOOL,
     "reference": models.PayloadSchemaType.BOOL,
+    # 时间口径(recall.relation_filter):现行口径下被取代的、来源文档标了状态的关系 / 事实不作种子
+    "superseded_by": models.PayloadSchemaType.KEYWORD,
+    "doc_status": models.PayloadSchemaType.KEYWORD,
 }
 
 # The entity graph's collections (entities, relations, facts). community (the old pipeline's community reports)

@@ -10,7 +10,7 @@ from pathlib import Path
 from .limits import (
     GRAPH_MAX_GLEANINGS_DEFAULT, GRAPH_TUNE_SAMPLE_DEFAULT, GRAPH_UNIT_CHUNKS_DEFAULT,
     normalize_entity_types, normalize_examples, normalize_parent_types, normalize_predicates,
-    normalize_profile, normalize_type_definitions,
+    normalize_profile, normalize_type_definitions, normalize_type_parents, normalize_type_scopes,
 )
 from .models import GraphRebuildPolicy, KBSource
 from .utils import load_env_file, pin_tokenizer_cache
@@ -53,6 +53,8 @@ class Settings:
     # retrieval side; they are here only so the console's "reranker service" row can probe / restart them.
     # Empty = not deployed on this machine, and the row is hidden from the drawer.
     reranker_base_url: str
+    reranker_model_id: str
+    reranker_api_key: str
     visual_reranker_base_url: str
     # pixel budget applied before an image goes to either vision model
     image_max_pixels: int
@@ -78,6 +80,8 @@ class Settings:
     qdrant_upsert_max_bytes: int
     qdrant_inactive_retention_days: int
     graph_work_dir: Path
+    # 每个库一份更正文件(<kb_id>.yaml),随库的生命周期建删,不随图谱;人手维护、重算不出来,所以放在配置目录
+    corrections_dir: Path
     graph_llm_concurrency: int
     graph_llm_timeout_seconds: int
     graph_circuit_fails: int
@@ -168,6 +172,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         visual_embedding_retry=int(os.getenv("VISUAL_EMBEDDING_RETRY", "5")),
         visual_embedding_timeout_seconds=float(os.getenv("VISUAL_EMBEDDING_TIMEOUT_SECONDS", "300")),
         reranker_base_url=os.getenv("RERANKER_BASE_URL", "http://127.0.0.1:8102/v1").strip(),
+        reranker_model_id=os.getenv("RERANKER_MODEL_ID", "").strip(),
+        reranker_api_key=os.getenv("RERANKER_API_KEY", "").strip(),
         visual_reranker_base_url=os.getenv("VISUAL_RERANKER_BASE_URL", "http://127.0.0.1:8104/v1").strip(),
         image_max_pixels=int(os.getenv("KB_IMAGE_MAX_PIXELS", "3686400")),
         vlm_base_url=os.getenv("VLM_BASE_URL", "http://127.0.0.1:8105/v1"),
@@ -205,7 +211,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         qdrant_inactive_retention_days=int(os.getenv("QDRANT_INACTIVE_RETENTION_DAYS", "7")),
         # Graph build workspace (units / graph / LLM cache); see the layout notes at the top of graph/build.py
         graph_work_dir=Path(os.getenv("KB_GRAPH_WORK_DIR", str(BASE_DIR / "runtime" / "graph"))),
-        # Public LLM concurrency / timeout / circuit-breaker threshold; see graph/llm.py for the rationale
+        corrections_dir=Path(os.getenv("KB_CORRECTIONS_DIR", str(BASE_DIR / "config" / "corrections"))),
+        # 公网 LLM 的并发 / 超时 / 熔断阈值,取值依据见 graph/llm.py
         graph_llm_concurrency=int(os.getenv("KB_GRAPH_LLM_CONCURRENCY", "8")),
         graph_llm_timeout_seconds=int(os.getenv("KB_GRAPH_LLM_TIMEOUT", "300")),
         graph_circuit_fails=int(os.getenv("KB_GRAPH_CIRCUIT_FAILS", "20")),
@@ -289,6 +296,8 @@ def _load_extra_sources(mirror_root: Path) -> dict[str, KBSource]:
             graph_language=str(item.get("graph_language") or "").strip() or None,
             graph_predicates=normalize_predicates(item.get("graph_predicates")),
             graph_parent_types=normalize_parent_types(item.get("graph_parent_types")),
+            graph_type_parents=normalize_type_parents(item.get("graph_type_parents")),
+            graph_type_scopes=normalize_type_scopes(item.get("graph_type_scopes")),
             graph_type_definitions=normalize_type_definitions(item.get("graph_type_definitions")),
             graph_examples=normalize_examples(item.get("graph_examples")),
             graph_profile=normalize_profile(item.get("graph_profile")),

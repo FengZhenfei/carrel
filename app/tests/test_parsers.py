@@ -40,10 +40,10 @@ class ParserRegressionTests(unittest.TestCase):
         new = SourceFile(
             kb_id="project_materials",
             collection="kb_project",
-            source_root="项目资料",
+            source_root="Project Library",
             source_type="local_mirror",
             file_key=1,
-            source_path="项目资料/after.html",
+            source_path="Project Library/after.html",
             rel_path="after.html",
             filename="after.html",
             dir="",
@@ -636,7 +636,7 @@ class EquationMergeTests(unittest.TestCase):
 
     MinerU breaks every connecting sentence between equations into its own text block. As long as equations
     cannot be merged, the buffer is flushed at every equation -- "where / $$equation$$ / therefore" becomes
-    three chunks, two of which hold a single token. Measured on the library KB: 1,424 of 44,043 chunks were
+    three chunks, two of which hold a single token. Measured in a chunking evaluation: 1,424 of 44,043 chunks were
     ≤5 tokens.
 
     But the real loss is at the other end: 14,338 equation chunks were separated from the prose explaining
@@ -1156,7 +1156,7 @@ class MergedCellFillTests(unittest.TestCase):
     dozens of times, surfacing in clusters at retrieval. Measured on table-native-v1, 9.2% of the chunks came
     from this, 66% for the "filling instructions" sheet.
 
-    Vertical fill must stay: a category label such as "WPS AI" spanning 54 rows is exactly what gives every
+    Vertical fill must stay: a category label such as "示例模块" spanning 54 rows is exactly what gives every
     row chunk its own category; without it every row but the first has no idea where it belongs.
     """
 
@@ -1202,11 +1202,11 @@ class MergedCellFillTests(unittest.TestCase):
         self.assertEqual(sorted({r for r, _ in filled}), list(range(2, 9)), "每一行都该有")
 
     def test_a_vertical_merge_still_labels_every_row(self) -> None:
-        # The "WPS AI" category label spanning 54 rows -- this branch must be kept as is
-        ws = self._sheet([(1, 5, 1, 58)], {(5, 1): "WPS AI"}, (110, 8))
+        # The "示例模块" category label spanning 54 rows -- this branch must be kept as is
+        ws = self._sheet([(1, 5, 1, 58)], {(5, 1): "示例模块"}, (110, 8))
         filled = self._fill(ws)
         self.assertEqual(len(filled), 54)
-        self.assertTrue(all(v == "WPS AI" for v in filled.values()))
+        self.assertTrue(all(v == "示例模块" for v in filled.values()))
         self.assertEqual({c for _, c in filled}, {1})
 
     def test_an_empty_merge_fills_nothing(self) -> None:
@@ -2349,7 +2349,7 @@ class VisualEvidenceTests(unittest.TestCase):
         self.assertEqual(out[3], "EMC 测试结果 一般")                        # non-numeric category conflicts are not on this path
         self.assertEqual([(c["label"], c["text_value"], c["model_value"]) for c in conflicts],
                          [("综合风险指数", "28", "25"), ("过热风险指数", "2", "0")])
-        # The real-box shape: the caption names the metric while the model summary and FACTS say "current risk
+        # Synthetic fixture: the caption names the metric while the model summary and FACTS say "current risk
         # value is 25" -- a generic label is matched against the single value in the image
         summary = "一个风险水平的进度条,显示当前风险值为25,并与同类产品平均值30比较"
         out2, sum2, conf2 = reconcile_visual_facts(["当前风险值为25", "同类产品平均值为30"], "综合风险指数 28 中低等级", summary)
@@ -2474,7 +2474,7 @@ class VlmEndpointFallbackTests(unittest.TestCase):
 
 
 class VlmRunawayStringFieldsTests(unittest.TestCase):
-    """2026-09-10, the "automation tasks" screenshot in the product docs KB: the model wrote FACTS into
+    """2026-09-10 screenshot evaluation: the model wrote FACTS into
     summary, repeating "1. task list; 2. task list; ..." up to 516 items, and over 5,000 characters went
     verbatim into the chunk (3,157 tokens) and into the cache. Four places were dropping state: title /
     summary were neither checked for repetition nor capped; numbering and punctuation diluted the share of
@@ -2538,7 +2538,7 @@ class VlmRunawayStringFieldsTests(unittest.TestCase):
         out2, _ = tidy_visual_text("短行一\n" + "长行" * 300 + "\n短行二", max_tokens=20)
         self.assertEqual(out2, "短行一")
         facts = "FACTS: " + "；".join(f"第{i}个按钮位于工具栏右侧,用于打开设置面板" for i in range(1, 80))
-        out3, _ = tidy_visual_text("VISUAL SUMMARY: 一个设置界面。\n" + facts + "\nENTITIES: WPS", kind="screenshot", max_tokens=200)
+        out3, _ = tidy_visual_text("VISUAL SUMMARY: 一个设置界面。\n" + facts + "\nENTITIES: Demo", kind="screenshot", max_tokens=200)
         self.assertTrue(out3.startswith("VISUAL SUMMARY: 一个设置界面。\nFACTS: 第1个按钮"))
         self.assertTrue(out3.endswith("；"))                                   # cut at the full-width semicolon, leaving no half fact
         self.assertNotIn("ENTITIES", out3)
@@ -2663,7 +2663,7 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         self.assertEqual(row_to_text(["a", "b", "", ""]), "a | b")
 
     def test_cell_newlines_are_flattened_so_one_record_stays_one_line(self) -> None:
-        """In-cell newlines ("Session list<LF>@owner", header "WPS Collab<LF>public") used to split one record
+        """In-cell newlines ("Session list<LF>@owner", header "Demo Collab<LF>public") used to split one record
         over two or three lines; rows, headers and the column names / values of an over-budget split all
         collapse to one line."""
         from kb_pipeline.parsers.native_table import flat_cell, header_text, row_to_text, split_long_row
@@ -2671,7 +2671,7 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         self.assertEqual(flat_cell("会话列表\n@某某"), "会话列表 @某某")
         self.assertEqual(flat_cell("  a \r\n\n b\tc  "), "a b c")
         self.assertEqual(row_to_text(["聊天能力", "会话列表\n@某某", "移除会话", "", "1"]), "聊天能力 | 会话列表 @某某 | 移除会话 |  | 1")
-        self.assertEqual(header_text(["支持情况/WPS协作\n公网", "WPS协作\n私网"]), "支持情况/WPS协作 公网 | WPS协作 私网")
+        self.assertEqual(header_text(["支持情况/示例协作\n公网", "示例协作\n私网"]), "支持情况/示例协作 公网 | 示例协作 私网")
         self.assertEqual(split_long_row(["a\nb", "c"], 100, ["x\ny", "z"]), ["x y: a b | z: c"])
         self.assertEqual(row_to_text(["", "", ""]), "")
 
@@ -3345,7 +3345,7 @@ class PdfTextLayerTests(unittest.TestCase):
         from kb_pipeline.parsers import service_clients
 
         posts: list[dict] = []
-        session = self._fake_mineru_service({"backend": "vlm-engine", "version": "3.4.4", "content_list": []}, posts)
+        session = self._fake_mineru_service({"backend": "vlm-engine", "version": "3.4.4", "content_list": [{"type":"text", "text":"real body"}]}, posts)
         with tempfile.TemporaryDirectory() as tmp, patch.object(service_clients, "_local_service_session", session), \
                 patch.dict(os.environ, {"MINERU_BACKEND": "vlm-engine", "MINERU_REUSE_CACHE": "1"}):
             src = Path(tmp) / "a.pdf"
@@ -3367,8 +3367,8 @@ class PdfTextLayerTests(unittest.TestCase):
             src.write_bytes(b"%PDF-1.4 another")
             call()                                                            # file changed: requested again
             self.assertEqual(len(posts), 3)
-            out.write_text(json.dumps({"content_list": [], "_kb_source": {"name": "a.pdf", "size": src.stat().st_size}}), encoding="utf-8")
-            call()                                                            # the stamp records no backend: nothing to compare, accepted as before
+            out.write_text(json.dumps({"content_list": [{"type":"text", "text":"real body"}], "_kb_source": {"name": "a.pdf", "size": src.stat().st_size}}), encoding="utf-8")
+            call()                                                            # 标记里没记后端:无从比较,照旧认
             self.assertEqual(len(posts), 3)
 
     def test_parse_job_picks_the_mode_from_the_attempts_left(self) -> None:

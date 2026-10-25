@@ -21,11 +21,12 @@ from . import prompts
 from .extract import normalize_name, strip_math
 from .llm import ChatClient, LLMSpec
 from .tabletext import FACTS_EXPAND_WIDE_TABLES, expand_wide_tables
+from .temporal import axis_value_kind
 from .units import Unit, unit_signals
 
 FACTS_MAX_PER_UNIT = 120
 FACTS_TABLE_RATIO = 0.3
-# A big table unit can yield hundreds of facts and 6144 cut the JSON midway (real box, QDR Table 15); after a
+# A big table unit can yield hundreds of facts and 6144 cut the JSON midway (observed in a large-table extraction); after a
 # truncation another request follows at twice the budget
 FACTS_MAX_TOKENS = 12288
 _NUMBER_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?(?:\s*[eE][-+]?\d+)?")
@@ -242,7 +243,7 @@ def _strip_trailing_commas(text: str) -> str:
 def _lenient_json(text: str) -> Any:
     """Parse the model's JSON leniently: as-is first; failing that, double the invalid escapes and retry; failing
     that, strip trailing commas outside strings. Control characters inside strings are always allowed, and string
-    contents are never altered. On 2026-09-13 one unit of the library KB's MySQL tutorial hit six "malformed
+    contents are never altered. On 2026-09-13 one sampled unit hit six "malformed
     response" errors in a row: the model wrote the pipes of a table as "backslash + pipe", json raised Invalid
     escape and the whole build failed. That is spelling noise and must not let one unit sink the whole graph.
     Raises ValueError when it still cannot be parsed."""
@@ -604,26 +605,54 @@ def value_text(fact: dict[str, Any]) -> str:
 
 
 def render_facts_prompt(unit: Unit, *, document: str, subjects: Iterable[str], max_facts: int = FACTS_MAX_PER_UNIT,
-                        axis: str = "") -> str:
+                        axis: str = "", narrative: bool = False) -> str:
+    """表格 / 列表单元用 FACTS_PROMPT;narrative=True(按日期组织的资料里的叙述段)用 NARRATIVE_FACTS_PROMPT。
+    两段提示词都带文档日期:相对日期、缺年份的日期按它换算。"""
+    from .temporal import axis_value_kind
+
     subject_text = ", ".join(str(s) for s in subjects if str(s).strip()) or "(unknown)"
+    axis_value = axis or getattr(unit, "axis", "") or ""
+    doc_date = str(getattr(unit, "doc_date", "") or "") or (axis_value if axis_value_kind(axis_value) == "date" else "")
+    doc_version = axis_value if axis_value_kind(axis_value) == "version" else ""
+    if narrative:
+        return prompts.NARRATIVE_FACTS_PROMPT.format(
+            document=document or unit.rel_path or "(unknown)", section=unit.section_label,
+            document_date=doc_date or "(unknown)", subjects=subject_text, input_text=unit.text, max_facts=int(max_facts))
     return prompts.FACTS_PROMPT.format(
         document=document or unit.rel_path or "(unknown)", section=unit.section_label,
-        axis=axis or getattr(unit, "axis", "") or "(unknown)",
+        document_date=doc_date or "(unknown)", document_version=doc_version or "(unknown)",
         subjects=subject_text, input_text=((expand_wide_tables(unit.text) if FACTS_EXPAND_WIDE_TABLES else None) or unit.text),
         max_facts=int(max_facts),
     )
 
 
 def facts_prompt_hash() -> str:
-    return hashlib.sha256(prompts.FACTS_PROMPT.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256((prompts.FACTS_PROMPT + prompts.NARRATIVE_FACTS_PROMPT).encode("utf-8")).hexdigest()[:16]
+
+
+NARRATIVE_FACTS_MIN_TOKENS = 40
+
+
+def wants_narrative_facts(unit: Unit, kind: str | None = None) -> bool:
+    """按日期组织的资料(画像 axis = date)里,不走表格事实抽取的叙述段也抽一遍状态事实:负责人、进度、截止日期、
+    决定、叙述里给出的数值。样板与罗列不抽,太短的段不抽。是否开由调用方按画像判。"""
+    effective = kind or unit.kind or "body"
+    if effective in ("boilerplate", "listing"):
+        return False
+    if wants_facts(unit, kind):
+        return False
+    return int(unit.n_tokens or 0) >= NARRATIVE_FACTS_MIN_TOKENS
+
+
+# 候选主体怎么挑也进指纹:候选写在提示词的 Likely subjects 行,规则变了,按旧候选抽出的单元不能沿用(提示词没变的
+# 单元重抽时走响应缓存,不花调用)。subjects-v2:小节标题点名的主题(改版十八)
+SUBJECT_CANDIDATES_VERSION = "subjects-v2"
 
 
 def facts_fingerprint(spec: LLMSpec) -> str:
-    # the version label follows the output of normalize_fact: what is stored is the normalised fact, so old rows
-    # cannot be reused once normalisation changes.
-    # facts-v4: a comma only counts as a thousands separator, value fields no longer get the LaTeX restoration
-    # of entity names
-    raw = "|".join(["facts-v4", spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
+    # 版本标签跟着 normalize_fact 的产出走:落库的是规范化之后的事实,规范化变了旧行就不能复用。
+    # facts-v4:逗号只认千分位、取值类字段不再按实体名还原 LaTeX;facts-v5:有效期只收日期(版本在 axis 里)、带观察时间
+    raw = "|".join(["facts-v5", SUBJECT_CANDIDATES_VERSION, spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -645,11 +674,12 @@ class FactExtractor:
     def fingerprint(self) -> str:
         return facts_fingerprint(self.client.spec)
 
-    def extract(self, unit: Unit, *, document: str = "", subjects: Iterable[str] = (), axis: str = "") -> FactResult:
-        prompt = render_facts_prompt(unit, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis)
-        # A response that is not acceptable JSON: the client asks once more with a correction hint, and if it is
-        # still unacceptable raises LLMMalformedResponse; the caller records the unit as failed, writing neither
-        # graph_facts nor the response cache (Codex review F03)
+    def extract(self, unit: Unit, *, document: str = "", subjects: Iterable[str] = (), axis: str = "",
+                narrative: bool = False) -> FactResult:
+        prompt = render_facts_prompt(unit, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis,
+                                     narrative=narrative)
+        # 不是合格 JSON 的响应:客户端带纠正提示再要一次,仍不合格就抛 LLMMalformedResponse ——
+        # 调用方把这个单元记成失败,不落 graph_facts、不进响应缓存(Codex 审查 F03)
         response = self.client.chat([{"role": "user", "content": prompt}], max_tokens=self.max_tokens,
                                     validate=facts_response_ok)
         parsed = parse_facts_response(response)
@@ -674,7 +704,8 @@ class FactExtractor:
                 still = False
                 for part in halves:
                     sub = replace(unit, text=part)
-                    sub_prompt = render_facts_prompt(sub, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis)
+                    sub_prompt = render_facts_prompt(sub, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis,
+                                                     narrative=narrative)
                     got = parse_facts_response(self.client.chat([{"role": "user", "content": sub_prompt}], max_tokens=self.max_tokens * 2,
                                                                 validate=facts_response_ok))
                     calls += 1
@@ -707,6 +738,8 @@ class FactExtractor:
             seen.add(fid)
             fact["id"] = fid
             fact["unit_id"] = unit.unit_id
+            if narrative:
+                fact["source_kind"] = "narrative"
             facts.append(fact)
             if len(facts) >= self.max_facts:
                 capped = i + 1 < len(raw_facts)      # some left: stopping at the budget is not "input fully processed" (Codex re-review N03)
@@ -720,33 +753,40 @@ class FactExtractor:
 
 
 def link_facts(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, units_by_id: dict[str, Unit]) -> dict[str, int]:
-    """Link a fact's subject / property to graph entities (this document's scope first, then global; title or
-    alias equal, case-insensitive). Matches get subject_key / property_key; non-matches keep the text. Returns
-    counts."""
-    by_title: dict[tuple[str, str], str] = {}
+    """把事实的 subject / property 对到图里的实体(先本文档作用域,再全局;标题或别名相等,大小写不敏感)。
+    对上的写 subject_key / property_key;对不上保留文本。返回计数。"""
+    by_title: dict[tuple[str, str], set[str]] = {}
+    by_ref: dict[tuple[str, str], set[str]] = {}
     for e in entities:
         scope = str(e.get("scope") or "")
         names = [str(e.get("title") or "")] + [str(a) for a in (e.get("aliases") or [])]
         for n in names:
             n = n.casefold().strip()
             if n:
-                by_title.setdefault((scope, n), e["key"])
+                by_title.setdefault((scope, n), set()).add(e["key"])
+                for ext in e.get("external_ids") or []:
+                    ref = f"{ext.get('scheme') or ''}:{ext.get('value') or ''}"
+                    by_ref.setdefault((n, ref), set()).add(e["key"])
     stats = {"subjects_linked": 0, "properties_linked": 0, "compound_subjects": 0}
 
     def lookup(doc: str, name: str) -> str:
         name = name.casefold().strip()
-        return by_title.get((doc, name)) or by_title.get(("", name)) or ""
+        found = by_title.get((doc, name)) or by_title.get(("", name)) or set()
+        return next(iter(found)) if len(found) == 1 else ""
 
     for f in facts:
         unit = units_by_id.get(str(f.get("unit_id") or ""))
         doc = unit.doc_id if unit else ""
         for field, key_field, counter in (("subject", "subject_key", "subjects_linked"), ("property", "property_key", "properties_linked")):
             name = str(f.get(field) or "")
-            key = lookup(doc, name)
+            ref = str(f.get("subject_ref") or "") if field == "subject" else ""
+            matches = by_ref.get((name.casefold().strip(), ref), set()) if ref else set()
+            key = (next(iter(matches)) if len(matches) == 1 else "") if ref else lookup(doc, name)
+            f.pop(key_field, None)
             if not key and f.get("symbol") and field == "property":
                 key = lookup(doc, str(f["symbol"]))
-            if not key and field == "subject":
-                # Compound subjects "A, B" / "A/B": one fact belongs to several things at once, attach it to each
+            if not key and field == "subject" and not ref:
+                # 合写主体「A, B」「A/B」:一条事实同时属于几个东西,每个都挂上
                 pieces = [x.strip() for x in _COMPOUND_SPLIT_RE.split(name) if x.strip()]
                 keys = [k for k in (lookup(doc, x) for x in pieces) if k] if len(pieces) >= 2 else []
                 if keys:
@@ -761,12 +801,17 @@ def link_facts(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, u
             f["rel_path"] = unit.rel_path
             f["section"] = unit.section_label
             f["point_ids"] = list(unit.point_ids)
-            # Document axis value: facts lacking a validity period take the document's (report date, manual version)
+            # 文档轴值:事实自己没写有效期就按文档日期算;版本只进 axis,不进 valid_from(有效期只收日期,
+            # 以前把 rev *L 这种版本串写进 valid_from,时间窗与新旧判断都把它当日期比)
             axis = str(getattr(unit, "axis", "") or "")
+            doc_date = str(getattr(unit, "doc_date", "") or "")
             if axis:
                 f["axis"] = axis
-                if not f.get("valid_from") and not f.get("valid_until"):
-                    f["valid_from"] = axis
+            if doc_date:
+                f["observed"] = doc_date
+            default_from = axis if axis_value_kind(axis) == "date" else doc_date
+            if default_from and not f.get("valid_from") and not f.get("valid_until"):
+                f["valid_from"] = default_from
             if f.get("ref_min_num") is not None or f.get("ref_max_num") is not None:
                 dist = bound_distance(f)
                 if dist is not None:
@@ -774,18 +819,20 @@ def link_facts(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, u
     return stats
 
 
+SUBJECT_UPPERS = ("agent", "entity")    # 与 compile.SUBJECT_UPPERS 同一口径
+
+
 def document_subjects(entities: list[dict[str, Any]], *, per_doc: int = 4, subject_types: Iterable[str] = (),
                       documents: dict[str, str] | None = None) -> dict[str, list[str]]:
-    """Default subjects per document (used when a table names no subject): the profile subject first (path / same-
-    directory series evidence preferred, see profile_subject_by_doc), then the other entities of the profile's
-    subject types, the rest by frequency; only global entities of upper class entity count. documents: doc_id →
-    rel_path."""
+    """每份文档里的默认主体(表格没写主体时用):画像主体(路径 / 同目录序列证据优先,见 profile_subject_by_doc)排最前,
+    然后是画像主体类型里的其他实体,其余按频次;只算上层类为 agent / entity 的全局实例(泛指的类别名不算)。
+    documents:doc_id → rel_path。"""
     priority = subject_type_priority(subject_types)
     scores: dict[str, dict[str, tuple[int, int]]] = {}
     for e in entities:
         if e.get("scope") or e.get("reference") or e.get("boilerplate"):
             continue
-        if str(e.get("upper") or "entity") != "entity":
+        if str(e.get("upper") or "entity") not in SUBJECT_UPPERS or e.get("kind") == "class":
             continue
         typed = _type_rank(e, priority)
         for doc in e.get("doc_ids") or []:
@@ -799,21 +846,113 @@ def document_subjects(entities: list[dict[str, Any]], *, per_doc: int = 4, subje
     return out
 
 
+def unit_subjects(units: Iterable[Unit], entities: list[dict[str, Any]], *, per_unit: int = 4, subject_types: Iterable[str] = (),
+                  documents: dict[str, str] | None = None) -> dict[str, list[str]]:
+    """每个单元的候选主体(表格 / 叙述没写主体时用):文档路径或同目录序列说明这份文档就是讲某个画像主体的(某人
+    文件夹里的报告),它排最前;然后是这个单元里抽到的人员与组织、实体的实例(画像主体类型优先,再按频次);
+    再是小节标题点名的那样东西(只给没有归属人的文档,见 HeadingTopics);最后用整份文档的主要主体补足
+    (只按频次认出来的画像主体在这里)。
+    一份文档里讲好几样东西(汇编手册、合集)时,只给整份文档的几个主要主体,一节里的数值会挂到别的小节的主体上
+    (各小节的值不能误归到其他子项目名下)。"""
+    units = list(units)
+    priority = subject_type_priority(subject_types)
+    by_doc = document_subjects(entities, per_doc=per_unit, subject_types=subject_types, documents=documents)
+    owner = {doc: str(e.get("title") or "") for doc, (e, how) in subject_evidence_by_doc(entities, subject_types, documents).items()
+             if how in ("path", "series")} if priority else {}
+    in_unit: dict[str, dict[str, tuple[int, int]]] = {}
+    for e in entities:
+        if e.get("scope") or e.get("reference") or e.get("boilerplate"):
+            continue
+        if str(e.get("upper") or "entity") not in SUBJECT_UPPERS or e.get("kind") == "class":
+            continue
+        rank = (_type_rank(e, priority), int(e.get("frequency") or 0))
+        for uid in e.get("unit_ids") or []:
+            in_unit.setdefault(str(uid), {})[str(e.get("title") or "")] = rank
+    topics = HeadingTopics(entities) if any(u.doc_id not in owner for u in units) else None
+    out: dict[str, list[str]] = {}
+    for u in units:
+        local = [t for t, _ in sorted((in_unit.get(u.unit_id) or {}).items(), key=lambda kv: (-kv[1][0], -kv[1][1]))]
+        topic = topics.topic(u) if topics is not None and u.doc_id not in owner else ""
+        names = [owner.get(u.doc_id, ""), *local, topic, *by_doc.get(u.doc_id, [])]
+        out[u.unit_id] = [t for t in dict.fromkeys(names) if t][:per_unit]
+    return out
+
+
+HEADING_TOPIC_EXCLUDED_UPPERS = ("property", "document")
+_HEADING_SPLIT_RE = re.compile(r"\s+[>|]\s+")
+_HEADING_WORD_RE = re.compile(r"[0-9a-z]+")
+
+
+def _heading_lower(text: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(text or ""))).casefold().strip()
+
+
+class HeadingTopics:
+    """小节标题点名的实体(10-24 改版十八)。没有归属人的汇编、手册里,一段自己没点名任何东西时,候选只剩整份文档的
+    主要主体,子实验的局数、题数、笔记本结构都挂到了框架名下;小节标题点名的那样东西才是这一节讲的。
+    从最近的一级标题往上找,一级里点名了几样取名字最长的。非 ASCII 的名字去掉空白和标点后按子串认(中文没有词边界),
+    ASCII 名字按整词认(Feature Discovery 里没有 Redis);名字至少 3 个字符,纯数字不算。
+    只认实例(类别名不是哪一样东西),属性、文档不算(数值不归它们),样板、引用不算;作用域是全局或本文档。"""
+
+    def __init__(self, entities: list[dict[str, Any]]) -> None:
+        self.wide: dict[str, dict[str, list[tuple[str, str]]]] = {}       # 作用域 → 首字符 → [(规范名, 标题)]
+        self.ascii: dict[str, dict[str, list[tuple[str, str]]]] = {}      # 作用域 → 首个词 → [(小写名, 标题)]
+        for e in entities:
+            if e.get("boilerplate") or e.get("reference") or e.get("kind") == "class":
+                continue
+            if str(e.get("upper") or "entity") in HEADING_TOPIC_EXCLUDED_UPPERS:
+                continue
+            title = str(e.get("title") or "")
+            scope = str(e.get("scope") or "")
+            for name in {title, *[str(a) for a in (e.get("aliases") or [])]}:
+                canon = _path_canon(name)
+                if len(canon) < 3 or canon.isdigit():
+                    continue
+                if canon.isascii():
+                    low = _heading_lower(name)
+                    word = _HEADING_WORD_RE.search(low)
+                    if word:
+                        self.ascii.setdefault(scope, {}).setdefault(word.group(0), []).append((low, title))
+                else:
+                    self.wide.setdefault(scope, {}).setdefault(canon[0], []).append((canon, title))
+
+    def topic(self, unit: Unit) -> str:
+        levels = [s for s in reversed(unit.section_path) if str(s).strip()]
+        for extra in unit.extra_sections or []:
+            levels += [s for s in reversed(_HEADING_SPLIT_RE.split(str(extra))) if s.strip()]
+        scopes = ("", str(unit.doc_id))
+        for level in levels:
+            canon, low = _path_canon(level), _heading_lower(level)
+            words = set(_HEADING_WORD_RE.findall(low))
+            hits: list[tuple[int, str]] = []
+            for scope in scopes:
+                wide = self.wide.get(scope) or {}
+                for ch in set(canon):
+                    hits += [(len(c), t) for c, t in wide.get(ch, ()) if c in canon]
+                ascii_names = self.ascii.get(scope) or {}
+                for word in words:
+                    hits += [(len(n), t) for n, t in ascii_names.get(word, ())
+                             if re.search(r"(?<![0-9a-z])" + re.escape(n) + r"(?![0-9a-z])", low)]
+            if hits:
+                return max(hits)[1]
+        return ""
+
+
 def subject_type_priority(subject_types: Iterable[str]) -> dict[str, int]:
-    """The order of subject types in the profile is the priority: the first is what the document is really "about"
-    (the examinee, the part number), the rest are supporting (the health KB's profile lists patient / medical
-    condition / health report; picking by frequency would select "diabetes")."""
+    """The profile orders subject types by priority: the first names the main subject,
+    while later types provide context. Frequency alone can promote a supporting entity."""
     names = [str(t).casefold() for t in subject_types if str(t).strip()]
     return {t: len(names) - i for i, t in enumerate(names)}
 
 
 def _type_rank(e: dict[str, Any], priority: dict[str, int]) -> int:
-    return max(priority.get(str(e.get("type") or "").casefold(), 0), priority.get(str(e.get("parent_type") or "").casefold(), 0))
+    """画像主体类型可以写在类型链的任何一级(类型本身、父类型、上层类)。"""
+    chain = [str(t).casefold() for t in (e.get("type_path") or [e.get("type") or ""])]
+    return max([priority.get(t, 0) for t in chain] or [0])
 
 
-# ── Re-homing measurement facts (2026-09-08, health KB on the real box): in report corpora the "subject" of a
-# table row is often the test item itself, the lab sheet name or a diagnosis in the abnormal summary table,
-# while the value is a measurement of the document subject (the examinee) ───────────────────────────────
+# ── Re-homing measurement facts: a table row may name a metric or a report instead
+# of the subject that owns the measured value. Use document evidence to resolve it. ──
 _GENERIC_PROPERTY_WORDS = {"测量结果", "检查结果", "检测结果", "检验结果", "结果", "值", "数值", "测定值", "参数", "指标",
                            "measurement", "measured value", "value", "result", "reading", "level"}
 _FLAG_SUFFIX_RE = re.compile(
@@ -861,7 +1000,11 @@ def subject_evidence_by_doc(entities: list[dict[str, Any]], subject_types: Itera
     best: dict[str, tuple[tuple[int, int, int], dict[str, Any]]] = {}
     typed_entities: list[dict[str, Any]] = []
     for e in entities:
-        if e.get("scope") or e.get("reference") or e.get("boilerplate"):
+        if e.get("scope") or e.get("reference") or e.get("boilerplate") or e.get("kind") == "class":
+            continue
+        # 与 document_subjects 同一口径:文档主体是人员与组织或实体。事件、概念也可能在画像类型中,
+        # 但不能因为名字与文件名匹配,就压过真正持有测量值的主体。
+        if str(e.get("upper") or "entity") not in SUBJECT_UPPERS:
             continue
         typed = _type_rank(e, priority)
         if not typed:
@@ -935,9 +1078,8 @@ def _document_own_entity(ent: dict[str, Any]) -> bool:
     numbers, issuer names and numbered subjects do. When path / series evidence assigns a document to the profile
     subject, only the facts under such an entity move over as a whole. Facts under cross-document global entities
     (the products and competitors in a feature comparison table) and document-scoped components (a product's
-    modules, features) are their own and stay put. 2026-09-12 product KB: the top-level directory was the vendor
-    name, and all 26k facts of the sample collaboration / competitor columns and the modules in the comparison
-    tables were assigned to the vendor."""
+    modules, features) are their own and stay put. 2026-09-12 evaluation: matching a top-level directory
+    to a shared parent entity incorrectly reassigned all 26k facts to that entity."""
     return not ent.get("scope") and len(ent.get("doc_ids") or []) <= 1
 
 
@@ -956,27 +1098,22 @@ def _is_quantity(fact: dict[str, Any]) -> bool:
 
 def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, units_by_id: dict[str, Unit],
                            profile: dict[str, Any] | None = None, documents: dict[str, str] | None = None) -> dict[str, int]:
-    """Deterministic re-homing, run after link_facts (so old facts from the cache get fixed too):
-    · marker words at the tail of a property name (total cholesterol elevated) are split off into flag, so the
-      concept can merge into "total cholesterol"; only when the value is text, and the original property name is
-      kept in property_raw;
-    · a period in the conditions (year: 2024/07) moves to valid_from / period_text, so each row of a multi-year
-      comparison table becomes its own time point;
-    · in documents with a profile subject (examinee, part number), measurement facts get the profile subject as
-      subject when the original subject is a lab sheet / test item (upper class process), the indicator itself
-      (upper class property), or has the same name as the property or a generic property such as "measurement
-      result"; in date-axis corpora a measurement with a reference range or flag goes to the examinee even when
-      it hangs under a diagnosis (abnormal summary table: obesity → uric acid 479↑), with the original subject
-      kept in context.
-    · when the document subject is settled by path / same-directory series evidence (subject_evidence_by_doc), the
-      facts under this document's own "subject type" entity (Mr. Li_checkup number, the issuer's name) move to the
-      profile subject as a whole (resubjected_identity).
-    Numbers are not changed and facts are not deleted; a changed subject is recorded in subject_raw."""
+    """确定性归位,在 link_facts 之后跑(缓存里的旧事实也能修):
+    · 属性名尾巴上的标记词(总胆固醇增高 / elevated)剥到 flag,概念才能并到「总胆固醇」;只剥取值是文字的,
+      原属性名记 property_raw;
+    · 条件里的时期(年份: 2024/07)搬到 valid_from / period_text,历年对照表的每一行各成一个时间点;
+    · 文档有归属人(路径 / 同目录序列证据定下的画像主体:某人文件夹里的报告、某器件目录下的资料)时,测量事实的主体
+      改成归属人:原主体是化验单 / 检查项目(上层 process)或指标本身(上层 property)或与属性同名、属性是「测量结果」
+      这类泛词的;日期轴的语料里,带参考范围或标记的测量即使挂在诊断名下(异常汇总表:肥胖 → 尿酸 479↑)也归受检者,
+      原主体记到 context。只按频次认出来的画像主体不归位,避免把文档中的不同对象归到最常出现的名字下。
+    · 文档主体由路径 / 同目录序列证据定下来(subject_evidence_by_doc)时,挂在本文档自己那个「主体类型」实体
+      (李先生_体检号、签发人名)名下的事实整个归到画像主体(resubjected_identity)。
+    不改数值,不删事实;改过主体的记 subject_raw。"""
     from .temporal import parse_date
 
     profile = profile or {}
     evidence = subject_evidence_by_doc(entities, profile.get("subject_types") or (), documents)
-    subj_by_doc = {doc: e for doc, (e, _) in evidence.items()}
+    subj_by_doc = {doc: e for doc, (e, how) in evidence.items() if how in ("path", "series")}
     priority = subject_type_priority(profile.get("subject_types") or ())
     date_axis = str(profile.get("axis") or "") == "date"
     lookup = _entity_lookup(entities)
@@ -1034,7 +1171,7 @@ def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str,
         if not subject or subject.casefold() == str(target.get("title") or "").casefold() or f.get("subject_key") == target.get("key"):
             continue
         ent = lookup.get((doc, subject.casefold())) or lookup.get(("", subject.casefold()))
-        upper = str((ent or {}).get("upper") or (ent or {}).get("parent_type") or "").casefold()
+        upper = str((ent or {}).get("upper") or "").casefold()
         prop = str(f.get("property") or "")
         generic = prop.casefold() in _GENERIC_PROPERTY_WORDS or not prop
         same = prop.casefold() == subject.casefold()
@@ -1045,9 +1182,9 @@ def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str,
             stats["identity_kept_shared"] += 1     # cross-document entity / component / multi-subject document: facts keep their own subject
             identity_case = False
         if identity_case:
-            rule = "resubjected_identity"          # own "subject type" entity, but path / series evidence assigns the document to the profile subject
-        elif measure and upper == "process":
-            rule = "resubjected_process"       # lab sheet / test item readings go to the examinee; business facts ("who submitted the form") stay put (Codex 2026-09-13 F03)
+            rule = "resubjected_identity"          # 主体是本文档自己的「主体类型」实体,但路径 / 序列证据说文档属于画像主体
+        elif measure and upper in ("process", "event"):
+            rule = "resubjected_process"       # 化验单 / 检查项目 / 某次检查名下的读数归受检者;「反馈单的提交人是谁」这种业务事实留在原主体(Codex 2026-09-13 F03)
         elif measure and (same or generic):
             rule = "resubjected_generic"
         elif measure and upper == "property":

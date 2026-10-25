@@ -6,6 +6,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from kb_pipeline.limits import SCHEMA_EFFECTIVE_KEYS
+from kb_pipeline.ontology import SchemaError
+
 from . import service
 
 router = APIRouter(prefix="/api")
@@ -16,6 +19,8 @@ def _wrap(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"not found: {exc}")
+    except SchemaError as exc:
+        raise HTTPException(status_code=422, detail={"code": "schema_invalid", "errors": exc.details[:20]})
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -96,13 +101,49 @@ def graph_corpus(kb_id: str) -> dict[str, Any]:
     return _wrap(service.graph_corpus_stats, kb_id)
 
 
-@router.post("/kbs/{kb_id}/graph_schema")
+@router.post("/kbs/{kb_id}/graph_schema", status_code=202)
 def graph_schema(kb_id: str) -> dict[str, Any]:
-    """"Extract / re-extract labels now": synchronously runs a full label extraction (several LLM calls,
-    usually a minute or two); the extracted version is written into the version ring but does not take
-    effect. The console fills the form with the result, and it takes effect only when the user reviews it
-    and clicks save."""
-    return _wrap(service.suggest_graph_schema, kb_id)
+    """Start a background label task; GET the same resource for status/results."""
+    return _wrap(service.start_graph_schema, kb_id)
+
+
+@router.get("/kbs/{kb_id}/graph_schema")
+def graph_schema_task(kb_id: str) -> dict[str, Any]:
+    return _wrap(service.graph_schema_task, kb_id)
+
+
+@router.post("/kbs/{kb_id}/graph_schema/cancel")
+def cancel_graph_schema(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(payload.get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=422, detail="task_id is required")
+    return _wrap(service.cancel_graph_schema, kb_id, task_id)
+
+
+@router.get("/kbs/{kb_id}/graph_schema/{version_id}/linkml")
+def download_graph_schema(kb_id: str, version_id: str) -> Response:
+    """下载一版模式的 LinkML(YAML);version_id 写 active 就是现行版本。"""
+    out = _wrap(service.graph_schema_linkml, kb_id, version_id)
+    return Response(content=out["text"].encode("utf-8"), media_type="application/yaml; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{out["filename"]}"'})
+
+
+@router.post("/kbs/{kb_id}/graph_schema/upload")
+async def upload_graph_schema(kb_id: str, request: Request, adopt: bool = False) -> dict[str, Any]:
+    """上传 LinkML 模式:请求体是 YAML 原文(或 {"linkml": "<YAML 原文>"})。默认只入环不生效,和抽取一样由人选中保存;
+    adopt=true 直接生效。"""
+    body = await request.body()
+    ctype = str(request.headers.get("content-type") or "")
+    if "json" in ctype:
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="The request body is not valid JSON")
+        text = payload.get("linkml") if isinstance(payload, dict) else None
+        if not isinstance(text, str):
+            raise HTTPException(status_code=422, detail="A JSON request body needs a linkml field (the YAML text)")
+        body = text.encode("utf-8")
+    return _wrap(service.upload_graph_schema, kb_id, body, adopt=adopt)
 
 
 @router.delete("/kbs/{kb_id}/graph_schema/{version_id}")
@@ -246,7 +287,7 @@ def _reject_bad_config(payload: dict[str, Any]) -> None:
     str_keys = {"vlm_prompt", "graph_rebuild_interval", "graph_rebuild_new_chunk_pct",
                 "graph_rebuild_operator"}
     for key, value in (payload or {}).items():
-        if value is None:
+        if value is None and key not in SCHEMA_EFFECTIVE_KEYS and key not in ("graph_schema_versions", "graph_paused", "graph_schema_active"):
             continue
         if key in int_keys and not isinstance(value, int):
             raise HTTPException(status_code=422, detail=f"{key} must be an integer")
@@ -254,14 +295,9 @@ def _reject_bad_config(payload: dict[str, Any]) -> None:
             raise HTTPException(status_code=422, detail=f"{key} must be a string")
         if key in ("graph_enabled", "graph_auto_append", "graph_rebuild_resuggest") and not isinstance(value, bool):
             raise HTTPException(status_code=422, detail=f"{key} must be a boolean")
-        if key in ("graph_predicates", "graph_entity_types") and not isinstance(value, (list, str)):
-            raise HTTPException(status_code=422, detail=f"{key} must be a list")
-        if key == "graph_parent_types" and not isinstance(value, dict):
-            raise HTTPException(status_code=422, detail="graph_parent_types must be an object")
-        if key in ("graph_type_definitions", "graph_profile") and not isinstance(value, dict):
-            raise HTTPException(status_code=422, detail=f"{key} must be an object")
-        if key == "graph_examples" and not isinstance(value, str):
-            raise HTTPException(status_code=422, detail="graph_examples must be a string")
+        # 模式字段是现行模式版本展开出来的派生值:改模式 = 抽一版新的、上传 LinkML、或选回旧版本再保存
+        if key in SCHEMA_EFFECTIVE_KEYS:
+            raise HTTPException(status_code=422, detail=f"{key} is derived from the schema version; extract, upload or select a schema version to change it")
         if key == "graph_llm" and not isinstance(value, dict):
             raise HTTPException(status_code=422, detail="graph_llm must be an object")
         if key == "graph_schema_active" and not isinstance(value, str):

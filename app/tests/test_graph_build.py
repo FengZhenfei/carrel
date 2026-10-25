@@ -34,7 +34,7 @@ class GraphPathRegressionTests(unittest.TestCase):
             source = KBSource(
                 kb_id="work_product",
                 collection="kb_product",
-                source_root="产品资料",
+                source_root="Catalog Library",
                 source_type="local_mirror",
                 max_tokens=400,
                 overlap_tokens=80,
@@ -290,7 +290,7 @@ class EmptyGraphSourceTests(unittest.TestCase):
 
     def _source(self):
         return KBSource(
-            kb_id="project_materials", collection="kb_project", source_root="项目资料",
+            kb_id="project_materials", collection="kb_project", source_root="Project Library",
             source_type="local_mirror", max_tokens=400, overlap_tokens=80, graph_enabled=True,
         )
 
@@ -301,7 +301,7 @@ class EmptyGraphSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._settings(Path(tmp))
             db.init_db(settings.state_db)
-            verdict = build_mod.evaluate_rebuild(settings, source_key="项目资料", source=self._source())
+            verdict = build_mod.evaluate_rebuild(settings, source_key="Project Library", source=self._source())
         self.assertFalse(verdict["due"])
         self.assertEqual(verdict["reason"], "no_active_content")
 
@@ -368,7 +368,7 @@ class KbIsolationTests(unittest.TestCase):
             with db.connect(settings.state_db) as con:
                 a = self._seed(con, settings, collection="kb_003", source_root="知识库",
                                rel_path="技术/编译原理.pdf", text="A库独有内容")
-                b = self._seed(con, settings, collection="kb_004", source_root="产品资料",
+                b = self._seed(con, settings, collection="kb_004", source_root="Catalog Library",
                                rel_path="手册/安装.pdf", text="B库独有内容")
                 con.commit()
 
@@ -407,7 +407,7 @@ class GraphCacheFingerprintTests(unittest.TestCase):
     def _prep(self, tmp: str):
         from kb_pipeline import discovery
 
-        root = Path(tmp); (root / "产品资料").mkdir(exist_ok=True)
+        root = Path(tmp); (root / "Catalog Library").mkdir(exist_ok=True)
         state = root / "s.db"
         db.init_db(state)
         with db.connect(state) as con:
@@ -415,7 +415,7 @@ class GraphCacheFingerprintTests(unittest.TestCase):
                                 ("社区", "m-comm"), ("另一个", "m-other")):
                 db.upsert_llm(con, name=name, base_url="http://x/v1",
                               api_key="k", model_id=model)
-            src, _ = discovery.enroll(con, root, "产品资料")
+            src, _ = discovery.enroll(con, root, "Catalog Library")
             con.commit()
         return root, state, src.kb_id
 
@@ -439,7 +439,7 @@ class GraphCacheFingerprintTests(unittest.TestCase):
             discovery.set_config(con, kb_id, full)
             con.commit()
             stored = discovery.get_config(con, kb_id)
-        source = discovery.build_source(root, "产品资料", stored,
+        source = discovery.build_source(root, "Catalog Library", stored,
                                         kb_id=kb_id, collection=kb_id)
         return graph_cache_fingerprint(self._settings(state), source)
 
@@ -482,10 +482,10 @@ class GraphCacheFingerprintTests(unittest.TestCase):
 
         con = db.connect(state).__enter__()
         stored = discovery.get_config(con, kb_id)
-        source = discovery.build_source(root, "产品资料", stored,
+        source = discovery.build_source(root, "Catalog Library", stored,
                                         kb_id=kb_id, collection=kb_id)
         bid = db.begin_graph_build(
-            con, source_key="产品资料", kb_id=kb_id,
+            con, source_key="Catalog Library", kb_id=kb_id,
             source_collection=source.collection, graph_version="v-test",
             cache_fingerprint=fingerprint)
         con.execute("UPDATE graph_builds SET status='cancelled', source_content_hash=? "
@@ -655,6 +655,7 @@ class GraphPhaseResumeTests(unittest.TestCase):
                 corpus = gb.source_snapshot_hash(db.active_chunk_refs(con, "kb_x"))
                 db.record_graph_build_input(con, bid, input_rows=0, chunks=[], source_content_hash=corpus)
                 db.mark_graph_phase_done(con, bid, "index")
+                db.update_graph_build_manifest(con, bid, {"pipeline_revision": gb.PIPELINE_REVISION})
                 previous = db.graph_build_by_version(con, "kb_x", "v1")
                 with mock.patch.object(gb, "graph_cache_fingerprint", return_value="fp1"):
                     self.assertEqual(gb._resumable_phases(con, previous, settings=settings, source=source),
@@ -928,8 +929,11 @@ class BundleTests(unittest.TestCase):
         rel = bundle["relation_entity_edges"][0]["related_props"]
         self.assertEqual((rel["type"], rel["weight"], rel["directed"]), ("has_pin", 7.5, True))
         self.assertEqual(bundle["entities"][0]["uid"], graph_uid("kb_003", "v1", "Entity", entity_id("a")))
-        self.assertEqual(bundle["entities"][0]["parent_type"], "p")
-        self.assertNotIn("parent_type", bundle["entities"][1])   # empty values are not written
+        self.assertEqual((bundle["entities"][0]["upper"], bundle["entities"][0]["type_path"], bundle["entities"][0]["kind"]),
+                         ("part", ["t", "part"], "instance"))
+        self.assertEqual(bundle["entities"][0]["ids"], [entity_id("a")])
+        self.assertNotIn("upper", bundle["entities"][1])          # 空值不写
+        self.assertNotIn("parent_type", bundle["entities"][0])   # 旧字段不再写
 
     def test_vector_payloads_and_upsert(self) -> None:
         from kb_pipeline.graph.vectors import entity_payload, point_id_for, relation_id, write_graph_vectors
@@ -1029,12 +1033,22 @@ class BuildWiringTests(unittest.TestCase):
                 ("换模型", {"graph_llm": {"extract": "B", "summarize": "A"}}),
                 ("改类型表", {"graph_entity_types": ["pin"]}),
                 ("改谓词", {"graph_predicates": [{"name": "has_pin"}]}),
-                ("改父类", {"graph_parent_types": {"pin": "interface"}}),
                 ("改语言", {"graph_language": "Chinese"}),
                 ("改合并切片数", {"graph_unit_chunks": 2}),
                 ("改补漏轮数", {"graph_max_gleanings": 0}),
             ):
                 self.assertNotEqual(base, fp(extra), label)
+            # 有模式时:父类、类型树、作用域、谓词的单值与否各自都进指纹
+            typed = {"graph_entity_types": ["pin", "chip"], "graph_parent_types": {"pin": "part", "chip": "entity"},
+                     "graph_predicates": [{"name": "has_pin"}]}
+            with_schema = fp(typed)
+            for label, extra in (
+                ("改父类", {"graph_parent_types": {"pin": "property", "chip": "entity"}}),
+                ("改类型树", {"graph_type_parents": {"pin": "chip", "chip": "entity"}}),
+                ("改作用域", {"graph_type_scopes": {"pin": "document"}}),
+                ("改单值", {"graph_predicates": [{"name": "has_pin", "multivalued": False}]}),
+            ):
+                self.assertNotEqual(with_schema, fp({**typed, **extra}), label)
             with db.connect(state) as con:
                 discovery.set_config(con, src.kb_id, {"graph_llm": {"extract": "A"}})
                 cfg = discovery.get_config(con, src.kb_id)
@@ -1070,21 +1084,20 @@ class BuildWiringTests(unittest.TestCase):
         self.assertTrue(validate_graph_unit_config(9, 1))
         self.assertTrue(validate_graph_unit_config(3, 5))
         self.assertTrue(validate_graph_unit_config("x", 1))
-        self.assertEqual(validate_graph_schema_config([{"name": "a"}], {"t": "p"}), [])
-        # the limit is counted before truncating: the list used to be cut to 24 first and compared afterwards, so it
-        # never exceeded the limit and the extra predicates were dropped silently on saving
-        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(24)] + ["p0", "related_to"], {}), [])
-        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(25)], {}), ["At most 24 predicates"])
-        self.assertTrue(validate_graph_schema_config("", {"t": "p", "u": "q", "v": "r", "w": "s", "x": "t", "y": "u", "z": "v", "aa": "w", "bb": "x"}))
+        self.assertEqual(validate_graph_schema_config([{"name": "a"}], {"t": "part"}), [])
+        # 数量上限在截断之前数:过去先截到上限再比,永远不超,多出来的谓词保存时被无声丢掉
+        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(28)] + ["p0", "related_to"], {}), [])
+        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(29)], {}), ["At most 28 predicates"])
+        self.assertTrue(validate_graph_schema_config("", {"t": "p"}))           # 父类必须是八个上层类之一
         with tempfile.TemporaryDirectory() as tmp:
             src = discovery.build_source(Path(tmp), "库", {
                 "graph_predicates": [{"name": "Has Pin", "source_parents": ["Component"]}, "related_to"],
-                "graph_parent_types": {"pin": "Interface"},
+                "graph_parent_types": {"pin": "Interface", "chip": "Part", "x": "??"},
                 "graph_unit_chunks": "2",
             })
         self.assertEqual(src.graph_predicates[0]["name"], "has_pin")
         self.assertEqual(len(src.graph_predicates), 1)
-        self.assertEqual(src.graph_parent_types, {"pin": "interface"})
+        self.assertEqual(src.graph_parent_types, {"pin": "part", "chip": "part"})      # 只认上层类(含同义词)
         self.assertEqual((src.graph_unit_chunks, src.graph_max_gleanings), (2, 1))
 
     def test_retired_console_keys_are_dropped_not_rejected(self) -> None:
@@ -1802,11 +1815,11 @@ class GraphBuildFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalT
         from kb_pipeline.graph.build import GRAPH_LLM_STEPS, resolve_llm_specs
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); (root / "产品资料").mkdir()
+            root = Path(tmp); (root / "Catalog Library").mkdir()
             state = Path(tmp) / "s.db"
             db.init_db(state)
             with db.connect(state) as con:
-                src, _ = discovery.enroll(con, root, "产品资料")
+                src, _ = discovery.enroll(con, root, "Catalog Library")
                 db.upsert_llm(con, name="通用模型", base_url="http://gpu-b:8000/v1", api_key="k", model_id="glm-5.2")
                 db.upsert_llm(con, name="抽取专用", base_url="http://gpu-a:8000/v1", api_key="k2",
                               model_id="qwen3.7-plus", protocol="anthropic")
@@ -2658,7 +2671,7 @@ class BuildGateTests(unittest.TestCase):
             for phase, _label in build_mod.GRAPH_PHASES:
                 db.mark_graph_phase_done(con, bid, phase)
             db.finish_graph_build(con, bid, status="cancelled", source_content_hash=build_mod.source_snapshot_hash([]),
-                                  error="stopped")
+                                  error="stopped", manifest={"pipeline_revision": build_mod.PIPELINE_REVISION})
 
     def _resume(self, build_mod, settings, source, *, during=None):
         from unittest import mock
@@ -3811,6 +3824,70 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
         self.assertEqual(scopes, {"e1": "kb_1:7", "e2": "kb_1:9", "e3": "kb_1:7"})
 
 
+class ExpansionRelevanceTests(unittest.TestCase):
+    """第一跳先按强度多取几倍邻边,再按与问题的相关度留 per_node 条:有关系向量按余弦,没有按词重合;相关度只决定留哪几条,
+    不乘进分数(10-24 新旧图对比:中心实体扩展出来的边只按强度挑,问「要哪些能力」,证据里是经验年限分布)。"""
+
+    def _run(self, vectors: dict | None, query_vector: list[float]):
+        from unittest import mock
+
+        from kb_pipeline.graph import recall
+        from kb_pipeline.graph.vectors import point_id_for
+
+        seed = SimpleNamespace(id="p-e1", score=0.9, payload={"gr_id": "e1", "title": "DSE", "type": "role", "graph_version": "v1"})
+        seen: dict = {}
+
+        class FakeQ:
+            def query_points(self, collection_name, query, limit, with_payload, query_filter=None, **kw):
+                return SimpleNamespace(points=[seed] if collection_name == "graph_1_entity" else [])
+
+            def scroll(self, **kw): return [], None
+
+            def retrieve(self, collection_name, ids, **kw):
+                if collection_name != "graph_1_relation" or vectors is None:
+                    return []
+                by_point = {point_id_for("v1", rid): (rid, vec) for rid, vec in vectors.items()}
+                return [SimpleNamespace(id=pid, vector=by_point[pid][1]) for pid in ids if pid in by_point]
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, query, **params):
+                rows: list = []
+                if "[r:RELATED_TO]" in query:
+                    seen["k"] = params.get("k")
+                    rows = [{"eid": "e1", "neighbours": [
+                        {"rid": "r-years", "type": "has_parameter", "weight": 5.0, "description": "岗位常见的工作年限", "nid": "e2",
+                         "title": "3-5年经验", "ntype": "parameter", "pagerank": 0.1, "degree": 1},
+                        {"rid": "r-skill", "type": "requires", "weight": 3.0, "description": "DSE 需要懂业务的能力", "nid": "e3",
+                         "title": "业务理解能力", "ntype": "skill", "pagerank": 0.1, "degree": 1}]}]
+                elif "RETURN eid, e.title" in query:
+                    rows = [{"eid": eid, "title": "x", "type": "t"} for eid in params["ids"]]
+                return SimpleNamespace(data=lambda: rows, single=lambda: {"m": 1.0, "n": 0})
+
+        driver = SimpleNamespace(session=lambda: FakeSession(), close=lambda: None)
+        settings = SimpleNamespace(qdrant_url="http://q", qdrant_api_key="")
+        source = SimpleNamespace(kb_id="kb_1", collection="kb_1")
+        with mock.patch.object(recall, "qdrant_client", return_value=FakeQ()), \
+                mock.patch.object(recall, "neo4j_driver", return_value=driver), \
+                mock.patch.object(recall, "active_neo4j_graph_version", return_value="v1"):
+            out = recall.graph_query(settings, source, "DSE 需要具备哪些能力？", vector=query_vector, hops=1, per_node=1)
+        return out, seen, recall
+
+    def test_without_relation_vectors_the_word_overlap_picks_the_edge(self) -> None:
+        out, seen, recall = self._run(None, [0.1] * 4)
+        self.assertEqual(seen["k"], recall.EXPAND_FETCH_FACTOR)                     # 先多取几倍
+        self.assertEqual({r["id"] for r in out["relations"]}, {"r-skill"})          # 留下的是对得上问题的那条
+        self.assertIn("e3", {e["id"] for e in out["entities"]})
+
+    def test_relation_vectors_pick_the_edge_closest_to_the_question(self) -> None:
+        # 「能力」那条边的向量与问题同向,年限那条正交:就算年限那条强度高、词也对得上,留下的也是能力那条
+        out, _, recall = self._run({"r-skill": [1.0, 0.0, 0.0, 0.0], "r-years": [0.0, 1.0, 0.0, 0.0]}, [1.0, 0.0, 0.0, 0.0])
+        rels = {r["id"]: r for r in out["relations"]}
+        self.assertEqual(set(rels), {"r-skill"})
+        self.assertAlmostEqual(rels["r-skill"]["score"], 0.9 / 3 * 3.0 / 10.0, places=4)   # 分数仍按强度算(种子分 / 3 × 强度 / 10),相关度不乘进去
+
+
 class GraphVectorWriteTests(unittest.TestCase):
     """Writing graph vectors is the longest step of a build: the batch for reading the previous version and writing
     the new one is separate from the embedding batch, only the payload fields needed to decide on reuse are
@@ -4043,8 +4120,9 @@ class StoreIndexTests(unittest.TestCase):
         recall.spec_seeds(q, "graph_1_spec", None, "tAS 的最小值是多少")
         filters.append(recall.seed_filter())
         used = set().union(*(self._keys(f) for f in filters if f is not None))
-        self.assertEqual(used, {"title", "aliases", "source", "target", "symbol", "property", "boilerplate", "reference"})
-        self.assertEqual(set(GRAPH_PAYLOAD_INDEX_FIELDS), used)
+        self.assertEqual(used, {"title", "aliases", "external_ids", "source", "target", "symbol", "property", "boilerplate", "reference",
+                                "doc_status"})
+        self.assertEqual(set(GRAPH_PAYLOAD_INDEX_FIELDS), used | {"superseded_by"})  # retained for older readers
         created: list[str] = []
         fake = SimpleNamespace(
             get_collections=lambda: SimpleNamespace(collections=[]),
@@ -4053,7 +4131,7 @@ class StoreIndexTests(unittest.TestCase):
                 config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=4)))),
             create_payload_index=lambda collection_name, field_name, field_schema: created.append(field_name))
         ensure_graph_collection(fake, "graph_1_entity__v1", 4)
-        self.assertEqual(set(created), used)
+        self.assertEqual(set(created), set(GRAPH_PAYLOAD_INDEX_FIELDS))
 
     def test_the_main_collection_indexes_exactly_the_fields_its_filters_use(self) -> None:
         from kb_pipeline.vector import qdrant as vq
@@ -4092,7 +4170,8 @@ class StoreIndexTests(unittest.TestCase):
         n4.ensure_constraints(SimpleNamespace(session=lambda: FakeSession()))
         indexes = {m.group(1): m.group(2) for s in statements
                    for m in [re.match(r"CREATE INDEX (\w+) IF NOT EXISTS FOR \(n:(\w+)\) ON \(n\.kb_id, n\.graph_version, n\.(\w+)\)", s)] if m}
-        self.assertEqual(indexes, {"ak_entity_pagerank": "Entity", "ak_entity_id": "Entity", "ak_relation_id": "Relation"})
+        self.assertEqual(indexes, {"ak_entity_pagerank": "Entity", "ak_entity_id": "Entity", "ak_relation_id": "Relation",
+                                   "ak_spec_series": "Spec"})
         constraints = [s for s in statements if s.startswith("CREATE CONSTRAINT")]
         self.assertEqual(len(constraints), 1 + len(n4.NODE_LABELS))                     # the uid unique constraint of each label stays
         # recall and the neighbourhood endpoint fetch entities / relations by (kb_id, graph_version, id) and read the
@@ -4137,3 +4216,116 @@ class MentionAttributionInputTests(unittest.TestCase):
         # text unchanged: all take part
         same = attribution_texts(ledger, [ref("p1", "VCC 的范围是 2.7 V 到 3.6 V"), ref("p2", "订购信息")])
         self.assertEqual((sorted(same[0]), same[2]), (["p1", "p2"], 0))
+
+
+class GraphStatsTests(unittest.TestCase):
+    """整版统计(方案第 2 条):导入时按 graph.json 与单元算好、写在 GraphVersion 上,/graph/stats 与目录的概览直接用。
+    覆盖面按文档数与周数算,不按提及次数。"""
+
+    def _graph(self):
+        from _support import _unit
+
+        units = []
+        for i, day in enumerate(("2026-01-05", "2026-01-07", "2026-02-20", "", "2025-12-30")):
+            u = _unit(f"u{i}", doc=f"kb:{i}", order=i)
+            u.doc_date = day
+            units.append(u)
+        entities = [
+            {"key": "张三", "title": "张三", "type": "person", "upper": "agent", "kind": "instance", "pagerank": 0.9,
+             "doc_ids": ["kb:0", "kb:1", "kb:2", "kb:3"], "unit_ids": ["u0", "u1", "u2", "u3"], "aliases": ["小张", "Zhang San"]},
+            {"key": "项目甲", "title": "项目甲", "type": "project", "upper": "entity", "kind": "instance", "pagerank": 0.5,
+             "doc_ids": ["kb:0", "kb:1"], "unit_ids": ["u0", "u1"], "aliases": [], "external_ids": [{"scheme": "编号", "value": "P-1"}]},
+            {"key": "周报", "title": "周报", "type": "report", "upper": "document", "kind": "class", "pagerank": 0.2,
+             "doc_ids": ["kb:4"], "unit_ids": ["u4"], "aliases": []},
+            {"key": "某漂移", "title": "某漂移", "type": "gadget", "upper": "entity", "kind": "instance", "pagerank": 0.1,
+             "doc_ids": ["kb:2"], "unit_ids": ["u2"], "aliases": []},
+            {"key": "函数f", "title": "f", "type": "function", "upper": "part", "kind": "instance", "exact": True, "pagerank": 0.0,
+             "doc_ids": ["kb:2"], "unit_ids": ["u2"], "aliases": []},
+        ]
+        relations = [
+            {"source_key": "张三", "target_key": "项目甲", "predicate": "works_on", "doc_ids": ["kb:0", "kb:1"], "evidence": 2},
+            {"source_key": "张三", "target_key": "某漂移", "predicate": "related_to", "doc_ids": ["kb:2"], "evidence": 3},
+            {"source_key": "张三", "target_key": "周报", "predicate": "authored", "doc_ids": ["kb:4"], "evidence": 1,
+             "superseded_by": "x", "valid_from": "2025-12"},
+        ]
+        specs = [
+            {"id": "f1", "subject_key": "张三", "concept": "职位", "source_kind": "narrative"},
+            {"id": "f2", "subject_key": "张三", "concept": "职位", "superseded_by": "f1"},
+            {"id": "f3", "subject_key": "项目甲", "concept": "预算", "source_kind": "table", "doc_status": "superseded"},
+        ]
+        graph = {"graph_version": "v9", "built_at": 1, "schema": {"version_id": "s3", "entity_types": ["person", "project", "report"]},
+                 "entities": entities, "relations": relations, "specs": specs}
+        return graph, units
+
+    def test_stats_cover_types_predicates_time_and_subjects(self) -> None:
+        from kb_pipeline.graph.stats import entity_coverage, graph_stats, overview
+
+        graph, units = self._graph()
+        st = graph_stats(graph, units)
+        self.assertEqual((st["graph_version"], st["schema_version_id"], st["documents"]), ("v9", "s3", 5))
+        self.assertEqual(st["time_span"], {"from": "2025-12-30", "to": "2026-02-20", "dated_documents": 4,
+                                           "by_year": {"2025": 1, "2026": 3}})
+        self.assertEqual((st["entities"]["total"], st["entities"]["classes"], st["entities"]["with_external_ids"]), (5, 1, 1))
+        person = next(t for t in st["types"] if t["type"] == "person")
+        # 四份文档、其中三份有日期,落在 2026-W02(两份)和 2026-W08:两个周
+        self.assertEqual((person["upper"], person["entities"], person["docs"], person["weeks"], person["first_seen"], person["last_seen"]),
+                         ("agent", 1, 4, 2, "2026-01-05", "2026-02-20"))
+        self.assertEqual(st["types"][0]["type"], "person")                                    # 按涉及的文档数排
+        self.assertFalse(next(t for t in st["types"] if t["type"] == "gadget")["in_schema"])
+        self.assertTrue(next(t for t in st["types"] if t["type"] == "function")["in_schema"])   # 规则抽取的类型不算漂移
+        self.assertEqual(st["unclassified"]["types_outside_schema"], [{"type": "gadget", "entities": 1}])
+        self.assertEqual(st["unclassified"]["frequent_related_to"], [{"source": "张三", "target": "某漂移", "evidence": 3}])
+        self.assertEqual((st["relations"]["related_to_share"], st["relations"]["superseded"], st["relations"]["with_period"]), (0.333, 1, 1))
+        works = next(p for p in st["predicates"] if p["predicate"] == "works_on")
+        self.assertEqual((works["edges"], works["docs"], works["pairs"]), (1, 2, [{"source_type": "person", "target_type": "project", "count": 1}]))
+        self.assertEqual((st["facts"]["total"], st["facts"]["superseded"], st["facts"]["narrative"], st["facts"]["table"],
+                          st["facts"]["non_current_documents"]), (3, 1, 1, 1, 1))
+        self.assertEqual(st["facts"]["properties"][0], {"property": "职位", "facts": 2, "subjects": 1})
+        self.assertEqual([s["title"] for s in st["subjects"]], ["张三", "项目甲", "某漂移"])      # 类别名、文档类不当主体
+        self.assertEqual(st["alias_clusters"][0], {"title": "张三", "type": "person", "count": 2, "aliases": ["小张", "Zhang San"]})
+        cov = entity_coverage(graph["entities"][0], {u.doc_id: u.doc_date for u in units})
+        self.assertEqual(cov, {"doc_count": 4, "week_count": 2, "first_seen": "2026-01-05", "last_seen": "2026-02-20"})
+        view = overview(st)
+        self.assertEqual((view["documents"], view["entities"], view["facts"]), (5, 5, 3))
+        self.assertEqual(view["predicates"][0]["pair"].count("->"), 1)
+        self.assertEqual(view["subjects"][:1], ["张三"])
+        self.assertEqual(overview({}), {})
+
+    def test_core_subjects_start_with_the_profile_subject_types(self) -> None:
+        """核心主体应覆盖画像中的不同类型,避免高频辅助概念占满。
+        合成图谱验证按类型轮流取样,然后按上层类补足。"""
+        from kb_pipeline.graph.stats import graph_stats
+
+        graph, units = self._graph()
+        graph["entities"].append({"key": "项目乙", "title": "项目乙", "type": "project", "upper": "entity", "kind": "instance",
+                                  "pagerank": 0.4, "doc_ids": ["kb:0"], "unit_ids": ["u0"], "aliases": []})
+        graph["profile"] = {"subject_types": ["project", "report"]}
+        st = graph_stats(graph, units)
+        self.assertEqual([s["title"] for s in st["subjects"]], ["项目甲", "周报", "项目乙", "张三", "某漂移"])
+
+    def test_bundle_carries_stats_status_and_coverage(self) -> None:
+        from kb_pipeline.graph.neo4j_import import load_bundle
+
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="半导体", source_type="local_mirror",
+                          max_tokens=400, overlap_tokens=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            out, graph, units, entity_id = _bundle_dir(self, tmp)
+            graph["relations"][0].update({"doc_status": "archived", "observed_first": "2024-01-01", "superseded_on": "2025-01-01"})
+            graph["specs"] = [{"id": "f1", "subject": "A", "property": "p", "subject_key": "a", "doc_status": "superseded"}]
+            (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+            from kb_pipeline.graph.units import read_units, write_units
+
+            us = read_units(out / "units.jsonl")
+            us[0].doc_date = "2024-03-04"
+            write_units(out / "units.jsonl", us)
+            bundle = load_bundle(out, source=source, graph_version="v1")
+        doc = next(d for d in bundle["documents"] if d["doc_id"] == "kb_003:1")
+        self.assertEqual(doc["date"], "2024-03-04")
+        self.assertNotIn("date", next(d for d in bundle["documents"] if d["doc_id"] == "kb_003:2"))
+        a = next(e for e in bundle["entities"] if e["title"] == "A")
+        self.assertEqual((a["doc_count"], a["week_count"], a["first_seen"]), (1, 1, "2024-03-04"))
+        edge = bundle["relation_entity_edges"][0]["related_props"]
+        self.assertEqual((edge["doc_status"], edge["observed_first"], edge["superseded_on"]), ("archived", "2024-01-01", "2025-01-01"))
+        self.assertEqual(bundle["relations"][0]["doc_status"], "archived")
+        self.assertEqual(bundle["specs"][0]["doc_status"], "superseded")
+        self.assertEqual((bundle["stats"]["documents"], bundle["stats"]["entities"]["total"]), (2, 2))

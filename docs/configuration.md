@@ -37,14 +37,27 @@ reranking, and vision model services are available with `--with-local-models`.
 | Text embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL_ID`, `EMBEDDING_API_KEY`, `EMBEDDING_DIM` | Indexing and vector search |
 | Image descriptions | `VLM_BASE_URL`, `VLM_MODEL_ID`, `VLM_API_KEY`, `KB_IMAGE_MAX_PIXELS` | Processing images and figures; images are scaled down to the pixel budget before the call |
 | Graph extraction and summaries | Register a chat model in the console, then select it per knowledge base | Graph building is enabled |
-| Text reranking | `RERANKER_BASE_URL` | Optional; retrieval otherwise uses fusion order |
+| Text reranking | `RERANKER_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_API_KEY` | Optional; retrieval otherwise uses fusion order |
 | Visual embeddings | `VISUAL_EMBEDDING_ENABLED`, `VISUAL_EMBEDDING_BASE_URL`, `VISUAL_EMBEDDING_MODEL_ID`, `VISUAL_EMBEDDING_DIM`, other `VISUAL_EMBEDDING_*` | Optional pixel-level retrieval; the bundled integration uses local vLLM |
-| Visual reranking | `VISUAL_RERANKER_BASE_URL` | Optional visual reranking |
+| Visual reranker service | `VISUAL_RERANKER_BASE_URL` | Optional multimodal reranking; joins retrieval automatically when configured |
 
 Text embeddings use an OpenAI-compatible embeddings API. Image descriptions
 and graph models use compatible chat APIs. Rerankers use a `/v1/rerank`
 endpoint; visual embedding requests use vLLM's multimodal pooling format.
 Configure each endpoint for the corresponding request format.
+
+For hosted text reranking, set `RERANKER_BASE_URL` to the API base or the full
+`/rerank` endpoint, `RERANKER_MODEL_ID` to the provider's model name, and
+`RERANKER_API_KEY` to its Bearer token. Requests contain `model`, `query`, and
+`documents`; responses contain `results` with `index` and `relevance_score`.
+Leaving the model name empty uses `/models` discovery. Leaving the key empty
+keeps unauthenticated local access.
+
+In the console model registry, **Max Input** is the model's input token limit.
+Label extraction selects samples automatically for document and section
+coverage, keeping the estimated complete request within 30% of this value.
+The sample count is read-only and shows **Not calculated** until extraction
+starts. Progress remains available after refreshing or reopening the console.
 
 For the bundled model stack, download the weights and run
 `./deploy.sh --with-local-models`, following the
@@ -98,7 +111,14 @@ its code default, commented out except the address and the token, so the
 calibrated defaults apply until you uncomment one (a test keeps the two in
 step). What each threshold means is explained in
 [`app/kb_search/config.py`](../app/kb_search/config.py); the search service's
-`/health` reports whether reranking and the visual channel are active.
+`/health` reports text reranking, visual recall and visual reranking separately.
+`KB_SEARCH_RERANK` controls both rankers. Images share the total
+`KB_SEARCH_RERANK_N` budget (64 by default), with up to
+`KB_SEARCH_VISUAL_RERANK_N=8` image positions, a separate
+`KB_SEARCH_VISUAL_RERANK_THRESHOLD=0.5`, and
+`KB_SEARCH_VISUAL_RERANK_TIMEOUT=15` seconds within the request budget.
+The image endpoint must support multimodal `content` containing text and
+`image_url` data URLs. See [retrieval](retrieval.md#text-and-image-reranking).
 
 ## Per-knowledge-base settings
 
@@ -108,10 +128,20 @@ The console stores these settings with each knowledge-base registration:
 |---|---|---|
 | Chunking | `max_tokens`, `overlap_tokens` | Chunk size and overlap, within the embedding model's context limit |
 | Graph control | `graph_enabled`, `graph_auto_append`, `graph_profile` | Enable graphs, allow incremental updates, and store the inferred scenario profile |
-| Schema | `graph_entity_types`, `graph_parent_types`, `graph_type_definitions`, `graph_predicates`, `graph_examples`, `graph_language` | Automatically derived types, relationships, and examples |
-| Extraction | `graph_tune_sample_size`, `graph_unit_chunks`, `graph_max_gleanings` | Schema sampling, extraction unit size, and supplementary extraction rounds |
+| Schema | `graph_schema_active`, `graph_language` | Select a versioned LinkML schema and output language; types and relationships are derived from the selected schema |
+| Extraction | `graph_unit_chunks`, `graph_max_gleanings` | Extraction unit size and supplementary extraction rounds; schema sampling is automatic |
 | Models | `graph_llm.extract`, `graph_llm.summarize`, `graph_llm.tune` | Select registered models for each graph stage |
-| Rebuild | `graph_rebuild_interval`, `graph_rebuild_new_chunk_pct`, `graph_rebuild_new_chunk_count`, `graph_rebuild_operator` | Time and change thresholds, combined with `or` or `and` |
+| Rebuild | `graph_rebuild_interval`, `graph_rebuild_new_chunk_pct`, `graph_rebuild_new_chunk_count`, `graph_rebuild_operator`, `graph_rebuild_resuggest` | Time and change thresholds, combined with `or` or `and`; refresh labels before full rebuilds by default |
+
+Schemas can be extracted from the corpus or uploaded as LinkML YAML. Carrel
+uses a LinkML subset for type inheritance, identity scope, and relationships.
+Set `graph_rebuild_resuggest=false` to reuse the selected schema on full rebuilds.
+
+`KB_CORRECTIONS_DIR` defaults to `config/corrections`. Each library has its own
+`<kb_id>.yaml` for entity corrections and document status. These rules follow
+the library through graph deletion and rebuilding, are included in state
+backups, and are removed when the library is deleted. New libraries receive
+fresh rules even if an identifier is reused.
 
 After changing chunking settings, use the console's full re-parse action to
 apply them to existing files. Parser implementation version changes

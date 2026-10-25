@@ -1,6 +1,6 @@
 [project]
 name = "carrel"
-version = "0.2.1"
+version = "0.3.0"
 description = "Carrel: Ontology-Augmented Generation for AI agents. Local knowledge-base ingestion pipeline, console and search service."
 license = "MIT"
 requires-python = ">=3.12"
@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
   "openai>=1.90.0,<4",
   "qdrant-client>=1.16.0,<1.18.0",
+  "numpy>=2,<3",
   "tiktoken>=0.11.0,<1",
   "requests>=2.32.0,<3",
   "openpyxl>=3.1.5,<4",
@@ -41,7 +42,7 @@ carrel = "kb_pipeline.cli:main"
 [tool.setuptools.package-data]
 # The console's static files must ship with the package: an editable install
 # finds them anyway, a plain `pip install ./app` would 404 on StaticFiles.
-kb_server = ["static/*"]
+kb_server = ["static/*", "static/vendor/*", "static/vendor/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["."]

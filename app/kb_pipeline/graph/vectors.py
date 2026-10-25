@@ -1,20 +1,15 @@
-"""Graph vectors: the entity collection (title: description) and the relation collection (A -[predicate]-> B:
-description) are written into Qdrant.
+"""图谱向量:实体集合(title: description)与关系集合(A -[谓词]-> B: 描述)写进 Qdrant。
 
-Replaces the old enrichment script (which only back-filled payloads; the vectors were written
-upstream). Now vectors and payloads are written together and the point id is determined by (graph_version,
-entity/relation id) -- re-running the same version is an idempotent upsert. The payload fields stay compatible
-with the old collections (gr_id / title / search_text / type / degree / frequency ...), minus the community
-fields, plus pagerank / parent_type / predicate / point_ids.
+替代原来的 scripts/graphrag_qdrant_enrich.py(那份只回填负载,向量由上游写)。
+现在向量与负载一起写、点 id 由 (graph_version, 实体/关系 id) 确定 —— 重跑同版本
+是幂等的 upsert。负载字段与旧集合兼容(gr_id / title / search_text / type / degree /
+frequency …),去掉社区字段,加 pagerank / upper / type_path / kind / ids / predicate / point_ids。
 
-Incremental append (reuse_from): rows whose gr_id exists in the previous version's collection with unchanged
-embedding text (same embed_sha in the payload) take over the previous version's vector; only new rows and rows
-whose description changed are embedded. Retrieval is batched, so the previous collection is never read into
-memory as a whole.
+增量并入(reuse_from):同一 gr_id 在上一版集合里、且嵌入文本没变(payload 的 embed_sha 相同)
+的行直接搬上一版的向量,只嵌新增 / 描述变了的行。按批 retrieve,不把上一版整个集合读进内存。
 
-Reading the previous version and writing the new one go in batches of UPSERT_BATCH, independent of the embedding
-batch size (the embedding client splits its own batches); writes are not awaited batch by batch, and the point
-count is checked once a collection has been written.
+取上一版、写新版按 UPSERT_BATCH 一批,与嵌入的批量无关(嵌入客户端自己再切);写入不逐批等待,一个集合写完
+统一核对点数。
 """
 from __future__ import annotations
 
@@ -48,6 +43,28 @@ def entity_id(key: str) -> str:
 def relation_id(source_key: str, target_key: str, predicate: str) -> str:
     raw = f"{source_key}|{target_key}|{predicate}"
     return "r" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def entity_ids(e: dict[str, Any]) -> list[str]:
+    """实体答应的全部编号:现在的,加上归并进来的成员原来的(别名归并、更正文件强制合并;代表换了也查得到)。"""
+    own = entity_id(e["key"])
+    out = [own]
+    for k in e.get("member_keys") or []:
+        i = entity_id(str(k))
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def external_id_strings(e: dict[str, Any]) -> list[str]:
+    """外部编号的检索形式「体系:编号」(体系为空就只有编号)。"""
+    out: list[str] = []
+    for x in e.get("external_ids") or []:
+        if isinstance(x, dict) and x.get("value"):
+            text = f"{x.get('scheme')}:{x['value']}" if x.get("scheme") else str(x["value"])
+            if text not in out:
+                out.append(text)
+    return out
 
 
 def point_id_for(graph_version: str, gr_id: str) -> str:
@@ -125,8 +142,13 @@ def spec_payload(f: dict[str, Any], *, kb_id: str, source_collection: str, graph
         "when": when_text(f) or None, "period_text": f.get("period_text") or None,
         "series_key": f.get("series_key") or None, "series_len": f.get("series_len"), "series_index": f.get("series_index"),
         "conflict_group": f.get("conflict_group") or None,
-        # the quality state is projected together with the fact (Codex re-review N02): downgraded values cannot rely
-        # on upstream Python callers voluntarily excluding them
+        # 新旧与观察时间(方案附录第 3 条):检索默认只给现行值
+        "superseded_by": f.get("superseded_by") or None, "superseded_on": f.get("superseded_on") or None,
+        "observed": f.get("observed") or None, "source_kind": f.get("source_kind") or None,
+        "lapses": True if f.get("lapses") else None,             # 写明的一段状态:过了止期算已结束(currency.lapses)
+        # 来源文档全都不现行(更正文件里标了被取代 / 归档 / 过了有效期):检索默认不给
+        "doc_status": f.get("doc_status") or None,
+        # 质量状态跟着事实一起投影(Codex 复审 N02):降级过的值不能只靠上游 Python 调用方自觉排除
         "confidence": f.get("confidence") or None, "evidence_conflict": f.get("evidence_conflict") or None,
         "cmps": f.get("cmps") or None, "comparable": comparable_number(f) is not None,
         "value": f.get("value") or None, "min": f.get("min") or None, "typ": f.get("typ") or None, "max": f.get("max") or None,
@@ -165,7 +187,9 @@ def page_payload(p: dict[str, Any], *, kb_id: str, source_collection: str, graph
         "entity_keys": list(p.get("entity_keys") or [])[:32], "concept_keys": list(p.get("concept_keys") or [])[:32],
         "doc_ids": list(p.get("doc_ids") or [])[:32], "point_ids": list(p.get("point_ids") or [])[:POINT_IDS_LIMIT],
         "spec_ids": list(p.get("spec_ids") or [])[:64], "path": p.get("path"),
-        "series": [str(x)[:200] for x in (p.get("series") or [])][:80] or None,     # the subject page's series lines: used as Q&A context
+        "compiled_day": p.get("compiled_day"), "time_mode": p.get("time_mode"),
+        "source_paths": list(p.get("source_paths") or []),
+        "series": [str(x)[:200] for x in (p.get("series") or [])][:80] or None,     # 主体页的序列行:问答上下文用
         "boilerplate": False, "reference": False, "evidence_kind": "page",
     }
     return {k: v for k, v in payload.items() if v is not None}
@@ -200,9 +224,13 @@ def entity_payload(e: dict[str, Any], *, kb_id: str, source_collection: str, gra
         "gr_id": entity_id(e["key"]),
         "kb_id": kb_id, "graph_version": graph_version, "graph_type": "entity",
         "source_collection": source_collection,
-        "title": e.get("title"), "type": e.get("type"), "parent_type": e.get("parent_type") or None,
-        # scope of a document-scoped entity (doc_id): same-named entities exist once per document, and search
-        # results tell them apart by it
+        "title": e.get("title"), "type": e.get("type"),
+        # 上层类、类型链(类型 → 父类 → 上层类,按祖先过滤用)、类与实例
+        "upper": e.get("upper") or "entity", "type_path": list(e.get("type_path") or [])[:8] or None,
+        "kind": e.get("kind") or "instance",
+        # 全部编号(含归并进来的旧编号)与外部编号
+        "ids": entity_ids(e), "external_ids": external_id_strings(e) or None,
+        # 文档内实体的作用域(doc_id):同名实体每份文档各有一个,检索结果靠它分辨
         "scope": e.get("scope") or None,
         "description": e.get("description"),
         "search_text": _search_text(e.get("title"), e.get("aliases"), e.get("type"), e.get("description")),
@@ -210,6 +238,7 @@ def entity_payload(e: dict[str, Any], *, kb_id: str, source_collection: str, gra
         "pagerank": float(e.get("pagerank") or 0.0),
         "aliases": list(e.get("aliases") or [])[:16],
         "doc_ids": list(e.get("doc_ids") or [])[:16],
+        "doc_count": len(e.get("doc_ids") or []),
         "point_ids": point_ids,
         "unit_count": len(e.get("unit_ids") or []),
         # noise flags: boilerplate-only / reference-number or downgraded type; recall seeds filter them out by default
@@ -232,6 +261,12 @@ def relation_payload(r: dict[str, Any], *, kb_id: str, source_collection: str, g
         "source_id": entity_id(r["source_key"]), "target_id": entity_id(r["target_key"]),
         "type": r.get("predicate"), "directed": bool(r.get("directed")),
         "description": r.get("description"),
+        # 时间与状态(方案附录第 3 条):原文写明的起止、各来源文档的日期(观察时间)、是否被更新的说法取代
+        "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
+        "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+        "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
+        "doc_status": r.get("doc_status") or None, "lapses": True if r.get("lapses") else None,
+        "doc_ids": list(r.get("doc_ids") or [])[:16] or None,
         "search_text": _search_text(r.get("source"), r.get("target"), r.get("predicate"), r.get("description")),
         "weight": float(r.get("weight") or 1.0), "strength_sum": float(r.get("strength_sum") or 0.0),
         "evidence": int(r.get("evidence") or 0), "cooccur": int(r.get("cooccur") or 0),

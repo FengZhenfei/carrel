@@ -48,7 +48,23 @@ def _doc_sample(con: Any, collection: str) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
-def build_catalog(settings: Settings, q: Any) -> list[dict[str, Any]]:
+OVERVIEW_TIMEOUT = 3.0
+
+
+def _overview(driver: Any, kb_id: str) -> tuple[dict[str, Any], str | None]:
+    """库的图谱概览(GraphVersion 上导入时算好的统计摘一份,见 kb_pipeline.graph.stats.overview);读不到只记原因。"""
+    from kb_pipeline.graph.stats import overview
+
+    from .graphwalk import version_stats
+
+    try:
+        _, stats = version_stats(driver, kb_id, timeout=OVERVIEW_TIMEOUT)
+    except Exception as exc:
+        return {}, f"neo4j: {type(exc).__name__}"
+    return overview(stats), None
+
+
+def build_catalog(settings: Settings, q: Any, driver: Any = None) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     down: str | None = None         # main store unreachable or timing out: the remaining knowledge bases are not tried, every attempt would wait for the timeout
     with db.connect(settings.state_db) as con:
@@ -76,6 +92,7 @@ def build_catalog(settings: Settings, q: Any) -> list[dict[str, Any]]:
             entries.append({
                 "kb_id": kb_id, "name": str(source.source_root), "collection": source.collection,
                 "language": getattr(source, "graph_language", None), "domain": schema["domain"], "persona": schema["persona"],
+                "schema_id": schema["schema_id"],
                 "subject_types": list(profile.get("subject_types") or []), "axis": profile.get("axis"),
                 "entity_types": list(getattr(source, "graph_entity_types", None) or [])[:40],
                 "chunks": chunks, "docs": docs, "docs_sample": _doc_sample(con, source.collection),
@@ -88,20 +105,36 @@ def build_catalog(settings: Settings, q: Any) -> list[dict[str, Any]]:
                 # chunks that cannot be counted and a graph alias that cannot be seen mean "unknown", not "0 chunks,
                 # no graph": whether there is a graph is recorded as unknown, and search still tries the graph channel
                 entries[-1].update({"chunks": None, "has_graph": None, "degraded": f"qdrant: {failed}"})
+            elif entries[-1]["has_graph"] and driver is not None:
+                # 有图的库带一份概览:类型(上层类、实体数、文档数)、常见关系及其两端、时间跨度、核心主体
+                view, err = _overview(driver, kb_id)
+                if view:
+                    entries[-1]["overview"] = view
+                if err:
+                    entries[-1]["overview_error"] = err
+                    driver = None           # 图库够不着:后面的库不再试(概览只是锦上添花,不能拖慢目录)
     return entries
 
 
-def get_catalog(settings: Settings, q: Any, *, ttl: float, force: bool = False) -> list[dict[str, Any]]:
-    """The catalog is cached for ttl; it is rebuilt at once when the set of enabled knowledge bases changes
-    (one opened or closed), and a catalog built while the main store was out of reach is cached only briefly."""
+def get_catalog(settings: Settings, q: Any, *, ttl: float, force: bool = False, driver: Any = None) -> list[dict[str, Any]]:
+    """目录按 ttl 缓存;库的开关变了(新开、关闭)立刻重建,主库够不着时建出来的那份只缓存一小会儿。
+    driver:图库(读各库的图谱概览);不给就不带概览。"""
     with _lock:
+        # Publication, rollback and deletion must be visible before the normal
+        # catalog TTL: otherwise a deleted graph keeps producing 404 warnings,
+        # and a newly published graph remains absent from retrieval.
+        with db.connect(settings.state_db) as con:
+            graph_revision = (str(settings.state_db), tuple(tuple(row) for row in con.execute(
+                "SELECT kb_id, graph_version, status FROM graph_builds "
+                "WHERE status IN ('done', 'rolled_back') ORDER BY kb_id, graph_version")))
         entries = _cache["entries"]
-        if not force and entries and {e["kb_id"] for e in entries} == set(settings.sources):
+        if not force and entries and _cache.get("graph_revision") == graph_revision and {e["kb_id"] for e in entries} == set(settings.sources):
             keep = min(ttl, DEGRADED_TTL) if any(e.get("degraded") for e in entries) else ttl
             if time.time() - float(_cache["at"]) < keep:
                 return entries
-        entries = build_catalog(settings, q)
+        entries = build_catalog(settings, q, driver)
         _cache["entries"], _cache["at"] = entries, time.time()
+        _cache["graph_revision"] = graph_revision
         return entries
 
 

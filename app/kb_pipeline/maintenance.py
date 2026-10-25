@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from .config import Settings
 from . import db
+from .limits import SCHEMA_EFFECTIVE_KEYS
 from .utils import looks_like_kb_process
 from .graph.lock import GraphBuildLock, build_lock_held, build_lock_path, clear_lock_leftovers
 
@@ -525,6 +526,10 @@ def _drop_graph_data(settings: Settings, con, *, kb_id: str, collection: str, er
     from . import discovery
     from .vector.qdrant import client as qdrant_client
     from .vector.qdrant import graph_collection_short_name
+    from .graph.schema_flow import discard_suggest
+
+    discard_suggest(con, kb_id)
+    con.commit()  # Fence late label publication before touching graph storage/cache.
 
     entry: dict[str, Any] = {}
     q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
@@ -568,13 +573,13 @@ def _drop_graph_data(settings: Settings, con, *, kb_id: str, collection: str, er
     except Exception as exc:
         errors.append(f"{kb_id}: graph build records cleanup failed: {exc!r}")
     try:
+        # A second browser may have submitted while external storage was being
+        # cleared. Fence that task in the same transaction as clearing schemas.
+        discard_suggest(con, kb_id)
         discovery.set_config(con, kb_id, {
-            "graph_entity_types": None, "graph_language": None,
-            "graph_predicates": None, "graph_parent_types": None,
-            "graph_type_definitions": None, "graph_examples": None, "graph_profile": None,
-            # Same for the historical versions: they were all induced from this version of the corpus, and
-            # once the graph is gone their basis is gone. The capability questions are a hand-maintained
-            # acceptance set and stay.
+            **{key: None for key in SCHEMA_EFFECTIVE_KEYS},
+            # 历史版本同理:它们都是从这一版语料归纳出来的,图删了依据就不在了。
+            # 能力问题是人维护的验收集,留着。
             "graph_schema_versions": None, "graph_schema_active": None,
         })
         entry["graph_schema_cleared"] = True
@@ -700,6 +705,17 @@ def _hard_delete_kb(settings: Settings, con, *, kb_id: str, collection: str, err
     else:
         discovery.forget(con, kb_id)
         entry["forgotten"] = True
+        # 更正文件跟着库走:库彻底删掉了才删它(关闭库、删图谱都不碰)。登记行已经删了,这里失败不算删除失败,
+        # 留下的文件由每晚对账挪进 orphaned/
+        from .graph.corrections import remove_corrections_file
+
+        try:
+            removed = remove_corrections_file(settings, kb_id)
+        except OSError as exc:
+            removed = None
+            entry["corrections_error"] = repr(exc)
+        if removed:
+            entry["corrections_removed"] = removed
     return entry
 
 
@@ -848,8 +864,47 @@ def kb_sources_gc(settings: Settings, *, retention_days: int, dry_run: bool = Fa
                 entry["dry_run"] = True
                 dropped.append(entry)
                 continue
-            entry.update(_hard_delete_kb(settings, con, kb_id=kb_id, collection=collection, errors=errors))
-            dropped.append(entry)
+            guard = GraphBuildLock(settings)
+            try:
+                guard.acquire()
+            except RuntimeError:
+                skipped.append({**entry, "reason": "graph build or deletion in progress"})
+                continue
+            try:
+                con.commit()
+                con.execute("BEGIN IMMEDIATE")
+                fresh = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+                pending_now = con.execute("SELECT 1 FROM jobs WHERE kb_id=? AND status IN ('queued','retry','running') LIMIT 1", (kb_id,)).fetchone()
+                if (fresh is None or fresh["status"] != "inactive" or fresh["inactive_at"] is None
+                        or (int(fresh["inactive_at"]) > cutoff_ts and str(fresh["inactive_reason"] or "") not in discovery.DELETE_PENDING_REASONS) or pending_now):
+                    con.rollback()
+                    skipped.append({**entry, "reason": "state changed before deletion"})
+                    continue
+                if (str(fresh["inactive_reason"] or "") not in ("unenrolled", *discovery.DELETE_PENDING_REASONS)
+                        and str(fresh["source_root"]) in discovery.discover_directories(settings.mirror_root)):
+                    con.rollback()
+                    skipped.append({**entry, "reason": "source directory returned"})
+                    continue
+                con.execute("UPDATE kb_sources SET inactive_reason='deleting' WHERE kb_id=?", (kb_id,))
+                con.commit()  # enroll refuses this intent, even if it read its candidate earlier.
+                entry.update(_hard_delete_kb(settings, con, kb_id=kb_id, collection=collection, errors=errors))
+                con.commit()
+                dropped.append(entry)
+            finally:
+                guard.release()
+        # 更正文件对账(跟着库的登记走):登记着的库缺文件补模板,登记表里没有的挪进 orphaned/,删到一半的库留着
+        corrections: dict[str, Any] = {}
+        if not dry_run:
+            from .graph.corrections import reconcile_corrections_files
+
+            rows_now = discovery.known_sources(con)
+            pending = {str(r["kb_id"]) for r in rows_now if str(r["inactive_reason"] or "") in discovery.DELETE_PENDING_REASONS}
+            try:
+                corrections = reconcile_corrections_files(
+                    settings, {str(r["kb_id"]): str(r["source_root"]) for r in rows_now if str(r["kb_id"]) not in pending},
+                    keep=pending)
+            except OSError as exc:
+                errors.append(f"corrections reconcile failed: {exc!r}")
         con.commit()
     return {
         "retention_days": retention_days,
@@ -857,6 +912,7 @@ def kb_sources_gc(settings: Settings, *, retention_days: int, dry_run: bool = Fa
         "dropped": dropped,
         "skipped": skipped,
         "errors": errors,
+        "corrections": corrections,
     }
 
 
@@ -1424,13 +1480,10 @@ def _remove_tree(path: Path, *, dry_run: bool) -> dict[str, object]:
 
 def backup_state(settings: Settings, *, base_dir: Path | None = None, keep: int | None = None,
                  dry_run: bool = False) -> dict[str, Any]:
-    """Keep a copy of what cannot be regenerated: the state database (SQLite online backup, a consistent snapshot
-    even while the pipeline runs; library configuration, the model registry and the extraction caches live in
-    it), the pipeline env file, every deployment/*/.env and the question sets and gold standards under
-    runtime/eval. Vectors, indexes, graphs and the parse cache are recomputed from the mirror and the caches in
-    the state database, so they are left out. Written to <base>/backups/state/<stamp>/ (directory 700, files
-    600); only the newest KB_BACKUP_KEEP copies (default 7) are kept. Needs no service, so the nightly round
-    runs it before waiting for Qdrant."""
+    """每夜留一份不可再生的东西:状态库(SQLite 在线备份,运行中也是一致的快照;各库配置、模型注册表和抽取缓存都在
+    里面)、管线的 env、deployment 下各工程的 .env、runtime/eval 里的题集与金标准、各库的更正文件。向量、索引、图谱、解析缓存都能从
+    镜像和状态库里的缓存重算,不备。放在 <base>/backups/state/<时间戳>/,目录 700、文件 600,只留最近 KB_BACKUP_KEEP
+    份(默认 7)。不依赖任何服务,夜间维护里放在等 Qdrant 之前。"""
     from .config import BASE_DIR
 
     base = Path(base_dir) if base_dir else BASE_DIR
@@ -1448,6 +1501,10 @@ def backup_state(settings: Settings, *, base_dir: Path | None = None, keep: int 
     for item in sorted(eval_dir.iterdir()) if eval_dir.is_dir() else []:
         if item.is_file():
             copies.append((f"eval/{item.name}", item))
+    corrections_dir = getattr(settings, "corrections_dir", None)
+    if isinstance(corrections_dir, (str, os.PathLike)) and Path(corrections_dir).is_dir():
+        for item in sorted(Path(corrections_dir).glob("*.yaml")):
+            copies.append((f"corrections/{item.name}", item))
     out: dict[str, Any] = {
         "dry_run": dry_run, "backup_dir": str(target), "keep": keep,
         "state_db": str(state_db) if state_db.is_file() else None,

@@ -254,7 +254,7 @@ def _repetitive(text: str) -> bool:
 
 def _repetitive_prose(text: str) -> bool:
     """Prose fields such as title / summary: strip numbering, punctuation and whitespace before judging
-    (2026-09-10 product material, the "automated tasks" screenshot: "1. task list; 2. task list; ..."
+    (2026-09-10 screenshot evaluation: "1. task list; 2. task list; ..."
     516 times, and with only spaces removed the gram share was 45%, so it was missed)."""
     t = _NOISE_RE.sub("", text or "")
     if len(t) < 40:
@@ -337,7 +337,7 @@ def normalize_result(data: Any) -> dict[str, Any]:
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             result[key] = value.strip()
-    # String fields run away too (2026-09-10 product material, the "automated tasks" screenshot: the
+    # String fields run away too (2026-09-10 screenshot evaluation: the
     # model wrote FACTS into summary as "1. task list; 2. task list; ..." 516 times, over 5,000 chars;
     # title / summary used to have neither a repetition check nor a cap, so it went into the chunk
     # verbatim (3,157 tokens) and into the cache). Repetitive ones are cut at the loop start and

@@ -40,9 +40,9 @@ relationships from document samples.
 
 | Stage | Work |
 |---|---|
-| Schema preparation | Infer entity types under six upper-level classes, relationship predicates, definitions, and examples; store a schema version |
+| Schema preparation | Derive a versioned LinkML schema with eight upper classes, inherited types, identity scopes, and relationship definitions |
 | Extraction | Group chunks into extraction units; collect entities, relationships, and structured facts with sources |
-| Deterministic routes | Extract structure from supported code, structured Markdown, and configuration files without LLM extraction |
+| Deterministic routes | Extract code and configuration structure directly; infer table column roles, then turn rows into entities and qualified facts |
 | Merge and reconciliation | Resolve entities and property concepts; normalize units; preserve conflicting evidence and time information |
 | Derived views | Compile subject, timeline, and source pages from available facts and relationships |
 | Publication | Write versioned Qdrant graph collections and, when enabled, the Neo4j projection; coordinate activation with failure and rollback checks |
@@ -50,11 +50,23 @@ relationships from document samples.
 Extraction responses are cached by input and configuration fingerprint.
 Incremental builds reuse unchanged extraction results, merge decisions, and
 vectors. Deleted documents are removed from the next graph version. Time or
-change thresholds can trigger a full rebuild instead.
+change thresholds can trigger a full rebuild instead, refreshing labels by default.
+A global build lock serializes graph publication across libraries.
 
 Graph work lives under `runtime/graph/`; the build lock coordinates graph
 processes. Relationships and compiled pages carry source references that
 agents can use to retrieve the underlying passages.
+
+The eight upper classes are `agent`, `entity`, `part`, `property`, `process`,
+`event`, `concept`, and `document`. Entities distinguish classes from instances,
+carry external identifiers when present, and retain links to their source
+passages. Per-library correction files supply reusable identity and document
+status rules. Current and historical views preserve superseded evidence.
+
+Carrel supplies general knowledge storage, retrieval, and evidence.
+**The Agent Loop plugin is in development and not yet implemented.** It is
+intended to use these interfaces to learn an enterprise ontology, ask people
+for clarification, and maintain correction rules.
 
 ## Retrieval
 
@@ -67,7 +79,9 @@ to the calling agent.
    usable results, automatic routing can widen the search.
 3. Add graph and visual candidates where those capabilities are available.
 4. Fuse candidates with reciprocal rank fusion, balance subjects or documents,
-   and optionally rerank with a cross-encoder.
+   and optionally rerank text and images in parallel. Each branch applies its
+   own relevance threshold, then their ranks are fused; unavailable image scores
+   fall back to text.
 5. Apply coverage and diversity selection, stitch neighboring chunks and table
    continuations, remove supported overlaps, and allocate text token budgets.
 6. Return evidence, provenance, and diagnostic status.

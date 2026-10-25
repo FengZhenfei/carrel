@@ -69,7 +69,7 @@ _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 def _expands(base: str, inner: str) -> bool:
     """Whether the bracketed text expands the symbol: the initials of the English words in the expansion (Forward
-    Deployed Engineer → FDE), or its upper-case letters joined (AI Platform → AIP), equal the letters of the
+    Deployed Engineer → DSE), or its upper-case letters joined (AI Platform → AIP), equal the letters of the
     symbol. Condition notes (ΘJA (With Still Air), HSB (STORE only)) do not match and do not count."""
     letters = "".join(ch for ch in base if ch.isascii() and ch.isalpha()).upper()
     words = _LATIN_WORD_RE.findall(inner)
@@ -81,8 +81,8 @@ def _expands(base: str, inner: str) -> bool:
 
 
 def paren_alias(title: str) -> tuple[str, str]:
-    """Two spellings of X(Y) count as aliases: "body mass index (BMI)" where Y is a symbol / abbreviation; "FDE
-    (Forward-Deployed Engineer)" where X is the symbol and Y its expansion (English initials or upper-case letters
+    """Two spellings of X(Y) count as aliases: "body mass index (BMI)" where Y is a symbol / abbreviation; "DSE
+    (Data-Systems Engineer)" where X is the symbol and Y its expansion (English initials or upper-case letters
     joined equal X). Returns (X, Y), otherwise ("", ""). Brackets holding an example, an explanation or a condition
     (dark vegetables (red cabbage), stroke (ischemic stroke), ΘJA (With Still Air)) are not aliases."""
     text = unicodedata.normalize("NFKC", str(title or "")).strip()
@@ -273,18 +273,17 @@ def _type_word_set(type_words: Iterable[str]) -> set[str]:
 AUTO_RULES = ("identifier", "type_words", "paren", "declared")     # rule-merge bases, most reliable first: symbol > type words > paren alias > declared alias
 
 _DECLARED_ALIAS_RE = re.compile(r"^\s*(?P<title>[^()（）\s]{1,40})\s*[(（](?P<inner>[^()（）]{1,40})[)）]")
-# "abbreviation of WorkBuddy" / "short for WorkBuddy": the description opens by declaring whose short form /
+# "abbreviation of WorkWidget" / "short for WorkWidget": the description opens by declaring whose short form /
 # abbreviation / alias this name is
 _DECLARED_SHORT_CJK_RE = re.compile(r"^\s*(?:即|是|为)?\s*(?P<inner>[^,，。;；:：()（）\s]{2,40}?)\s*的(?:简称|缩写|简写|别称|昵称|全称)")
 _DECLARED_SHORT_EN_RE = re.compile(r"^\s*(?:short for|abbreviation (?:of|for)|abbreviated from|also known as|aka|alias of)\s+(?P<inner>[^,.;:()]{2,40})", re.IGNORECASE)
 
 
 def declared_alias(title: str, descriptions: Iterable[str]) -> str:
-    """An alias declared at the start of the description: "WB (WorkBuddy) is Tencent's …", "FDE (Forward Deployed
-    Engineer) …": the corpus itself says the two names are one thing, no need to ask the model (2026-09-12 product
-    KB: WB's description read WB (WorkBuddy), yet the judge model looked at an unrelated description of WorkBuddy
-    and answered no). Only the spelling where the brackets directly follow this entity's name counts; a pure
-    number / year in brackets does not. Returns the bracketed name, or an empty string."""
+    """An alias declared at the start of the description, such as "WW (WorkWidget) ..."
+    or "DSE (Data Systems Engineer) ...", is direct evidence of identity. Only brackets
+    immediately following this entity name count; a pure number or year does not.
+    Returns the bracketed name, or an empty string."""
     want = normalize(title)
     if not want:
         return ""
@@ -336,7 +335,7 @@ def auto_merge_pairs(entities: list[dict[str, Any]], reasons: dict[tuple[int, in
             keys.setdefault(canonical_identifier(inner), "paren")
         stated = declared_alias(title, row.get("descriptions") or ([row["description"]] if row.get("description") else []))
         if stated and canonical_identifier(stated) in titled.get((etype, scope), set()):
-            keys.setdefault(canonical_identifier(stated), "declared")     # WB's description says WB (WorkBuddy): merge with WorkBuddy
+            keys.setdefault(canonical_identifier(stated), "declared")     # WW's description says WW (WorkWidget): merge with WorkWidget
         for key, rule in keys.items():
             if len(key) >= 2:
                 gk = (etype, scope, key)
@@ -434,7 +433,7 @@ _INITIALS_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 
 def _initials(title: str) -> str:
-    """WorkBuddy → WB (the upper-case letters of camel case), Forward Deployed Engineer → FDE (word initials). A
+    """WorkWidget → WW (the upper-case letters of camel case), Data Systems Engineer → DSE (word initials). A
     name that is itself a short all-caps word does not count."""
     text = str(title or "").strip()
     if not text or not text.isascii():
@@ -453,9 +452,9 @@ def _initials(title: str) -> str:
 def prefix_and_initial_candidates(entities: list[dict[str, Any]], by_type: dict[tuple[str, str], list[int]]) -> list[tuple[int, int]]:
     """Two kinds of alias that literal similarity cannot reach, looked for among global entities only and only as
     candidates for the model (2026-09-12 spot check over five KBs):
-    · removing a prefix that is itself a name in this graph leaves exactly another entity of the same type: WPS
-      Comate / Comate, Tencent Lexiang / Lexiang, WPS Docs Center / Docs Center;
-    · one is the initialism of the other: WorkBuddy / WB, Forward Deployed Engineer / FDE."""
+    · removing a prefix that is itself a name in this graph leaves exactly another entity of the same type: EXO
+      Gadget / Gadget, Example Notes / Notes;
+    · one is the initialism of the other: WorkWidget / WW, Data Systems Engineer / DSE."""
     all_titles = {normalize(e.get("title")) for e in entities if not e.get("scope") and not e.get("exact")}
     out: set[tuple[int, int]] = set()
     for (_etype, scope), indexes in by_type.items():
@@ -538,7 +537,7 @@ def _first_sentence(row: dict[str, Any], limit: int = 160, sentences: int = 2) -
     """Evidence shown to the model for the judgement: the first two sentences of the description (≤160 chars).
     Names alone cause misjudgements, and one sentence is not enough either. With dozens of descriptions the first
     is no longer taken (it is merely the first unit in extraction order, not necessarily representative): prefer
-    a definition-style description starting with this entity's name ("WB (WorkBuddy) is Tencent's …"), else the
+    a definition-style description starting with this entity's name ("WW (WorkWidget) is a sample tool …"), else the
     longest among the first few."""
     descriptions = [str(d).strip() for d in (row.get("descriptions") or ([row["description"]] if row.get("description") else [])) if str(d).strip()]
     if not descriptions:
@@ -664,6 +663,21 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
+def merged_period(a: dict[str, Any], b: dict[str, Any]) -> tuple[str, str]:
+    """两条关系并成一条时的起止:两段时间并成从最早的起到最晚的止(一边只写了起、一边只写了止也能拼上)。
+    有一边是一个时间点(起止相同:某天做的一次检查)就不并 —— 两次检查不是一段从第一次到第二次的状态,
+    并出来的假区间过了止期会被当成已结束(currency.lapses);留起得早的那边(一样早留原来的)。"""
+    sides = [(str(x.get("valid_from") or ""), str(x.get("valid_until") or "")) for x in (a, b)]
+    sides = [p for p in sides if p[0] or p[1]]
+    if not sides:
+        return ("", "")
+    if any(lo and lo == hi for lo, hi in sides):
+        return min(sides, key=lambda p: p[0] or p[1])
+    starts = sorted(lo for lo, _ in sides if lo)
+    ends = sorted(hi for _, hi in sides if hi)
+    return (starts[0] if starts else ""), (ends[-1] if ends else "")
+
+
 def _ordered_union(groups: list[list[Any]]) -> list[Any]:
     seen: set[Any] = set()
     out: list[Any] = []
@@ -697,19 +711,53 @@ def merge_entities(
     yes_pairs: list[tuple[int, int]],
     *,
     canonical_out: dict[str, str] | None = None,
+    forbidden: set[frozenset[str]] | None = None,
+    require_compatible_identity: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
-    """Pairs judged yes form a graph and are merged per connected component (not pairwise). When canonical_out is
-    given it is filled with {merged key: representative key} (for incremental append replay).
+    """判 yes 的对连成图,按连通分量整体合并(不是两两)。canonical_out 给了就填上
+    {被并掉的键: 代表键}(增量并入回放用)。forbidden:更正文件里禁止合并的键对,两个分量里分别有这样一对就不连。
+    require_compatible_identity:自动判同/回放必须核对类型与作用域;显式的唯一编号关联和人工强制合并不走此猜测约束。
 
-    Representative = the highest frequency (ties go to the shortest title); descriptions deduplicated in order,
-    each with its source label, and none cut off (unmerged entities are not cut either: the summary batches them
-    by token budget); unit_ids / doc_ids / aliases unioned, frequency summed. Relation endpoints are rewritten to
-    the representative; self-loops are dropped; edges that coincide after rewriting are merged (strength_sum and
-    evidence added, descriptions and unit_ids unioned).
+    外部编号(表格编号列、主数据):同一体系下编号不同的两个实体绝不合并 —— 连通时逐对检查两个分量已有的编号,
+    冲突的那一对不连(否则 A-B、B-C 会把两个编号不同的 A、C 经由 B 并到一起)。
+    代表 = 带外部编号的优先,再按 frequency 最高(平手取标题最短、再按键);描述去重保序、带着各自的来源标签,一条不截
+    (没归并的实体也不截,长度由摘要按 token 预算分批),unit_ids / doc_ids / aliases / 外部编号并集,frequency 求和。
+    member_keys 记下分量里所有成员的键(含代表):代表换了、名字改了,旧编号照样能查到(方案附录第 4 条)。
+    关系两端改写成代表;自环丢掉;改写后重合的边合并(strength_sum 相加、evidence 相加、描述与 unit_ids 并集)。
     """
     uf = _UnionFind(len(entities))
+    ext_of: dict[int, dict[str, str]] = {}
+    for idx, e in enumerate(entities):
+        ext_of[idx] = {str(x.get("scheme") or ""): str(x.get("value") or "") for x in (e.get("external_ids") or [])
+                       if isinstance(x, dict) and x.get("value")}
+    blocked = 0
+    forbid_partners: dict[str, set[str]] = {}
+    for pair in forbidden or ():
+        a_key, b_key = tuple(pair)
+        forbid_partners.setdefault(a_key, set()).add(b_key)
+        forbid_partners.setdefault(b_key, set()).add(a_key)
+    keys_of: dict[int, set[str]] = {i: {str(e.get("key"))} for i, e in enumerate(entities)} if forbid_partners else {}
+    identity_of = {i: {(str(e.get("type") or "").casefold(), str(e.get("scope") or ""), str(e.get("upper") or ""))}
+                   for i, e in enumerate(entities)}
     for i, j in yes_pairs:
+        ri, rj = uf.find(i), uf.find(j)
+        if ri == rj:
+            continue
+        if require_compatible_identity and identity_of[ri] != identity_of[rj]:
+            blocked += 1
+            continue
+        a, b = ext_of.get(ri) or {}, ext_of.get(rj) or {}
+        if any(scheme in b and b[scheme] != value for scheme, value in a.items()):
+            blocked += 1
+            continue
+        if forbid_partners and any(forbid_partners.get(k, set()) & keys_of[rj] for k in keys_of[ri]):
+            blocked += 1
+            continue
         uf.union(i, j)
+        root = uf.find(i)
+        ext_of[root] = {**b, **a}
+        if forbid_partners:
+            keys_of[root] = keys_of[ri] | keys_of[rj]
     groups: dict[int, list[int]] = {}
     for idx in range(len(entities)):
         groups.setdefault(uf.find(idx), []).append(idx)
@@ -721,7 +769,8 @@ def merge_entities(
         if len(members) == 1:
             merged.append(dict(entities[members[0]]))
             continue
-        members.sort(key=lambda i: (-int(entities[i].get("frequency") or 0), len(str(entities[i].get("title") or ""))))
+        members.sort(key=lambda i: (not entities[i].get("external_ids"), -int(entities[i].get("frequency") or 0),
+                                    len(str(entities[i].get("title") or "")), str(entities[i].get("key") or "")))
         head = dict(entities[members[0]])
         head["descriptions"], head["description_sources"] = [], []
         for i in members:
@@ -734,6 +783,19 @@ def merge_entities(
         ) if a and a != head.get("title")]
         head["frequency"] = sum(int(entities[i].get("frequency") or 0) for i in members)
         head["attributes"] = _ordered_union([list(entities[i].get("attributes") or []) for i in members])
+        head["member_keys"] = _ordered_union([[str(entities[i].get("key"))] + list(entities[i].get("member_keys") or [])
+                                              for i in members])
+        ext: list[dict[str, str]] = []
+        for i in members:
+            for x in entities[i].get("external_ids") or []:
+                if isinstance(x, dict) and x not in ext:
+                    ext.append(dict(x))
+        head["external_ids"] = ext
+        kinds_by_freq: dict[str, int] = {}
+        for i in members:
+            k = str(entities[i].get("kind") or "instance")
+            kinds_by_freq[k] = kinds_by_freq.get(k, 0) + int(entities[i].get("frequency") or 0)
+        head["kind"] = "class" if kinds_by_freq.get("class", 0) > kinds_by_freq.get("instance", 0) else "instance"
         head["boilerplate"] = all(bool(entities[i].get("boilerplate")) for i in members)
         head["reference"] = all(bool(entities[i].get("reference")) for i in members)
         kinds = {str(entities[i].get("evidence_kind") or "body") for i in members}
@@ -762,6 +824,8 @@ def merge_entities(
             slot["evidence"] = int(slot.get("evidence") or 0) + int(rel.get("evidence") or 0)
             _absorb_descriptions(slot, rel)
             slot["unit_ids"] = _ordered_union([list(slot.get("unit_ids") or []), list(rel.get("unit_ids") or [])])
+            slot["doc_ids"] = _ordered_union([list(slot.get("doc_ids") or []), list(rel.get("doc_ids") or [])])
+            slot["valid_from"], slot["valid_until"] = merged_period(slot, rel)
             slot["type_violation"] = bool(slot.get("type_violation")) and bool(rel.get("type_violation"))
             slot["boilerplate"] = bool(slot.get("boilerplate")) and bool(rel.get("boilerplate"))
             slot["reference"] = bool(slot.get("reference")) and bool(rel.get("reference"))
@@ -778,6 +842,7 @@ def merge_entities(
         canonical_out.update(canonical_of)
     stats = {
         "entities_before": len(entities), "entities_after": len(merged), "merged_away": merged_away,
+        "external_id_conflicts_blocked": blocked,
         "relationships_before": len(relations), "relationships_after": len(edges),
         "self_loops_dropped": self_loops, "groups": sum(1 for m in groups.values() if len(m) > 1),
     }
@@ -828,20 +893,17 @@ def resolve(client: ChatClient, entities: list[dict[str, Any]], relations: list[
             embed: Callable[[list[str]], list[list[float]]] | None = None,
             prior: dict[str, Any] | None = None,
             type_words: Iterable[str] = (),
+            forbidden: set[frozenset[str]] | None = None,
             ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Deterministic direct merges → coarse screening (literal + containment + vector neighbours) → batched
-    same-entity judgement → merge.
-    type_words: profile-induced type words (signal / register / indicator … in the corpus language), treated as
-    removable type words together with the words of the ontology type names.
-    A failed batch call is skipped and counted; it does not abort the whole build.
+    """确定性直接合并 → 粗筛(字面 + 包含 + 向量近邻)→ 批量判同 → 合并。
+    forbidden:更正文件里禁止合并的键对(合并时守住,判成同一个也不并)。
+    type_words:画像归纳的类型词(语料语言的 信号 / 寄存器 / 指标 …),与本体类型名里的词一起当可去掉的类型词。
+    单批调用失败只跳过并计数,不中止整次建图。
 
-    prior: the previous graph version's resolution results ({"map": {merged key: representative key}, "judged":
-    [[key, key], …]}), passed on incremental append. Pairs judged before are replayed from the previous version
-    (merged stays merged, rejected stays rejected) and only unjudged candidate pairs (those involving new
-    entities) go to the judge; pairs merged last version are merged again even if they are no longer candidates
-    this version, so resolution results do not drift with the number of appends and everything is re-judged only
-    on a full rebuild. The returned stats carry _map / _judged (this version's results for the next replay); the
-    caller takes them out before writing the manifest."""
+    prior:上一版图的归并结论({"map": {被并掉的键: 代表键}, "judged": [[键, 键], …]}),增量并入时传。
+    判过的对照上一版回放(并过的照并、否过的照否),只把没判过的候选对(牵涉新实体的)送去判同;
+    上一版并掉的对即使这一版没再进候选也照旧并 —— 归并结论不随并入次数漂移,整库重建时才全部重判。
+    返回的 stats 里带 _map / _judged(这一版的结论,供下一版回放),调用方取走后再落 manifest。"""
     auto_reasons: dict[tuple[int, int], str] = {}
     auto = auto_merge_pairs(entities, auto_reasons)
     auto_set = set(auto)
@@ -992,7 +1054,8 @@ def resolve(client: ChatClient, entities: list[dict[str, Any]], relations: list[
                                  "b_title": str(entities[index_now[b]].get("title") or r.get("b_title") or ""), "source": "replay"})
         stats["replayed_rejected"] = len(rejected)
     canonical_of: dict[str, str] = {}
-    merged_entities, merged_relations, merge_stats = merge_entities(entities, relations, yes_pairs, canonical_out=canonical_of)
+    merged_entities, merged_relations, merge_stats = merge_entities(entities, relations, yes_pairs, canonical_out=canonical_of,
+                                                                    forbidden=forbidden, require_compatible_identity=True)
     stats.update(merge_stats)
     stats["_map"] = canonical_of
     stats["_judged"] = sorted(sorted(p) for p in judged_keys if len(p) == 2)

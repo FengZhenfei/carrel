@@ -29,10 +29,10 @@ def _local_file(rel_path: str, *, checksum: str = "same-checksum") -> SourceFile
     return SourceFile(
         kb_id="project_materials",
         collection="kb_project",
-        source_root="项目资料",
+        source_root="Project Library",
         source_type="local_mirror",
         file_key=stable_int(f"file:project_materials:{rel_path}"),
-        source_path=f"项目资料/{rel_path}",
+        source_path=f"Project Library/{rel_path}",
         rel_path=rel_path,
         filename=Path(rel_path).name,
         dir=parent,
@@ -130,6 +130,20 @@ def _client(responses, **kw) -> ChatClient:
     return ChatClient(SPEC, chat=chat, **kw)
 
 
+def _schema_entry(vid: str, types, *, language: str = "", definitions=None, scopes=None, predicates=(), profile=None,
+                  examples: str = "", **extra) -> dict:
+    """模式版本条目(版本环里存的形状:LinkML + 语料示例 + 元信息)。types 是 [(类型, 父类), …] 或类型名列表(父类按 entity)。"""
+    from kb_pipeline.ontology import normalize_model, to_linkml
+
+    rows = []
+    for t in types:
+        name, parent = (t if isinstance(t, (tuple, list)) else (t, "entity"))
+        rows.append({"name": name, "is_a": parent, "description": (definitions or {}).get(name, ""),
+                     "scope": (scopes or {}).get(name, "")})
+    model, _ = normalize_model({"language": language, "types": rows, "predicates": list(predicates), "profile": profile or {}})
+    return {"id": vid, "linkml": to_linkml(model, name="kb_test", version=vid), "examples": examples, **extra}
+
+
 def _unit(uid: str, doc: str = "d1", points=("p1",), order: int = 0) -> Unit:
     return Unit(unit_id=uid, doc_id=doc, rel_path=f"{doc}.pdf", section_path=["S"], block_ids=["b"],
                 chunk_uids=[f"c{p}" for p in points], point_ids=list(points), n_tokens=10, text="t", order=order)
@@ -152,9 +166,9 @@ def _bundle_dir(self, tmp: str):
     write_units(out / "units.jsonl", units)
     graph = {
         "entities": [
-            {"key": "a", "title": "A", "type": "t", "parent_type": "p", "description": "da", "frequency": 2,
+            {"key": "a", "title": "A", "type": "t", "upper": "part", "type_path": ["t", "part"], "kind": "instance", "description": "da", "frequency": 2,
              "degree": 1, "pagerank": 0.6, "unit_ids": ["u1", "u2"], "aliases": ["a1"], "doc_ids": ["kb_003:1"]},
-            {"key": "b", "title": "B", "type": "t", "parent_type": "", "description": "db", "frequency": 1,
+            {"key": "b", "title": "B", "type": "t", "upper": "", "description": "db", "frequency": 1,
              "degree": 1, "pagerank": 0.4, "unit_ids": ["u1"], "aliases": [], "doc_ids": ["kb_003:1"]},
         ],
         "relations": [

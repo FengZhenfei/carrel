@@ -92,13 +92,11 @@ def validate_graph_unit_config(unit_chunks: Any, max_gleanings: Any) -> list[str
     return errors
 
 
-# How many passages "extract / re-extract labels" samples to feed the LLM for inducing the domain /
-# language / entity types. Cap 32: this step splices the full text of the passages into one prompt
-# (generate_domain / generate_entity_types both do " ".join(docs) internally), so more would overflow
-# the context window -- and inducing the domain never needed that many samples anyway.
-GRAPH_TUNE_SAMPLE_MIN = 1
-GRAPH_TUNE_SAMPLE_MAX = 32
-GRAPH_TUNE_SAMPLE_DEFAULT = 8
+# 「立即/重新抽取标签」采样多少个片段喂给 LLM 归纳领域/语言/实体类型。
+# 兼容旧配置字段的校验;生产采样已忽略此字段,统一按模型输入预算自动决定数量。
+GRAPH_TUNE_SAMPLE_MIN = 0
+GRAPH_TUNE_SAMPLE_MAX = 1_000_000
+GRAPH_TUNE_SAMPLE_DEFAULT = 0
 
 # Cap on the type table length. The value of a closed type table lies in being "narrow": with many types
 # the model's attention is diluted when choosing, which is worse than giving no table at all (upstream's
@@ -112,43 +110,27 @@ GRAPH_SCHEMA_VERSION_MAX = 3
 # means "keep things as they are".
 CURRENT_SCHEMA_VERSION_ID = "__current__"
 
-# Id used when the placeholder entry above is materialized into the version ring. It must be a **real
-# id** rather than the placeholder id -- the placeholder id is treated as a no-op on the save path, while
-# the materialized entry is a real version that can be selected again.
-LEGACY_SCHEMA_VERSION_ID = "v-legacy"
 
 
-def push_schema_version(versions, entry, *, active_id=None, limit=GRAPH_SCHEMA_VERSION_MAX):
-    """Push a new version into the ring, newest first, evicting the oldest beyond the limit -- but **never
-    the version currently in effect**. Evicting the active version would mean the dropdown can no longer
-    select the labels the current build used, while the graph is still built on them.
+def push_schema_version(versions, entry, *, active_id=None, limit=GRAPH_SCHEMA_VERSION_MAX, protected_ids=()):
+    """新版本入环,最新的排最前,超出上限就淘汰最旧的 —— 但**绝不淘汰正在生效的
+    那一版**。淘汰掉生效版意味着下拉框里选不回当前建图用的标签,而图还是按它建的。
     """
     kept = [dict(v) for v in (versions or []) if str(v.get("id")) != str(entry.get("id"))]
     out = [dict(entry)] + kept
     if len(out) <= limit:
         return out
-    protected = str(active_id or "")
+    protected = {str(active_id or ""), *map(str, protected_ids)}
     trimmed = list(out)
     # Evict from the oldest forward, skipping the active version
     for index in range(len(trimmed) - 1, 0, -1):
         if len(trimmed) <= limit:
             break
-        if str(trimmed[index].get("id")) == protected:
+        if str(trimmed[index].get("id")) in protected:
             continue
         trimmed.pop(index)
-    return trimmed[:limit] if len(trimmed) > limit else trimmed
+    return trimmed  # Referenced versions may temporarily exceed the display retention limit.
 
-
-# Global default for the graph extraction type table. KBs that leave graph_entity_types empty use this one.
-#
-# Why here rather than settings.yaml: settings.yaml is expanded as plain text via Template.substitute,
-# which cannot express "keep the literal YAML value when this key is not injected" -- build.graph_env can
-# only inject either "this KB's table" or "this default". So the source of truth must live on the Python
-# side.
-GRAPH_ENTITY_TYPES_DEFAULT = (
-    "organization", "person", "product", "module", "feature", "technology",
-    "customer", "process", "risk", "requirement", "document",
-)
 
 GRAPH_ENTITY_TYPES_MAX = 32
 GRAPH_ENTITY_TYPE_MAX_LEN = 64
@@ -210,13 +192,12 @@ def validate_graph_tune_config(entity_types: Any, sample_size: Any) -> list[str]
     if not (GRAPH_TUNE_SAMPLE_MIN <= size <= GRAPH_TUNE_SAMPLE_MAX):
         errors.append(
             f"Sample size must be between {GRAPH_TUNE_SAMPLE_MIN} and {GRAPH_TUNE_SAMPLE_MAX} "
-            f"(default {GRAPH_TUNE_SAMPLE_DEFAULT}; the full sample text goes into one prompt)"
+            "(0 is automatic; the model input budget determines the actual sample)"
         )
     return errors
 
 
-GRAPH_PREDICATES_MAX = 24
-GRAPH_PARENT_TYPES_MAX = 8
+GRAPH_PREDICATES_MAX = 28
 _PREDICATE_NAME_RE = re.compile(r"[^a-z0-9_]+")
 
 
@@ -226,9 +207,9 @@ def normalize_predicate_name(value: Any) -> str:
 
 
 def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX) -> tuple[dict[str, Any], ...]:
-    """Predicate table: [{name, description, source_parents, target_parents}]; names are lower_snake,
-    de-duplicated, with the fallback related_to removed, keeping at most limit entries (None = no cut, used
-    when validating the count). A string form (names separated by commas / newlines) is accepted too."""
+    """谓词表:[{name, description, source_parents, target_parents, multivalued, core}];名字 lower_snake、
+    去重、去掉兜底的 related_to,最多留 limit 条(None = 不截,校验数量时用)。端点是上层类、类型名或 "*",
+    原样保留写法(类型名大小写有意义)。字符串形式(逗号/换行分隔的名字)也接受。"""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -248,11 +229,15 @@ def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX
         if not name or name == "related_to" or name in seen:
             continue
         seen.add(name)
+        multivalued = item.get("multivalued")
         out.append({
             "name": name,
             "description": str(item.get("description") or "").strip()[:200],
-            "source_parents": [str(p).strip().lower() for p in (item.get("source_parents") or []) if str(p).strip()][:8],
-            "target_parents": [str(p).strip().lower() for p in (item.get("target_parents") or []) if str(p).strip()][:8],
+            "source_parents": [str(p).strip() for p in (item.get("source_parents") or []) if str(p).strip()][:12],
+            "target_parents": [str(p).strip() for p in (item.get("target_parents") or []) if str(p).strip()][:12],
+            # 没写就是多值:只有模式里显式声明单值的关系才做「新值取代旧值」(ontology 模块说明)
+            "multivalued": multivalued is not False,
+            "core": bool(item.get("core")),
         })
         if limit is not None and len(out) >= limit:
             break
@@ -260,59 +245,37 @@ def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX
 
 
 def normalize_parent_types(value: Any) -> dict[str, str]:
+    """{类型: 上层类}:生效字段,由模式版本展开(ontology.expand_model),值只能是八个上层类之一。"""
+    from .ontology import upper_of_name
+
     if not isinstance(value, dict):
         return {}
     out: dict[str, str] = {}
     for k, v in value.items():
         key = str(k or "").strip()
-        parent = str(v or "").strip().lower()
+        parent = upper_of_name(v)
         if key and parent:
             out[key] = parent
     return out
 
 
-# ── Upper ontology (domain-independent, fixed six classes) ─────────────────────────────────────────
-# Every sampled entity type maps to one of these six classes. They decide two general rules:
-# · Scope: part / property / process belong to something and are scoped within the document (the tAS in
-#   two manuals are two nodes); entity / standard / document are global.
-# · The "concept" vs "instance" distinction for retrieval and health checks is not done yet; only the
-#   scope is used for now.
-UPPER_PARENTS = ("entity", "part", "property", "process", "standard", "document")
-UPPER_PARENT_DESCRIPTIONS = {
-    "entity": "independent things that exist on their own: products, devices, organizations, people, places, systems, materials",
-    "part": "constituents that belong to an entity: components, pins, modules, members, fields, ingredients",
-    "property": "measurable or descriptive attributes: parameters, metrics, characteristics, ratings, settings",
-    "process": "operations, modes, states, procedures, events, instructions, methods",
-    "standard": "standards, technologies, protocols, specifications, concepts and terms shared across documents",
-    "document": "documents, sections, figures, tables and other references to material",
-}
-DOCUMENT_SCOPED_PARENTS = frozenset({"part", "property", "process"})
-# Self-invented parent type names from old schema versions → upper class (the model's mapping takes
-# precedence; this is the fallback)
-UPPER_LEGACY_MAP = {
-    "entity": "entity", "component": "entity", "组件": "entity", "device": "entity", "product": "entity", "organization": "entity",
-    "person": "entity", "location": "entity", "place": "entity", "system": "entity", "material": "entity", "实体": "entity",
-    "part": "part", "interface": "part", "接口": "part", "signal": "part", "pin": "part", "register": "part", "module": "part",
-    "部件": "part", "零件": "part",
-    "property": "property", "parameter": "property", "参数": "property", "attribute": "property", "metric": "property",
-    "characteristic": "property", "属性": "property", "指标": "property",
-    "process": "process", "mode": "process", "模式": "process", "operation": "process", "event": "process", "state": "process",
-    "procedure": "process", "instruction": "process", "过程": "process", "操作": "process",
-    "standard": "standard", "标准": "standard", "technology": "standard", "protocol": "standard", "concept": "standard",
-    "term": "standard", "概念": "standard", "技术": "standard",
-    "document": "document", "文档": "document", "reference": "document", "figure": "document", "table": "document",
-}
+def normalize_type_parents(value: Any) -> dict[str, str]:
+    """{类型: 直接父类}(类型树,父类是上层类或另一个类型):按祖先查询、端点约束按祖先判。"""
+    if not isinstance(value, dict):
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in value.items() if str(k or "").strip() and str(v or "").strip()}
 
 
-def upper_parent_of(parent: Any) -> str | None:
-    """Parent type name → upper class; returns None when unrecognized (a one-off model mapping at build
-    time, or the default entity, serves as the fallback)."""
-    key = str(parent or "").strip().lower()
-    if not key:
-        return None
-    if key in UPPER_PARENTS:
-        return key
-    return UPPER_LEGACY_MAP.get(key)
+def normalize_type_scopes(value: Any) -> dict[str, str]:
+    """{类型: global | document}:模式阶段逐类型判定的作用域。"""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in value.items():
+        scope = str(v or "").strip().lower()
+        if str(k or "").strip() and scope in ("global", "document"):
+            out[str(k).strip()] = scope
+    return out
 
 
 # 2026-09-07 schema layer completion: normalization of type definitions / corpus examples / scenario
@@ -405,23 +368,6 @@ def normalize_predicate_names(value: Any) -> list[str]:
     return names
 
 
-def normalize_upper_parents(value: Any, entity_types: Iterable[str] = ()) -> dict[str, str]:
-    """{type: upper class}, keeping only the six classes; when entity_types is given, type names are aligned
-    case-insensitively."""
-    if not isinstance(value, dict):
-        return {}
-    lookup = {str(t).casefold(): str(t) for t in entity_types}
-    out: dict[str, str] = {}
-    for k, v in value.items():
-        key = str(k or "").strip()
-        if lookup:
-            key = lookup.get(key.casefold(), "")
-        upper = upper_parent_of(v)
-        if key and upper:
-            out[key] = upper
-    return out
-
-
 def validate_graph_schema_config(predicates: Any, parent_types: Any) -> list[str]:
     errors: list[str] = []
     if predicates not in (None, "", (), []):
@@ -432,8 +378,8 @@ def validate_graph_schema_config(predicates: Any, parent_types: Any) -> list[str
     if parent_types not in (None, "", {}):
         if not isinstance(parent_types, dict):
             errors.append("graph_parent_types must be an object")
-        elif len(set(normalize_parent_types(parent_types).values())) > GRAPH_PARENT_TYPES_MAX:
-            errors.append(f"At most {GRAPH_PARENT_TYPES_MAX} parent types")
+        elif len(normalize_parent_types(parent_types)) < len(parent_types):
+            errors.append("The values of graph_parent_types must be one of the eight upper classes")
     return errors
 
 
@@ -481,16 +427,15 @@ def validate_chunk_config(max_tokens: Any, overlap_tokens: Any, limits: dict[str
 
 
 def apply_schema_version(current: dict[str, Any], updates: dict[str, Any]) -> None:
-    """Expand graph_schema_active in updates into the labels and language that actually take effect (in
-    place).
+    """把 updates 里的 graph_schema_active 展开成真正生效的模式字段(原地改)。
 
-    Expanding, rather than having the graph build look up the version table, is deliberate: the effective
-    value lives in one place, and the graph build, the rebuild policy and the prompt rendering all read
-    it. The version list is only responsible for "visible and revertible".
-    Moved here from kb_server.service on 2026-09-08: the pipeline itself also needs to activate versions
-    (automatic label extraction for a blank graph, re-extraction before a full rebuild) and must not
-    depend on the server side the other way round.
+    展开而不是让建图去查版本表,是刻意的:生效值只有一处,建图、重建策略、
+    提示词渲染、检索目录读的都是它。版本列表只负责「能看见、能回退」。
+    版本条目里存的是 LinkML(ontology.to_linkml 的产物),展开走 ontology.expand_model;
+    语料示例不在 LinkML 里,单独随版本生效。
     """
+    from .ontology import entry_model, expand_model
+
     raw = updates.get("graph_schema_active")
     if raw is None:
         return
@@ -503,18 +448,16 @@ def apply_schema_version(current: dict[str, Any], updates: dict[str, Any]) -> No
     match = next((v for v in versions if str(v.get("id")) == chosen), None)
     if match is None:
         raise ValueError(f"The label version does not exist or has been rotated out: {chosen}")
-    types = list(normalize_entity_types(match.get("entity_types")))
-    updates["graph_entity_types"] = types or None
-    updates["graph_language"] = str(match.get("language") or "").strip() or None
-    # Schema layer (4.10): the predicate table and parent types take effect together with the version
-    predicates = list(normalize_predicates(match.get("predicates")))
-    updates["graph_predicates"] = predicates or None
-    parents = normalize_parent_types(match.get("parent_types"))
-    updates["graph_parent_types"] = parents or None
-    # 2026-09-07: type definitions, corpus examples and the scenario profile take effect with the version
-    # (cleared when an old version lacks them, falling back to no definitions / generic examples)
-    definitions = normalize_type_definitions(match.get("type_definitions"), types)
-    updates["graph_type_definitions"] = definitions or None
+    model = entry_model(match)
+    if model is None:
+        raise ValueError(f"Cannot read the schema of label version {chosen}")
+    updates.update(expand_model(model))
     updates["graph_examples"] = normalize_examples(match.get("examples")) or None
-    updates["graph_profile"] = normalize_profile(match.get("profile")) or None
     updates["graph_schema_active"] = chosen
+
+
+# 模式展开出来的生效字段:只由 apply_schema_version 写,控制台与 CLI 不能直接改(改模式 = 上传或抽一版新的)
+SCHEMA_EFFECTIVE_KEYS = (
+    "graph_entity_types", "graph_language", "graph_predicates", "graph_parent_types", "graph_type_parents",
+    "graph_type_scopes", "graph_type_definitions", "graph_examples", "graph_profile",
+)

@@ -13,7 +13,7 @@ import os
 import pathlib
 
 from kb_search import catalog as catalog_mod
-from kb_search import channels, evalset, graphwalk, images, service
+from kb_search import channels, docstatus, evalset, graphwalk, images, service
 from kb_search.config import SearchSettings, load_search_settings
 from kb_search.evidence import assemble_sources, doc_aggs, page_rows, select_hits, spec_rows, stitch_short_hit
 from kb_search.fusion import interleave, rrf_merge
@@ -950,7 +950,7 @@ class CatalogTests(unittest.TestCase):
         profile = {"sizes": {"kb_001": 500, "kb_002": 10000, "kb_003": 200},
                    "terms": {"尿酸": {"kb_001": 20},                                   # only one KB has it: max weight; kb_001 = 1 after density normalisation
                              "企业": {"kb_001": 2, "kb_002": 3000, "kb_003": 60},      # every KB has it: weight 0
-                             "workbuddy": {"kb_002": 900, "kb_003": 8},                 # two KBs have it: kb_002 density 0.09 far above kb_003 at 0.04
+                             "workwidget": {"kb_002": 900, "kb_003": 8},                 # two KBs have it: kb_002 density 0.09 far above kb_003 at 0.04
                              "不存在": {}}}
         lex = catalog_mod.lexical_evidence(profile, cols)
         w1, w2 = math.log(4 / 2), math.log(4 / 3)                                            # three KBs: token weight for "only 1 KB has it" / "2 KBs have it"
@@ -1065,8 +1065,30 @@ class CatalogCacheTests(unittest.TestCase):
             settings, q = self._env(tmp, kbs=("kb_001",)), self.Q()
             self.assertEqual([e["kb_id"] for e in catalog_mod.get_catalog(settings, q, ttl=600)], ["kb_001"])
             grown = self._env(tmp, kbs=("kb_001", "kb_007"))
-            self.assertEqual([e["kb_id"] for e in catalog_mod.get_catalog(grown, q, ttl=600)], ["kb_001", "kb_007"])   # a newly enrolled knowledge base does not wait for the cache to expire
+            self.assertEqual([e["kb_id"] for e in catalog_mod.get_catalog(grown, q, ttl=600)], ["kb_001", "kb_007"])
             self.assertEqual([e["kb_id"] for e in catalog_mod.get_catalog(settings, q, ttl=600)], ["kb_001"])
+
+    def test_graph_publication_and_deletion_refresh_a_warm_catalog(self) -> None:
+        import tempfile
+        from kb_pipeline import db
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(catalog_mod._cache, {"at": 0.0, "entries": []}), \
+                mock.patch.object(catalog_mod, "_active_schema", return_value={"domain": "", "persona": "", "schema_id": None}):
+            settings, q = self._env(tmp, kbs=("kb_001",)), self.Q()
+            with mock.patch.object(q, "get_aliases", return_value=SimpleNamespace(aliases=[])):
+                empty = catalog_mod.get_catalog(settings, q, ttl=600)
+            self.assertFalse(empty[0]["has_graph"])
+            with db.connect(settings.state_db) as con:
+                con.execute("INSERT INTO graph_builds(graph_build_id,source_key,kb_id,source_collection,graph_version,status,started_at) "
+                            "VALUES ('build7','001','kb_001','kb_001','v7','done',1)")
+            built = catalog_mod.get_catalog(settings, q, ttl=600)
+            self.assertTrue(built[0]["has_graph"])
+            self.assertIs(catalog_mod.get_catalog(settings, q, ttl=600), built)
+            with db.connect(settings.state_db) as con:
+                con.execute("DELETE FROM graph_builds WHERE kb_id='kb_001'")
+            with mock.patch.object(q, "get_aliases", return_value=SimpleNamespace(aliases=[])):
+                deleted = catalog_mod.get_catalog(settings, q, ttl=600)
+            self.assertFalse(deleted[0]["has_graph"])
 
 
 def _payload(pid: str, doc: str, idx: int, text: str, **extra):
@@ -1082,7 +1104,8 @@ class OrchestrationTests(unittest.TestCase):
 
     def _run(self, *, rerank_fn=None, kbs=None, settings_over=None, question="我的尿酸多少", graph_entities=None, extra_vec=None, extra_bm25=None,
              image=None, visual_fn=None, vec_delay=None, graph_specs=None, hints=None, graph_delay=None, broken=(),
-             visual_query_fn=None, entries=None, graph_relations=None, graph_pages=None, hoods=None):
+             visual_query_fn=None, entries=None, graph_relations=None, graph_pages=None, hoods=None, history=False, as_of=None,
+             doc_dates=None):
         docs = {"p1": _payload("p1", "d1", 2, "尿酸 433 umol/L,参考范围 208-428。" * 12),
                 "p2": _payload("p2", "d1", 3, "甘油三酯 1.7 mmol/L。" * 20),
                 "p3": _payload("p3", "d2", 0, "封装类型 361-ball FCBGA。" * 15, visual_ref="parse/x.jpg", visual_summary="图", visual_value_conflicts=[{"a": 1}], visual_confidence="high"),
@@ -1092,7 +1115,7 @@ class OrchestrationTests(unittest.TestCase):
                 "p9": _payload("p9", "d9", 0, "产品部署手册:安装步骤。" * 20),
                 "p8": _payload("p8", "d8", 0, "架构图。", visual_ref="parse/y.jpg", visual_summary="架构图", visual_confidence="high")}
         src = SimpleNamespace(kb_id="kb_001", collection="kb_001", source_root="health-samples", graph_language="Chinese", graph_entity_types=[], graph_profile={})
-        src2 = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="产品资料", graph_language="Chinese", graph_entity_types=[], graph_profile={})
+        src2 = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="Catalog Library", graph_language="Chinese", graph_entity_types=[], graph_profile={})
         settings = SimpleNamespace(sources={"kb_001": src, "kb_002": src2}, opensearch_url="http://os", reranker_base_url="http://rr/v1",
                                    embedding_base_url="", embedding_api_key="", embedding_model_id="", embedding_dim=2, qdrant_url="", qdrant_api_key=None,
                                    state_db=":memory:", visual_embedding_enabled=True, visual_embedding_base_url="http://vis/v1", visual_embedding_model_id="m",
@@ -1169,9 +1192,9 @@ class OrchestrationTests(unittest.TestCase):
                 return [{"point_id": "p1", "score": 0.8, "payload": docs["p1"]}, {"point_id": "p3", "score": 0.6, "payload": docs["p3"]}] + list(extra_vec or [])
             return [{"point_id": "p9", "score": 0.3, "payload": docs["p9"]}]
 
-        def fake_hoods(settings, sources, graph_versions, question, seeds, *, limit, driver=None, timeout=None):
+        def fake_hoods(settings, sources, graph_versions, question, seeds, *, limit, driver=None, timeout=None, scope=None):
             calls["hoods"] = {"kbs": list(sources), "question": question, "seeds": [e.get("title") for e in seeds], "graph_versions": graph_versions,
-                              "limit": limit, "timeout": timeout}
+                              "limit": limit, "timeout": timeout, "scope": scope}
             if callable(hoods):
                 return hoods()
             return list(hoods or [])
@@ -1200,8 +1223,9 @@ class OrchestrationTests(unittest.TestCase):
                 mock.patch.object(channels, "shared_driver", return_value=object()), \
                 mock.patch.object(graphwalk, "neighborhoods", side_effect=fake_hoods), \
                 mock.patch.object(graphwalk, "point_payloads", side_effect=fake_points), \
+                mock.patch.object(docstatus, "document_dates", side_effect=lambda settings, rows, gvs, **kw: dict(doc_dates or {})), \
                 mock.patch.object(Reranker, "score", fake_rerank):
-            out = service.search(question, kbs=kbs, explain=True, image_bytes=image, hints=hints)
+            out = service.search(question, kbs=kbs, explain=True, image_bytes=image, hints=hints, history=history, as_of=as_of)
         return out, calls
 
     def test_search_facts_carry_the_chunks_they_rest_on(self) -> None:
@@ -1838,7 +1862,8 @@ class ApiTests(unittest.TestCase):
 
         summary = {"kbs": ["kb_001", "kb_002"], "routing": {"widened": True}, "rerank": "below_threshold", "evidence_state": "diagnostic",
                    "degraded": ["kb_002:graph", "budget: context skipped"], "image_query": False, "sources": {"hits": 3},
-                   "timings_ms": {"embed_ms": 12, "recall_ms": 800, "total_ms": 1900}}
+                   "timings_ms": {"embed_ms": 12, "recall_ms": 800, "total_ms": 1900},
+                   "ranking": {"method": "text", "visual": {"status": "skipped"}}}
         class Out:
             def __init__(self): self.writes = []
             def write(self, text): self.writes.append(text)
@@ -1862,7 +1887,8 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("尿酸", lines[0])
         self.assertEqual(json.loads(lines[0][len("[search.request] "):]),
                          {"timings_ms": summary["timings_ms"], "kbs": 2, "widened": True, "rerank": "below_threshold", "evidence_state": "diagnostic",
-                          "hits": 3, "image_query": False, "degraded": ["kb_002:graph", "budget: context skipped"]})
+                          "hits": 3, "image_query": False, "ranking": summary["ranking"],
+                          "degraded": ["kb_002:graph", "budget: context skipped"]})
 
     def test_graph_neighbors_route_and_shaping(self) -> None:
         from fastapi.testclient import TestClient
@@ -1884,18 +1910,18 @@ class ApiTests(unittest.TestCase):
                     return FakeResult([{"type": "has_stage", "n": 5}, {"type": "part_of", "n": 2}])
                 if "RELATED_TO" in cypher:
                     return FakeResult([{"relation_id": "r1", "type": "has_stage", "outgoing": True, "directed": True, "weight": 3.0, "npmi": 0.4, "cooccur": 2,
-                                        "description": "FDE 有阶段二", "type_violation": False, "other_id": "e2", "other_title": "阶段二", "other_type": "stage", "other_scope": None, "other_pagerank": 0.1,
+                                        "description": "DSE 有阶段二", "type_violation": False, "other_id": "e2", "other_title": "阶段二", "other_type": "stage", "other_scope": None, "other_pagerank": 0.1,
                                         "other_degree": 3, "other_aliases": ["Stage Two"]}])
                 if "EVIDENCES" in cypher:
-                    return FakeResult([{"rid": "r1", "point_id": p, "chunk_uid": "u" + p[1:], "rel_path": "x/fde.pdf", "doc_id": None, "chunk_index": None, "content_version": None, "page_idx": None}
+                    return FakeResult([{"rid": "r1", "point_id": p, "chunk_uid": "u" + p[1:], "rel_path": "x/dse.pdf", "doc_id": None, "chunk_index": None, "content_version": None, "page_idx": None}
                                        for p in ("p6", "p7")])
                 if "MENTIONED_IN" in cypher:
-                    return FakeResult([{"rel_path": "x/fde.pdf"}])
+                    return FakeResult([{"rel_path": "x/dse.pdf"}])
                 if "HAS_SPEC" in cypher:
                     return FakeResult([{"n": 4}])
                 if "id: $id" in cypher:
                     return FakeResult([])
-                return FakeResult([{"id": "e1", "title": "FDE", "type": "role", "parent_type": None, "scope": None, "description": "前向部署工程师", "pagerank": 0.5, "degree": 9, "aliases": ["Forward Deployed Engineer"]}])
+                return FakeResult([{"id": "e1", "title": "DSE", "type": "role", "parent_type": None, "scope": None, "description": "前向部署工程师", "pagerank": 0.5, "degree": 9, "aliases": ["Data Systems Engineer"]}])
 
         class FakeDriver:
             def __init__(self): self.s = FakeSession()
@@ -1906,24 +1932,24 @@ class ApiTests(unittest.TestCase):
         class FakeQ:
             def retrieve(self, collection_name, ids, with_payload, with_vectors):
                 self.keys = list(with_payload)
-                base = {"is_active": True, "doc_id": "d7", "content_version": "v1", "page_idx": 4, "rel_path": "x/fde.pdf", "filename": "fde.pdf", "section_path": ["2. Roles"],
+                base = {"is_active": True, "doc_id": "d7", "content_version": "v1", "page_idx": 4, "rel_path": "x/dse.pdf", "filename": "dse.pdf", "section_path": ["2. Roles"],
                         "block_type": "text"}
-                return [SimpleNamespace(id="p6", payload={**base, "chunk_index": 2, "text": "FDE 是前向部署工程师。"}),
-                        SimpleNamespace(id="p7", payload={**base, "chunk_index": 3, "text": "TITLE: 2. Roles\nFDE 的工作分三个阶段。阶段二由 FDE 驻场交付,周期约三个月。阶段三转入运维。"})]
+                return [SimpleNamespace(id="p6", payload={**base, "chunk_index": 2, "text": "DSE 是前向部署工程师。"}),
+                        SimpleNamespace(id="p7", payload={**base, "chunk_index": 3, "text": "TITLE: 2. Roles\nDSE 的工作分三个阶段。阶段二由 DSE 驻场交付,周期约三个月。阶段三转入运维。"})]
 
         with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", return_value=FakeDriver()), \
                 mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="003-v"):
             fq = FakeQ()
-            out = graphwalk.neighbors(SimpleNamespace(), src, entity="fde", entity_id=None, limit=5, types=None, direction="both", q=fq)
-            only = graphwalk.neighbors(SimpleNamespace(), src, entity="fde", entity_id=None, limit=5, types=["part_of"], direction="both", q=fq)
-        self.assertTrue(out["found"]); self.assertEqual(out["entity"]["title"], "FDE"); self.assertEqual(out["entity"]["docs"], ["x/fde.pdf"])
+            out = graphwalk.neighbors(SimpleNamespace(), src, entity="dse", entity_id=None, limit=5, types=None, direction="both", q=fq)
+            only = graphwalk.neighbors(SimpleNamespace(), src, entity="dse", entity_id=None, limit=5, types=["part_of"], direction="both", q=fq)
+        self.assertTrue(out["found"]); self.assertEqual(out["entity"]["title"], "DSE"); self.assertEqual(out["entity"]["docs"], ["x/dse.pdf"])
         nb = out["neighbors"][0]
         self.assertEqual((nb["type"], nb["direction"], nb["other"]["title"]), ("has_stage", "out", "阶段二"))            # predicate, direction, far end
         # every relation carries an excerpt of the original text: the evidence chunk that names the far end is picked (p7, moved to
         # the front) and cut from the start of a sentence; the chunk that does not name it (p6) carries none
         self.assertEqual([ev["point_id"] for ev in nb["evidence"]], ["p7", "p6"])
         self.assertEqual((nb["evidence"][0]["excerpt"], nb["evidence"][0]["excerpt_match"], nb["evidence"][0]["block_type"]),
-                         ("阶段二由 FDE 驻场交付,周期约三个月。阶段三转入运维。", "both", "text"))
+                         ("阶段二由 DSE 驻场交付,周期约三个月。阶段三转入运维。", "both", "text"))
         self.assertNotIn("excerpt", nb["evidence"][1]); self.assertNotIn("visual", nb["evidence"][0]); self.assertNotIn("_names", nb)
         self.assertIn("text", fq.keys)                                                                    # the text is fetched for the excerpt only
         # relation counts per predicate are not bounded by limit; the far end's own relation count and the number of facts under the
@@ -1938,9 +1964,9 @@ class ApiTests(unittest.TestCase):
         with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
                 mock.patch.object(service, "graph_neighbors", return_value={"found": True}) as gn:
             client = TestClient(create_app())
-            r = client.post("/graph/neighbors", json={"kb_id": "kb_003", "entity": "FDE", "types": ["has_stage"], "direction": "out"}, headers={"Authorization": "Bearer secret"})
+            r = client.post("/graph/neighbors", json={"kb_id": "kb_003", "entity": "DSE", "types": ["has_stage"], "direction": "out"}, headers={"Authorization": "Bearer secret"})
             self.assertEqual((r.status_code, r.json()), (200, {"found": True})); self.assertEqual(gn.call_args.kwargs["types"], ["has_stage"])
-            self.assertEqual(client.post("/graph/neighbors", json={"kb_id": "kb_003", "entity": "FDE", "direction": "sideways"}, headers={"Authorization": "Bearer secret"}).status_code, 422)
+            self.assertEqual(client.post("/graph/neighbors", json={"kb_id": "kb_003", "entity": "DSE", "direction": "sideways"}, headers={"Authorization": "Bearer secret"}).status_code, 422)
 
     def test_graph_neighbors_reuses_the_shared_client_and_driver(self) -> None:
         from kb_search import graphwalk
@@ -1958,8 +1984,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("e.id IS NOT NULL", by_name)                                                          # the lookup by name can use the composite index too
 
     def test_graph_entities_lists_by_type_with_total_and_paging(self) -> None:
-        """ "All of them" questions: entities by type / upper class / name, with a total and paging; the first page
-        also carries the number of entities per type."""
+        """「全部 / 所有」类问题:按类型(含子类型)/ 上层类 / 类与实例 / 名字列实体,带总数与翻页,第一页附各类型的实体数。"""
         from fastapi.testclient import TestClient
 
         from kb_search import graphwalk
@@ -1976,39 +2001,48 @@ class ApiTests(unittest.TestCase):
                 if "count(e) AS total" in text:
                     rows = [{"total": 3}]
                 elif "AS etype" in text:
-                    rows = [{"etype": "product", "parent": "entity", "n": 3}, {"etype": "module", "parent": "part", "n": 9}]
+                    rows = [{"etype": "product", "upper": "entity", "n": 3, "classes": 1}, {"etype": "module", "upper": "part", "n": 9, "classes": 0}]
                 elif "MENTIONED_IN" in text:
                     rows = [{"eid": "e1", "docs": ["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], "doc_count": 7}]
                 else:
-                    rows = [{"id": "e1", "title": "Northwind Suite", "type": "product", "parent_type": "entity", "scope": None, "description": "An office suite. " * 40,
-                             "pagerank": 0.9, "degree": 40, "aliases": ["NW Suite"]},
-                            {"id": "e2", "title": "Northwind Notes", "type": "product", "parent_type": "entity", "scope": None, "description": None,
-                             "pagerank": 0.5, "degree": 12, "aliases": []}]
+                    rows = [{"id": "e1", "title": "Northwind Suite", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
+                             "kind": "instance", "scope": None, "description": "An office suite. " * 40, "pagerank": 0.9, "degree": 40,
+                             "aliases": ["NW Suite"], "external_ids": ["sku:W365"], "doc_count": 11},
+                            {"id": "e2", "title": "Northwind Notes", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
+                             "kind": "instance", "scope": None, "description": None, "pagerank": 0.5, "degree": 12, "aliases": []}]
                 return SimpleNamespace(data=lambda: rows)
 
         driver = SimpleNamespace(session=lambda: Session(), close=mock.Mock())
         src = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
         with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", side_effect=AssertionError("must not create a Neo4j driver")), \
                 mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="005-v"):
-            out = graphwalk.list_entities(SimpleNamespace(), src, types=["Product", " product "], parent_types=["Entity"], name=" Northwind ",
+            out = graphwalk.list_entities(SimpleNamespace(), src, types=["Product", " product "], uppers=["Entity"], name=" Northwind ",
                                           limit=2, offset=0, driver=driver, timeout=7.0)
-            page2 = graphwalk.list_entities(SimpleNamespace(), src, types=["product"], limit=999, offset=2, driver=driver)
+            page2 = graphwalk.list_entities(SimpleNamespace(), src, types=["product"], kind="bogus", limit=999, offset=2, driver=driver)
         self.assertEqual((out["kb_name"], out["graph_version"], out["total"], out["count"], out["has_more"]), ("products", "005-v", 3, 2, True))
-        self.assertEqual(out["filters"], {"types": ["product"], "parent_types": ["entity"], "name": "northwind"})    # case-insensitive, de-duplicated
+        self.assertEqual(out["filters"], {"types": ["product"], "uppers": ["entity"], "kind": "all", "name": "northwind"})   # 不分大小写、去重;默认都列
+        self.assertEqual(page2["filters"]["kind"], "all")                                                         # 认不出的 kind 按默认
         self.assertEqual([e["id"] for e in out["entities"]], ["e1", "e2"])
-        self.assertEqual(len(out["entities"][0]["description"]), 200); self.assertIsNone(out["entities"][1]["description"])   # a listing keeps only the start of a description
-        self.assertEqual((out["entities"][0]["docs"], out["entities"][0]["doc_count"]), (["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], 7))   # items carry their documents: a listing needs no query per item
+        self.assertEqual((out["entities"][0]["upper"], out["entities"][0]["kind"], out["entities"][0]["external_ids"]),
+                         ("entity", "instance", ["sku:W365"]))
+        self.assertNotIn("parent_type", out["entities"][0])
+        self.assertEqual(len(out["entities"][0]["description"]), 200); self.assertIsNone(out["entities"][1]["description"])   # 清单里描述只留开头
+        # 条目带出处文档;文档数以建图时记的全数为准(11),节点上没有才用提及数
+        self.assertEqual((out["entities"][0]["docs"], out["entities"][0]["doc_count"]), (["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], 11))
         self.assertEqual((out["entities"][1]["docs"], out["entities"][1]["doc_count"]), ([], 0))
         docs_query = next((t, kw) for t, _, kw in log if "MENTIONED_IN" in t)
         self.assertEqual((docs_query[1]["ids"], docs_query[1]["top"]), (["e1", "e2"], 3)); self.assertIn("ORDER BY mentions DESC", docs_query[0])
-        self.assertEqual(out["types"], [{"type": "product", "parent_type": "entity", "count": 3}, {"type": "module", "parent_type": "part", "count": 9}])
-        self.assertNotIn("types", page2); self.assertEqual((page2["limit"], page2["offset"]), (200, 2))             # the type summary only on the first page; limit is capped
+        self.assertEqual(out["types"], [{"type": "product", "upper": "entity", "count": 3, "classes": 1},
+                                        {"type": "module", "upper": "part", "count": 9, "classes": 0}])
+        self.assertNotIn("types", page2); self.assertEqual((page2["limit"], page2["offset"]), (200, 2))            # 类型清单只在第一页;limit 封顶
         listing = next(t for t, _, _ in log if "SKIP $offset LIMIT $limit" in t)
         for piece in ("e.id IS NOT NULL", "coalesce(e.boilerplate, false) = false", "coalesce(e.reference, false) = false",
-                      "toLower(e.type) IN $types", "ORDER BY coalesce(e.pagerank, 0) DESC, e.id"):
-            self.assertIn(piece, listing)                                                                           # uses the composite index, skips boilerplate and references, stable order
-        self.assertTrue(all(timeout == 7.0 for _, timeout, kw in log[:4]))                                          # every query carries the transaction timeout
-        self.assertEqual(driver.close.call_count, 0)                                                                # the shared driver is not closed
+                      "any(t IN coalesce(e.type_path, [toLower(e.type)]) WHERE t IN $types)",       # 给父类型就连子类型一起列
+                      "toLower(coalesce(e.upper, 'entity')) IN $uppers", "$kind = 'all' OR coalesce(e.kind, 'instance') = $kind",
+                      "ORDER BY coalesce(e.pagerank, 0) DESC, e.id"):
+            self.assertIn(piece, listing)                                                                          # 走复合索引、不列样板与引用类、顺序稳定
+        self.assertTrue(all(timeout == 7.0 for _, timeout, kw in log[:4]))                                         # 每条查询都带事务超时
+        self.assertEqual(driver.close.call_count, 0)                                                               # 共用的 driver 不关
         ss = _settings(token="secret")
         auth = {"Authorization": "Bearer secret"}
         with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)), \
@@ -2018,6 +2052,10 @@ class ApiTests(unittest.TestCase):
             self.assertEqual((r.status_code, r.json()), (200, {"total": 0}))
             self.assertEqual((ge.call_args.kwargs["types"], ge.call_args.kwargs["limit"], ge.call_args.kwargs["offset"]), (["product"], 20, 40))
             self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005", "limit": 201}, headers=auth).status_code, 422)
+            # 改版前的 parent_types 不再收:直接 422,不悄悄忽略成一份没筛过的清单
+            self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005", "parent_types": ["entity"]}, headers=auth).status_code, 422)
+            r = client.post("/graph/entities", json={"kb_id": "kb_005", "uppers": ["agent"], "kind": "class"}, headers=auth)
+            self.assertEqual((r.status_code, ge.call_args.kwargs["uppers"], ge.call_args.kwargs["kind"]), (200, ["agent"], "class"))
             self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005"}).status_code, 401)
         with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)):
             self.assertEqual(TestClient(create_app()).post("/graph/entities", json={"kb_id": "kb_009"}, headers=auth).status_code, 404)
@@ -2043,8 +2081,8 @@ class ApiTests(unittest.TestCase):
                 log.append((text, kw))
                 rows: list = []
                 if "replace(toLower(e.title), ' ', '') = $name" in text:
-                    rows = [{"id": "e-small", "title": "ZK200", "type": "device", "parent_type": "entity", "scope": None, "description": "", "pagerank": 0.1, "degree": 2, "aliases": []},
-                            {"id": "e-main", "title": "ZK200", "type": "device", "parent_type": "entity", "scope": None, "description": "", "pagerank": 0.2, "degree": 30, "aliases": []}]
+                    rows = [{"id": "e-small", "title": "ZK200", "type": "device", "upper": "entity", "scope": None, "description": "", "pagerank": 0.1, "degree": 2, "aliases": []},
+                            {"id": "e-main", "title": "ZK200", "type": "device", "upper": "entity", "scope": None, "description": "", "pagerank": 0.2, "degree": 30, "aliases": []}]
                 elif "RETURN DISTINCT f.concept_key AS key" in text:
                     rows = [] if " = $p" in text else [{"key": "c-vcc"}]            # nothing exact, containment hits one concept
                 elif "count(f) AS total" in text:
@@ -2501,7 +2539,7 @@ class ApiTests(unittest.TestCase):
                 log.append((text, kw))
                 rows: list = []
                 if "replace(toLower(e.title), ' ', '') = $name" in text:
-                    rows = [{"id": "e-main", "title": "Alpha Widget", "type": "product", "parent_type": "entity", "scope": None, "description": "",
+                    rows = [{"id": "e-main", "title": "Alpha Widget", "type": "product", "upper": "entity", "scope": None, "description": "",
                              "pagerank": 0.2, "degree": 30, "aliases": []}]
                 elif "RETURN DISTINCT f.concept_key AS key" in text:
                     rows = [{"key": "c-power"}]
@@ -2530,7 +2568,13 @@ class ApiTests(unittest.TestCase):
             self.assertIn("ORDER BY coalesce(f.conflict_group, ''), coalesce(f.subject, ''),", listing)              # one conflict group sorts together
             self.assertIn("SKIP $offset LIMIT $limit", listing)
             props = next(t for t, kw in log if "count(f) AS n" in t)
-            self.assertIn("WHERE f.doc_id = $doc RETURN", props); self.assertNotIn("conflict_group", props)          # the property summary is scoped by the document
+            # 属性清单按文档圈范围,按同一个时间口径数(默认现行)
+            self.assertIn("WHERE f.doc_id = $doc AND", props)
+            self.assertNotIn("conflict_group", props)
+            counted = [t for t, kw in log if "count(f) AS total" in t]
+            self.assertEqual(len(counted), 2)                    # 同样条件下的全部条数与按口径的条数:差就是 time.hidden
+            self.assertNotIn("superseded_by", counted[0]); self.assertIn("f.superseded_on", counted[1])
+            self.assertEqual(out["time"]["mode"], "current")
             self.assertEqual(out["filters"], {"doc_id": "kb_002:1", "conflict_only": True})
             self.assertEqual(out["properties"], [{"concept": "rated power", "concept_key": "c-power", "count": 2}])
             f1, f2 = out["facts"]
@@ -2548,7 +2592,7 @@ class ApiTests(unittest.TestCase):
             listing = next(t for t, kw in log if "AS row" in t)
             self.assertIn("e.id AS subject_id ORDER BY coalesce(f.conflict_group, ''), coalesce(f.concept, f.property, '')", listing)
             self.assertNotIn("OPTIONAL MATCH", listing)
-            self.assertIn("WHERE true RETURN coalesce(f.concept", next(t for t, kw in log if "count(f) AS n" in t))       # with only a subject the summary is as before
+            self.assertIn("f.superseded_on", next(t for t, kw in log if "count(f) AS n" in t))   # 属性清单按取代的生效日期计数
             self.assertEqual(out3["filters"], {"conflict_only": True})
             # none of the new conditions: behaviour as before, no filters, no conflict-group ordering
             log.clear()
@@ -2691,7 +2735,7 @@ class SkillClientTests(unittest.TestCase):
              "evidence": [{"point_id": "p9", "doc_id": "d1", "content_version": "v1", "chunk_index": 5, "rel_path": "vendor/manual.pdf", "place": "page 2",
                            "active": True, "excerpt": "A block diagram.", "excerpt_match": "center", "visual": True}]}]}}
     ENTITIES = {"call_id": "cccccc", "operation": "entities", "result": {
-        "kb_id": "kb_005", "kb_name": "products", "total": 1, "offset": 0, "types": [{"type": "product", "parent_type": "entity", "count": 3}],
+        "kb_id": "kb_005", "kb_name": "products", "total": 1, "offset": 0, "types": [{"type": "product", "upper": "entity", "count": 3}],
         "entities": [{"id": "e1", "title": "ZK200", "type": "product", "degree": 30, "doc_count": 2, "docs": ["vendor/manual.pdf"]}]}}
     NO_FACTS = {"call_id": "dddddd", "operation": "facts", "result": {"kb_id": "kb_005", "kb_name": "products", "found": True, "total": 0, "offset": 0, "facts": []}}
     CONTEXT = {"call_id": "eeeeee", "operation": "context", "result": {
@@ -2738,7 +2782,8 @@ class SkillClientTests(unittest.TestCase):
         self.assertEqual(view[at(picture):][:2], [picture, "FACTS: a wiring diagram."])                # the index lines of a picture chunk are left out
         self.assertEqual(view[at("[S5] same citation as S4"):][1], ("Step 5 of the setup. " * 12).strip())
         self.assertIn("[F1] ZK200 · failover time = 2 s [conflict] — same citation as S1", view)
-        self.assertEqual(view[at("[F2] ZK200 · weight: 3 kg [sources no longer active] — products/vendor/sheet.pdf"):][1], "     series: 3 kg (2024), 2.8 kg (2025)")
+        self.assertIn("Historical series summary", view[at("[F2] ZK200 · weight: 3 kg [sources no longer active] — products/vendor/sheet.pdf"):][1])
+        self.assertNotIn("3 kg (2024), 2.8 kg (2025)", "\n".join(view))
         # a fact the service gave no hint reads the same way and is placed at the chunk its value was found in; a file
         # already named by an earlier entry is pointed at, with the entry's own place
         self.assertIn("[F3] ZK200 · standby power = 3 W @ mode: idle · 2025-03 — same file as S1 · page 9", view)
@@ -2814,7 +2859,7 @@ class SkillClientTests(unittest.TestCase):
             work = Path(tmp)
             entities, none, context = self._stored(c, work, self.ENTITIES, self.NO_FACTS, self.CONTEXT)
             listed, empty, read = c.view_entities(entities), c.view_facts(none), c.view_context(context)
-        self.assertIn("entities per type (--type takes the type name; the upper class in brackets goes with --parent-type): product 3 (entity)", listed)
+        self.assertIn("Entities per type (--type includes subtypes; --upper filters the upper class; --kind instance selects concrete instances): product 3 (entity)", listed)
         self.assertIn("[E1] ZK200 (product · 30 relations · 2 documents) — products/vendor/manual.pdf", listed)
         self.assertEqual(listed[-1], "products/vendor/manual.pdf  ← E1")                              # the document that mentions it most, as a reference file
         self.assertEqual(empty[1:], ["nothing matches"])                                              # no rows: no hint on how to point at one
@@ -3035,9 +3080,9 @@ class SkillClientTests(unittest.TestCase):
 
     def test_listing_commands_build_their_requests(self) -> None:
         c = self._client()
-        args = c.parser().parse_args(["entities", "--kb", "kb_005", "--type", "product", "--type", "module", "--parent-type", "entity", "--name", "suite",
+        args = c.parser().parse_args(["entities", "--kb", "kb_005", "--type", "product", "--type", "module", "--upper", "entity", "--name", "suite",
                                       "--limit", "20", "--offset", "40"])
-        self.assertEqual(c.payload(args), {"kb_id": "kb_005", "limit": 20, "offset": 40, "types": ["product", "module"], "parent_types": ["entity"], "name": "suite"})
+        self.assertEqual(c.payload(args), {"kb_id": "kb_005", "limit": 20, "offset": 40, "types": ["product", "module"], "uppers": ["entity"], "name": "suite"})
         args = c.parser().parse_args(["facts", "--kb", "kb_002", "--subject", "ZK200", "--property", "VCC", "--match", "exact"])
         self.assertEqual(c.payload(args), {"kb_id": "kb_002", "subject": "ZK200", "property": "VCC", "match": "exact"})
         with self.assertRaises(ValueError):
@@ -3087,3 +3132,312 @@ class ImageCacheBoundaryTests(unittest.TestCase):
             for bad in ("../outside.png", "/etc/passwd", "kb/../../x.png", ""):
                 with self.assertRaises(KeyError):
                     _cached_file(settings, {"visual_ref": bad})
+
+
+class SkillOntologyClientTests(unittest.TestCase):
+    _client = staticmethod(SkillClientTests._client)
+    def test_time_and_schema_commands_match_api_models(self):
+        from kb_search.api import SearchRequest, NeighborsRequest, FactsRequest, EntitiesRequest, SchemaRequest, StatsRequest
+
+        c = self._client()
+        cases = [
+            (["search", "--question", "Earlier plan", "--history"], SearchRequest, {"history": True}),
+            (["neighbors", "--kb", "kb_001", "--entity", "Example", "--as-of", "2025-06"],
+             NeighborsRequest, {"as_of": "2025-06"}),
+            (["facts", "--kb", "kb_001", "--subject", "Example", "--history"], FactsRequest, {"history": True}),
+            (["entities", "--kb", "kb_001", "--upper", "agent", "--kind", "instance"],
+             EntitiesRequest, {"uppers": ["agent"], "kind": "instance"}),
+            (["schema", "--kb", "kb_001", "--version", "s1", "--format", "yaml"],
+             SchemaRequest, {"version": "s1", "format": "yaml"}),
+            (["stats", "--kb", "kb_001"], StatsRequest, {"kb_id": "kb_001"}),
+        ]
+        for argv, request_type, expected in cases:
+            with self.subTest(command=argv):
+                payload = c.payload(c.parser().parse_args(argv))
+                parsed = request_type.model_validate(payload).model_dump()
+                self.assertEqual({key: parsed[key] for key in expected}, expected)
+
+    def test_schema_view_shows_hierarchy_and_yaml(self):
+        c = self._client()
+        result = {"kb_id": "kb_001", "schema_id": "s1", "origin": "upload", "graph_schema_id": "s1",
+                  "active_schema_id": "s2", "linkml_yaml": "classes:\n  engineer:\n    is_a: person\n",
+                  "summary": {"types": [{"name": "engineer", "upper": "agent", "is_a": "person", "scope": "global"}],
+                              "predicates": [{"name": "works_for", "source_parents": ["agent"],
+                                              "target_parents": ["agent"], "multivalued": False}]}}
+        text = "\n".join(c.view_schema({"call_id": "abc123", "operation": "schema", "result": result}))
+        for word in ("engineer", "person", "works_for", "classes:", "s1", "s2"):
+            self.assertIn(word, text)
+
+
+class TimeAwareSearchTests(unittest.TestCase):
+    """破坏性改版的检索口径:关系与事实默认只给现行的、带状态;旧 id 与外部编号查得到实体;事实序列带全部档位;
+    更正文件里标了被取代 / 归档的文档默认不进结果;模式与统计接口;目录带图谱概览。"""
+
+    class _Session:
+        def __init__(self, handler):
+            self.handler, self.calls = handler, []
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def run(self, cypher, **kw):
+            text = str(getattr(cypher, "text", cypher))
+            self.calls.append((text, kw))
+            return SimpleNamespace(data=lambda: self.handler(text, kw))
+
+    def _driver(self, handler):
+        session = self._Session(handler)
+        return SimpleNamespace(session=lambda: session, close=lambda: None), session
+
+    def test_neighbors_default_to_current_relations_and_say_how_many_were_hidden(self) -> None:
+        def handler(text, kw):
+            if "count(r) AS n" in text:
+                current = "coalesce(r.doc_status, '') = ''" in text
+                return [{"type": "reports_to", "n": 1 if current else 3}]
+            if "RELATED_TO" in text:
+                return [{"relation_id": "r1", "type": "reports_to", "outgoing": True, "directed": True, "weight": 2.0,
+                         "valid_from": "2025-03", "observed_first": "2025-03-01", "observed_last": "2026-01-10",
+                         "other_id": "e2", "other_title": "组B", "other_type": "team", "other_upper": "agent", "other_kind": "instance"}]
+            if "HAS_SPEC" in text:
+                return [{"n": 2}]
+            if "MENTIONED_IN" in text or "EVIDENCES" in text:
+                return []
+            if "id: $id" in text:
+                return []
+            if "$id IN coalesce(e.ids, [])" in text:
+                return [{"id": "e1", "title": "张三", "type": "person", "upper": "agent", "type_path": ["person", "agent"], "kind": "instance",
+                         "degree": 4, "pagerank": 0.5}]
+            return []
+
+        driver, session = self._driver(handler)
+        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Project Library")
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
+            out = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="old-id", driver=driver)
+            back = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="old-id", driver=driver, as_of="2025-06")
+        # 旧 id(归并进来的成员原来的 id)也查得到:先按现在的 id 点查,没有再看 ids
+        self.assertEqual(out["entity"]["id"], "e1"); self.assertEqual(out["entity"]["upper"], "agent")
+        nb = out["neighbors"][0]
+        self.assertEqual((nb["status"], nb["valid_from"], nb["observed_last"], nb["other"]["upper"]), ("current", "2025-03", "2026-01-10", "agent"))
+        self.assertEqual(out["time"], {"mode": "current", "day": out["time"]["day"], "hidden": 2})     # 同样条件下还有两条不算数的关系
+        self.assertEqual((out["total"], out["entity"]["facts"]), (1, 2))
+        rows_q = [kw for text, kw in session.calls if "LIMIT $limit" in text and "RELATED_TO" in text]
+        self.assertEqual(rows_q[-1]["day"], "2025-06-30")                                            # 回看:只给到月就是那月的最后一天
+        self.assertEqual(back["time"]["mode"], "as_of")
+        with self.assertRaises(ValueError):
+            graphwalk.neighbors(SimpleNamespace(), src, entity="张三", entity_id=None, driver=driver, as_of="去年")
+
+    def test_only_lapsing_periods_count_as_ended(self) -> None:
+        """一段状态(2014–2016 在某公司)过了止期标「已结束」;某天做的一次检查(起止都是那天)照样算数。
+        会不会过期是建图时定的(lapses),要跟着关系一起从图库取出来。"""
+        def handler(text, kw):
+            if "count(r) AS n" in text:
+                return [{"type": "works_at", "n": 2}]
+            if "RELATED_TO" in text:
+                return [{"relation_id": "r1", "type": "works_at", "outgoing": True, "directed": True, "weight": 2.0,
+                         "valid_from": "2014", "valid_until": "2016", "lapses": True,
+                         "other_id": "e2", "other_title": "公司A", "other_type": "company", "other_upper": "agent", "other_kind": "instance"},
+                        {"relation_id": "r2", "type": "related_to", "outgoing": True, "directed": False, "weight": 1.0,
+                         "valid_from": "2025-10-18", "valid_until": "2025-10-18", "lapses": False,
+                         "other_id": "e3", "other_title": "机构B", "other_type": "org", "other_upper": "agent", "other_kind": "instance"}]
+            if "HAS_SPEC" in text:
+                return [{"n": 0}]
+            if "id: $id" in text:
+                return [{"id": "e1", "title": "张三", "type": "person", "upper": "agent", "kind": "instance", "degree": 2}]
+            return []
+
+        driver, session = self._driver(handler)
+        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Project Library")
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
+            out = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="e1", driver=driver, history=True)
+        self.assertEqual({nb["relation_id"]: nb["status"] for nb in out["neighbors"]}, {"r1": "ended", "r2": "current"})
+        self.assertFalse(any("lapses" in nb for nb in out["neighbors"]))
+        rows_q = next(text for text, kw in session.calls if "LIMIT $limit" in text and "RELATED_TO" in text)
+        self.assertIn("r.lapses AS lapses", rows_q)
+
+    def test_entities_resolve_by_external_id(self) -> None:
+        driver, session = self._driver(lambda text, kw: [{"id": "e9", "title": "需求条目 A", "external_ids": ["需求编号:REQ-001"]}]
+                                       if "external_ids" in text and "$name" in text else [])
+        rows = graphwalk.resolve_entity(driver.session(), "kb_004", "v1", entity_id=None, name="req-001")
+        self.assertEqual(rows[0]["id"], "e9")
+        by_name = session.calls[-1][0]
+        self.assertIn("ENDS WITH ':' + $name", by_name)                                              # 只给编号、不给体系也算
+
+    def test_facts_list_current_values_with_the_whole_series(self) -> None:
+        def handler(text, kw):
+            if "RETURN DISTINCT f.concept_key" in text:
+                return [{"key": "c-ldl"}]
+            if "count(f) AS total" in text:
+                return [{"total": 1 if "superseded_by" in text else 3}]
+            if "AS row" in text:
+                return [{"row": {"id": "f3", "subject": "我", "property": "LDL", "value": "3.1", "unit": "mmol/L", "valid_from": "2025-05",
+                                 "series_key": "s1", "series_index": 2, "observed": "2025-05-10", "doc_id": "kb:3"}, "subject_id": "e1"}]
+            if "f.series_key IN $keys" in text:
+                return [{"series_key": "s1", "id": f"f{i}", "value": v, "unit": "mmol/L", "valid_from": d, "series_index": i - 1}
+                        for i, (v, d) in enumerate((("3.6", "2023-05"), ("3.4", "2024-05"), ("3.1", "2025-05")), 1)]
+            return []
+
+        driver, session = self._driver(handler)
+        src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="Example Collection A")
+        with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
+            out = graphwalk.list_facts(SimpleNamespace(), src, prop="LDL", driver=driver, fields=service.FACT_FIELDS)
+            hist = graphwalk.list_facts(SimpleNamespace(), src, prop="LDL", driver=driver, history=True, fields=service.FACT_FIELDS)
+        f = out["facts"][0]
+        self.assertEqual((f["status"], f["observed"]), ("current", "2025-05-10"))
+        self.assertEqual(f["series_text"], "3.6 mmol/L(2023-05)、3.4 mmol/L(2024-05)、3.1 mmol/L(2025-05)")   # 更早的档位不单列,但看得到
+        self.assertNotIn("series_members", f)
+        self.assertEqual(out["time"]["hidden"], 2)
+        self.assertNotIn("hidden", hist["time"]); self.assertEqual(hist["time"]["mode"], "history")
+        probe = next(text for text, kw in session.calls if "RETURN DISTINCT f.concept_key" in text)
+        self.assertNotIn("superseded_by", probe)                                                    # 属性试探只认写法,不受口径影响
+
+    def test_document_status_from_the_corrections_file(self) -> None:
+        import tempfile
+
+        from kb_pipeline import db as dbm, discovery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state = root / "state.sqlite3"
+            dbm.init_db(state)
+            mirror = root / "mirror"
+            (mirror / "Project Library" / ".carrel").mkdir(parents=True)
+            with dbm.connect(state) as con:
+                src, _ = discovery.enroll(con, mirror, "Project Library")
+                for i, rel in enumerate(("报价/2024 报价.xlsx", "报价/2025 报价.xlsx", "归档/旧方案.docx", "合同/框架协议.pdf", "旧/删掉的.pdf")):
+                    row = {"file_id": f"{src.kb_id}:{i + 1}", "kb_id": src.kb_id, "collection": src.collection, "source_root": "Project Library",
+                           "source_type": "local", "file_key": i + 1, "source_path": "Project Library/" + rel, "rel_path": rel,
+                           "filename": rel.rsplit("/", 1)[-1], "dir": rel.rsplit("/", 1)[0], "physical_path": str(mirror / "Project Library" / rel),
+                           "mime_type": "application/pdf", "size": 1, "mtime": 1, "content_version": "v1", "metadata_fingerprint": "m",
+                           "first_seen_at": 1, "last_seen_at": 1, "status": "deleted" if rel.startswith("旧/") else "indexed"}
+                    con.execute(f"INSERT INTO files ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+                con.commit()
+            # 库文件夹下的旧位置不再读(2026-10-25 起更正文件放在 config/corrections/<kb_id>.yaml)
+            (mirror / "Project Library" / ".carrel" / "corrections.yaml").write_text(
+                "documents:\n  - path: 报价/\n    status: archived\n", encoding="utf-8")
+            (root / "corrections").mkdir()
+            (root / "corrections" / f"{src.kb_id}.yaml").write_text(
+                "documents:\n"
+                "  - path: 报价/2024 报价.xlsx\n    status: superseded\n    superseded_by: 报价/2025 报价.xlsx\n"
+                "  - path: 归档/\n    status: archived\n"
+                "  - path: 合同/框架协议.pdf\n    valid_from: 2024-01-01\n    valid_until: 2025-12-31\n"
+                "  - path: 旧/\n    status: archived\n", encoding="utf-8")
+            settings = SimpleNamespace(mirror_root=mirror, state_db=state, sources={src.kb_id: src},
+                                       corrections_dir=root / "corrections")
+            from kb_pipeline.graph.currency import query_scope
+
+            now = query_scope(today="2026-10-24")
+            self.assertEqual(docstatus.excluded_paths(settings, src, now), ["合同/框架协议.pdf", "归档/旧方案.docx", "报价/2024 报价.xlsx"])
+            # 回看 2024 年中:写明被取代 / 归档但没写日期的那天还算数,框架协议那天在有效期里
+            self.assertEqual(docstatus.excluded_paths(settings, src, query_scope(as_of="2024-06")), [])
+            self.assertEqual(docstatus.excluded_paths(settings, src, query_scope(as_of="2023")), ["合同/框架协议.pdf"])
+            self.assertEqual(docstatus.excluded_paths(settings, src, query_scope(history=True)), [])
+            rows = [{"kb_id": src.kb_id, "rel_path": "报价/2024 报价.xlsx", "doc_id": "d1"}, {"kb_id": src.kb_id, "rel_path": "报价/2025 报价.xlsx"}]
+            self.assertEqual(docstatus.annotate(settings, rows, query_scope(history=True)), 1)
+            self.assertEqual((rows[0]["doc_status"], rows[0]["superseded_by"]), ("superseded", "报价/2025 报价.xlsx"))
+            self.assertNotIn("doc_status", rows[1])
+        dates = docstatus.document_dates(SimpleNamespace(), [{"kb_id": "kb_1", "doc_id": "d1", "rel_path": "周报/2026-03-02 周报.docx"},
+                                                             {"kb_id": "kb_1", "doc_id": "d2", "rel_path": "说明.pdf"}], {})
+        self.assertEqual(dates, {("kb_1", "d1"): "2026-03-02"})                                       # 没建图的库按文件名认,认不出不给
+
+    def test_search_excludes_non_current_documents_at_recall(self) -> None:
+        from kb_pipeline.graph.currency import query_scope
+
+        flt, os_flt = service._kb_filters(None, ["报价/2024 报价.xlsx"])
+        self.assertEqual([c.key for c in flt.must], ["is_active"])
+        self.assertEqual((flt.must_not[0].key, flt.must_not[0].match.any), ("rel_path", ["报价/2024 报价.xlsx"]))
+        self.assertEqual(os_flt, [{"bool": {"must_not": [{"terms": {"rel_path": ["报价/2024 报价.xlsx"]}}]}}])
+        flt2, _ = service._kb_filters({"doc_ids": ["d1"]}, None)
+        self.assertEqual(sorted(c.key for c in flt2.must), ["doc_id", "is_active"]); self.assertFalse(flt2.must_not)
+        fused = service._fuse("kb_1", {"text": [], "bm25": [], "channels": {}, "degraded": []},
+                              {"chunks": [{"point_id": "p1", "rel_path": "报价/2024 报价.xlsx", "score": 1.0},
+                                          {"point_id": "p2", "rel_path": "报价/2025 报价.xlsx", "score": 0.5}]}, None, k=60,
+                              excluded=["报价/2024 报价.xlsx"])
+        self.assertEqual([c["point_id"] for c in fused["fused"]], ["p2"])                            # 图路候选没走召回过滤,融合时再筛
+        self.assertEqual(query_scope()["mode"], "current")
+
+    def test_the_real_graph_channel_takes_what_the_service_passes(self) -> None:
+        """编排测试里的图路是假的(收 **kw):真函数的签名得收得下服务传的每个参数,不然图路每次都被当成失败跳过
+        (10-24 上线后真机:graph_channel() got an unexpected keyword argument 'history')。graph_query 同理。"""
+        import inspect
+
+        from kb_pipeline.graph.recall import graph_query
+
+        inspect.signature(channels.graph_channel).bind(SimpleNamespace(), SimpleNamespace(), "q", limit=60, hops=1, vector=None,
+                                                       lexical_only=False, q=None, timeout=5.0, history=False, as_of="2025-06-30")
+        inspect.signature(graph_query).bind(SimpleNamespace(), SimpleNamespace(), "q", hops=1, chunk_limit=60, candidate_limit=60,
+                                            with_text=True, vector=None, lexical_only=False, q=None, driver=None, timeout=5.0,
+                                            history=False, as_of=None)
+        calls = {}
+
+        def fake_query(settings, source, question, **kw):
+            calls.update(kw)
+            return {"chunks": [], "time": {"mode": "as_of", "day": "2025-06-30"}}
+
+        with mock.patch("kb_pipeline.graph.recall.graph_query", side_effect=fake_query), \
+                mock.patch.object(channels, "shared_driver", return_value=None):
+            out = channels.graph_channel(SimpleNamespace(), SimpleNamespace(), "q", limit=60, hops=1, as_of="2025-06-30")
+        self.assertNotIn("skipped", out)
+        self.assertEqual((calls["as_of"], calls["history"], out["time"]["mode"]), ("2025-06-30", False, "as_of"))
+
+    def test_search_passes_the_time_scope_to_every_part(self) -> None:
+        out, calls = OrchestrationTests()._run(kbs=["kb_001"], as_of="2025-06", hoods=[],
+                                               doc_dates={("kb_001", "d1"): "2025-04-01"})
+        t = out["retrieval_summary"]["time"]
+        self.assertEqual((t["mode"], t["day"], t["excluded_documents"], t["non_current_sources"]), ("as_of", "2025-06-30", {}, 0))
+        self.assertEqual(calls["hoods"]["scope"]["mode"], "as_of")
+        self.assertEqual({r.get("doc_date") for r in out["sources"] if r.get("doc_id") == "d1"}, {"2025-04-01"})
+
+    def test_schema_and_stats_routes(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from kb_search.main import create_app
+
+        ss = _settings(token="secret")
+        auth = {"Authorization": "Bearer secret"}
+        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)), \
+                mock.patch.object(service, "graph_schema", return_value={"schema_id": "s1"}) as gs, \
+                mock.patch.object(service, "graph_stats", return_value={"stats": {}}) as gst:
+            client = TestClient(create_app())
+            r = client.post("/graph/schema", json={"kb_id": "kb_003", "format": "yaml"}, headers=auth)
+            self.assertEqual((r.status_code, gs.call_args.kwargs["fmt"], gs.call_args.kwargs["version"]), (200, "yaml", None))
+            self.assertEqual(client.post("/graph/schema", json={"kb_id": "kb_003", "format": "xml"}, headers=auth).status_code, 422)
+            self.assertEqual(client.post("/graph/stats", json={"kb_id": "kb_003"}, headers=auth).status_code, 200)
+            self.assertEqual(gst.call_args.args, ("kb_003",))
+            self.assertEqual(client.post("/search", json={"question": "x", "as_of": "去年"}, headers=auth).status_code, 422)
+
+    def test_schema_endpoint_returns_the_version_the_graph_was_built_with(self) -> None:
+        from kb_pipeline.ontology import default_model, to_linkml
+
+        linkml = to_linkml(default_model(), name="kb_003", version="s1")
+        cfg = {"graph_schema_versions": [{"id": "s1", "origin": "auto_blank", "domain": "论文", "linkml": linkml},
+                                         {"id": "s2", "origin": "upload", "linkml": linkml}], "graph_schema_active": "s2"}
+        settings = SimpleNamespace(sources={"kb_003": SimpleNamespace(kb_id="kb_003", source_root="Example Collection B")}, state_db=":memory:")
+        with mock.patch.object(service, "runtime", return_value=(settings, _settings(), None)), \
+                mock.patch("kb_pipeline.db.connect") as connect, \
+                mock.patch("kb_pipeline.discovery.get_config", return_value=cfg), \
+                mock.patch.object(channels, "shared_driver", return_value=object()), \
+                mock.patch.object(graphwalk, "version_stats", return_value=("v7", {"schema_version_id": "s1"})):
+            connect.return_value.__enter__.return_value = object()
+            out = service.graph_schema("kb_003")
+            yaml_out = service.graph_schema("kb_003", version="s2", fmt="yaml")
+            with self.assertRaises(KeyError):
+                service.graph_schema("kb_003", version="s9")
+        self.assertEqual((out["schema_id"], out["active_schema_id"], out["graph_schema_id"], out["domain"]), ("s1", "s2", "s1", "论文"))
+        self.assertEqual(out["linkml"]["id"], linkml["id"]); self.assertIn("types", out["summary"])
+        self.assertIn("classes:", yaml_out["linkml_yaml"]); self.assertEqual(yaml_out["schema_id"], "s2")
+
+    def test_catalog_carries_the_graph_overview(self) -> None:
+        from kb_search import catalog as cat
+
+        stats = {"documents": 9, "time_span": {"from": "2024-01-02", "to": "2026-03-01", "dated_documents": 7},
+                 "entities": {"total": 40}, "facts": {"total": 12}, "relations": {"related_to_share": 0.2},
+                 "types": [{"type": "person", "upper": "agent", "entities": 5, "docs": 7, "weeks": 3}],
+                 "predicates": [{"predicate": "works_on", "edges": 8, "pairs": [{"source_type": "person", "target_type": "project", "count": 6}]}],
+                 "subjects": [{"title": "张三"}]}
+        with mock.patch("kb_search.graphwalk.version_stats", return_value=("v1", stats)):
+            view, err = cat._overview(object(), "kb_004")
+        self.assertIsNone(err)
+        self.assertEqual((view["documents"], view["types"][0], view["predicates"][0]["pair"], view["subjects"]),
+                         (9, {"type": "person", "upper": "agent", "entities": 5, "docs": 7}, "person -> project", ["张三"]))
+        with mock.patch("kb_search.graphwalk.version_stats", side_effect=RuntimeError("down")):
+            self.assertEqual(cat._overview(object(), "kb_004"), ({}, "neo4j: RuntimeError"))

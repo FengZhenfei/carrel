@@ -24,11 +24,15 @@
 | 文本向量 | `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL_ID`、`EMBEDDING_API_KEY`、`EMBEDDING_DIM` | 入库和向量检索需要 |
 | 图片描述 | `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY`、`KB_IMAGE_MAX_PIXELS` | 处理图片和文档插图时需要；图片送出前先缩到像素预算以内 |
 | 图谱抽取与摘要 | 在控制台注册对话模型，再为知识库选择 | 启用建图时需要 |
-| 文本重排 | `RERANKER_BASE_URL` | 可选，未配置时使用检索融合顺序 |
+| 文本重排 | `RERANKER_BASE_URL`、`RERANKER_MODEL_ID`、`RERANKER_API_KEY` | 可选，未配置时使用检索融合顺序 |
 | 视觉向量 | `VISUAL_EMBEDDING_ENABLED`、`VISUAL_EMBEDDING_BASE_URL`、`VISUAL_EMBEDDING_MODEL_ID`、`VISUAL_EMBEDDING_DIM` 及其他 `VISUAL_EMBEDDING_*` | 可选，用于像素层面的检索；配套实现连接本地 vLLM |
-| 视觉重排 | `VISUAL_RERANKER_BASE_URL` | 可选，用于视觉结果重排 |
+| 视觉重排服务 | `VISUAL_RERANKER_BASE_URL` | 可选的多模态重排；配置后自动参与检索融合 |
 
 文本向量使用 OpenAI 兼容的 embeddings API，图片描述和建图模型使用兼容的 chat API。重排使用 `/v1/rerank`，视觉向量使用 vLLM 的多模态 pooling 请求格式；各接口需使用对应的请求格式。
+
+使用公网文本重排时，`RERANKER_BASE_URL` 填 API 基础地址或完整的 `/rerank` 地址，`RERANKER_MODEL_ID` 填供应商的模型名，`RERANKER_API_KEY` 填 Bearer 密钥。请求包含 `model`、`query` 和 `documents`，响应包含带 `index`、`relevance_score` 的 `results`。模型名留空时通过 `/models` 自动发现，密钥留空时沿用本地无认证访问。
+
+控制台模型卡片的“最大输入”（英文模式显示 **Max Input**）填写模型的输入 token 上限。标签抽取按文档和章节覆盖度自动选择样本，完整请求的估算输入控制在该值的 30% 以内。采样数量为只读字段，启动抽取前显示“尚未计算”；刷新或重新打开控制台后可以继续查看进度。
 
 使用配套模型服务时，先按 [本地模型部署说明](../deployment/compose/README.md#local-model-servers-profile-local-models) 下载权重，再运行 `./deploy.sh --with-local-models`。建图用的对话模型仍需在控制台单独配置。
 
@@ -60,7 +64,7 @@
 | 控制台 | `KB_WEB_HOST`、`KB_WEB_PORT`、`KB_WEB_TOKEN`、`KB_CONSOLE_SERVICES` | 默认 `127.0.0.1:9800`，默认管理 `database,mineru` 服务组 |
 | 检索 | `KB_SEARCH_HOST`、`KB_SEARCH_PORT`、`KB_SEARCH_TOKEN`、`KB_SEARCH_TOP_K`、`KB_SEARCH_RERANK`、`KB_SEARCH_CONTEXT_TOKENS`、`KB_SEARCH_REQUEST_BUDGET`、`KB_SEARCH_ROUTE_MAX_KBS`、`KB_SEARCH_ROUTE_GAP`、`KB_SEARCH_ROUTE_FLOOR` 及其他 `KB_SEARCH_*` | 监听地址与令牌、返回数量、重排、上下文预算、整次请求的时间预算（应小于调用方的超时）；自动路由会把证据分数与最高分相差不超过 GAP 的知识库一起查（最多 MAX_KBS 个），全部低于 FLOOR 时标记结果偏弱 |
 
-每个参数在代码里都有默认值。模板列出了全部检索参数及其代码默认值，除监听地址和令牌外都是注释掉的，取消注释之前一律按标定好的默认值运行（有一条测试保证两边不再漂移）。各阈值的含义见 [`app/kb_search/config.py`](../app/kb_search/config.py)；检索服务的 `/health` 会报告重排和视觉通道当前是否启用。
+每个参数在代码里都有默认值。模板列出了全部检索参数及其代码默认值，除监听地址和令牌外都是注释掉的，取消注释之前一律按标定好的默认值运行（有一条测试保证两边不再漂移）。各阈值的含义见 [`app/kb_search/config.py`](../app/kb_search/config.py)；检索服务的 `/health` 分别报告文本重排、视觉召回和图片重排是否启用。`KB_SEARCH_RERANK` 统一控制两路重排。图片共享 `KB_SEARCH_RERANK_N` 的总候选预算（默认 64），最多占 `KB_SEARCH_VISUAL_RERANK_N=8` 个位置，使用独立阈值 `KB_SEARCH_VISUAL_RERANK_THRESHOLD=0.5`；图片阶段预算 `KB_SEARCH_VISUAL_RERANK_TIMEOUT=15` 秒，同时受请求总预算约束。图片重排接口需支持包含文本及 `image_url` 数据 URL 的多模态 `content`，详见[检索说明](retrieval.zh-CN.md#图文分路重排)。
 
 ## 单库设置
 
@@ -70,10 +74,14 @@
 |---|---|---|
 | 切块 | `max_tokens`、`overlap_tokens` | 在向量模型上下文限制内控制块大小与重叠 |
 | 图谱控制 | `graph_enabled`、`graph_auto_append`、`graph_profile` | 启用图谱、允许增量更新、保存自动归纳的场景画像 |
-| 类型与关系 | `graph_entity_types`、`graph_parent_types`、`graph_type_definitions`、`graph_predicates`、`graph_examples`、`graph_language` | 自动生成的类型、关系与示例 |
-| 抽取 | `graph_tune_sample_size`、`graph_unit_chunks`、`graph_max_gleanings` | 类型归纳采样量、抽取单元大小与补充抽取轮数 |
+| 类型与关系 | `graph_schema_active`、`graph_language` | 选择 LinkML 模式版本和输出语言，类型与关系从选定模式展开 |
+| 抽取 | `graph_unit_chunks`、`graph_max_gleanings` | 抽取单元大小与补充抽取轮数；标签采样自动计算 |
 | 模型 | `graph_llm.extract`、`graph_llm.summarize`、`graph_llm.tune` | 为各建图阶段选择已注册的模型 |
-| 重建 | `graph_rebuild_interval`、`graph_rebuild_new_chunk_pct`、`graph_rebuild_new_chunk_count`、`graph_rebuild_operator` | 按时间与资料变化阈值触发，支持 `or` / `and` |
+| 重建 | `graph_rebuild_interval`、`graph_rebuild_new_chunk_pct`、`graph_rebuild_new_chunk_count`、`graph_rebuild_operator`、`graph_rebuild_resuggest` | 按时间与资料变化阈值触发，支持 `or` / `and`；默认在全量重建前重新抽取标签 |
+
+标签模式可以从资料中抽取，也可以上传 LinkML YAML。Carrel 使用 LinkML 子集表达类型继承、身份范围和关系。设置 `graph_rebuild_resuggest=false` 后，全量重建沿用选定的模式版本。
+
+`KB_CORRECTIONS_DIR` 默认为 `config/corrections`。每个库的 `<kb_id>.yaml` 保存实体更正和文档状态，删除图谱、重建图谱时保留，并随状态备份一起备份；删除知识库时清理。新建知识库使用新的更正规则文件，即使编号被复用也不会继承旧库内容。
 
 修改切块设置后，使用控制台的整库重新解析操作，将新配置应用到已有文件。解析器实现版本更新时，后续扫描会自动为受影响文件重新排队。
 

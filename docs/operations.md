@@ -53,7 +53,19 @@ are defined in [`kb_server/api.py`](../app/kb_server/api.py).
 | `GET` / `POST /api/llms`; `DELETE /api/llms/{name}` | Model registry (keys are write-only) |
 | `POST /api/services/{key}/restart`, `restart_all`, `stop_all` | Service controls for the rows in `KB_CONSOLE_SERVICES` |
 
+Label extraction starts with `POST /api/kbs/{kb_id}/graph_schema` (202),
+returns a task ID, and runs in the background. Read its status with `GET` on
+the same route; cancel with `POST .../graph_schema/cancel` and `task_id`.
+Upload LinkML YAML with `POST .../graph_schema/upload?adopt=true` and download
+a version with `GET .../graph_schema/{version_id}/linkml`.
+
+Deleting a graph clears its label schemas and graph outputs while retaining
+parsed files, RAG indexes, and library correction rules. Deleting the library
+also removes its correction file. State backups include correction YAML files.
+
 ## Deployment and services
+
+For an existing 0.2 installation, follow the [0.3.0 upgrade steps](releases/0.3.0.md).
 
 | Command | Effect |
 |---|---|
@@ -206,7 +218,7 @@ before rebuilding indexes or projections.
 the suite was run against (pytest included); by hand that is
 `app/.venv/bin/pip install -r app/requirements.lock -e app`. After a dependency
 change, regenerate the lock from a virtual environment you have tested with
-`app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml > app/requirements.lock`.
+`app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml --output app/requirements.lock`.
 After installing the application and test dependencies:
 
 ```bash

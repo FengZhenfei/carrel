@@ -64,7 +64,7 @@ def mineru_pdf_blocks(
     items = content if content else list(walk_dicts(payload))
 
     blocks: list[ParsedBlock] = []
-    seen: set[tuple[str, str, str, int | None]] = set()
+    seen: set[tuple] = set()
     sections = SectionTracker()
     # Heading levels: MinerU's text_level is combined with layout inference (CJK chapter numbering /
     # 1.2.3 / Chapter N), then corrected at document level -- recurring labels (KEYWORD / Note:) and
@@ -117,7 +117,8 @@ def mineru_pdf_blocks(
             latex = None
 
         page = page_idx(item)
-        key = (block_type, text[:160], Path(image_path).name if image_path else "", page)
+        key = (block_type, hashlib.sha256(text.encode("utf-8")).hexdigest(),
+               str(image_path or ""), page, tuple(bbox(item) or ()))
         if key in seen:
             continue
         seen.add(key)
