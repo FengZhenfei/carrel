@@ -44,7 +44,7 @@ def run(env, rows, **kwargs):
 
 
 def test_fusion_uses_ranks_and_an_image_has_only_one_vote(env):
-    result = run(env, [candidate("text", score=0.2), candidate("image", image=True, score=0.99)])
+    result = run(env, [candidate("text", score=0.9), candidate("image", image=True, score=0.99)])
     text, image = result["ordered"]
     assert text["score_fusion"] == image["score_fusion"] == 1 / 61
     assert image["ranking"]["branch"] == "visual"
@@ -59,6 +59,28 @@ def test_equal_branch_ranks_keep_recall_order_unless_query_contains_pixels(env):
     assert [c["point_id"] for c in result["ordered"]] == ["image", "text"]
     result = run(env, [candidate("text"), candidate("image", image=True)], image_query=True)
     assert [c["point_id"] for c in result["ordered"]] == ["image", "text"]
+
+
+def test_borderline_branch_does_not_tie_a_strong_match_by_rank_alone(env):
+    env[2].return_value["scores"] = {"image": 0.51}
+    result = run(env, [candidate("image", image=True), candidate("text")])
+    text, image = result["ordered"]
+    assert text["point_id"] == "text" and image["point_id"] == "image"
+    assert image["accepted"] is True
+    assert text["score_fusion"] == image["score_fusion"]
+    assert text["score_final"] > image["score_final"]
+    assert image["ranking"]["margin_weight"] < text["ranking"]["margin_weight"]
+    assert result["ranking"]["fusion"]["method"] == "rank_margin"
+
+
+def test_text_gate_uses_unrounded_model_score(env, monkeypatch):
+    monkeypatch.setattr(service, "rerank", Mock(return_value=[0.9, 0.099999]))
+    rows = [candidate("strong"), candidate("borderline")]
+    for row in rows:
+        row.pop("score_rerank")
+    result = run(env, rows)
+    assert result["cands"][1]["score_rerank"] == 0.099999
+    assert [c["point_id"] for c in result["ordered"]] == ["strong"]
 
 
 def test_fused_refinements_are_counted_without_applying_them_twice(env):

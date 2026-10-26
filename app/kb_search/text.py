@@ -77,14 +77,47 @@ def truncate_tokens(text: str, max_tokens: int) -> str:
         return ""
     if count_tokens(body) <= max_tokens:
         return body
-    lo, hi = 1, len(body)
+    lo, hi = 0, len(body)
     while lo < hi:
         mid = (lo + hi + 1) // 2
         if count_tokens(body[:mid]) <= max_tokens:
             lo = mid
         else:
             hi = mid - 1
-    return body[:max(1, lo)]
+    return body[:lo]
+
+
+def relevant_excerpt(text: str, max_tokens: int, question: str) -> tuple[str, int]:
+    """Choose one bounded, contiguous source excerpt and its character offset.
+
+    Prefer a preceding sentence when it fits, so conditions and negations stay
+    beside the matching passage. No rewriting or concatenation of distant text.
+    """
+    prefix = truncate_tokens(text, max_tokens)
+    if not question or prefix == text or max_tokens <= 0:
+        return prefix, 0
+    terms = {t for t in token_set(question) if len(t) >= 2 and t not in _CJK_STOP}
+    if not terms:
+        return prefix, 0
+    ends = [m.end() for m in re.finditer(r"(?<=[。!?！？；;\n])|(?<=[.!?])\s+", text)]
+    boundaries = sorted({0, len(text), *ends})
+    spans = list(zip(boundaries, boundaries[1:]))
+    ranked = sorted(range(len(spans)),
+                    key=lambda i: (-len(terms & token_set(text[slice(*spans[i])])), i))[:12]
+    starts = {0}
+    for i in ranked:
+        starts.add(spans[i][0])
+        if i and count_tokens(text[spans[i - 1][0]:spans[i][1]]) <= max_tokens:
+            starts.add(spans[i - 1][0])
+    # A long unpunctuated paragraph still needs a way to reach a late match.
+    if len(spans) <= 2:
+        for term in sorted(terms)[:24]:
+            match = re.search(re.escape(term), text, re.IGNORECASE)
+            if match:
+                starts.add(max(0, match.start() - max_tokens // 2))
+    choices = [(prefix, 0)] + [(truncate_tokens(text[start:], max_tokens), start)
+                             for start in sorted(starts) if start]
+    return max(choices, key=lambda x: (question_coverage(question, x[0]), -x[1]))
 
 
 def windows(text: str, *, window_tokens: int = 480, overlap_tokens: int = 32) -> list[str]:

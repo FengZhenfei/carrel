@@ -116,6 +116,8 @@ needed. With no image endpoint or image candidates, the text path remains in use
 
 - Both branches share 64 candidates by default (`KB_SEARCH_RERANK_N`), reserving
   up to 8 image positions (`KB_SEARCH_VISUAL_RERANK_N`) before truncation.
+  Each knowledge-base/subject group receives a minimum share; remaining positions
+  go to candidates with higher recall RRF scores.
   Document status and explicit scope are checked before reading cached images.
 - Text and image scoring run in parallel. The image model sees cached pixels,
   bounded source text and, for an image query, the query image. Requests use a
@@ -124,17 +126,30 @@ needed. With no image endpoint or image candidates, the text path remains in use
 - Each branch decides relevance independently. Images use their own threshold
   (0.5 by default); thresholds should be checked when changing models. An image
   scored successfully belongs only to the image branch. Each accepted branch
-  rank contributes `1 / (KB_SEARCH_RRF_K + rank)`; equal ranks retain recall
-  order, with images preferred for queries containing an image. Document and
-  subject quotas, deduplication, MMR and context budgets still apply.
+  rank contributes `1 / (KB_SEARCH_RRF_K + rank)`. For text queries, a branch's
+  distance above its own relevance threshold reduces the weight of borderline
+  matches. Confident matches retain their rank weight. Queries containing an
+  image use rank fusion, with images preferred at equal ranks.
+  Fused text-query results reserve accepted evidence across selected knowledge
+  bases and subject/document groups, then fill by relevance. Other paths retain
+  MMR when enabled. Deduplication and context budgets continue to apply.
 - Missing images, timeouts or invalid model scores fall back to text and report
   degradation. Low image relevance is a rejection, not a reason to restore a
   high vector score. Block-type preferences apply inside each branch before fusion.
+  Text scoring also treats missing, duplicate or invalid document scores as a
+  service failure, so an incomplete response cannot masquerade as low relevance.
 
-`retrieval_summary.ranking` reports branch status and counts; each source's
-`ranking` reports its branch and rank. Fusion scores are rank scores, not
+`retrieval_summary.ranking` reports branch status and counts; its `candidates`
+field records the available, admitted and scoped pool sizes. Each source's
+`ranking` reports its branch, rank and `margin_weight`. Fusion scores are rank scores, not
 confidence probabilities. These retrieval changes reuse existing parsed content,
 indexes and graphs. For image retrieval and display, see the image endpoints below.
+
+When a text passage exceeds the context budget, search selects one continuous,
+query-relevant excerpt and keeps a preceding sentence when it fits. The source
+retains `text_truncated` and an `excerpt` character range within the original
+chunk; `/context` retrieves the full passage. Tables and stitched passages keep
+their existing truncation and provenance handling.
 
 ### Search
 

@@ -27,7 +27,7 @@ from . import catalog as catalog_mod
 from . import channels, docstatus
 from .config import SearchSettings, env_file_values, load_search_settings
 from .evidence import assemble_sources, doc_aggs, numbered, page_rows, select_hits, spec_rows
-from .fusion import interleave, rrf_merge
+from .fusion import admit_candidates, interleave, relevance_weight, rrf_merge
 from .rerank import Reranker, rerank, rerank_images
 
 _state: dict[str, Any] = {"settings": None, "search": None, "q": None, "q_key": None, "at": 0.0, "pool": None, "pool_size": 0,
@@ -480,24 +480,13 @@ def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups:
           buckets: dict[str, Any] | None = None, *, until: float, image_query: bool = False,
           hint: dict[str, Any] | None = None, scope: dict[str, Any] | None = None,
           image_bytes: bytes | None = None) -> dict[str, Any]:
-    """多组:轮询交错,每组都有名额;单组:直接取融合序前 rerank_n。回填负载后交叉编码器重排,带阈值与地板(Q06 / Q19)。
-    只带 id 的候选回填后才知道正文,分桶在这里补一次。带图的请求里视觉路候选不受文字阈值约束(Codex S02)。
-    预算用完时不再重排,按重排不可用处理(退回融合序、记降级)。"""
-    if len(groups) > 1:
-        cands = interleave(groups, limit=ss.rerank_n)
-    else:
-        cands = list(groups[0][:ss.rerank_n]) if groups else []
-    if visual_rerank_active(settings, ss):
-        # Reserve image candidates before truncation; retain the total budget and
-        # the caller's KB/document grouping. Images do not need a text rerank pass
-        # to qualify for pixel-based scoring.
-        visual_groups = [[c for c in group if (c.get("payload") or {}).get("visual_ref")
-                          or "visual" in (c.get("recall_sources") or [])] for group in groups]
-        reserved = interleave(visual_groups, limit=min(ss.visual_rerank_n, ss.rerank_n))
-        chosen = {str(c["point_id"]) for c in reserved}
-        cands = reserved + [c for c in cands if str(c["point_id"]) not in chosen][:max(0, ss.rerank_n - len(reserved))]
-        prior = {str(c["point_id"]): i for i, c in enumerate(interleave(groups, limit=sum(map(len, groups))))}
-        cands = [{**c, "_recall_order": prior[str(c["point_id"])]} for c in cands]
+    """Admit a bounded pool with group/image reserves and recall-quality allocation.
+    Backfill source payloads, enforce scope and apply the available rankers within
+    the request deadline. Rejected evidence remains distinct from unavailable scoring.
+    """
+    cands = admit_candidates(groups, limit=ss.rerank_n,
+                             visual_limit=ss.visual_rerank_n if visual_rerank_active(settings, ss) else 0)
+    admitted = len(cands)
     degraded: list[str] = []
     cands = _backfill(q, settings, ss, cands, until=until, degraded=degraded)
     if scope is not None:
@@ -526,6 +515,11 @@ def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups:
         out["ranking"] = {"method": "text", "text": {"status": out["status"]},
                           "visual": {"status": "no_candidates" if visual_rerank_active(settings, ss) else "disabled"}}
     out["degraded"] = degraded + out.get("degraded", [])
+    out.setdefault("ranking", {})["candidates"] = {
+        "available": len({str(c["point_id"]) for g in groups for c in g}),
+        "admitted": admitted, "scoped": len(cands), "limit": ss.rerank_n,
+        "groups": sum(bool(g) for g in groups), "allocation": "quota_recall",
+    }
     return out
 
 
@@ -563,7 +557,7 @@ def _rank_text(settings: Settings, ss: SearchSettings, question: str, cands: lis
                                         api_key=getattr(settings, "reranker_api_key", ""), timeout=timeout), question, fresh,
                                 window_tokens=ss.rerank_window_tokens, overlap_tokens=ss.rerank_overlap_tokens)
                 for c, s in zip(fresh, scores):
-                    c["score_rerank"] = round(float(s), 4)
+                    c["score_rerank"] = float(s)
             ordered, status, floor_used = _text_relevance(cands, ss, image_query=image_query)
         except Exception as exc:
             status, error, ordered = "skipped", f"rerank: {type(exc).__name__}", cands
@@ -660,15 +654,23 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
         for rank, c in enumerate(retained, 1):
             c["ranking"]["rank"] = rank
             c["score_fusion"] = 1.0 / (k + rank)
-            c["score_final"] = round((k + 1) * c["score_fusion"], 6)
+            weight = 1.0
+            if accepted and not image_query:
+                visual = c["ranking"]["branch"] == "visual"
+                score = float(c.get("score_rerank_visual" if visual else "score_rerank") or 0)
+                threshold = ss.visual_rerank_threshold if visual else (floor or 0)
+                weight = relevance_weight(score, threshold)
+            c["ranking"]["margin_weight"] = weight
+            c["score_final"] = round((k + 1) * c["score_fusion"] * weight, 6)
     ordered = [c for c in cands if not accepted or c.get("accepted") is True]
     # Equal ranks carry no cross-model relevance comparison. Retain the original
     # recall order; only a request with pixels explicitly prefers the image lane.
-    ordered.sort(key=lambda c: (-float(c.get("score_fusion") or 0),
+    ordered.sort(key=lambda c: (-float(c.get("score_final") or 0),
                                bool(image_query and c["ranking"]["branch"] != "visual"),
                                c.get("_recall_order", 0), str(c["point_id"])))
     status = "ok" if accepted else ("skipped" if any(c.get("accepted") is None for c in cands) else "below_threshold")
-    audit["fusion"] = {"status": "ok", "constant": k, "accepted": sum(c.get("accepted") is True for c in cands)}
+    audit["fusion"] = {"status": "ok", "constant": k, "accepted": sum(c.get("accepted") is True for c in cands),
+                       "method": "rank" if image_query else "rank_margin"}
     return {"cands": cands, "ordered": ordered, "status": status, "error": text_out["error"], "floor": floor,
             "degraded": issues, "ranking": audit, "fusion_applied": True}
 
@@ -880,8 +882,12 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     evidence_state = _mark_accepted(ordered, rerank_status, ranked.get("floor"), image_query=image_query)
     merged_n = sum(len(per_kb[kb]["fused"]) for kb in chosen)
     k = int(top_k or ss.top_k)
+    # Branch fusion already establishes a shared order. Keep subject/document
+    # coverage, then fill by relevance rather than flattening it with token overlap.
+    fused_selection = ranked.get("fusion_applied") and not image_query and evidence_state == "accepted"
     hits, selection = select_hits(ordered, k, buckets=buckets, min_hits=ss.quota_min_hits,
-                                  mmr_lambda=ss.mmr_lambda if ss.mmr_enabled else None,
+                                  kb_keys=chosen if fused_selection else None,
+                                  mmr_lambda=ss.mmr_lambda if ss.mmr_enabled and not fused_selection else None,
                                   priority_key="score_visual" if image_query and not ranked.get("fusion_applied") else None,
                                   priority_n=ss.visual_quota if image_query and not ranked.get("fusion_applied") else 0)
     if not hits:
@@ -916,7 +922,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     sources, src_stats = assemble_sources(
         hits, budget_tokens=ss.context_tokens, neighbors=neighbors if with_context else None,
         table_head=head_of if with_context else None, stitch=(ss.stitch_min_chars, ss.stitch_max_chars) if with_context else None,
-        neighbor_span=ss.neighbor_span)
+        neighbor_span=ss.neighbor_span, question=question)
     degraded.extend(dict.fromkeys(context_gaps))
     timings["evidence_ms"] = int((time.time() - t) * 1000)
     source_ns = {str(r.get("point_id")): int(r["n"]) for r in sources}

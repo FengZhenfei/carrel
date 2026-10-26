@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from kb_pipeline.utils import count_tokens
 
-from .text import adjacent, body_token_set, dedupe_overlaps, is_boilerplate, jaccard, place, position, same_facts, scope_of, token_set, truncate_tokens
+from .text import adjacent, body_token_set, dedupe_overlaps, is_boilerplate, jaccard, place, position, relevant_excerpt, same_facts, scope_of, token_set, truncate_tokens
 
 EXCERPT_TOKENS = 80          # length of the excerpt kept for a hit over budget (with its position; the full text comes later via /context)
 
@@ -159,7 +159,7 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
                      neighbors: Callable[[dict[str, Any], int], list[dict[str, Any]]] | None,
                      table_head: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
                      stitch: tuple[int, int] | None = None, neighbor_span: int = 1,
-                     overlap_threshold: float = 0.85) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                     overlap_threshold: float = 0.85, question: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """hits are already ranked and each carries a payload. Hits are first deduped by text and all
     numbered first; short hits are then stitched with neighbours (Q16; the material excludes other hits,
     chunks a higher-ranked hit already stitched in, and boilerplate chunks); table continuation chunks
@@ -197,7 +197,12 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
             used += n
             continue
         r["full_tokens"] = n
-        r["text"] = truncate_tokens(str(r.get("text") or ""), allowance)
+        full_text = str(r.get("text") or "")
+        if question and not r.get("stitched") and str(r.get("block_type") or "") in STITCHABLE_BLOCKS:
+            r["text"], start = relevant_excerpt(full_text, allowance, question)
+            r["excerpt"] = {"char_start": start, "char_end": start + len(r["text"])}
+        else:
+            r["text"] = truncate_tokens(full_text, allowance)
         r["token_count"] = count_tokens(r["text"])
         r["text_truncated"] = True
         _trim_pieces(r)
@@ -260,7 +265,7 @@ def assemble_sources(hits: list[dict[str, Any]], *, budget_tokens: int,
 
 def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "score_final", buckets: dict[str, Any] | None = None,
                 min_hits: int = 2, mmr_lambda: float | None = 0.7, priority_key: str | None = None,
-                priority_n: int = 0) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                priority_n: int = 0, kb_keys: list[str] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Cut to top-k (Q08 / Q16): first reserve priority_n slots by priority_key (the visual score of a
     request carrying an image, Codex S02), then reserve min_hits per subject / document bucket (taken
     in rank order), and finally fill up with MMR (lambda * relevance - (1 - lambda) * max Jaccard with
@@ -280,9 +285,26 @@ def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "scor
             picked.append(c)
             chosen_ids.add(id(c))
             priority_filled += 1
+    # Subject labels can occur in several libraries. Cover each requested library
+    # with accepted evidence before filling its subject/document quota; a shared
+    # label must not let one library consume the whole result set.
+    kb_filled: dict[str, int] = {}
+    keys = list(dict.fromkeys(kb_keys or []))
+    if len(keys) > 1:
+        for level in range(max(0, min_hits)):
+            for key in keys:
+                present = sum(c.get("kb_id") == key for c in picked)
+                if present > level or len(picked) >= k:
+                    continue
+                match = next((c for c in ordered if c.get("kb_id") == key
+                              and c.get("accepted") is True and id(c) not in chosen_ids), None)
+                if match is not None:
+                    picked.append(match)
+                    chosen_ids.add(id(match))
+        kb_filled = {key: sum(c.get("kb_id") == key for c in picked) for key in keys}
     if buckets and buckets.get("keys"):
         for key in buckets["keys"]:
-            n = 0
+            n = sum(c.get("bucket") == key for c in picked)
             for c in ordered:
                 if len(picked) >= k:
                     break
@@ -323,7 +345,8 @@ def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "scor
     # Quotas and MMR decide "which ones"; the presentation order still follows the final score: a
     # quota pick must not be listed ahead of a more relevant one
     picked.sort(key=lambda c: -float(c.get(score_key) or 0.0))
-    return picked, {"avg_redundancy": redundancy, "quota_filled": filled, "priority_filled": priority_filled}
+    return picked, {"avg_redundancy": redundancy, "quota_filled": filled, "priority_filled": priority_filled,
+                    "kb_quota_filled": kb_filled}
 
 
 def doc_aggs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:

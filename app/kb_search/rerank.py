@@ -48,7 +48,7 @@ class Reranker:
         model_id = _model_ids[self.cache_key] = str(data[0].get("id"))
         return model_id
 
-    def score(self, query: Any, documents: list[Any], *, strict: bool = False) -> list[float]:
+    def score(self, query: Any, documents: list[Any], *, strict: bool = True) -> list[float]:
         if not documents:
             return []
         body = {"model": self.resolve_model(), "query": query, "documents": documents}
