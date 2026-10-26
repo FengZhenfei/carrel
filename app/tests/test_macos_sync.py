@@ -196,6 +196,10 @@ cmd = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 with (base / 'push-events.jsonl').open('a') as out:
     out.write(json.dumps([cmd, args, time.time()]) + '\n')
+if cmd == 'stat':
+    info = pathlib.Path(args[-1]).stat()
+    print(info.st_size if args[1] in ['%z', '%s'] else int(info.st_mtime))
+    sys.exit(0)
 if cmd == 'find':
     if '-flags' in args:
         if os.environ.get('FAKE_SCAN_ERROR'):
@@ -230,7 +234,7 @@ class PushFlowTests(unittest.TestCase):
         (self.root / 'source' / 'document.txt').write_text('example')
         self.fake = self.root / 'fake'
         self.fake.mkdir()
-        for name in ['ssh', 'rsync', 'find']:
+        for name in ['ssh', 'rsync', 'find', 'stat']:
             p = self.fake / name
             p.write_text('#!' + sys.executable + '\n' + FAKE_PUSH)
             p.chmod(0o755)
