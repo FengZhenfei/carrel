@@ -47,6 +47,7 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "doc": payload.get("filename"), "rel_path": payload.get("rel_path"), "doc_type": payload.get("doc_type"),
         "position": position(payload), "place": place(payload), "page_idx": payload.get("page_idx"),
         "section_path": list(payload.get("section_path") or []),
+        "source_locator": payload.get("source_locator"),
         "block_type": payload.get("block_type"), "block_id": payload.get("block_id"), "text": text,
         "token_count": int(payload.get("token_count") or 0) or count_tokens(text),
         "scores": dict(cand.get("scores") or {}), "recall_sources": list(cand.get("recall_sources") or []),

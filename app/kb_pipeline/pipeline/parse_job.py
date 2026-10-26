@@ -27,6 +27,8 @@ from ..parsers.native_table import parse_native_table
 from ..parsers.pdf_enhanced import parse_pdf_enhanced
 from ..parsers.pptx_enhanced import parse_pptx_enhanced
 from ..parsers.router import TEXT_FILENAMES, TEXT_SUFFIXES, parse_native
+from ..parsers.source_guard import MissingSourceContent, require_source_content
+from ..parsers.formats import extensionless_script
 from ..parsers.table_check import table_ambiguity_summary
 from ..parsers.visual_blocks import vlm_failure_summary, went_through_vlm
 from ..utils import count_tokens, detect_lang, dir_ancestors_from_rel_path, infer_doc_type, sha256_file
@@ -39,7 +41,7 @@ from ..vision.images import IMAGE_SUFFIXES
 from ..vision.vlm import prompt_with_language
 
 
-TABLE_SUFFIXES = {".xlsx", ".xls", ".csv"}
+TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 
 
 # The definition moved to parsers.errors (the router raises it too); the name is kept here so the worker and
@@ -226,8 +228,16 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     # A temporary fault in the text-layer repair makes the job retry; on the last attempt the document is stored
     # with a degraded flag instead, so that a document is not kept out of the index forever
     last_attempt = int(job["retry_count"] or 0) >= settings.job_max_retries
-    blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage,
-                           text_layer_repair="final" if last_attempt else "retry")
+    try:
+        blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage,
+                               text_layer_repair="final" if last_attempt else "retry")
+    except MissingSourceContent:
+        check_cancelled(force=True)
+        outcome = _finish_empty_document(con, settings, job, file_row, content_version, parser_profile,
+                                         source=source, missing_source=True)
+        if not outcome.startswith("parse-missing-source:"):
+            return outcome
+        raise
     print(f"[parse] blocks={len(blocks)} file={file_row['source_path']}", flush=True)
     event(f"Parsed into {len(blocks)} blocks")
     degraded = sum(1 for block in blocks if block.metadata.get("degraded"))
@@ -531,9 +541,12 @@ def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_d
 
 
 def _is_intentionally_empty(path: Path) -> bool:
+    if path.suffix.lower() == ".ipynb":
+        # Called only after the notebook parser validated the document and produced no blocks.
+        return True
     # Every suffix that is read as text counts: the code suffixes chunked by symbol (.mjs / .lua ...) are not all
     # in TEXT_SUFFIXES
-    if path.suffix.lower() not in {*TEXT_SUFFIXES, *LANGUAGE_BY_SUFFIX, ".csv"} and path.name not in TEXT_FILENAMES:
+    if path.suffix.lower() not in {*TEXT_SUFFIXES, *LANGUAGE_BY_SUFFIX, ".csv", ".tsv"} and path.name not in TEXT_FILENAMES and not extensionless_script(path):
         return False
     try:
         size = path.stat().st_size
@@ -543,7 +556,11 @@ def _is_intentionally_empty(path: Path) -> bool:
         return True          # a truly empty file need not be read
     if size > 1_000_000:
         return False         # above one MB it cannot be "whitespace only"; do not read it whole
-    return not path.read_text(encoding="utf-8", errors="ignore").strip()
+    from ..parsers.common import read_text_smart, strip_markdown_comments
+    text = read_text_smart(path)
+    if path.suffix.lower() in {".md", ".markdown", ".qmd", ".rmd"}:
+        text = strip_markdown_comments(text)
+    return not text.strip()
 
 
 
@@ -586,6 +603,7 @@ def _finish_empty_document(
     parser_profile: str,
     *,
     source: Any,
+    missing_source: bool = False,
 ) -> str:
     write_row = db.get_file_by_id(con, str(job["file_id"]))
     if write_row is None:
@@ -598,6 +616,11 @@ def _finish_empty_document(
     changed = _changed_since_scan(con, write_row, write_path, _disk_state_within(settings, source, write_path))
     if changed:
         return _changed_skip(con, job, write_row, changed, when="write")
+    if missing_source:
+        # Re-read at the write boundary: a restored original must not be withdrawn.
+        from ..parsers.source_guard import git_lfs_pointer
+        if not git_lfs_pointer(write_path) or sha256_file(write_path) != content_version:
+            return _changed_skip(con, job, write_row, "source restored since validation", when="write")
 
     q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     collection = str(write_row["collection"])
@@ -625,6 +648,11 @@ def _finish_empty_document(
         _defer_fts_sync(con, job, write_row, collection=collection, content_version=content_version, exc=exc)
         fts_result = {"inserted_rows": 0, "deferred": True}
     db.mark_chunks_inactive(con, str(write_row["file_id"]))
+    if missing_source:
+        con.execute("UPDATE files SET status='seen', indexed_version=NULL, indexed_parser_profile=NULL WHERE file_id=? AND content_version=?",
+                    (str(write_row["file_id"]), content_version))
+        db.add_job_event(con, str(job["job_id"]), "info", "Git LFS original missing; placeholder content removed from active indexes")
+        return f"parse-missing-source:{job['job_id']}:inactive_points={stale_points}"
     db.mark_file_indexed(con, str(write_row["file_id"]), content_version, parser_profile)
     print(
         f"[parse] empty document indexed file={write_row['source_path']} "
@@ -668,7 +696,7 @@ def _parse_blocks(
     """text_layer_repair: see parse_pdf_enhanced. The default uses the cache only: the chunk preview takes the
     default, so MinerU is never called inside the web process."""
     suffix = path.suffix.lower()
-
+    require_source_content(path)
     vlm_progress = vlm_progress_callback(stage_cb)
     vlm_options = {
         "temperature": settings.vlm_temperature,
@@ -681,6 +709,17 @@ def _parse_blocks(
     # When the KB's output language (from label extraction) is not Chinese, image descriptions are written in
     # that language too; Chinese / never extracted leaves the prompt unchanged
     vlm_prompt = prompt_with_language(source.vlm_prompt, source.graph_language)
+    if suffix == ".ipynb":
+        from ..parsers.notebook import parse_notebook
+        from ..parsers.visual_blocks import enrich_blocks_with_vlm
+        blocks = parse_notebook(path, cache_dir)
+        enrich_blocks_with_vlm(
+            blocks, base_url=settings.vlm_base_url, api_key=settings.vlm_api_key,
+            model_id=settings.vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
+            filter_decorative=False, vlm_options=vlm_options, caption_cache_root=caption_cache_root,
+            prompt=vlm_prompt, progress_cb=vlm_progress,
+        )
+        return blocks
     if suffix in IMAGE_SUFFIXES:
         return parse_image_file(
             path=path,
@@ -883,6 +922,7 @@ def _payload_for_chunk(
         # extraction and by retrieval
         "symbol": block.metadata.get("symbol"),
         "frontmatter": block.metadata.get("frontmatter"),
+        "source_locator": block.metadata.get("source_locator"),
         # Table merged-cell flags and screenshot verification result (F02): fact extraction marks facts that took
         # an unverified merged value as untrusted, and the console shows a badge
         "table_flags": block.metadata.get("table_flags") or None,

@@ -388,7 +388,13 @@ counts only).
 Responses carry the knowledge base's folder name (`kb_names` in `/search`,
 `kb_name` elsewhere). A document is cited as `<folder name>/<rel_path>`,
 followed by `place`: the short locator that sources and evidence chunks carry
-(page, slide, or sheet rows; the deepest heading for documents without pages).
+(page, slide, sheet rows, notebook cell/output, or source lines; the deepest
+heading when available).
+
+For formats with structured locations, `source_locator` records notebook
+`cell` and optional `output`, a JSONL or XML `line`, or a text range's `start`
+and `end`. These locations accompany search sources and `/grep` hits, alongside
+the document and chunk identifiers used by `/context`.
 
 ## Interpret the evidence
 

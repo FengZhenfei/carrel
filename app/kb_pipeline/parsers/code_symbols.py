@@ -21,6 +21,7 @@ MAX_CALLS = 40          # how many callee names are recorded per symbol
 
 # Extension -> tree-sitter language name
 LANGUAGE_BY_SUFFIX = {
+    ".r": "r",
     ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "tsx",
     ".go": "go", ".java": "java", ".rs": "rust",
@@ -192,7 +193,10 @@ def _callee(node) -> str | None:
     if t in ("new_expression", "object_creation_expression"):
         c = node.child_by_field_name("constructor") or node.child_by_field_name("type")
         return _qual(_text(c)) if c is not None else None
-    if t == "call":      # ruby
+    if t == "call":      # R / Ruby
+        function = node.child_by_field_name("function")
+        if function is not None:
+            return _qual(_text(function))
         recv, m = node.child_by_field_name("receiver"), node.child_by_field_name("method")
         return _qual((f"{_text(recv)}." if recv is not None else "") + _text(m)) if m is not None else None
     if t == "command":   # bash
@@ -458,6 +462,11 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
         for raw in children:
             node = _unwrap(raw)
             t = node.type
+            if language == "r" and t == "binary_operator":
+                lhs, rhs = node.child_by_field_name("lhs"), node.child_by_field_name("rhs")
+                if lhs is not None and rhs is not None and lhs.type == "identifier" and rhs.type == "function_definition":
+                    handle_function(rhs, _text(lhs), prefix, children, doc_node=raw)
+                    continue
             if language == "bash" and t == "command":
                 nn = node.child_by_field_name("name")
                 args = [c for c in node.named_children if c.type in ("word", "string", "raw_string", "concatenation")]

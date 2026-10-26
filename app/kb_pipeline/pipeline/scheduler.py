@@ -381,7 +381,7 @@ def _failed_parse_blocks_auto_requeue(job_row, change_type: str = "needs_parse")
     error = error_raw.lower()
     if "physical file not found" in error:
         return False   # the file reappeared: re-queue
-    if "NonRetryableParseError" in error_raw:
+    if any(marker in error_raw for marker in ("NonRetryableParseError", "MissingSourceContent", "非重试")):
         # Deterministic failure (no parser route, broken format): re-queueing is pointless, so hold it back
         # until the parser / router changes or the user retries by hand. This used to return False (let
         # through), re-enqueueing the same unchanged input on every scan (Codex review F07).

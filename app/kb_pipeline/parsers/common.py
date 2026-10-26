@@ -378,6 +378,130 @@ def _setext_level(text: str, underline: str, *, paragraph_open: bool) -> int:
     return 0
 
 
+def _frontmatter_span(data: bytes) -> tuple[int, int]:
+    """Protect metadata even when a leading hidden comment precedes its delimiter."""
+    pos = 0
+    leading_comment = re.compile(rb"(?:[ \t]*\r?\n)* {0,3}<!--.*?-->", re.S)
+    while match := leading_comment.match(data, pos):
+        pos = match.end()
+    pos += len(data[pos:]) - len(data[pos:].lstrip())
+    lines = data[pos:].splitlines(keepends=True)
+    if not lines or lines[0].strip() != b"---":
+        return 0, 0
+    end = pos + len(lines[0])
+    for line in lines[1:]:
+        end += len(line)
+        if line.strip() in (b"---", b"..."):
+            return pos, end
+    return 0, 0
+
+
+def _inline_code_spans(data: bytes) -> list[tuple[int, int]]:
+    """Backtick delimiters must match an entire run, including across source lines."""
+    runs = list(re.finditer(rb"`+", data))
+    following, last = {}, {}
+    for i in range(len(runs) - 1, -1, -1):
+        width = len(runs[i][0])
+        if width in last:
+            following[i] = last[width]
+        last[width] = i
+    spans, i = [], 0
+    while i < len(runs):
+        start = runs[i].start()
+        escaped = start
+        while escaped and data[escaped - 1:escaped] == b"\\":
+            escaped -= 1
+        if (start - escaped) % 2 == 0 and i in following:
+            end = following[i]
+            spans.append((start, runs[end].end()))
+            i = end + 1
+        else:
+            i += 1
+    return spans
+
+
+def strip_markdown_comments(md: str) -> str:
+    """Remove HTML comments in prose, retaining code and metadata byte for byte.
+
+    Reuse the syntax grammars already used for source-code ingestion. Block context
+    protects nested fences; the inline grammar handles multiline code spans and escapes.
+    If a grammar is unavailable, retain the source rather than guess what to delete.
+    """
+    if "<!--" not in md:
+        return md
+    try:
+        from tree_sitter_language_pack import get_parser
+
+        block_parser = get_parser("markdown")
+        inline_parser = get_parser("markdown_inline")
+        html_parser = get_parser("html")
+        data = md.encode("utf-8")
+        fm_start, fm_end = _frontmatter_span(data)
+        ranges: list[tuple[int, int]] = []
+
+        def add(start: int, end: int) -> None:
+            if not (start < fm_end and end > fm_start):
+                ranges.append((start, end))
+
+        pending = [block_parser.parse(data).root_node]
+        while pending:
+            node = pending.pop()
+            if node.type in {"fenced_code_block", "indented_code_block", "minus_metadata", "plus_metadata"}:
+                continue
+            if node.type not in {"inline", "html_block"}:
+                pending.extend(reversed(node.named_children))
+                continue
+            fragment = data[node.start_byte:node.end_byte]
+            if b"<!--" not in fragment:
+                continue
+            if node.type == "html_block" and fragment.startswith(b"<!--") and b"-->" not in fragment:
+                # CommonMark treats an unclosed block comment as hidden through the block's end.
+                add(node.start_byte, node.end_byte)
+                continue
+            inline_comments = None
+            protected = []
+            if node.type == "inline":
+                inline_comments = set()
+                protected = _inline_code_spans(fragment)
+                children = [inline_parser.parse(fragment).root_node]
+                while children:
+                    child = children.pop()
+                    if child.type == "code_span":
+                        continue
+                    if child.type == "html_tag":
+                        if fragment[child.start_byte:child.end_byte].startswith(b"<!--"):
+                            inline_comments.add((child.start_byte, child.end_byte))
+                    else:
+                        children.extend(child.named_children)
+            # Both grammars must agree for inline comments. The HTML grammar protects quoted
+            # attributes, while the Markdown grammar protects escapes and link destinations.
+            children = [html_parser.parse(fragment).root_node]
+            while children:
+                child = children.pop()
+                if child.type in {"attribute", "script_element", "style_element"}:
+                    continue
+                if child.type == "comment":
+                    span = (child.start_byte, child.end_byte)
+                    if (inline_comments is None or span in inline_comments) and not any(
+                        child.start_byte < end and child.end_byte > start for start, end in protected
+                    ):
+                        add(node.start_byte + child.start_byte, node.start_byte + child.end_byte)
+                else:
+                    children.extend(reversed(child.named_children))
+        parts, pos = [], 0
+        for start, end in sorted(set(ranges)):
+            if start < pos:
+                continue
+            parts.append(data[pos:start])
+            # Preserve line boundaries so removing a comment cannot join adjacent source lines.
+            parts.append(re.sub(rb"[^\r\n]", b"", data[start:end]))
+            pos = end
+        parts.append(data[pos:])
+        return b"".join(parts).decode("utf-8")
+    except (ImportError, LookupError, RuntimeError, ValueError, OSError):
+        return md
+
+
 def markdown_to_blocks(
     md: str,
     *,
@@ -387,7 +511,7 @@ def markdown_to_blocks(
 ) -> list[ParsedBlock]:
     from ..headings import clean_heading_text
 
-    md = clean_text(md)
+    md = clean_text(strip_markdown_comments(md))
     if not md:
         return []
     frontmatter, md = parse_frontmatter(md)
@@ -452,19 +576,19 @@ def markdown_to_blocks(
             continue
         else:
             current_lines.append(line)
-    if current_lines:
+    if current_lines or current_title:
         sections.append((current_title, current_lines, tracker.path))
 
     for idx, (title, lines, section_path) in enumerate(sections, start=1):
         text = clean_text("\n".join(lines))
-        if not text:
+        if not text and (not title or idx != len(sections)):
             continue
         blocks.append(
             ParsedBlock(
                 parser=parser,
                 parser_profile=parser_profile,
                 doc_type=doc_type,
-                block_type="text",
+                block_type="text" if text else "title",
                 text=text,
                 title=title,
                 block_id=f"md-{idx:04d}",
@@ -583,6 +707,11 @@ def parser_profile_for_path(path: Path) -> str:
     numbers them, and a decorator belongs to the definition it decorates.
     """
     suffix = path.suffix.lower()
+    from .formats import EXTRA_PROFILES, WORKFLOW_FILENAMES, extensionless_script
+    if suffix in EXTRA_PROFILES:
+        return EXTRA_PROFILES[suffix]
+    if path.name in WORKFLOW_FILENAMES or extensionless_script(path):
+        return "workflow-text-v1"
     if suffix == ".pdf":
         # v10 (2026-09-09 Codex review): original text absorbed while folding decorative images flows
         # back (F03), cross-page page ranges enter the payload (F09), conflicts between in-image text

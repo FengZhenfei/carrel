@@ -28,6 +28,19 @@ The console operates these processes; agents consume the retrieval API.
    without counting as a failed attempt. Old content versions become inactive
    and expire through maintenance tasks.
 
+Additional readers handle R, Jupyter Notebook, RST, Quarto/RMarkdown, TeX,
+BibTeX, JSONL, TSV, Nextflow/CWL/WDL, Snakefiles, Feature, DOT, XSD, and logs.
+Notebooks retain cell numbers, code, saved text/table outputs and raster plots;
+JSONL records retain line numbers and TSV tables retain columns and row ranges.
+Scripts and document templates are read statically. Markdown HTML comments
+are omitted from prose while code examples remain intact. Git LFS pointers
+are reported as missing originals; their placeholder text is removed from active
+indexes when reprocessed. Restoring the original queues normal incremental parsing.
+
+The added formats enter through the normal incremental scan. Existing formats
+retain their parser versions and cached results; reparsing applies the updated
+Markdown and image handling to documents already indexed.
+
 The parser backend is selected by the deployed MinerU container. GPU and CPU
 routes differ; the application can read that decision with
 `MINERU_BACKEND=auto`. Backend selection is documented in

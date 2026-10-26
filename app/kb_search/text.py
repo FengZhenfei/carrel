@@ -137,6 +137,16 @@ def _page_part(payload: dict[str, Any]) -> str:
             return f"page {int(page)}"
         except (TypeError, ValueError):
             pass
+    locator = payload.get("source_locator") or {}
+    if isinstance(locator, dict):
+        if locator.get("kind") == "notebook":
+            return f"cell {locator.get('cell')}" + (f" output {locator['output']}" if locator.get("output") is not None else "")
+        if locator.get("line") is not None:
+            return f"line {locator['line']}"
+        if locator.get("start") is not None:
+            return f"lines {locator['start']}–{locator.get('end', locator['start'])}"
+    if payload.get("row_start") is not None:
+        return f"rows {payload['row_start']}–{payload.get('row_end', payload['row_start'])}"
     return ""
 
 

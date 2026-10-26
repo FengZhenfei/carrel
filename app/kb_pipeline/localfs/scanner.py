@@ -8,9 +8,11 @@ from pathlib import Path
 from ..models import KBSource, SourceFile
 from ..utils import normalize_rel_path, sha256_file
 from ..vision.images import IMAGE_SUFFIXES
+from ..parsers.formats import EXTRA_PROFILES, WORKFLOW_FILENAMES, extensionless_script
 
 
 SUPPORTED_EXTS = {
+    *EXTRA_PROFILES,
     ".txt", ".md", ".markdown", ".pdf", ".pptx", ".docx", ".xlsx", ".xls", ".csv",
     # Code suffixes aligned with parsers.code_symbols.LANGUAGE_BY_SUFFIX (.mjs/.cjs/.lua/.cxx/.hh added in
     # health check B8)
@@ -21,7 +23,11 @@ SUPPORTED_EXTS = {
     # standalone pictures: VLM description + visual vector (parsers.image_file)
     *IMAGE_SUFFIXES,
 }
-SUPPORTED_FILENAMES = {"Dockerfile", "Makefile", "Gemfile", "Rakefile", "Jenkinsfile"}
+SUPPORTED_FILENAMES = {"Dockerfile", "Makefile", "Gemfile", "Rakefile", "Jenkinsfile", *WORKFLOW_FILENAMES}
+
+
+def is_supported_path(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_EXTS or path.name in SUPPORTED_FILENAMES or extensionless_script(path)
 
 
 def list_source_files(
@@ -67,10 +73,10 @@ def list_source_files(
         if not path.is_file() or should_skip(path, root):
             continue
         suffix = path.suffix.lower()
-        if suffix not in SUPPORTED_EXTS and path.name not in SUPPORTED_FILENAMES:
-            continue
         if not inside_boundary(path, boundary):
             outside += 1          # a symlink (or a file under one) that leaves the enrolled directory
+            continue
+        if not is_supported_path(path):
             continue
         # The mirror is rsync's working directory; a file can vanish between
         # rglob and stat/hash. One racing delete must not abort the whole
@@ -156,9 +162,9 @@ def list_recent_source_files(
         if not path.is_file() or should_skip(path, root):
             continue
         suffix = path.suffix.lower()
-        if suffix not in SUPPORTED_EXTS and path.name not in SUPPORTED_FILENAMES:
-            continue
         if not inside_boundary(path, boundary):
+            continue
+        if not is_supported_path(path):
             continue
         try:
             mtime = path.stat().st_mtime

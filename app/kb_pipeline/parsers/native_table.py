@@ -15,6 +15,7 @@ from ..chunking.chunker import pack_labelled_cells
 from ..models import ParsedBlock
 from ..utils import count_tokens
 from .common import clean_text
+from .source_guard import require_source_content
 from .openpyxl_compat import load_workbook_compat
 
 
@@ -25,9 +26,14 @@ def parse_native_table(
     overlap_tokens: int,
 ) -> list[ParsedBlock]:
     suffix = path.suffix.lower()
-    if suffix == ".csv":
+    require_source_content(path)
+    if suffix in {".csv", ".tsv"}:
         rows = read_csv_rows_numbered(path)          # with source-file row numbers: provenance no longer shifts after blank rows are filtered (final review S01)
-        return chunk_rows_to_blocks("csv", rows, None, max_tokens, overlap_tokens)
+        blocks = chunk_rows_to_blocks(suffix[1:], rows, None, max_tokens, overlap_tokens)
+        if suffix == ".tsv":
+            for block in blocks:
+                block.parser_profile = "tsv-table-v1"
+        return blocks
     if suffix == ".xlsx":
         blocks: list[ParsedBlock] = []
         for sheet_name, rows, spans in read_xlsx_rows(path):
@@ -45,7 +51,10 @@ def read_csv_rows_numbered(path: Path) -> list[tuple[int, list[str]]]:
     """(source-file row number, cells). Blank rows are filtered out but row numbers follow the source
     file, so provenance lines up (final review S01)."""
     last_error: Exception | None = None
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+    with path.open("rb") as handle:
+        prefix = handle.read(4)
+    bom = "utf-32" if prefix in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff") else "utf-16" if prefix[:2] in (b"\xff\xfe", b"\xfe\xff") else None
+    for encoding in ((bom,) if bom else ("utf-8-sig", "utf-8", "gb18030", "gbk")):
         try:
             return _read_csv_rows_with_encoding(path, encoding=encoding, errors="strict")
         except Exception as exc:
@@ -59,7 +68,8 @@ def read_csv_rows_numbered(path: Path) -> list[tuple[int, list[str]]]:
 def _read_csv_rows_with_encoding(path: Path, *, encoding: str, errors: str) -> list[tuple[int, list[str]]]:
     rows: list[tuple[int, list[str]]] = []
     with path.open("r", encoding=encoding, errors=errors, newline="") as handle:
-        for row_no, row in enumerate(csv.reader(handle), start=1):
+        reader = csv.reader(handle, delimiter="\t" if path.suffix.lower() == ".tsv" else ",")
+        for row_no, row in enumerate(reader, start=1):
             cleaned = [normalize_cell(cell) for cell in row]
             if any(cleaned):
                 rows.append((row_no, cleaned))
@@ -546,7 +556,7 @@ def summary_block(
     header_line: str,
     lead_lines: list[str] | None = None,
 ) -> ParsedBlock:
-    target = f"Sheet: {sheet_name}" if sheet_name else "CSV"
+    target = f"Sheet: {sheet_name}" if sheet_name else doc_type.upper()
     text = f"{target}\nRows: {len(rows)}"
     for line in (lead_lines or []):
         if line.strip():

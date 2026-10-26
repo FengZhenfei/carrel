@@ -26,7 +26,7 @@ ERROR_CHARS = 300
 DIAG_STATS = ("blocks", "headings", "tokens_total")
 
 GREP_FIELDS = ("body", "title", "visual")
-GREP_SOURCE = ["doc_id", "rel_path", "chunk_index", "block_type", "page_idx", "sheet_name", "row_start", "row_end", "content_version",
+GREP_SOURCE = ["doc_id", "rel_path", "chunk_index", "block_type", "page_idx", "sheet_name", "row_start", "row_end", "content_version", "source_locator",
                *GREP_FIELDS]
 GREP_DOC_BUCKETS = 1000
 SNIPPET_CHARS = 60
@@ -266,7 +266,7 @@ def _hit_row(hit: dict[str, Any], phrase: str, fields: tuple[str, ...]) -> dict[
     text, _ = cuts.get(field, ("", False))
     row: dict[str, Any] = {"doc_id": src.get("doc_id"), "rel_path": src.get("rel_path"), "chunk_index": src.get("chunk_index"),
                            "block_type": src.get("block_type")}
-    for key in ("page_idx", "sheet_name", "row_start", "row_end"):
+    for key in ("page_idx", "sheet_name", "row_start", "row_end", "source_locator"):
         if src.get(key) is not None:
             row[key] = src[key]
     row.update({"point_id": str(hit.get("_id")), "field": field, "snippet": text, "literal": any(c[1] for c in cuts.values())})

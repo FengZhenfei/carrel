@@ -175,13 +175,14 @@ def _dir_file_count(mirror_root: Path, name: str, *, ttl: float = 30.0) -> int |
         return hit[1]
     count = 0
     try:
+        boundary = (mirror_root / name).resolve()
         for path in (mirror_root / name).rglob("*"):
             try:
                 if not path.is_file() or scanner.should_skip(path, mirror_root / name):
                     continue
             except OSError:
                 continue
-            if path.suffix.lower() in scanner.SUPPORTED_EXTS or path.name in scanner.SUPPORTED_FILENAMES:
+            if scanner.inside_boundary(path, boundary) and scanner.is_supported_path(path):
                 count += 1
     except OSError:
         return hit[1] if hit else None

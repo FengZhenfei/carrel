@@ -192,7 +192,7 @@ def enrich_blocks_with_vlm(
                 "visual_kind": kind,
                 "visual_confidence": confidence,
                 "visual_value_conflicts": value_conflicts,
-                "decorative": decorative,
+                "decorative": decorative if filter_decorative else False,
                 "vlm_status": "success" if got_content else "empty",
                 "vlm_model": model_id,
             }

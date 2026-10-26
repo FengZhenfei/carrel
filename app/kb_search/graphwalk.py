@@ -52,7 +52,7 @@ CONCEPT_KEYS_MAX = 200
 # Payload keys fetched from the main collection for an evidence chunk: the locators of /context, the position
 # string, whether it is still active
 EVIDENCE_PAYLOAD_KEYS = ["is_active", "doc_id", "rel_path", "filename", "chunk_index", "content_version", "page_idx",
-                         "slide_idx", "sheet_name", "row_start", "row_end", "section_path"]
+                         "slide_idx", "sheet_name", "row_start", "row_end", "section_path", "source_locator"]
 # Entities a listing leaves out: those found only on boilerplate pages and reference numbers (the same rule graph
 # recall uses for its seeds).
 # e.id IS NOT NULL does not change the result (every entity has an id); it is only there so that the plan uses

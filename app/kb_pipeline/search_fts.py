@@ -43,6 +43,7 @@ PAYLOAD_FIELDS = [
     "sheet_name",
     "row_start",
     "row_end",
+    "source_locator",
     "title",
     "caption",
     "section_path",
@@ -118,6 +119,7 @@ INDEX_BODY: dict[str, Any] = {
             "slide_idx": {"type": "integer"},
             "sheet_name": {"type": "keyword"},
             "row_start": {"type": "integer"},
+            "source_locator": {"type": "object", "enabled": False},
             "row_end": {"type": "integer"},
             "updated_at": {"type": "long"},
         },
@@ -167,6 +169,7 @@ def doc_source(payload: dict[str, Any]) -> dict[str, Any]:
         "slide_idx": _int_or_none(payload.get("slide_idx")),
         "sheet_name": _text(payload.get("sheet_name")),
         "row_start": _int_or_none(payload.get("row_start")),
+        "source_locator": payload.get("source_locator"),
         "row_end": _int_or_none(payload.get("row_end")),
         "updated_at": int(time.time()),
     }

@@ -24,7 +24,8 @@ Code and Codex to the retrieval service.
 **0.3.0:** [Release notes and upgrade steps](docs/releases/0.3.0.md).
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
-  Markdown, and source code, with processing suited to each format.
+  Markdown, notebooks, source code, and workflow files, with processing suited
+  to each format. [Format details](docs/architecture.md#ingestion).
 - **Automatic updates:** scan for file changes, update indexes, and maintain
   enabled knowledge graphs through scheduled tasks.
 - **Hybrid retrieval:** combine vector, keyword, graph, and visual search,
