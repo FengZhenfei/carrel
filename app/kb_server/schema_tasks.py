@@ -32,7 +32,8 @@ def summary(con: Any, kb_id: str) -> dict[str, Any] | None:
     if task.get("status") == "running" and (mark.get("token") != task.get("task_id")
             or time.time() - float(mark.get("started_at") or 0) > flow.SUGGEST_MARK_FRESH_SECONDS):
         out["status"] = "interrupted"
-    if mark.get("token") == task.get("task_id"):
+    # Completion is committed before the worker releases its progress claim.
+    if task.get("status") == "running" and mark.get("token") == task.get("task_id"):
         out.update(phase=mark.get("phase"), sampled=mark.get("sampled"))
     elif task.get("result"):
         out["sampled"] = task["result"].get("sampled")

@@ -85,6 +85,36 @@ def test_api_returns_before_sampling_finishes_and_restores_result(setup):
         assert api.post('/api/kbs/kb_x/graph_schema/cancel',json={}).status_code==422
 
 
+def test_completed_result_is_stable_before_claim_cleanup(setup):
+    settings, source, spec = setup
+    cleanup_entered, allow_cleanup, cleaned = (threading.Event() for _ in range(3))
+    real_release = flow.release_suggest
+
+    def hold_cleanup(*args):
+        cleanup_entered.set()
+        assert allow_cleanup.wait(3)
+        removed = real_release(*args)
+        cleaned.set()
+        return removed
+
+    with patch.object(flow, 'sample_docs', return_value={'texts': ['sample']}), \
+         patch('kb_pipeline.graph.llm.ChatClient',
+               return_value=_client(list(schema_tests.SchemaFeedbackTests.ANSWERS))), \
+         patch.object(flow, 'release_suggest', side_effect=hold_cleanup):
+        try:
+            task = tasks.start(*setup)
+            assert cleanup_entered.wait(1)
+            assert flow.suggest_owner(settings, source.kb_id) == task['task_id']
+            done = tasks.status(settings, source.kb_id)
+            assert done['status'] == 'completed'
+            assert 'phase' not in done, 'completed results must not expose live progress'
+            assert done['sampled'] == done['result']['sampled'] == 1
+        finally:
+            allow_cleanup.set()
+            assert cleaned.wait(1)
+        assert tasks.status(settings, source.kb_id) == done
+
+
 @pytest.mark.parametrize('action', ['cancel','delete'])
 def test_late_model_completion_cannot_publish_after_cancel_or_delete(setup, action):
     settings, source, spec = setup
