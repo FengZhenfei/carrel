@@ -703,6 +703,7 @@ async function renderConfig() {
       $("#cfg-ro").value = (dd.graph_rebuild_operator || "or").toLowerCase();
       $("#cfg-gaa").checked = dd.graph_auto_append !== false;
       $("#graph-fields").disabled = true;
+      formBase = { dir: kb.dir, ...parseFormValues() };
     } else {
       $("#cfg-max").value = 400; $("#cfg-ov").value = 80;
       $("#cfg-graph").checked = false; $("#cfg-prompt").value = "";
