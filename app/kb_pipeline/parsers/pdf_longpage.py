@@ -85,6 +85,11 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
         tile_no = block.page_idx
         seg = segments[tile_no - 1]
         block.page_idx = seg["page"]
+        end_tile = block.metadata.get("page_end")
+        if end_tile is not None:
+            if not isinstance(end_tile, int) or not tile_no <= end_tile <= len(segments):
+                raise ValueError("segmented PDF table has no valid ending page")
+            block.metadata["page_end"] = segments[end_tile - 1]["page"]
         if seg["tiled"]:
             tile_height = seg["y1"] - seg["y0"]
             if block.bbox and len(block.bbox) >= 4:

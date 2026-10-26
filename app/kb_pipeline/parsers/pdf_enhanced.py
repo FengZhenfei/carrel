@@ -207,7 +207,8 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
                          max(prev.bbox[2], block.bbox[2]), max(prev.bbox[3], block.bbox[3])]
             prev.metadata.setdefault("merged_source_tiles", []).append(dict(block.metadata["source_tile"]))
         if block.page_idx is not None:
-            prev.metadata["page_end"] = block.page_idx
+            prev.metadata["page_end"] = max(prev_end or block.page_idx,
+                                            block.metadata.get("page_end") or block.page_idx)
     return out
 
 

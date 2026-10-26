@@ -14,7 +14,7 @@ Carrel 将入库、建图和检索分为独立流程，通过 SQLite 记录文�
 
 MinerU 容器按部署环境选择解析后端，GPU 与 CPU 路径有所不同。应用使用 `MINERU_BACKEND=auto` 时读取容器的选择结果，详见 [解析容器说明](../deployment/compose/README.md#the-parser-container)。
 
-还支持 R、Jupyter Notebook、RST、Quarto/RMarkdown、TeX、BibTeX、JSONL、TSV、Nextflow/CWL/WDL、Snakefile、Feature、DOT、XSD 和日志。Notebook 保留单元格编号、代码、已保存的文本/表格输出及位图；JSONL 保留记录行号，TSV 保留列与行范围。脚本和文档模板采用静态读取。Markdown 正文中过滤 HTML 注释，代码示例保持完整。Git LFS 占位文件明确显示原件缺失，重新处理时移除其在活动索引中的占位内容；补回原件后按正常增量流程解析。
+还支持 R、Jupyter Notebook、RST、Quarto/RMarkdown、TeX、BibTeX、JSONL、TSV、Nextflow/CWL/WDL、Snakefile、Feature、DOT、XSD 和日志。Notebook 保留单元格编号、代码、已保存的文本/表格输出及位图；JSONL 保留记录行号，TSV 保留列与行范围。脚本和文档模板采用静态读取。Markdown 正文中过滤 HTML 注释，代码示例保持完整。扫描时忽略 Git LFS 占位文件，不计入文件清单或解析队列；已入库文件变为占位符时撤下旧索引，补回原件后按正常增量流程入库。
 
 新增格式通过正常的增量扫描入库。已有格式沿用解析版本与缓存；已入库文档重新解析后，会应用更新后的 Markdown 和图片处理规则。
 

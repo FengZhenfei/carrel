@@ -9,6 +9,7 @@ from ..models import KBSource, SourceFile
 from ..utils import normalize_rel_path, sha256_file
 from ..vision.images import IMAGE_SUFFIXES
 from ..parsers.formats import EXTRA_PROFILES, WORKFLOW_FILENAMES, extensionless_script
+from ..parsers.source_guard import is_source_placeholder
 
 
 SUPPORTED_EXTS = {
@@ -28,6 +29,14 @@ SUPPORTED_FILENAMES = {"Dockerfile", "Makefile", "Gemfile", "Rakefile", "Jenkins
 
 def is_supported_path(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTS or path.name in SUPPORTED_FILENAMES or extensionless_script(path)
+
+
+def is_ingestible_path(path: Path) -> bool:
+    """Supported source content, excluding missing Git LFS originals.
+
+    Call after checking the directory boundary: this may read the file.
+    """
+    return is_supported_path(path) and not is_source_placeholder(path)
 
 
 def list_source_files(
@@ -76,7 +85,7 @@ def list_source_files(
         if not inside_boundary(path, boundary):
             outside += 1          # a symlink (or a file under one) that leaves the enrolled directory
             continue
-        if not is_supported_path(path):
+        if not is_ingestible_path(path):
             continue
         # The mirror is rsync's working directory; a file can vanish between
         # rglob and stat/hash. One racing delete must not abort the whole
@@ -164,7 +173,7 @@ def list_recent_source_files(
         suffix = path.suffix.lower()
         if not inside_boundary(path, boundary):
             continue
-        if not is_supported_path(path):
+        if not is_ingestible_path(path):
             continue
         try:
             mtime = path.stat().st_mtime

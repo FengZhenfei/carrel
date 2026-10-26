@@ -649,7 +649,7 @@ def _finish_empty_document(
         fts_result = {"inserted_rows": 0, "deferred": True}
     db.mark_chunks_inactive(con, str(write_row["file_id"]))
     if missing_source:
-        con.execute("UPDATE files SET status='seen', indexed_version=NULL, indexed_parser_profile=NULL WHERE file_id=? AND content_version=?",
+        con.execute("UPDATE files SET status='skipped', indexed_version=NULL, indexed_parser_profile=NULL WHERE file_id=? AND content_version=?",
                     (str(write_row["file_id"]), content_version))
         db.add_job_event(con, str(job["job_id"]), "info", "Git LFS original missing; placeholder content removed from active indexes")
         return f"parse-missing-source:{job['job_id']}:inactive_points={stale_points}"

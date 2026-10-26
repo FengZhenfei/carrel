@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from ..models import ParsedBlock
-from .common import read_text_smart, parser_profile_for_path
+from .common import SectionTracker, read_text_smart, parser_profile_for_path
 from .errors import NonRetryableParseError
 
 
@@ -74,6 +74,8 @@ def parse_text_format(path: Path) -> list[ParsedBlock]:
         return parse_jsonl(path)
     if suffix == ".xsd":
         return parse_xsd(path)
+    if suffix == ".tex":
+        return _parse_tex(path)
     lines = read_text_smart(path).splitlines()
     starts: list[tuple[int, str]] = [(0, "")]
     for i, line in enumerate(lines):
@@ -105,4 +107,61 @@ def parse_text_format(path: Path) -> list[ParsedBlock]:
         text = "\n".join(lines[start:end]).strip()
         if text:
             blocks.append(_block(path, text, len(blocks) + 1, start + 1, end, title))
+    return blocks
+
+
+def _parse_tex(path: Path) -> list[ParsedBlock]:
+    """Keep the source intact while carrying TeX's explicit section hierarchy."""
+    levels = {name: i for i, name in enumerate(
+        ("part", "chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph"), 1)}
+    lines = read_text_smart(path).splitlines()
+    starts = [(0, "", None)]
+    literal = None
+    for i, line in enumerate(lines):
+        # Section commands inside literal examples are code, not document structure.
+        if literal:
+            if re.search(r"\\end\{" + re.escape(literal) + r"\}", line):
+                literal = None
+            continue
+        begin = re.search(r"\\begin\{(verbatim\*?|lstlisting|minted)\}", line)
+        if begin:
+            literal = begin[1]
+            continue
+        match = re.match(r"\s*\\(part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?(?:\[[^\]]*\])?\{", line)
+        if not match:
+            continue
+        depth, end = 1, match.end()
+        while end < len(line) and depth:
+            if line[end] == "\\":
+                end += 2
+                continue
+            depth += (line[end] == "{") - (line[end] == "}")
+            end += 1
+        if depth:
+            continue
+        entry = (i, line[match.end():end - 1], levels[match[1]])
+        if i == 0:
+            starts[0] = entry
+        else:
+            starts.append(entry)
+    tracker = SectionTracker()
+    blocks = []
+    pending_start = None
+    for n, (start, title, level) in enumerate(starts):
+        tracker.observe(level, title)
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        # An empty parent contributes its path and original command to the next
+        # section, rather than becoming an isolated embedding of its heading.
+        body = lines[start + 1:end] if title else lines[start:end]
+        heading_line_only = bool(title and re.fullmatch(r"\s*\\[a-z]+\*?(?:\[[^\]]*\])?\{.*\}\s*", lines[start]))
+        if heading_line_only and not any(s.strip() for s in body) and n + 1 < len(starts):
+            if pending_start is None:
+                pending_start = start
+            continue
+        first = start if pending_start is None else pending_start
+        text = "\n".join(lines[first:end]).strip()
+        if text:
+            blocks.append(_block(path, text, len(blocks) + 1, first + 1, end, title,
+                                 section_path=list(tracker.path)))
+        pending_start = None
     return blocks

@@ -469,6 +469,18 @@ def _normalize_text(text: str) -> str:
 
 
 def _table_markdown(table: etree._Element) -> str:
+    # Template markers and captions may sit directly inside table/tbody rather
+    # than a cell. Keep that text as context without inventing a data row.
+    extra = []
+    for value in table.xpath(".//text()"):
+        parent = value.getparent()
+        if value.is_tail:
+            parent = parent.getparent()
+        ancestors = ([parent] + list(parent.iterancestors())) if parent is not None else []
+        if any(_tag(node) in {"td", "th", "script", "style", "template"} for node in ancestors):
+            continue
+        if str(value).strip():
+            extra.append(str(value).strip())
     rows: list[list[str]] = []
     carry: dict[int, list] = {}      # column -> [rows still to fill below, value]: placeholders left by a rowspan above
     for tr in table.xpath(".//tr"):
@@ -500,7 +512,7 @@ def _table_markdown(table: etree._Element) -> str:
         if any(cells):
             rows.append(cells)
     if not rows:
-        return ""
+        return "\n".join(extra)
     width = max(len(row) for row in rows)
     rows = [row + [""] * (width - len(row)) for row in rows]
     header = rows[0]
@@ -510,7 +522,7 @@ def _table_markdown(table: etree._Element) -> str:
         "| " + " | ".join("---" for _ in header) + " |",
     ]
     output.extend("| " + " | ".join(row) + " |" for row in body)
-    return "\n".join(output)
+    return "\n".join(output + (["", *extra] if extra else []))
 
 
 def _escape_table_cell(text: str) -> str:

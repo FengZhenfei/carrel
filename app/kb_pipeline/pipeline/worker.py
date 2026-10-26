@@ -13,6 +13,7 @@ from .. import db
 from .. import search_fts
 from ..config import Settings
 from ..parsers.errors import service_unreachable
+from ..parsers.source_guard import MissingSourceContent
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
 from ..vector.qdrant import client as qdrant_client
@@ -201,6 +202,9 @@ def run_once(
             con.commit()
             print(f"[worker] job={job['job_id']} kb={job['kb_id']} cancelled while failing ({exc!r})", flush=True)
             return f"cancelled:{job['job_id']}" if owned else f"superseded:{job['job_id']}"
+        if isinstance(exc, MissingSourceContent):
+            owned = db.mark_job_skipped(con, job["job_id"], str(exc), worker_id=current_worker_id)
+            return f"skipped:{job['job_id']}:{exc}" if owned else f"superseded:{job['job_id']}"
         if settings is not None and service_unreachable(exc):
             # After a boot the parsing, embedding and image-description services can take over ten minutes to become
             # ready, while the worker starts claiming jobs after two: not reaching them is not a failure of this file

@@ -108,6 +108,32 @@ class TextTests(unittest.TestCase):
 
 
 class PlaceTests(unittest.TestCase):
+    def test_source_citations_preserve_page_ranges(self) -> None:
+        from kb_search.evidence import source_row
+        from kb_search.text import place
+
+        payload = _payload("p1", "d1", 0, "body") | {
+            "page_idx": 2, "page_end": 4, "section_path": ["Measurements"]}
+        row = source_row(1, {}, payload)
+        self.assertEqual((row["page_idx"], row["page_end"]), (2, 4))
+        self.assertEqual(row["place"], "pages 2–4")
+        self.assertEqual(row["position"], "pages 2–4 · Measurements")
+        for end in (None, "", "unknown", 1, 2):
+            with self.subTest(page_end=end):
+                self.assertEqual(place(payload | {"page_end": end}), "page 2")
+        self.assertEqual(place({"page_idx": "2", "page_end": "4"}), "pages 2–4")
+        self.assertEqual(place({"page_idx": 2, "page_end": 4, "slide_idx": 3}), "slide 3")
+        self.assertEqual(place({"page_end": 4}), "")
+
+    def test_stitched_pieces_keep_their_own_page_ranges(self) -> None:
+        from kb_search.evidence import source_row
+
+        row = source_row(1, {}, _payload("p1", "d1", 0, "first") | {"page_idx": 2, "page_end": 3})
+        neighbor = _payload("p2", "d1", 1, "following paragraph") | {"page_idx": 4, "page_end": 5}
+        self.assertTrue(stitch_short_hit(row, [neighbor], min_chars=20, max_chars=100))
+        self.assertEqual([(p["page_idx"], p["page_end"], p["position"]) for p in row["stitched"]["pieces"]],
+                         [(2, 3, position(row)), (4, 5, position(neighbor))])
+
     def test_place_is_the_short_locator_for_citations(self) -> None:
         """The short locator appended to the file path in a citation: page / slide / sheet rows when there are any,
         the deepest heading for documents without pages. It cannot be cut out of the position string: headings

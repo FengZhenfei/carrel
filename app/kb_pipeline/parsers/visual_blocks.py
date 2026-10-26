@@ -136,7 +136,9 @@ def enrich_blocks_with_vlm(
         # are interpretation: when the same metric's values disagree the text wins, and the conflict
         # leaves a trace
         own_text = (block.text or "").strip()
-        trusted = "\n".join(x for x in (str(block.caption or ""), verbatim, own_text if kind in KEEP_OWN_TEXT_KINDS else "") if x)
+        generated_own = block.metadata.get("image_text_source") == "model"
+        trusted = "\n".join(x for x in (str(block.caption or ""), verbatim,
+                            own_text if kind in KEEP_OWN_TEXT_KINDS and not generated_own else "") if x)
         facts, summary, value_conflicts = reconcile_visual_facts([str(x) for x in facts], trusted, summary)
         if value_conflicts:
             print(f"[vlm] {block.block_id}: {len(value_conflicts)} estimated value(s) disagree with the in-image text; using the text", flush=True)
@@ -164,7 +166,12 @@ def enrich_blocks_with_vlm(
         # architecture diagrams / formulas; on screenshots and photos it is mostly hallucinated OCR
         # (repetition, fabrication), so it is dropped whenever the VLM returned something. The VLM
         # paragraphs go first: when an over-long block is truncated, the read text is what falls off
-        keep_own = bool(own) and (not got_content or kind in KEEP_OWN_TEXT_KINDS)
+        # Preserve structured diagram/formula transcriptions, but do not stack
+        # a free-form upstream image description onto a successful VLM reading.
+        structured_own = own.lstrip().startswith(("```", "$$", "\\[", "<table", "|"))
+        confirmed_own = bool(verbatim) and "".join(own.split()) in "".join(verbatim.split())
+        keep_own = bool(own) and (not got_content or (kind in KEEP_OWN_TEXT_KINDS
+                                and (not generated_own or structured_own or confirmed_own)))
         pieces = ([visual_text] if visual_text else []) + ([own] if keep_own else [])
         if pieces:
             block.text = "\n".join(pieces)

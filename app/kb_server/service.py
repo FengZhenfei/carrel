@@ -182,7 +182,7 @@ def _dir_file_count(mirror_root: Path, name: str, *, ttl: float = 30.0) -> int |
                     continue
             except OSError:
                 continue
-            if scanner.inside_boundary(path, boundary) and scanner.is_supported_path(path):
+            if scanner.inside_boundary(path, boundary) and scanner.is_ingestible_path(path):
                 count += 1
     except OSError:
         return hit[1] if hit else None
@@ -606,13 +606,13 @@ def _kb_stats(con, kb_id: str) -> dict[str, int]:
         row = con.execute(sql, params).fetchone()
         return int(row[0] if row else 0)
 
-    total = one("SELECT COUNT(*) FROM files WHERE kb_id=? AND status != 'deleted'", kb_id)
+    total = one("SELECT COUNT(*) FROM files WHERE kb_id=? AND status NOT IN ('deleted','skipped')", kb_id)
     indexed = one(
-        "SELECT COUNT(*) FROM files WHERE kb_id=? AND status != 'deleted' AND COALESCE(indexed_version,'') = content_version",
+        "SELECT COUNT(*) FROM files WHERE kb_id=? AND status NOT IN ('deleted','skipped') AND COALESCE(indexed_version,'') = content_version",
         kb_id,
     )
     failed = one(
-        "SELECT COUNT(*) FROM files f WHERE f.kb_id=? AND f.status != 'deleted' "
+        "SELECT COUNT(*) FROM files f WHERE f.kb_id=? AND f.status NOT IN ('deleted','skipped') "
         "AND COALESCE(f.indexed_version,'') != f.content_version "
         "AND EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.file_id AND j.job_type='parse' AND j.status='failed') "
         "AND NOT EXISTS (SELECT 1 FROM jobs j2 WHERE j2.file_id=f.file_id AND j2.job_type='parse' AND j2.status IN ('queued','retry','running'))",
@@ -631,7 +631,7 @@ def _kb_stats(con, kb_id: str) -> dict[str, int]:
     # the "indexed but being re-parsed" files from the completed count, otherwise a re-parse shows 100%
     # from the very start.
     reparsing = one(
-        "SELECT COUNT(*) FROM files f WHERE f.kb_id=? AND f.status != 'deleted' "
+        "SELECT COUNT(*) FROM files f WHERE f.kb_id=? AND f.status NOT IN ('deleted','skipped') "
         "AND COALESCE(f.indexed_version,'') = f.content_version "
         "AND EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.file_id AND j.job_type='parse' "
         "AND j.status IN ('queued','retry','running'))",
@@ -652,11 +652,11 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
         rows = con.execute(
             "SELECT file_id, rel_path, filename, size, mtime, status, content_version, indexed_version, "
             "indexed_parser_profile, last_seen_at, chunk_diag_json FROM files "
-            "WHERE kb_id=? AND status != 'deleted' ORDER BY rel_path", (kb_id,)
+            "WHERE kb_id=? AND status NOT IN ('deleted','skipped') ORDER BY rel_path", (kb_id,)
         ).fetchall()
         jobs = con.execute(
             "SELECT job_id, file_id, status, stage, error, updated_at FROM jobs "
-            "WHERE kb_id=? AND job_type='parse' ORDER BY created_at", (kb_id,)
+            "WHERE kb_id=? AND job_type='parse' ORDER BY created_at, rowid", (kb_id,)
         ).fetchall()
         chunk_counts = {str(r["file_id"]): int(r["n"]) for r in con.execute(
             "SELECT c.file_id, COUNT(*) AS n FROM chunks c JOIN files f ON f.file_id = c.file_id "
@@ -2092,6 +2092,8 @@ def _synthesize_job_events(job: dict[str, Any]) -> list[dict[str, Any]]:
         add(job.get("finished_at") or job.get("updated_at"), "error", str(job.get("error") or "Failed")[:300])
     elif status == "cancelled":
         add(job.get("finished_at") or job.get("updated_at"), "cancelled", "Cancelled")
+    elif status == "skipped":
+        add(job.get("finished_at") or job.get("updated_at"), "skipped", str(job.get("error") or "Skipped")[:300])
     elif status == "retry":
         add(job.get("updated_at"), "retry", str(job.get("error") or "Waiting to retry")[:300])
     out.sort(key=lambda e: e["ts"])

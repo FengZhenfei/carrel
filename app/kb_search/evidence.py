@@ -46,6 +46,7 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "chunk_index": payload.get("chunk_index"), "chunk_total": payload.get("chunk_total"),
         "doc": payload.get("filename"), "rel_path": payload.get("rel_path"), "doc_type": payload.get("doc_type"),
         "position": position(payload), "place": place(payload), "page_idx": payload.get("page_idx"),
+        "page_end": payload.get("page_end"),
         "section_path": list(payload.get("section_path") or []),
         "source_locator": payload.get("source_locator"),
         "block_type": payload.get("block_type"), "block_id": payload.get("block_id"), "text": text,
@@ -85,6 +86,7 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
                  key=lambda p: int(p["chunk_index"]))
     pieces: dict[int, dict[str, Any]] = {idx: {"text": text, "point_id": row.get("point_id"), "chunk_index": idx,
                                                "page_idx": row.get("page_idx"), "position": row.get("position"),
+                                               "page_end": row.get("page_end"),
                                                "degraded": row.get("degraded")}}
     total = len(text)
     order = []
@@ -100,7 +102,8 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
         if not t or total + len(t) + 1 > max_chars:
             continue
         pieces[int(p["chunk_index"])] = {"text": t, "point_id": p.get("point_id"), "chunk_index": int(p["chunk_index"]),
-                                         "page_idx": p.get("page_idx"), "position": position(p), "degraded": p.get("degraded")}
+                                         "page_idx": p.get("page_idx"), "page_end": p.get("page_end"),
+                                         "position": position(p), "degraded": p.get("degraded")}
         total += len(t) + 1
     if len(pieces) == 1:
         return False

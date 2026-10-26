@@ -399,6 +399,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     # A vanished KB's directory is gone by definition; for a live
                     # scan, re-check the disk before tearing anything down.
                     verify_physical=not key.startswith("vanished:"),
+                    source_root=source.physical_base,
                     dry_run=args.dry_run,
                 )
                 stats.deleted += deleted
@@ -427,7 +428,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "scan summary: "
         f"seen={stats.seen} added={stats.added} content_changed={stats.content_changed} parser_changed={stats.parser_changed} "
         f"metadata_changed={stats.metadata_changed} needs_parse={stats.needs_parse} "
-        f"parse_failed={stats.parse_failed} deleted={stats.deleted} unchanged={stats.unchanged} jobs={stats.jobs} "
+        f"parse_failed={stats.parse_failed} skipped={stats.skipped} deleted={stats.deleted} unchanged={stats.unchanged} jobs={stats.jobs} "
         f"recent_pending={stats.recent_pending} "
         f"dry_run={args.dry_run}"
     )

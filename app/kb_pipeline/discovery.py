@@ -386,17 +386,18 @@ def directory_match_report(con: sqlite3.Connection, mirror_root: Path, kb_id: st
     """Whether an unenrolled directory looks like a renamed KB: look for the files the KB has on record
     (relative path + size) in the new directory, then compare checksums on a sample. Returns matched / total
     / ratio / verified / new_files."""
-    from .localfs.scanner import inside_boundary, is_supported_path, should_skip
+    from .localfs.scanner import inside_boundary, is_ingestible_path, should_skip
     from .utils import sha256_file
 
-    rows = con.execute("SELECT rel_path, size, checksum FROM files WHERE kb_id = ?", (kb_id,)).fetchall()
+    rows = con.execute("SELECT rel_path, size, checksum FROM files WHERE kb_id = ? AND status != 'skipped'", (kb_id,)).fetchall()
     root = mirror_root / dir_name
     boundary = root.resolve()
     matched: list[tuple[Path, str]] = []
     for row in rows:
         path = root / str(row["rel_path"])
         try:
-            if path.is_file() and inside_boundary(path, boundary) and path.stat().st_size == int(row["size"]):
+            if (path.is_file() and inside_boundary(path, boundary) and is_ingestible_path(path)
+                    and path.stat().st_size == int(row["size"])):
                 matched.append((path, str(row["checksum"] or "")))
         except OSError:
             continue
@@ -415,7 +416,7 @@ def directory_match_report(con: sqlite3.Connection, mirror_root: Path, kb_id: st
     new_files = 0
     try:
         for path in root.rglob("*"):
-            if path.is_file() and not should_skip(path, root) and inside_boundary(path, boundary) and is_supported_path(path):
+            if path.is_file() and not should_skip(path, root) and inside_boundary(path, boundary) and is_ingestible_path(path):
                 new_files += 1
     except OSError:
         pass

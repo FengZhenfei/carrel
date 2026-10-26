@@ -134,9 +134,15 @@ def _page_part(payload: dict[str, Any]) -> str:
         return f"sheet {sheet}" + (f" rows {rs}–{re_}" if rs is not None and re_ is not None else "")
     if page is not None and str(page) != "":
         try:
-            return f"page {int(page)}"
+            start = int(page)
         except (TypeError, ValueError):
             pass
+        else:
+            try:
+                end = int(payload.get("page_end"))
+            except (TypeError, ValueError):
+                end = start
+            return f"pages {start}–{end}" if end > start else f"page {start}"
     locator = payload.get("source_locator") or {}
     if isinstance(locator, dict):
         if locator.get("kind") == "notebook":

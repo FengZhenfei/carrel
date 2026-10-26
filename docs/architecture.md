@@ -34,8 +34,9 @@ Notebooks retain cell numbers, code, saved text/table outputs and raster plots;
 JSONL records retain line numbers and TSV tables retain columns and row ranges.
 Scripts and document templates are read statically. Markdown HTML comments
 are omitted from prose while code examples remain intact. Git LFS pointers
-are reported as missing originals; their placeholder text is removed from active
-indexes when reprocessed. Restoring the original queues normal incremental parsing.
+are excluded during scanning, so they do not enter file lists or parsing queues.
+If an indexed file becomes a pointer, its old index entries are withdrawn; restoring
+the original brings it back through the normal incremental pipeline.
 
 The added formats enter through the normal incremental scan. Existing formats
 retain their parser versions and cached results; reparsing applies the updated

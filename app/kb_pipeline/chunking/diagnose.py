@@ -128,11 +128,22 @@ def chunk_diagnostics(
 
 
 def _heading_only(text: str) -> bool:
-    lines = [l.strip() for l in str(text or "").splitlines() if l.strip() and not l.strip().startswith("TITLE:")]
+    all_lines = [l.strip() for l in str(text or "").splitlines() if l.strip()]
+    titles = [l.removeprefix("TITLE:").strip() for l in all_lines if l.startswith("TITLE:")]
+    lines = [l for l in all_lines if not l.startswith("TITLE:")]
     if len(lines) != 1:
         return False
     line = lines[0]
-    return _NOTE_RE.match(line) is not None or infer_heading_level(line) is not None or is_short_lead_in(line)
+    explicit = _NOTE_RE.match(line) is not None or infer_heading_level(line) is not None
+    if explicit:
+        return True
+    # A short description under its own TITLE is still body text. Do not let
+    # the figure lead-in heuristic classify complete API descriptions as titles.
+    if titles and line not in titles:
+        return False
+    if line.endswith((".", "。", "!", "！", "?", "？")) or line.startswith(('"', "'", "“", "‘")):
+        return False
+    return is_short_lead_in(line)
 
 
 def _table_without_header(text: str) -> bool:

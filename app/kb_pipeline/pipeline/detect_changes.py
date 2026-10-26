@@ -9,7 +9,7 @@ from ..models import SourceFile
 from ..parsers.common import parser_profile_for_path
 
 
-ChangeType = Literal["new", "content_changed", "parser_changed", "metadata_changed", "needs_parse", "unchanged"]
+ChangeType = Literal["new", "content_changed", "parser_changed", "metadata_changed", "needs_parse", "skipped", "unchanged"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,8 @@ def detect_change(old_row, file: SourceFile) -> Change:
     new_content_version = file.content_version
     if old_content_version != new_content_version or int(old_row["size"]) != file.size:
         return Change("content_changed", "parse", "checksum/size changed")
+    if str(old_row["status"]) == "skipped":
+        return Change("skipped", None, "original source content is still missing")
     old_indexed_version = str(old_row["indexed_version"] or "")
     if old_indexed_version != new_content_version:
         return Change("needs_parse", "parse", "current content version is not indexed")

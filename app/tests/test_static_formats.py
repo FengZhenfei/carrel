@@ -84,8 +84,8 @@ def test_directory_match_count_uses_scanner_rules(tmp_path):
     (root / "linked.py").symlink_to(outside)
     with sqlite3.connect(":memory:") as con:
         con.row_factory = sqlite3.Row
-        con.execute("CREATE TABLE files (kb_id TEXT, rel_path TEXT, size INTEGER, checksum TEXT)")
-        con.execute("INSERT INTO files VALUES ('test', 'linked.py', 4, 'hash')")
+        con.execute("CREATE TABLE files (kb_id TEXT, rel_path TEXT, size INTEGER, checksum TEXT, status TEXT)")
+        con.execute("INSERT INTO files VALUES ('test', 'linked.py', 4, 'hash', 'indexed')")
         report = directory_match_report(con, tmp_path, "test", root.name)
     assert report["new_files"] == 2
     assert report["matched"] == 0
@@ -314,7 +314,7 @@ def test_existing_parser_profiles_do_not_trigger_bulk_reparse():
         assert parser_profile_for_path(Path(name)) == profile
 
 
-def test_missing_original_withdraws_placeholder_index_and_reports_failure(tmp_path):
+def test_missing_original_withdraws_placeholder_index_and_reports_skip(tmp_path):
     import hashlib
     from kb_pipeline.pipeline import worker
     from test_scanner_worker import _parse_harness
@@ -329,13 +329,14 @@ def test_missing_original_withdraws_placeholder_index_and_reports_failure(tmp_pa
         h.con.commit()
         h.hooks["parse"] = lambda: require_source_content(path)
         result = worker.run_once(h.con, settings=h.settings)
-        assert result.startswith("failed:") and "original file missing" in result
+        assert result.startswith("skipped:") and "original file missing" in result
         assert "mark_stale" in h.calls and "fts" in h.calls
         assert "embed" not in h.calls and "upsert" not in h.calls
         updated = h.con.execute("SELECT status,indexed_version FROM files WHERE file_id=?", (h.file_id,)).fetchone()
-        assert updated["status"] == "seen" and updated["indexed_version"] is None
+        assert updated["status"] == "skipped" and updated["indexed_version"] is None
         job = h.con.execute("SELECT status,retry_count FROM jobs WHERE job_id=?", (h.job_id,)).fetchone()
-        assert job["status"] == "failed" and not job["retry_count"]
+        assert job["status"] == "skipped" and not job["retry_count"]
+        assert not h.con.execute("SELECT 1 FROM failures WHERE job_id=?", (h.job_id,)).fetchone()
 
 
 def test_restored_source_is_not_withdrawn_after_placeholder_check(tmp_path):

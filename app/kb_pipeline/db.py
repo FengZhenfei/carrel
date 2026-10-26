@@ -276,6 +276,7 @@ def init_db(path: str | Path) -> None:
         con.executescript(SCHEMA)
         migrate_schema(con)
         init_kb_sources_schema(con)
+        migrate_missing_source_jobs(con)
     _chmod_private(Path(path))
 
 
@@ -1134,13 +1135,13 @@ def get_file_by_path(con: sqlite3.Connection, kb_id: str, source_path: str) -> s
 # present is kept: the file table's "Indexed at" and the job timeline both come from it, and once it is gone a
 # file not re-parsed for 30 days shows nothing but a dash.
 _PRUNABLE_JOBS_SQL = """
-    status IN ('done','cancelled') AND COALESCE(finished_at, updated_at) < ?
+    status IN ('done','cancelled','skipped') AND COALESCE(finished_at, updated_at) < ?
     AND NOT (
-      job_type = 'parse' AND status = 'done'
+      job_type = 'parse' AND status IN ('done','skipped')
       AND EXISTS (SELECT 1 FROM files f WHERE f.file_id = jobs.file_id)
       AND NOT EXISTS (
         SELECT 1 FROM jobs later
-        WHERE later.file_id = jobs.file_id AND later.job_type = 'parse' AND later.status = 'done'
+        WHERE later.file_id = jobs.file_id AND later.job_type = 'parse' AND later.status IN ('done','skipped')
           AND (COALESCE(later.finished_at, 0) > COALESCE(jobs.finished_at, 0)
                OR (COALESCE(later.finished_at, 0) = COALESCE(jobs.finished_at, 0) AND later.rowid > jobs.rowid))
       )
@@ -1665,6 +1666,46 @@ def mark_job_done(con: sqlite3.Connection, job_id: str, worker_id: str | None = 
         "UPDATE failures SET resolved_at = COALESCE(resolved_at, ?) WHERE job_id = ?",
         (ts, job_id),
     )
+
+
+def mark_job_skipped(con: sqlite3.Connection, job_id: str, reason: str, *, worker_id: str) -> bool:
+    """Finish a source-content skip without creating a failure or consuming a retry."""
+    ts = now_ts()
+    cur = con.execute(
+        "UPDATE jobs SET status='skipped', error=?, finished_at=?, updated_at=?, "
+        "locked_by=NULL, locked_until=NULL WHERE job_id=? AND status='running' "
+        "AND locked_by=? AND COALESCE(cancel_requested,0)=0",
+        (reason[:4000], ts, ts, job_id, worker_id),
+    )
+    if cur.rowcount:
+        con.execute("INSERT INTO job_events(job_id,ts,kind,text) VALUES (?,?,'skipped',?)", (job_id, ts, reason[:1000]))
+        con.execute("UPDATE failures SET resolved_at=COALESCE(resolved_at,?) WHERE job_id=?", (ts, job_id))
+        supersede_failed_attempts(con, job_id)
+    return bool(cur.rowcount)
+
+
+def migrate_missing_source_jobs(con: sqlite3.Connection) -> int:
+    """Reclassify older typed placeholder failures, retaining their diagnostic history."""
+    rows = con.execute(
+        "SELECT job_id,file_id,dedupe_key FROM jobs WHERE job_type='parse' AND status='failed' "
+        "AND error LIKE 'MissingSourceContent(%'"
+    ).fetchall()
+    ts = now_ts()
+    for row in rows:
+        con.execute("UPDATE jobs SET status='skipped',updated_at=? WHERE job_id=?", (ts, row['job_id']))
+        con.execute("UPDATE failures SET resolved_at=COALESCE(resolved_at,?) WHERE job_id=?", (ts, row['job_id']))
+        con.execute("INSERT INTO job_events(job_id,ts,kind,text) VALUES (?,?,'skipped',?)",
+                    (row['job_id'], ts, "Original file missing (Git LFS pointer)"))
+        file = get_file_by_id(con, row['file_id'])
+        latest = con.execute(
+            "SELECT job_id FROM jobs WHERE file_id=? AND job_type='parse' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (row['file_id'],)
+        ).fetchone()
+        if (file is not None and file['status'] != 'deleted' and latest['job_id'] == row['job_id']
+                and str(file['indexed_version'] or '') != file['content_version']
+                and str(row['dedupe_key'] or '').startswith(f"parse:{row['file_id']}:{file['content_version']}:")):
+            con.execute("UPDATE files SET status='skipped' WHERE file_id=?", (row['file_id'],))
+    return len(rows)
 
 
 SUPERSEDED_EVENT = "Superseded by a later task for the same file"

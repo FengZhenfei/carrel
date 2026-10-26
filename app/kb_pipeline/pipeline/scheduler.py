@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .. import db
 from ..models import SourceFile
+from ..localfs.scanner import inside_boundary
+from ..parsers.source_guard import is_source_placeholder
 from .detect_changes import detect_change, parser_profile_for
 
 
@@ -21,6 +23,7 @@ class ScanStats:
     metadata_changed: int = 0
     needs_parse: int = 0
     parse_failed: int = 0
+    skipped: int = 0
     deleted: int = 0
     unchanged: int = 0
     jobs: int = 0
@@ -196,6 +199,8 @@ def update_stats(stats: ScanStats, change_type: str, job_id: str | None) -> None
         stats.needs_parse += 1
     elif change_type == "parse_failed":
         stats.parse_failed += 1
+    elif change_type == "skipped":
+        stats.skipped += 1
     else:
         stats.unchanged += 1
     if job_id:
@@ -289,6 +294,8 @@ def requeue_single_file(
 
     from ..parsers.common import parser_profile_for_path
 
+    if str(file_row["status"]) in {"deleted", "skipped"}:
+        return None
     profile = parser_profile_for_path(_Path(str(file_row["filename"])))
     dedupe_key = f"parse:{file_row['file_id']}:{file_row['content_version']}:{profile}"
     if db.active_job_for_dedupe_key(con, dedupe_key) is not None:
@@ -339,7 +346,7 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
     from ..parsers.common import parser_profile_for_path
 
     for row in con.execute(
-        "SELECT * FROM files WHERE kb_id = ? AND status != 'deleted' ORDER BY source_path", (kb_id,)
+        "SELECT * FROM files WHERE kb_id = ? AND status NOT IN ('deleted','skipped') ORDER BY source_path", (kb_id,)
     ).fetchall():
         profile = parser_profile_for_path(_Path(str(row["filename"])))
         dedupe_key = f"parse:{row['file_id']}:{row['content_version']}:{profile}"
@@ -405,6 +412,7 @@ def schedule_deletes_for_source(
     collection: str,
     seen_file_keys: set[int],
     verify_physical: bool = False,
+    source_root: Path | None = None,
     dry_run: bool = False,
 ) -> tuple[int, int]:
     current_rows = db.files_for_kb(con, kb_id)
@@ -413,13 +421,19 @@ def schedule_deletes_for_source(
     ]
     if verify_physical and missing_rows:
         # Second line of defence for scan-driven deletes: never tear down a file
-        # that is still sitting on disk (a scanner skip, a permission blip, or a
-        # key that drifted). Unenroll passes verify_physical=False -- there the
+        # that is still sitting on disk (a permission blip or a key that drifted).
+        # A confirmed LFS pointer inside the source is no longer indexable content.
+        # Unenroll passes verify_physical=False -- there the
         # files legitimately stay put while their points go away.
         kept = []
+        boundary = source_root.resolve() if source_root is not None else None
         for row in missing_rows:
             physical = str(row["physical_path"] or "")
             if physical and Path(physical).exists():
+                if (boundary is not None and inside_boundary(Path(physical), boundary)
+                        and is_source_placeholder(Path(physical))):
+                    kept.append(row)
+                    continue
                 print(
                     f"[scan] source={kb_id} delete skipped, file still on disk: {row['source_path']}",
                     flush=True,
@@ -490,4 +504,6 @@ def _status_after_scan(old_row, file: SourceFile) -> str:
         return "seen"
     if str(old_row["indexed_version"] or "") == file.content_version:
         return "indexed"
+    if str(old_row["status"]) == "skipped" and str(old_row["content_version"]) == file.content_version:
+        return "skipped"
     return "seen"
