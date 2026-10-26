@@ -269,6 +269,7 @@ const ZH_EN = {
   "下一页": "Next",
   "已重新排队": "Re-queued",
   "载入失败: ": "Failed to load: ",
+  "请求超时，正在重试…": "Request timed out; retrying…",
 
   // ── chunk preview drawer ──
   "读取切片中…": "Reading chunks…",

@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import requests
 from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -76,6 +77,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Carrel console", docs_url="/api/docs", openapi_url="/api/openapi.json",
                   lifespan=_lifespan)
     app.include_router(router)
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     # KB_WEB_TOKEN: when set, all of /api requires a Bearer token; the static pages open as usual, and
     # the front end asks for the token once and remembers it in the browser. It can stay unset while
     # listening on 127.0.0.1 only (the default); it should be set when opening up to the LAN

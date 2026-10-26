@@ -404,6 +404,7 @@ function selectKb(dir) {
 // Clear the previous KB's table when switching: otherwise, until the new KB's data arrives, a few hundred
 // milliseconds show someone else's files
 function resetWorkspace() {
+  if (filesRequest) { filesRequest.controller.abort(); filesRequest = null; }
   const loading = `<div class="empty-state">${t("载入中…")}</div>`;
   setHtml($("#fl-wrap"), loading);
   setHtml($("#fl-pager"), "");
@@ -1394,29 +1395,44 @@ function fileMatches(f, q, status) {
   }
 }
 
+let filesRequest = null;
 async function refreshFilesTab(force = false) {
   const kb = selectedEntry();
   if (!kb || kb.state !== "active") return;
   const fresh = state.files.kbId === kb.kb_id && Date.now() - state.files.at < (kb.jobs_active ? 2000 : 8000);
   if (!force && fresh) return;
+  if (filesRequest?.kbId === kb.kb_id) return;
+  if (filesRequest) filesRequest.controller.abort();
+  const request = { kbId: kb.kb_id, controller: new AbortController(), timedOut: false };
+  filesRequest = request;
+  const timer = setTimeout(() => { request.timedOut = true; request.controller.abort(); }, 20000);
+  const current = () => filesRequest === request && selectedEntry()?.kb_id === kb.kb_id;
   try {
     // Send the last ETag: unchanged content gets a 304 from the server and the whole table is neither sent
     // nor redrawn (every 2 s while parsing; health check D5)
     const sameKb = state.files.kbId === kb.kb_id;
     const load = () => fetch(`/api/kbs/${encodeURIComponent(kb.kb_id)}/files`,
-      { headers: { ...authHeaders(), ...(sameKb && state.files.etag ? { "If-None-Match": state.files.etag } : {}) } });
+      { signal: request.controller.signal, cache: "no-store",
+        headers: { ...authHeaders(), ...(sameKb && state.files.etag ? { "If-None-Match": state.files.etag } : {}) } });
     const sentWith = authHeaders().Authorization || "";
     let res = await load();
     if (res.status === 401 && ((authHeaders().Authorization || "") !== sentWith || await askToken())) res = await load();
-    if (selectedEntry()?.kb_id !== kb.kb_id) return;   // the KB was switched meanwhile
-    if (res.status === 304 && sameKb) { state.files.at = Date.now(); return; }
+    if (!current()) return;
+    if (res.status === 304 && sameKb) { state.files.at = Date.now(); renderFilesTable(); return; }
     if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
     const rows = await res.json();
+    if (!current()) return;   // Switching libraries can also happen while the body is downloading.
     if (!sameKb) state.files.page = 1;
     state.files = { ...state.files, kbId: kb.kb_id, rows, at: Date.now(), etag: res.headers.get("ETag") || null };
     renderFilesTable();
   } catch (e) {
-    setHtml($("#fl-wrap"), `<div class="empty-state">${t("载入失败: ")}${esc(t(e.message))}</div>`);
+    if (current()) {
+      const message = request.timedOut ? t("请求超时，正在重试…") : t("载入失败: ") + t(e.message);
+      setHtml($("#fl-wrap"), `<div class="empty-state">${esc(message)}</div>`);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (filesRequest === request) filesRequest = null;
   }
 }
 
