@@ -329,6 +329,10 @@ class DeploymentAssetTests(unittest.TestCase):
             for pat in patterns:
                 if pat in ICLOUD_PATTERNS and rel.startswith(ICLOUD_EXAMPLE_PATHS):
                     continue
+                # Release notes may name the supported sync service; paths and
+                # all other private patterns remain checked.
+                if pat == "iCloud" and rel.startswith("docs/releases/"):
+                    continue
                 if pat in text:
                     line = next(i for i, l in enumerate(text.splitlines(), 1) if pat in l)
                     hits.append(f"{rel}:{line}: {pat if pat in GENERIC_PRIVATE_PATTERNS else '<private pattern>'}")
