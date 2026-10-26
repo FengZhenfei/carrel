@@ -210,6 +210,8 @@ curl -sS http://127.0.0.1:9810/search \
 
 ## 检索评测
 
+[0.3.0 检索评测报告](evaluations/retrieval-evaluations-0.3.0.zh-CN.md) 列出了模型与测试条件，以及不同图谱、重排配置下的 hit@5、MRR、跨文档证据覆盖和耗时。
+
 题集与结果放在 `runtime/eval/`，不提交到 Git。准备好题集后执行：
 
 ```bash

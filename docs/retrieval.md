@@ -446,6 +446,10 @@ channels and source positions for citation. Entries include:
 
 ## Evaluate retrieval
 
+The [0.3.0 retrieval evaluation](evaluations/retrieval-evaluations-0.3.0.md) reports
+hit@5, MRR, cross-document evidence coverage, and latency across graph and
+reranking configurations, with the models and test conditions used.
+
 Keep question sets and outputs under `runtime/eval/`, outside Git. With a
 question set you have created:
 
