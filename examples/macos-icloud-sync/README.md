@@ -79,6 +79,19 @@ round stops at the checks above. The permission also applies to other bash
 and zsh scripts that launchd starts, not only to these two, so weigh that
 before you grant it.
 
+The optional download helper may need its own grant. If
+`logs/icloud-prefetch.trace.log` reports `Code=257` for it, you can enable
+the helper by adding `bin/icloud-download` from the installation folder to Full Disk Access.
+When the helper fails, prefetch uses the system's `brctl` for the rest of
+that round and tries the helper again next round.
+
+Downloads use a window of 64 pending files by default, checked together
+every 5 seconds while waiting. A slot is refilled as soon as a check detects completion.
+Files that time out are recorded and retried next round.
+`logs/icloud-prefetch.log` reports progress every 30 seconds and a final
+summary, counting accepted requests separately from files downloaded.
+Batch size and timeouts are configurable in `sync.env`.
+
 Follow the log to see the first rounds:
 
 ```bash
@@ -137,6 +150,11 @@ Each script rotates its own log in `logs/` at 2 MB and keeps three old
 copies. The `*.launchd.log` files only collect unexpected errors.
 `logs/icloud-prefetch.last-errors.log` lists the files that failed or timed
 out in the last prefetch round.
+
+During a transfer, the push refreshes its server lock. It records a pending
+notification before copying, so an interrupted run can notify Carrel on
+the next round even when no files remain to copy. Dry runs only inspect
+the server and preview changes.
 
 ## Uninstall
 

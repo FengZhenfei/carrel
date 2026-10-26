@@ -4,9 +4,9 @@
 #
 # With "Optimize Mac Storage" on, iCloud keeps some files as "dataless" placeholders: they list with their
 # real size but hold no data until something asks for them. push-mirror.sh refuses to push while any
-# placeholder is left, and while this script holds its lock. For each placeholder this script asks iCloud to
-# download it (bin/icloud-download, built from icloud_download.swift; `brctl download` and a one-byte read
-# as fallbacks), then waits until the file is materialized. File contents are never changed.
+# placeholder is left, and while this script holds its lock. Download requests use a bounded window,
+# refilled as files arrive. The optional helper falls back to brctl and a one-byte read. Completion is
+# checked independently of request success; file contents are never changed.
 set -euo pipefail
 
 SYNC_HOME="${0:A:h}"
@@ -37,6 +37,8 @@ WAIT_SECONDS="${SYNC_DOWNLOAD_WAIT_SECONDS:-900}"      # per file; a file still 
 POLL_SECONDS="${SYNC_DOWNLOAD_POLL_SECONDS:-5}"
 RETRY_SECONDS="${SYNC_DOWNLOAD_RETRY_SECONDS:-60}"     # ask again this often while waiting
 READ_TIMEOUT_SECONDS="${SYNC_READ_TIMEOUT_SECONDS:-30}"
+BATCH_SIZE="${SYNC_DOWNLOAD_BATCH_SIZE:-64}"
+REQUEST_SECONDS="${SYNC_DOWNLOAD_REQUEST_TIMEOUT_SECONDS:-10}"
 MAX_FILES="${SYNC_PREFETCH_LIMIT:-0}"                  # placeholders handled per round; 0 = all
 
 ts() { date "+%F %T"; }
@@ -56,7 +58,6 @@ rotate_log() {
   mv -f "$f" "$f.1"
   rm -f "$f.$((keep+1))"
 }
-rotate_log "$LOG_FILE" "${SYNC_LOG_MAX_KB:-2048}" "${SYNC_LOG_KEEP:-3}"
 
 VALID_SCAN_ROOTS=()
 for scan_root in "${SCAN_ROOTS[@]}"; do
@@ -94,7 +95,7 @@ lock_pid_is_live() {
 }
 
 remove_lock_dir() {
-  rm -f "$LOCK_DIR/pid"
+  rm -f "$LOCK_DIR/pid" "$LOCK_DIR/candidates"
   rmdir "$LOCK_DIR" 2>/dev/null
 }
 
@@ -126,95 +127,174 @@ cleanup() {
   remove_lock_dir >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
-is_dataless() {
-  /bin/ls -ldO "$1" 2>/dev/null | /usr/bin/grep -q "dataless"
+log() { print -r -- "[$(ts)] $*" >> "$LOG_FILE"; }
+rotate_log "$LOG_FILE" "${SYNC_LOG_MAX_KB:-2048}" "${SYNC_LOG_KEEP:-3}"
+rotate_log "$TRACE_FILE" "${SYNC_LOG_MAX_KB:-2048}" "${SYNC_LOG_KEEP:-3}"
+
+# Validate arithmetic settings before starting requests.
+for setting in WAIT_SECONDS POLL_SECONDS RETRY_SECONDS READ_TIMEOUT_SECONDS BATCH_SIZE REQUEST_SECONDS MAX_FILES; do
+  value="${(P)setting}"
+  if [[ "$value" != <-> ]] || (( value < 0 )) || { [[ "$setting" != MAX_FILES ]] && (( value == 0 )); }; then
+    log "abort: $setting must be a positive integer (MAX_FILES may be zero)"
+    exit 2
+  fi
+done
+if (( BATCH_SIZE > 256 )); then
+  log "abort: BATCH_SIZE must be at most 256"
+  exit 2
+fi
+zmodload zsh/datetime
+
+: >"$ERR_FILE"
+: >"$TRACE_FILE"
+: >"$FIND_ERR_FILE"
+: >"$LOCK_DIR/candidates"
+for scan_root in "${VALID_SCAN_ROOTS[@]}"; do
+  if ! /usr/bin/find "$scan_root" -type f -flags +dataless -print0 >>"$LOCK_DIR/candidates" 2>>"$FIND_ERR_FILE"; then
+    log "abort: placeholder scan failed; see $FIND_ERR_FILE"
+    exit 1
+  fi
+done
+if [[ -s "$FIND_ERR_FILE" ]]; then
+  log "abort: placeholder scan incomplete; see $FIND_ERR_FILE"
+  exit 1
+fi
+
+# A failed stat must not be counted as a downloaded file. Inspect flags only, not the filename.
+file_state() {
+  local flags
+  if [[ ! -f "$1" ]] || ! flags="$(/usr/bin/stat -f %Sf "$1" 2>>"$TRACE_FILE")"; then
+    FILE_STATE=unavailable
+  elif [[ "$flags" == *dataless* ]]; then
+    FILE_STATE=pending
+  else
+    FILE_STATE=local
+  fi
 }
 
-# Reading one byte makes the file provider fetch the file; the alarm keeps a stuck read from hanging the round.
+run_timed() {
+  /usr/bin/perl -e 'my $seconds = shift; alarm $seconds; exec @ARGV or exit 127;' \
+    "$REQUEST_SECONDS" "$@" >>"$TRACE_FILE" 2>&1
+}
+
 read_probe() {
   /usr/bin/perl -e '
-    my ($timeout, $path) = @ARGV;
+    my ($timeout, $file) = @ARGV;
     $SIG{ALRM} = sub { exit 124 };
     alarm int($timeout);
-    open(my $fh, "<", $path) or exit 2;
+    open(my $fh, "<", $file) or exit 2;
     binmode($fh);
     my $n = read($fh, my $buf, 1);
-    exit(($n // 0) >= 0 ? 0 : 3);
+    exit(defined($n) ? 0 : 3);
   ' "$READ_TIMEOUT_SECONDS" "$1" >>"$TRACE_FILE" 2>&1
 }
 
+HELPER_ENABLED=0
+[[ -x "$DOWNLOAD_HELPER" ]] && HELPER_ENABLED=1
 request_download() {
   local f="$1"
-  if [[ -x "$DOWNLOAD_HELPER" ]] && "$DOWNLOAD_HELPER" "$f" >>"$TRACE_FILE" 2>&1; then
-    return 0
+  if (( HELPER_ENABLED )); then
+    if run_timed "$DOWNLOAD_HELPER" "$f"; then
+      return 0
+    fi
+    HELPER_ENABLED=0
+    log "download helper unavailable; using brctl for this round. Check helper permissions if trace reports Code=257: $DOWNLOAD_HELPER"
   fi
-  if /usr/bin/brctl download "$f" >>"$TRACE_FILE" 2>&1; then
+  if run_timed /usr/bin/brctl download "$f"; then
     return 0
   fi
   read_probe "$f"
 }
 
-wait_until_materialized() {
-  local f="$1"
-  local waited=0
-  while is_dataless "$f"; do
-    touch "$LOCK_DIR"            # keep the lock fresh, so a long download is not mistaken for a stale lock
-    if [[ "$waited" -ge "$WAIT_SECONDS" ]]; then
-      return 1
-    fi
-    if [[ "$waited" -eq 0 || $((waited % RETRY_SECONDS)) -eq 0 ]]; then
-      request_download "$f" || true
-    fi
-    sleep "$POLL_SECONDS"
-    waited=$((waited + POLL_SECONDS))
-  done
-  read_probe "$f" || true
-  return 0
-}
+matched=0 requested=0 processed=0 completed=0 failures=0 timeouts=0 request_errors=0
+queue_open=1
+pending_files=() pending_started=() pending_retry=()
+started_at=$EPOCHSECONDS
+last_progress=$EPOCHSECONDS
+log "started: batch=$BATCH_SIZE wait=${WAIT_SECONDS}s poll=${POLL_SECONDS}s"
+exec 3<"$LOCK_DIR/candidates"
 
-matched=0
-requested=0
-processed=0
-completed=0
-failures=0
-timeouts=0
-: >"$ERR_FILE"
-: >"$TRACE_FILE"
-: >"$FIND_ERR_FILE"
-while IFS= read -r -d '' f; do
-  matched=$((matched + 1))
-  if [[ "$MAX_FILES" -gt 0 && "$processed" -ge "$MAX_FILES" ]]; then
-    break
+while (( queue_open || ${#pending_files} )); do
+  # Only the request is synchronous. Downloads proceed together in the file provider.
+  while (( queue_open && ${#pending_files} < BATCH_SIZE )); do
+    if (( MAX_FILES > 0 && processed >= MAX_FILES )); then
+      queue_open=0
+      break
+    fi
+    if ! IFS= read -r -d '' f <&3; then
+      queue_open=0
+      break
+    fi
+    matched=$((matched + 1))
+    file_state "$f"
+    if [[ "$FILE_STATE" == local ]]; then
+      completed=$((completed + 1))
+      continue
+    elif [[ "$FILE_STATE" == unavailable ]]; then
+      failures=$((failures + 1))
+      print -r -- "unavailable\t$f" >>"$ERR_FILE"
+      continue
+    fi
+    processed=$((processed + 1))
+    began=$EPOCHSECONDS
+    if request_download "$f"; then
+      requested=$((requested + 1))
+    else
+      request_errors=$((request_errors + 1))
+      log "request failed; will retry: $f"
+    fi
+    pending_files+=("$f")
+    pending_started+=("$began")
+    pending_retry+=("$((EPOCHSECONDS + RETRY_SECONDS))")
+  done
+
+  kept_files=() kept_started=() kept_retry=()
+  for (( i=1; i<=${#pending_files}; i++ )); do
+    f="${pending_files[$i]}"
+    file_state "$f"
+    if [[ "$FILE_STATE" == local ]]; then
+      completed=$((completed + 1))
+      continue
+    elif [[ "$FILE_STATE" == unavailable ]]; then
+      failures=$((failures + 1))
+      print -r -- "unavailable\t$f" >>"$ERR_FILE"
+      continue
+    elif (( EPOCHSECONDS - pending_started[i] >= WAIT_SECONDS )); then
+      timeouts=$((timeouts + 1))
+      print -r -- "timeout\t$f" >>"$ERR_FILE"
+      continue
+    fi
+    retry_at=${pending_retry[$i]}
+    if (( EPOCHSECONDS >= retry_at )); then
+      if ! request_download "$f"; then
+        request_errors=$((request_errors + 1))
+        log "request failed; will retry: $f"
+      fi
+      retry_at=$((EPOCHSECONDS + RETRY_SECONDS))
+    fi
+    kept_files+=("$f")
+    kept_started+=("${pending_started[$i]}")
+    kept_retry+=("$retry_at")
+  done
+  pending_files=("${kept_files[@]}")
+  pending_started=("${kept_started[@]}")
+  pending_retry=("${kept_retry[@]}")
+  touch "$LOCK_DIR"
+  if (( EPOCHSECONDS - last_progress >= 30 )); then
+    log "progress: matched=$matched requested=$requested completed=$completed pending=${#pending_files} timeouts=$timeouts failures=$failures request_errors=$request_errors"
+    last_progress=$EPOCHSECONDS
   fi
-  if ! is_dataless "$f"; then        # downloaded in the meantime
-    completed=$((completed + 1))
+  # Refill free slots immediately: a slow file does not hold up later files.
+  if (( queue_open && ${#pending_files} < BATCH_SIZE )); then
     continue
   fi
-
-  processed=$((processed + 1))
-  asked=0
-  if request_download "$f"; then
-    requested=$((requested + 1))
-    asked=1
+  if (( ${#pending_files} )); then
+    sleep "$POLL_SECONDS"
   fi
-  if wait_until_materialized "$f"; then
-    completed=$((completed + 1))
-  elif is_dataless "$f"; then
-    timeouts=$((timeouts + 1))
-    print -r -- "timeout	$f" >>"$ERR_FILE"
-  elif [[ "$asked" -eq 0 ]]; then
-    failures=$((failures + 1))
-    print -r -- "failed	$f" >>"$ERR_FILE"
-  fi
-done < <(
-  for scan_root in "${VALID_SCAN_ROOTS[@]}"; do
-    /usr/bin/find "$scan_root" -type f -flags +dataless -print0 2>>"$FIND_ERR_FILE" || true
-  done
-)
-
-if [[ -s "$FIND_ERR_FILE" ]]; then
-  echo "[$(ts)] find warning: $(tr '\n' ';' < "$FIND_ERR_FILE")" >> "$LOG_FILE"
-fi
-
-echo "[$(ts)] placeholders: matched=$matched requested=$requested completed=$completed timeouts=$timeouts failures=$failures roots=${#VALID_SCAN_ROOTS[@]} (details: $ERR_FILE)" >> "$LOG_FILE"
+done
+exec 3<&-
+log "finished: matched=$matched requested=$requested completed=$completed timeouts=$timeouts failures=$failures request_errors=$request_errors elapsed=$((EPOCHSECONDS - started_at))s"
+(( timeouts == 0 && failures == 0 ))

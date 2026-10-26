@@ -21,7 +21,17 @@ for arg in "$@"; do
   esac
 done
 
-unload() { launchctl bootout "$DOMAIN/$1" 2>/dev/null || true; }   # not being loaded is fine
+unload() {
+  launchctl bootout "$DOMAIN/$1" 2>/dev/null || true
+  # bootout returns before a busy job finishes handling SIGTERM.
+  local attempt
+  for ((attempt=0; attempt<30; attempt++)); do
+    if ! launchctl print "$DOMAIN/$1" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  echo "$1 is still stopping; retry once it has exited" >&2
+  return 1
+}
 
 if [[ "$mode" == uninstall ]]; then
   for label in "$PUSH" "$PREFETCH"; do
@@ -78,3 +88,12 @@ takes a path). Without it the agents cannot read the folder, and every round sto
 Then follow the log:
   tail -f "$SYNC_HOME/logs/push-mirror.log"
 EOF
+if [[ "$with_prefetch" -eq 1 && -x "$SYNC_HOME/bin/icloud-download" ]]; then
+  cat <<EOF
+
+Optional download helper: $SYNC_HOME/bin/icloud-download
+If the prefetch trace reports Code=257 for this helper, add that executable to Full Disk Access too.
+The prefetch uses brctl for the rest of a round if the helper fails, and tries the helper again next round.
+Download progress: $SYNC_HOME/logs/icloud-prefetch.log
+EOF
+fi

@@ -145,16 +145,59 @@ echo $$ > "$LOCK_DIR/pid"
 # The server lock is released here as well, so any abnormal exit short of SIGKILL (SIGTERM, set -e, logout)
 # does not leave it behind; after a SIGKILL, gate 5 reclaims it once it is stale.
 REMOTE_LOCK_HELD=0
+REMOTE_LOCK_OWNER="mac-$$-$(date +%s)"
+HEARTBEAT_PID=""
+changes_file=""
+dl_err=""
+stop_lock_heartbeat() {
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+    HEARTBEAT_PID=""
+  fi
+}
+start_lock_heartbeat() {
+  (
+    trap - EXIT
+    hb_child=""
+    trap 'if [[ -n "$hb_child" ]]; then kill "$hb_child" 2>/dev/null || true; wait "$hb_child" 2>/dev/null || true; fi; exit 0' TERM INT
+    parent_is_live() {
+      local parent_state
+      parent_state="$(ps -o stat= -p "$$" 2>/dev/null || true)"
+      [[ -n "$parent_state" && "$parent_state" != *Z* ]]
+    }
+    while parent_is_live; do
+      sleep "$HEARTBEAT_INTERVAL" & hb_child=$!
+      wait "$hb_child" || exit 0
+      hb_child=""
+      parent_is_live || exit 0
+      ssh "${SSH_OPTS[@]}" "$SYNC_HOST" \
+        "[ \"\$(cat '$REMOTE_LOCK/owner' 2>/dev/null)\" = '$REMOTE_LOCK_OWNER' ] && touch '$REMOTE_LOCK'" >>"$LOG_FILE" 2>&1 &
+      hb_child=$!
+      if ! wait "$hb_child"; then
+        log "warning: mirror-lock heartbeat failed; retrying"
+      fi
+      hb_child=""
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
 release_remote_lock() {
+  stop_lock_heartbeat
   [[ "$REMOTE_LOCK_HELD" -eq 1 ]] || return 0
   REMOTE_LOCK_HELD=0
-  ssh "${SSH_OPTS[@]}" "$SYNC_HOST" "rm -f '$REMOTE_LOCK/owner'; rmdir '$REMOTE_LOCK' 2>/dev/null" || true
+  ssh "${SSH_OPTS[@]}" "$SYNC_HOST" \
+    "if [ \"\$(cat '$REMOTE_LOCK/owner' 2>/dev/null)\" = '$REMOTE_LOCK_OWNER' ]; then rm -f '$REMOTE_LOCK/owner'; rmdir '$REMOTE_LOCK' 2>/dev/null; fi" || true
 }
 cleanup() {
   release_remote_lock
+  [[ -z "$changes_file" ]] || rm -f "$changes_file"
+  [[ -z "$dl_err" ]] || rm -f "$dl_err"
   rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # If the flag cannot be set, remember it locally and set it next round: by then rsync has nothing left to
 # transfer, and without this the batch would wait for the next real change to be scanned.
@@ -220,7 +263,9 @@ if [[ "$ssh_rc" -ne 0 ]]; then
   exit 0
 fi
 
-ssh "${SSH_OPTS[@]}" "$SYNC_HOST" "mkdir -p '$REMOTE_MIRROR' '$REMOTE_STATE'"
+if [[ "$DRY_RUN" -ne 1 ]]; then
+  ssh "${SSH_OPTS[@]}" "$SYNC_HOST" "mkdir -p '$REMOTE_MIRROR' '$REMOTE_STATE'"
+fi
 
 if [[ -f "$FLAG_PENDING" && "$SET_FLAG" -eq 1 && "$DRY_RUN" -ne 1 ]]; then
   if set_remote_flag; then
@@ -237,7 +282,7 @@ REMOTE_LOCK_STALE_SECONDS="${SYNC_REMOTE_LOCK_STALE_SECONDS:-3600}"
 take_remote_lock() {
   # mkdir succeeding is what takes the lock; the owner file is only for humans
   ssh "${SSH_OPTS[@]}" "$SYNC_HOST" \
-    "mkdir '$REMOTE_LOCK' 2>/dev/null || exit 1; echo 'holder=mac-mirror-push' > '$REMOTE_LOCK/owner' || true"
+    "mkdir '$REMOTE_LOCK' 2>/dev/null || exit 1; echo '$REMOTE_LOCK_OWNER' > '$REMOTE_LOCK/owner'"
 }
 remote_lock_age() {
   local age
@@ -260,6 +305,10 @@ if [[ "$DRY_RUN" -ne 1 ]]; then
     fi
   fi
   REMOTE_LOCK_HELD=1
+  HEARTBEAT_INTERVAL=$(( REMOTE_LOCK_STALE_SECONDS / 3 ))
+  [[ "$HEARTBEAT_INTERVAL" -ge 1 ]] || HEARTBEAT_INTERVAL=1
+  [[ "$HEARTBEAT_INTERVAL" -le 30 ]] || HEARTBEAT_INTERVAL=30
+  start_lock_heartbeat
 fi
 
 # Finder metadata, iCloud bookkeeping, Office lock files and sync-conflict copies (English and Chinese
@@ -275,6 +324,12 @@ rsync_flags=(-a --delete --itemize-changes
 
 changes_file="$(mktemp)"
 started="$(date +%s)"
+flag_pending_before_transfer=0
+if [[ "$DRY_RUN" -ne 1 && "$SET_FLAG" -eq 1 ]]; then
+  [[ ! -f "$FLAG_PENDING" ]] || flag_pending_before_transfer=1
+  # Persist the intent before rsync: SIGKILL may arrive after files changed but before notification.
+  touch "$FLAG_PENDING"
+fi
 set +e
 rsync "${rsync_flags[@]}" "$SRC/" "$SYNC_HOST:$REMOTE_MIRROR/" >"$changes_file" 2>>"$LOG_FILE"
 status=$?
@@ -326,5 +381,8 @@ if [[ "$meaningful" -gt 0 ]]; then
     log "pushed: local=$local_count changed=$meaningful size=${kbytes}KB ${elapsed}s; server flag NOT set (ssh failed), will retry next round"
   fi
 else
+  if [[ "$SET_FLAG" -eq 1 && "$flag_pending_before_transfer" -eq 0 ]]; then
+    rm -f "$FLAG_PENDING"
+  fi
   log "no-op: nothing meaningful changed (${elapsed}s)"
 fi
