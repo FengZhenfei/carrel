@@ -14,7 +14,7 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 ## 核心功能
 
-**0.3.0：** [更新内容与升级步骤](docs/releases/0.3.0.zh-CN.md)。
+**0.3.1：** [更新内容与升级步骤](docs/releases/0.3.1.zh-CN.md)。
 
 - **多格式解析：** 支持 PDF、Word、PowerPoint、表格、图片、HTML、Markdown、Notebook、源代码及工作流文件，按文件格式采用相应的处理方式。[格式说明](docs/architecture.zh-CN.md#入库流程)。
 - **自动更新：** 定时发现文件变化，更新索引，并维护已启用的知识图谱。

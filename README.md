@@ -21,7 +21,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-**0.3.0:** [Release notes and upgrade steps](docs/releases/0.3.0.md).
+**0.3.1:** [Release notes and upgrade steps](docs/releases/0.3.1.md).
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
