@@ -2426,12 +2426,12 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(first["docs"], [{"doc_id": "kb_005:3", "rel_path": "0.xlsx", "chunks": 2}, {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunks": 2},
                                                  {"doc_id": "kb_005:2", "rel_path": "b.pdf", "chunks": 1}])     # chunks descending, then path ascending
                 h1, h2, h3 = first["hits"]
-                self.assertEqual(h1, {"doc_id": "kb_005:1", "rel_path": "a.pdf", "chunk_index": 2, "block_type": "text", "page_idx": 3, "point_id": "p1",
+                self.assertEqual(h1, {"kb_id": "kb_005", "doc_id": "kb_005:1", "content_version": "v1", "rel_path": "a.pdf", "chunk_index": 2, "block_type": "text", "page_idx": 3, "point_id": "p1",
                                       "field": "body", "snippet": "…" + "甲" * 60 + "WidgetX9" + "乙" * 60 + "…", "literal": True})
                 self.assertEqual((h2["field"], h2["literal"], h2["snippet"]), ("body", False, "Preface. widget x9 overview."))
                 self.assertNotIn("page_idx", h2)
                 self.assertEqual((h3["field"], h3["literal"], h3["sheet_name"], h3["row_start"], h3["row_end"]), ("visual", True, "pricing", 2, 9))
-                self.assertNotIn("body", h1); self.assertNotIn("content_version", h1)
+                self.assertNotIn("body", h1)
                 self.assertEqual((second["total_chunks"], second["docs"], second["hits"], second["literal_checked"]), (0, [], [], 0))
                 self.assertIn("literal is checked only for the hits returned", out["note"]); self.assertNotIn("degraded", out)
                 # all three fields by default; limit=0 returns counts only
@@ -2829,7 +2829,7 @@ class SkillClientTests(unittest.TestCase):
                          ["products/vendor/manual.pdf  ← S1 F1 F3", "products/vendor/board.pdf  ← S2", "products/vendor/notes.md  ← S4 S5 S6", "products/vendor/sheet.pdf  ← F2"])
         self.assertEqual(view[-1], "complete response: " + str(work / "aaaaaa.json"))
         # the reminder of what to do with the result stands last, where the agent decides its next step
-        self.assertTrue(view[-3].startswith("▶ Answer directly from the result above, in this order: the answer, the reference files, numbered follow-ups."))
+        self.assertEqual(view[-3], c.TXT["next"])
         nothing = dict(search, result=dict(search["result"], retrieval_summary={"evidence_state": "diagnostic", "no_relevant_content": True}))
         self.assertFalse([line for line in c.view_search(nothing) if line.startswith("▶")])            # nothing to conclude from: no reminder
         self.assertLess(c.nbytes(view), c.PAGE_BYTES)
@@ -2848,9 +2848,9 @@ class SkillClientTests(unittest.TestCase):
         # an excerpt shared by several relations is printed once
         self.assertEqual(near[near.index("[N3] →requires Power unit (module · 1 relations)"):][1],
                          "     same excerpt as N2 (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N3 when needed) — same citation as N1")
-        # a hop ends with the files its excerpts come from and the reminder to answer only what the user picked
+        # a hop ends with its reference files and the reminder for evaluating graph evidence
         self.assertIn("products/vendor/manual.pdf  ← N1 N2 N3", near)
-        self.assertTrue(near[-3].startswith("▶ Answer only the follow-up the user picked and go no further"))
+        self.assertEqual(near[-3], c.TXT["next_hop"])
 
     def test_a_rel_path_that_matched_no_document_is_named(self) -> None:
         """The service matches --rel-path exactly against the path inside the knowledge base, and a bare file name
@@ -2994,7 +2994,7 @@ class SkillClientTests(unittest.TestCase):
         got = pages(search("aaaaaa", [source(i, 4500) for i in range(1, 5)] + [source(i, 300) for i in range(5, 9)]))
         first = got[0]
         self.assertTrue(all(size(page) <= limit for page in got), [size(page) for page in got])
-        for part in ("━━ Facts ━━", "━━ Reference files", "▶ Answer directly",
+        for part in ("━━ Facts ━━", "━━ Reference files", c.TXT["next"],
                      "some of the best sources among them. Their full text is on the next page; read it before answering: show aaaaaa --page 2"):
             self.assertTrue(part in first, part)
         self.assertIn("more follows, read on: show aaaaaa --page 2)", first.splitlines()[-3])
@@ -3003,7 +3003,7 @@ class SkillClientTests(unittest.TestCase):
         # the usual overflow, lower-ranked sources and neighbouring chunks: the following pages are supplementary
         got = pages(search("bbbbbb", [source(i, 600) for i in range(1, 13)] + [source(20 + i, 5000, role="neighbor", of=i) for i in range(1, 7)]))
         self.assertTrue(all(size(page) <= limit for page in got) and len(got) >= 3, [size(page) for page in got])
-        self.assertTrue("▶ Answer directly" in got[0])
+        self.assertIn(c.TXT["next"], got[0])
         for page in got[:-1]:
             self.assertIn("the next page holds the full text of the other sources, to be read when useful: show bbbbbb --page", page.splitlines()[-3])
         self.assertEqual(got[1].splitlines()[2], "━━ Full text of the other sources ━━")

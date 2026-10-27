@@ -58,7 +58,7 @@ def _doc_paths(settings: Settings, kb_id: str) -> list[str]:
     return paths
 
 
-def excluded_paths(settings: Settings, source: KBSource, scope: dict[str, Any]) -> list[str]:
+def excluded_paths(settings: Settings, source: KBSource, scope: dict[str, Any], *, max_paths: int | None = EXCLUDED_MAX) -> list[str]:
     """按口径不给的文档路径(召回时排除);更正文件里没写文档状态就是空。"""
     if scope.get("mode") == "history":
         return []
@@ -66,7 +66,7 @@ def excluded_paths(settings: Settings, source: KBSource, scope: dict[str, Any]) 
     if not corr.get("documents"):
         return []
     out = [rp for rp in _doc_paths(settings, source.kb_id) if not document_in_scope(document_status(rp, corr), scope)]
-    return out[:EXCLUDED_MAX]
+    return out if max_paths is None else out[:max_paths]
 
 
 def allowed(settings: Settings, source: KBSource, rel_path: Any, scope: dict[str, Any]) -> bool:

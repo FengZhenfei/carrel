@@ -130,6 +130,8 @@ class DocsRequest(BaseModel):
 
 class GrepRequest(BaseModel):
     kb_id: str
+    history: bool = False
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
     phrases: list[str] = Field(min_length=1, max_length=8)
     rel_paths: list[str] | None = Field(default=None, max_length=500)
     doc_ids: list[str] | None = Field(default=None, max_length=500)
@@ -289,5 +291,5 @@ def docs(req: DocsRequest) -> dict[str, Any]:
 @router.post("/grep", dependencies=[Depends(require_token)])
 def grep(req: GrepRequest) -> dict[str, Any]:
     return _wrap(service.grep, req.kb_id, req.phrases, fields=list(req.fields) if req.fields else None, rel_paths=req.rel_paths,
-                 doc_ids=req.doc_ids, limit=req.limit)
+                 doc_ids=req.doc_ids, limit=req.limit, history=req.history, as_of=req.as_of)
 

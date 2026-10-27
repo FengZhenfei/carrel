@@ -266,7 +266,7 @@ def _hit_row(hit: dict[str, Any], phrase: str, fields: tuple[str, ...]) -> dict[
     text, _ = cuts.get(field, ("", False))
     row: dict[str, Any] = {"doc_id": src.get("doc_id"), "rel_path": src.get("rel_path"), "chunk_index": src.get("chunk_index"),
                            "block_type": src.get("block_type")}
-    for key in ("page_idx", "sheet_name", "row_start", "row_end", "source_locator"):
+    for key in ("page_idx", "sheet_name", "row_start", "row_end", "source_locator", "content_version"):
         if src.get(key) is not None:
             row[key] = src[key]
     row.update({"point_id": str(hit.get("_id")), "field": field, "snippet": text, "literal": any(c[1] for c in cuts.values())})
@@ -279,7 +279,8 @@ def _total(resp: dict[str, Any]) -> int:
 
 
 def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
-         doc_ids: list[str] | None = None, limit: int = 30, client: Any = None, timeout: float | None = None) -> dict[str, Any]:
+         doc_ids: list[str] | None = None, limit: int = 30, client: Any = None, timeout: float | None = None,
+         excluded_paths: list[str] | None = None) -> dict[str, Any]:
     """Literal phrase counts: for each phrase, in how many chunks and which documents it appears (the analyzer's
     phrase match), plus the first limit hits (sorted by path and chunk index).
     The cjk analyzer turns CJK text into bigrams, so phrase matching is approximate (a phrase also matches the same
@@ -299,6 +300,8 @@ def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: li
         filters.append({"terms": {"doc_id": scope["doc_ids"]}})
     if scope["rel_paths"]:
         filters.append({"terms": {"rel_path": scope["rel_paths"]}})
+    if excluded_paths:
+        filters.append({"bool": {"must_not": [{"terms": {"rel_path": excluded_paths}}]}})
     client = client if client is not None else os_client(settings.opensearch_url)
     out: dict[str, Any] = {"kb_id": source.kb_id, "kb_name": kb_name(source), "fields": list(fields_t),
                            "scope": {k: len(v) for k, v in scope.items()}, "results": [], "note": f"{GREP_NOTE}. {GREP_STALE_NOTE}"}

@@ -140,3 +140,141 @@ def test_search_reference_fetches_an_image_with_provenance(client, tmp_path, mon
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('start,end', [(0,20),(100,125)])
+def test_excerpt_provenance_keeps_evidence_and_quality(client,start,end):
+    row={'text':'Original evidence, unchanged', 'text_truncated':True,
+         'excerpt':{'char_start':start,'char_end':end},'accepted':False,
+         'doc_status':'superseded','degraded':'parser fallback'}
+    before=copy.deepcopy(row)
+    text=' '.join(client.source_notes(row,'abcdef:S1'))
+    assert f'{start}–{end}' in text
+    assert 'context --ref abcdef:S1' in text
+    assert client.TXT['not_accepted'] in text
+    assert client.TXT['status_doc_superseded'] in text
+    assert 'parser fallback' in text
+    assert row==before
+
+
+@pytest.mark.parametrize('excerpt',[None,{}, {'char_start':-1,'char_end':20},
+    {'char_start':2,'char_end':2},{'char_start':True,'char_end':8},
+    {'char_start':'2','char_end':20},'invalid',[1,2]])
+def test_missing_or_invalid_excerpt_retains_readback_cue(client,excerpt):
+    row={'text':'Source','text_truncated':True,'excerpt':excerpt}
+    assert client.TXT['truncated'].format(ref='abcdef:S2') in client.source_notes(row,'abcdef:S2')
+
+
+def test_full_source_does_not_acquire_excerpt_label(client):
+    row={'text':'Full source','excerpt':{'char_start':0,'char_end':11}}
+    assert not client.source_notes(row,'abcdef:S2')
+
+
+@pytest.mark.parametrize('command,extra',[('search',['--question','Pump pressure']),
+    ('neighbors',['--entity','Pump']),('facts',['--subject','Pump'])])
+@pytest.mark.parametrize('scope,field',[(['--history'],'history'),(['--as-of','2024'],'as_of')])
+def test_time_and_library_scope_are_preserved(client,command,extra,scope,field):
+    args=client.parser().parse_args([command,'--kb','example']+extra+scope)
+    result=client.payload(args)
+    assert result.get('kbs',result.get('kb_id')) in (['example'],'example')
+    assert result.get(field) == (True if field=='history' else '2024')
+
+
+def test_document_and_phrase_references_preserve_scope_and_version(client, tmp_path, monkeypatch, capsys):
+    calls = []
+    work = tmp_path / 'cache'
+    config = tmp_path / 'client.json'
+    config.write_text(json.dumps({'base_url': 'http://unused', 'work_dir': str(work)}))
+    for key in ('CARREL_SEARCH_BASE_URL', 'CARREL_SEARCH_WORK_DIR', 'CARREL_SEARCH_TOKEN', 'KB_SEARCH_TOKEN'):
+        monkeypatch.delenv(key, raising=False)
+    def request(url, token, timeout, method, route, data=None):
+        calls.append((method, route, copy.deepcopy(data)))
+        common = {'kb_id': 'example', 'kb_name': 'Sample Library'}
+        if route == '/docs':
+            result = dict(common, docs=[{'n': 9, 'doc_id': 'doc', 'rel_path': 'folder/Guide.md', 'indexed': True,
+                                        'content_version': 'v8', 'chunk_total': 4}], total=1, count=1, limit=10, offset=8)
+        elif route == '/grep':
+            result = dict(common, time={'mode': 'as_of', 'day': '2024-12-31'}, results=[{'phrase': 'term',
+                'total_chunks': 1, 'hits': [{'point_id': 'p', 'doc_id': 'doc', 'rel_path': 'folder/Guide.md',
+                    'chunk_index': 2, 'content_version': 'v8', 'literal': True, 'snippet': 'term', 'field': 'body'}]}])
+        else:
+            result = dict(common, sources=[], retrieval_summary={})
+        return json.dumps(result).encode(), {}
+    monkeypatch.setattr(client, 'request', request)
+    base = ['--config', str(config)]
+    assert client.main(base + ['docs', '--kb', 'example', '--name', 'Guide', '--offset', '8', '--limit', '10', '--json']) == 0
+    d = json.loads(capsys.readouterr().out)
+    dref = d['call_id'] + ':D9'
+    assert client.main(base + ['grep', '--phrase', 'term', '--in-doc', dref, '--as-of', '2024', '--json']) == 0
+    g = json.loads(capsys.readouterr().out)
+    assert calls[-1] == ('POST', '/grep', {'kb_id': 'example', 'doc_ids': ['doc'], 'phrases': ['term'], 'as_of': '2024', 'limit': 8})
+    gref = g['call_id'] + ':G1'
+    assert client.main(base + ['context', '--ref', gref, '--json']) == 0
+    capsys.readouterr()
+    assert calls[-1] == ('POST', '/context', {'kb_id': 'example', 'doc_id': 'doc', 'chunk_from': 1,
+                                             'chunk_to': 3, 'content_version': 'v8'})
+    assert client.main(base + ['search', '--question', 'Meaning?', '--in-doc', dref, '--json']) == 0
+    capsys.readouterr()
+    assert calls[-1][2] == {'question': 'Meaning?', 'kbs': ['example'], 'hints': {'doc_ids': ['doc']}}
+    count = len(calls)
+    assert client.main(base + ['grep', '--kb', 'other', '--in-doc', dref, '--phrase', 'term']) == 1
+    capsys.readouterr()
+    assert len(calls) == count
+    assert client.main(base + ['show', dref, gref]) == 0
+    capsys.readouterr()
+    assert len(calls) == count
+
+
+def test_phrase_labels_are_unique_across_phrases_and_quality_survives(client):
+    r = {'kb_id': 'example', 'kb_name': 'Sample Library', 'degraded': ['index_missing'],
+         'time': {'mode': 'history'}, 'results': [
+             {'phrase': 'one', 'total_chunks': 4, 'docs_truncated': True, 'hits': [
+                 {'rel_path': 'a.pdf', 'field': 'visual', 'literal': False, 'doc_status': 'archived', 'snippet': 'first'}]},
+             {'phrase': 'two', 'hits': [{'rel_path': 'b.md', 'literal': True, 'snippet': 'second'}]}]}
+    client.number_rows(r)
+    client.add_cites(r)
+    before = copy.deepcopy(r)
+    text = '\n'.join(client.view_grep({'call_id': 'abcdef', 'operation': 'grep', 'request': {}, 'result': r}))
+    assert '[G1]' in text and '[G2]' in text
+    for value in ('index_missing', client.TXT['grep_approx'], client.TXT['picture_text'],
+                  client.TXT['status_doc_archived'], client.TXT['grep_docs_truncated'], 'first', 'second'):
+        assert value in text
+    assert r == before
+
+
+def test_old_keyword_server_is_identified_without_inventing_time_scope(client):
+    text = '\n'.join(client.view_grep({'call_id': 'abcdef', 'operation': 'grep', 'request': {}, 'result': {'results': []}}))
+    assert client.TXT['grep_legacy'] in text
+
+
+def test_keyword_image_body_and_future_document_keep_provenance(client):
+    row = {'n': 1, 'block_type': 'image', 'field': 'body', 'snippet': 'Extracted diagram description',
+           'literal': True, 'doc_status': 'not_started'}
+    e = {'call_id': 'abcdef', 'operation': 'grep', 'request': {},
+         'result': {'time': {'mode': 'history'}, 'results': [{'hits': [row]}]}}
+    text = '\n'.join(client.view_grep(e))
+    assert client.TXT['picture_text'] in text
+    assert 'source document not yet in effect today' in text
+    assert 'source document not yet in effect today' in client.source_notes(row, 'abcdef:S1')
+
+
+@pytest.mark.parametrize('operation,label', [('docs','D1'),('grep','G1')])
+def test_empty_navigation_has_no_dangling_reference(client, operation, label):
+    envelope = {'call_id': 'abcdef', 'operation': operation, 'request': {},
+                'result': {'docs': [], 'results': [{'hits': [], 'total_chunks': 0}], 'total': 0}}
+    text = '\n'.join(client.VIEWS[operation](envelope))
+    assert 'abcdef:' + label not in text
+
+
+@pytest.mark.parametrize('request_limit,cli_limit,expected', [
+    (None, None, 8), (None, 0, 0), (None, 30, 30), (17, None, 17), (17, 2, 2),
+])
+def test_phrase_limit_default_preserves_explicit_requests(client, tmp_path, request_limit, cli_limit, expected):
+    args = ['grep', '--kb', 'example', '--phrase', 'term']
+    if request_limit is not None:
+        path = tmp_path / 'request.json'
+        path.write_text(json.dumps({'limit': request_limit}))
+        args += ['--request', str(path)]
+    if cli_limit is not None:
+        args += ['--limit', str(cli_limit)]
+    assert client.payload(client.parser().parse_args(args))['limit'] == expected

@@ -1295,20 +1295,34 @@ def docs(kb_id: str, *, dir: str | None = None, name: str | None = None, include
 
 
 def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
-         doc_ids: list[str] | None = None, limit: int = 30) -> dict[str, Any]:
+         doc_ids: list[str] | None = None, limit: int = 30, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     """Literal phrase counts: in how many chunks and which documents each phrase appears, with the first few hits
     and a literal check; an unreachable keyword index is reported as 503."""
     from . import library
+    from kb_pipeline.graph import currency
 
     settings, ss, q = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     if not [p for p in phrases if str(p).strip()]:
         raise ValueError("phrases must not be empty")
+    scope = currency.query_scope(history=history, as_of=as_of)
+    source = settings.sources[kb_id]
+    if docstatus.corrections_of(settings, source).get("errors"):
+        raise RetrievalUnavailable("document status rules are unreadable; keyword counts are unavailable")
+    # Counts must use the entire exclusion set: unlike ranked search there is
+    # no later candidate filter that could repair a truncated exclusion list.
+    excluded = docstatus.excluded_paths(settings, source, scope, max_paths=None)
     try:
-        return library.grep(settings, settings.sources[kb_id], phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, limit=limit,
-                            client=channels.os_client(settings.opensearch_url), timeout=ss.channel_timeout)
+        result = library.grep(settings, source, phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, limit=limit,
+                              client=channels.os_client(settings.opensearch_url), timeout=ss.channel_timeout, excluded_paths=excluded)
     except (KeyError, ValueError, sqlite3.Error):
         raise                   # state-database errors are not the keyword index's; they go to the common error handling as they are (a lock is reported as 503)
     except Exception as exc:
         raise RetrievalUnavailable(f"opensearch: {_err(exc)}") from exc
+    result["time"] = {**scope, "excluded_documents": {kb_id: len(excluded)}}
+    for group in result.get("results") or []:
+        for row in group.get("hits") or []:
+            row["kb_id"] = kb_id
+        docstatus.annotate(settings, group.get("hits") or [], scope)
+    return result

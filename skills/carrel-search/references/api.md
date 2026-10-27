@@ -30,8 +30,10 @@ Below, `$SKILL_DIR` is the actual skill directory.
 |---|---|---|
 | `health` | GET `/health` | Status of the service and its listed dependencies, no token needed; does not prove every branch is healthy |
 | `catalog` | GET `/catalog` | Current knowledge base names, IDs, domains, document samples and graph availability, plus graph type, relationship, subject and time-coverage overviews; not required before every query |
+| `docs` | POST `/docs` | Registered documents and parse state. `--kb`, optional `--name` (path substring), `--dir` (prefix), `--limit 1..2000`, `--offset`, `--include-deleted`. Use D references with `search --in-doc` or `grep --in-doc` |
+| `grep` | POST `/grep` | Locate phrases. `--kb` or `--in-doc`; repeat `--phrase` up to eight times; `--field body/title/visual`, `--rel-path`, `--limit 0..200` (eight snippets per phrase by default), `--history`, `--as-of`. Read G references with `context --ref` |
 | `search` | POST `/search` | Retrieval. `--question` (required, at most 2000 characters), `--kb` (repeatable; without it the service routes), `--top-k 1..50`, `--block-type` (repeatable, a soft preference), `--in-doc <ref>` (repeatable; search only inside the document of that source; without `--kb` the knowledge base follows the document, and with `--kb` given and the document outside it the command fails), `--rel-path` (repeatable; a hard filter; the path inside the knowledge base, sub-folders included: the path on a source line without the knowledge base folder at its start, so for a source line naming `KB/folder/file.pdf` write `folder/file.pdf`; `catalog` lists bare file names, not paths; when no document matches, the result says so at the top), `--image file` (search by picture), `--no-context` (no neighbouring chunks), `--explain` |
-| `context` | POST `/context` | Read back a range of original text from the same version of a document. `--ref <ref>` (S, F or N) with `--before` / `--after` (1 chunk each by default; a stitched hit is read over its whole range), or `--whole` for the whole document; at most 300 chunks per command, a range of more than 60 being read in several requests and merged by the client |
+| `context` | POST `/context` | Read back a range of original text from the same version of a document. `--ref <ref>` (S, G, F or N) with `--before` / `--after` (1 chunk each by default; a stitched hit is read over its whole range), or `--whole` for the whole document; at most 300 chunks per command, a range of more than 60 being read in several requests and merged by the client |
 | `image` | GET `/image/{kb_id}/{point_id}` | The original picture, saved to the work directory; the path is printed. `--ref <ref>` |
 | `crop` | POST `/crop` | Deterministic crop of the original picture. `--ref <ref> --bbox x0,y0,x1,y1`, optionally `--pad 0..200` |
 | `neighbors` | POST `/graph/neighbors` | One-hop relations of an entity. `--ref <ref>`, or `--kb` with `--entity name` / `--entity-id`; `--type` (repeatable, only these predicates), `--direction both/out/in`, `--limit 1..100` (20 by default) |
@@ -41,7 +43,7 @@ Below, `$SKILL_DIR` is the actual skill directory.
 | `stats` | POST `/graph/stats` | `--kb`; graph coverage and type statistics |
 | `show` | — | `show <call id>:<label>` (several at once are fine): the full text of a source or page, every field (JSON) of any other entry, and of sources and pages too with `--json`; `show <call id>` prints the compact view of that call again, page N of it with `--page N` |
 
-`search`, `neighbors`, and `facts` accept `--history` (include superseded and expired records) and `--as-of YYYY-MM-DD` (a historical date; year and month forms use their last day). The default is current evidence.
+`search`, `grep`, `neighbors`, and `facts` accept `--history` (include superseded and expired records) and `--as-of YYYY-MM-DD` (a historical date; year and month forms use their last day). The default is current evidence.
 
 Every command also takes `--json` (print the complete response instead of the compact view) and `--output new-file` (save another copy; for pictures, save there instead). `--request file` still passes a JSON request body directly and is rarely needed.
 
@@ -66,8 +68,12 @@ Labels:
 | `R` | A relation matching the question (for `show` only; it cannot follow `--ref`) | `search` |
 | `H` | The one-hop neighbourhood of a subject; `H1.2` is the second relation of the first subject | `search` |
 | `N` | A relation returned by a neighbourhood lookup | `neighbors` |
+| `D` | A registered document; a scope for `--in-doc` | `docs` |
+| `G` | A phrase hit; a versioned chunk for `context --ref` | `grep` |
 
-What `--ref` takes: `context` / `image` / `crop` need a chunk, so `S` stands for itself and `N` and `F` for their first evidence chunk (for a fact, the chunk holding its value comes first when that can be told); `neighbors` / `facts` need an entity, so `E` and `H` stand for themselves and `H1.2` and `N` for the far end of the relation; an `R` names its two ends by title only, without entity IDs, and is no starting point: the error message gives the lookup by name instead. Pointing at the wrong kind is reported as an error. So is a reference to an entry of another knowledge base than the one named with `--kb`: the client neither switches nor widens the scope. Labels are independent per call, which is why a reference carries the call id.
+`docs` confirms file registration and parse state, not semantic coverage. `grep` counts keyword-analyzer phrase matches and checks normalized literal presence only in the returned snippets. Zero hits do not establish semantic absence. Counts reflect current indexed content versions; `--history` includes archived or superseded documents, not old deleted parse versions. A server without the new `time` response is identified in the compact view; use its hits as navigation leads and confirm current evidence with search/context.
+
+What `--ref` takes: `context` / `image` / `crop` need a chunk, so `S` and `G` stand for themselves and `N` and `F` for their first evidence chunk (for a fact, the chunk holding its value comes first when that can be told); `neighbors` / `facts` need an entity, so `E` and `H` stand for themselves and `H1.2` and `N` for the far end of the relation; an `R` names its two ends by title only, without entity IDs, and is no starting point: the error message gives the lookup by name instead. Pointing at the wrong kind is reported as an error. So is a reference to an entry of another knowledge base than the one named with `--kb`: the client neither switches nor widens the scope. Labels are independent per call, which is why a reference carries the call id.
 
 Where an entry comes from (file path and place) is printed in full the first time it appears in a view; later entries from the same place say "same citation as S3", and entries from the same file but another place "same file as S1" followed by their own place.
 
@@ -138,3 +144,9 @@ The text of a fact row is a statement the pipeline composed from extracted field
 ## Errors
 
 On failure one line of JSON is written to stderr and the exit code is non-zero; an empty result is never returned silently. A mistyped label, a reference of the wrong kind, or a call whose stored response has been removed is reported as an error without sending a request.
+
+## Relevant excerpts and follow-up evidence
+
+When the source budget is tight, the service may select a contiguous query-relevant passage with `text_truncated=true`. `excerpt.char_start/char_end` records its character range in the original chunk (zero-based, end exclusive). The compact view retains the range and a `context --ref` cue; the passage is not rewritten. Older responses without offsets retain the existing readback cue.
+
+An entity reference does not inherit the preceding request's time conditions. Carry the question's library, document and `--as-of` / `--history` scope into subsequent `search`, `neighbors` and `facts` calls. Use `facts --in-doc` for facts restricted to one document; a neighbourhood can include other documents, so check each source against the user's allowed scope.

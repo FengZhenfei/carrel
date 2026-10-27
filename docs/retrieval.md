@@ -39,14 +39,19 @@ command points at it with `--ref <call id>:<label>` instead of retyping IDs:
 `show 3fa2c1:F2` prints an entry in full. `--json` prints the complete
 response instead.
 
-The skill starts with one search and answers from the evidence, followed by
-reference files and useful graph follow-ups. A specific evidence gap may prompt
-one targeted fact or neighbourhood lookup. Original images can accompany an
-answer after inspection, with their document and figure/page in the caption.
-Low-confidence or conflicting readings are checked against the source; historical
-series summaries remain leads until their individual values are verified.
-Whole-document reads serve explicit, complete item-by-item requests; summaries
-and scope comparisons use the retrieved evidence and focused context.
+The skill starts with one search. Simple questions use the returned evidence;
+comparisons and synthesis check the requested subjects, facts and conditions,
+then fill specific gaps through focused searches, source context or graph
+lookups. A relevant intermediate entity can lead to a second hop when a
+necessary connection is missing. Each step preserves the question's scope,
+and retrieval stops when the evidence suffices or no useful lead remains.
+
+Original images can accompany an answer after inspection, with their document
+and figure/page in the caption. Low-confidence readings, version differences
+and conflicting facts are checked against the source. Related excerpts retain
+their original character range and can be read in full through `context`.
+Whole-document reads serve explicit, complete item-by-item requests. Answers
+include the files used and worthwhile follow-up directions.
 
 How long an answer takes depends mostly on the agent's reasoning effort, not on
 the service: retrieval returns within seconds and the rest is the agent
@@ -379,7 +384,14 @@ carries `n` (its position in the whole result), `doc_id`, `rel_path`,
 trimming), optional `rel_paths` and `doc_ids` (up to 500 each) to restrict the
 scope, `fields` (any of `body`, `title`, and `visual`; all three by default),
 and `limit` (hits returned per phrase, 30 by default, at most 200; `0` returns
-counts only).
+counts only). `history` and `as_of` select the same document-status scope as
+search; by default, superseded, archived and out-of-validity documents are excluded
+before counting. Each hit includes its `content_version` for readback, and `time`
+reports the selected scope and excluded-document count.
+
+The bundled client exposes these routes as `docs --kb ID --name "filename"`
+and `grep --kb ID --phrase "term"`. D references can constrain `search --in-doc`;
+G references open the surrounding original text through `context --ref`.
 
 - The response carries `kb_name`, `fields` (the fields searched), `scope` (how
   many `rel_paths` and `doc_ids` restrict it), `note` (how to read the

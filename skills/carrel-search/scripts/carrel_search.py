@@ -25,7 +25,7 @@ import urllib.request
 import uuid
 
 KEEP_SECONDS = 86400              # responses and pictures in the work directory older than a day are removed
-REF_RE = re.compile(r"^([0-9a-f]{6}):([SFPERHN])(\d+)(?:\.(\d+))?$")
+REF_RE = re.compile(r"^([0-9a-f]{6}):([SFPERHNDG])(\d+)(?:\.(\d+))?$")
 STORED_RE = re.compile(r"^[0-9a-f]{6}(-[A-Za-z0-9.\-]+)?\.(json|png|jpg|jpeg|webp|gif|bmp|img)$")
 # One printed output stays below what agent harnesses show inline: Claude Code moves a tool output above 30,000 bytes
 # into a file and shows a 2 KB preview, which costs the agent further steps. Nothing is dropped to get there: what does
@@ -75,8 +75,8 @@ TXT = {
     "kb": "knowledge base: {names}",
     "ref_hint": "Point at an entry as {id}:{label} after --ref: context (read the original), image / crop (see the picture), neighbors (walk the graph), facts (facts under it); show {id}:{label} prints its full text or every field",
     "full": "complete response: {path}",
-    "next": "▶ Answer directly from the result above, in this order: the answer, the reference files, numbered follow-ups. No walking along the graph this turn; pick the follow-ups from the graph leads, each one hop from one entity.",
-    "next_hop": "▶ Answer only the follow-up the user picked and go no further; then list the reference files as before and offer new numbered follow-ups.",
+    "next": '▶ Check required items against the source text and valid facts already returned. Answer when supported; use the skill to fill only a specific gap. Include reference files and worthwhile follow-ups.',
+    "next_hop": '▶ Check whether these relations support the current question; follow a missing connection or read its source as needed under the skill, then answer.',
     "state": "evidence: {state}",
     "hits": "{hits} hits",
     "neighbors_n": "{n} neighbouring chunks",
@@ -110,6 +110,7 @@ TXT = {
     "not_accepted": "below the relevance threshold; a lead only",
     "unranked": "relevance not confirmed",
     "truncated": "text truncated; context --ref {ref} when needed",
+    "excerpt": 'Relevant source excerpt (characters {start}–{end}, zero-based, end exclusive); full text: context --ref {ref}',
     "stitched": "stitched with adjacent chunks",
     "boilerplate": "boilerplate page",
     "parse_degraded": "parsing degraded: {why}",
@@ -158,8 +159,28 @@ TXT = {
     "lp": " (", "rp": ")", "list": ", ", "semi": "; ", "colon": ": ", "ql": "\"", "qr": "\"", "dot": " · ",
 }
 
+TXT.update({'docs_inventory': 'Document inventory: confirms registered files and parse state, not semantic coverage or '
+                   'factual absence.',
+ 'docs_totals': 'Files {files}; indexed {indexed}; not indexed {pending}.',
+ 'doc_indexed': 'indexed',
+ 'doc_not_indexed': 'not indexed',
+ 'docs_follow': 'Locate within a listed document: search --question ... --in-doc {id}:D1',
+ 'grep_counts': 'Counts use keyword-analyzer phrase matches, not exact occurrence counts. Literal checks '
+                'cover returned snippets only; index repair may still be pending.',
+ 'grep_legacy': 'This server did not report a time scope; treat matches as navigation leads and verify '
+                'current evidence with search/context.',
+ 'grep_group': 'Phrase {phrase}: {chunks} chunks in {docs} listed documents; {literal}/{checked} returned '
+               'hits contain the normalized literal phrase.',
+ 'grep_docs_truncated': 'The matching document list is incomplete.',
+ 'grep_more': 'Only the first hits are shown, ordered by file and chunk; narrow by document/path for more.',
+ 'grep_literal': 'literal in normalized text',
+ 'grep_approx': 'analyzer match only',
+ 'grep_docs': 'Matching documents: ',
+ 'grep_follow': 'Read around a hit: context --ref {id}:G1; a missing phrase is not proof that the subject is '
+                'absent.'})
+
 LABEL_LISTS = {"S": ("sources",), "F": ("specs", "facts"), "P": ("pages",), "E": ("entities",), "R": ("relationships",),
-               "H": ("neighborhoods",), "N": ("neighbors",)}
+               "H": ("neighborhoods",), "N": ("neighbors",), "D": ("docs",), "G": ()}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -283,6 +304,12 @@ def number_rows(result):
     for i, row in enumerate(result.get("neighbors") or [], 1):
         if isinstance(row, dict):
             row.setdefault("n", i)
+    number = 0
+    for group in result.get('results') or []:
+        for row in group.get('hits') or []:
+            if isinstance(row, dict):
+                number += 1
+                row['n'] = number
     offset = int(result.get("offset") or 0)
     for i, row in enumerate(result.get("entities") or [], 1):
         if isinstance(row, dict):
@@ -307,7 +334,8 @@ def resolve(work, ref):
     call_id, letter, num, sub = m.group(1), m.group(2), int(m.group(3)), m.group(4)
     envelope = stored(work, call_id)
     result = envelope.get("result") or {}
-    rows = next((result[k] for k in LABEL_LISTS[letter] if isinstance(result.get(k), list)), None)
+    rows = ([row for group in result.get('results') or [] for row in group.get('hits') or []] if letter == 'G'
+            else next((result[k] for k in LABEL_LISTS[letter] if isinstance(result.get(k), list)), None))
     entry = next((r for r in rows or [] if isinstance(r, dict) and r.get("n") == num), None)
     if entry is None:
         raise ValueError("response " + call_id + " has no entry " + letter + str(num))
@@ -359,12 +387,79 @@ def chunk_of(envelope, letter, entry):
         row = next((by_n[n] for n in entry.get("sources") or [] if n in by_n), None)
         if row is None:
             raise ValueError("this fact names no chunk in the response; look inside its document instead: search --question ... --rel-path <path in the knowledge base>")
-    elif letter != "S":
-        raise ValueError("this entry is not a chunk; use an S, N or F reference")
+    elif letter not in ("S", "G"):
+        raise ValueError("this entry is not a chunk; use an S, G, N or F reference")
     kb = row.get("kb_id") or entry.get("kb_id") or result.get("kb_id")
     if not kb or not row.get("point_id"):
         raise ValueError("the referenced entry carries no chunk")
     return str(kb), row
+
+
+def document_of(envelope, letter, entry):
+    """Document references need no point id; chunk references retain their version."""
+    if letter == 'D':
+        kb = entry.get('kb_id') or (envelope.get('result') or {}).get('kb_id')
+        if not kb or not entry.get('doc_id'):
+            raise ValueError('the referenced entry carries no document')
+        return str(kb), entry
+    return chunk_of(envelope, letter, entry)
+
+
+def view_docs(envelope, limit=PAGE_BYTES):
+    r = envelope['result']
+    out = [head(envelope), TXT['docs_inventory']]
+    totals = r.get('totals') or {}
+    out.append(TXT['docs_totals'].format(files=totals.get('files', r.get('total', 0)), indexed=totals.get('indexed', '?'),
+                                        pending=totals.get('not_indexed', '?')))
+    out += page_bits(r, len(r.get('docs') or []))
+    files = Files()
+    for row in r.get('docs') or []:
+        label = 'D' + str(row.get('n'))
+        bits = [TXT['doc_indexed'] if row.get('indexed') else TXT['doc_not_indexed'],
+                str(row.get('status') or ''), str(row.get('chunk_total') or 0) + ' chunks']
+        out.append('[' + label + '] ' + str(row.get('cite') or row.get('rel_path') or '') + par(*bits))
+        if row.get('last_error'):
+            out.append('  ' + flat((row['last_error'] or {}).get('message'), 300))
+        files.add(label, row.get('file'))
+    out += files.lines()
+    if r.get('docs'):
+        out.append(TXT['docs_follow'].format(id=envelope['call_id']))
+    return out
+
+
+def view_grep(envelope, limit=PAGE_BYTES):
+    r = envelope['result']
+    out = [head(envelope), TXT['grep_counts']]
+    if r.get('time'):
+        out += scope_lines(r['time'])
+    else:
+        out.append(TXT['grep_legacy'])
+    if r.get('degraded'):
+        out.append(TXT['degraded'].format(items='; '.join(str(x) for x in r['degraded'])))
+    files = Files()
+    for group in r.get('results') or []:
+        docs, hits = group.get('docs') or [], group.get('hits') or []
+        out += ['', TXT['grep_group'].format(phrase=group.get('phrase'), chunks=group.get('total_chunks', 0),
+                                             docs=len(docs), checked=group.get('literal_checked', len(hits)),
+                                             literal=group.get('literal_true', 0))]
+        if group.get('docs_truncated'):
+            out.append(TXT['grep_docs_truncated'])
+        if group.get('total_chunks', 0) > len(hits):
+            out.append(TXT['grep_more'])
+        for row in hits:
+            label = 'G' + str(row.get('n'))
+            flags = [TXT['grep_literal'] if row.get('literal') else TXT['grep_approx'],
+                     TXT['picture_text'] if row.get('field') == 'visual' or row.get('block_type') == 'image' else str(row.get('field') or '')]
+            flags += source_notes(row, envelope['call_id'] + ':' + label)
+            out.append('[' + label + '] ' + str(row.get('cite') or row.get('rel_path') or '') + par(*flags))
+            out.append(str(row.get('snippet') or ''))
+            files.add(label, row.get('file'))
+        if not hits and docs:
+            out.append(TXT['grep_docs'] + TXT['semi'].join(str(d.get('rel_path')) + par(d.get('chunks')) for d in docs))
+    out += files.lines()
+    if any(group.get('hits') for group in r.get('results') or []):
+        out.append(TXT['grep_follow'].format(id=envelope['call_id']))
+    return out
 
 
 # ── compact view ──
@@ -579,6 +674,8 @@ def source_notes(s, ref, parent=None, position=False):
     notes = []
     if s.get("doc_status") in ("superseded", "archived"):
         notes.append(TXT["status_doc_archived" if s["doc_status"] == "archived" else "status_doc_superseded"])
+    if s.get("doc_status") == "not_started":
+        notes.append('source document not yet in effect today')
     if parent is not None:
         notes.append(TXT["neighbor_of"].format(label=parent))
     elif s.get("accepted") is False:
@@ -586,7 +683,12 @@ def source_notes(s, ref, parent=None, position=False):
     elif s.get("accepted") is None and s.get("role") == "hit":
         notes.append(TXT["unranked"])
     if s.get("text_truncated"):
-        notes.append(TXT["truncated"].format(ref=ref))
+        excerpt = s.get("excerpt") if isinstance(s.get("excerpt"), dict) else {}
+        start, end = excerpt.get("char_start"), excerpt.get("char_end")
+        if type(start) is int and type(end) is int and 0 <= start < end:
+            notes.append(TXT["excerpt"].format(start=start, end=end, ref=ref))
+        else:
+            notes.append(TXT["truncated"].format(ref=ref))
     if s.get("stitched"):
         notes.append(TXT["stitched"])
     if s.get("boilerplate"):
@@ -1012,7 +1114,7 @@ def view_stats(envelope, limit=PAGE_BYTES):
 
 
 VIEWS = {"search": view_search, "context": view_context, "neighbors": view_neighbors, "entities": view_entities, "facts": view_facts,
-         "catalog": view_catalog, "schema": view_schema, "stats": view_stats}
+         "catalog": view_catalog, "schema": view_schema, "stats": view_stats, "docs": view_docs, "grep": view_grep}
 
 
 BLOCK_RE = re.compile(r"^(\[(?:[0-9a-f]{6}:)?[A-Z]\d+(?:\.\d+)?\] |▶ )")
@@ -1121,6 +1223,32 @@ def compact(envelope, path, limit=PAGE_BYTES, page=1):
 def payload(args, work=None):
     data = read_object(args.request) if getattr(args, "request", None) else {}
     ref = resolve(work, args.ref) if getattr(args, "ref", None) else None
+    if args.command in ('docs', 'grep'):
+        if args.kb:
+            data['kb_id'] = args.kb
+        for key in ('limit', 'offset', 'dir', 'name'):
+            if getattr(args, key, None) is not None:
+                data[key] = getattr(args, key)
+        if args.command == 'docs' and args.include_deleted:
+            data['include_deleted'] = True
+        if args.command == 'grep':
+            data.setdefault('limit', 8)
+            if args.phrase:
+                data['phrases'] = args.phrase
+            if args.field:
+                data['fields'] = args.field
+            if args.rel_path:
+                data['rel_paths'] = args.rel_path
+            for item in args.in_doc or []:
+                kb, row = document_of(*resolve(work, item)[:3])
+                within([data['kb_id']] if data.get('kb_id') else [], kb, '--in-doc ' + item)
+                data['kb_id'] = kb
+                data.setdefault('doc_ids', []).append(row['doc_id'])
+            time_scope(args, data)
+            if not data.get('phrases'):
+                raise ValueError('grep requires --phrase or phrases in --request')
+        if not data.get('kb_id'):
+            raise ValueError(args.command + ' requires --kb' + (' or --in-doc' if args.command == 'grep' else ''))
     if args.command == "search":
         if args.question is not None:
             data["question"] = args.question
@@ -1133,7 +1261,7 @@ def payload(args, work=None):
             hints["rel_paths"] = args.rel_path
         named = list(data.get("kbs") or [])         # named by the caller (--kb or the request file): never widened
         for item in args.in_doc or []:
-            kb, row = chunk_of(*resolve(work, item)[:3])
+            kb, row = document_of(*resolve(work, item)[:3])
             if not row.get("doc_id"):
                 raise ValueError("the referenced entry carries no document id: " + item)
             within(named, kb, "--in-doc " + item)
@@ -1234,7 +1362,7 @@ def payload(args, work=None):
             if getattr(args, key, None):
                 data[field] = getattr(args, key)
         if getattr(args, "in_doc", None):
-            kb, row = chunk_of(*resolve(work, args.in_doc)[:3])
+            kb, row = document_of(*resolve(work, args.in_doc)[:3])
             within([data["kb_id"]] if data.get("kb_id") else [], kb, "--in-doc " + args.in_doc)
             if not row.get("doc_id"):
                 raise ValueError("the referenced entry carries no document id: " + args.in_doc)
@@ -1342,7 +1470,7 @@ def parser():
     p.add_argument("--timeout", type=float, help="HTTP timeout seconds (default 60); no automatic retries")
     sub = p.add_subparsers(dest="command", required=True)
     ref_help = "An entry of an earlier response: <call id>:<label>, e.g. 3fa2c1:S3"
-    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors", "entities", "facts", "schema", "stats", "show"):
+    for name in ("health", "catalog", "search", "context", "image", "crop", "neighbors", "entities", "facts", "schema", "stats", "docs", "grep", "show"):
         cmd = sub.add_parser(name)
         if name == "show":
             cmd.add_argument("refs", nargs="+", help="A call id (prints its compact view again) or references such as 3fa2c1:S3")
@@ -1351,14 +1479,27 @@ def parser():
             continue
         cmd.add_argument("--output", help="Also save to this new file (pictures: save here instead of the work directory)")
         cmd.add_argument("--json", action="store_true", help="Print the complete response instead of the compact view")
-        if name in ("search", "context", "crop", "neighbors", "entities", "facts", "schema", "stats"):
+        if name in ("search", "context", "crop", "neighbors", "entities", "facts", "schema", "stats", "docs", "grep"):
             cmd.add_argument("--request", help="UTF-8 JSON request file, or - for stdin")
-        if name in ("search", "neighbors", "facts"):
+        if name in ("search", "neighbors", "facts", "grep"):
             cmd.add_argument("--history", action="store_true",
                              help="Also what is no longer in effect: replaced statements, ended relations, documents marked replaced or archived")
             cmd.add_argument("--as-of", help="Look back to a day: YYYY, YYYY-MM or YYYY-MM-DD (a year or month means its last day)")
         if name in ("context", "image", "crop", "neighbors", "facts"):
             cmd.add_argument("--ref", help=ref_help)
+        if name in ('docs', 'grep'):
+            cmd.add_argument('--kb', help='Knowledge base ID')
+            cmd.add_argument('--limit', type=int, choices=range(0 if name == 'grep' else 1, 201 if name == 'grep' else 2001), metavar='N')
+        if name == 'docs':
+            cmd.add_argument('--name', help='Filename or relative-path substring')
+            cmd.add_argument('--dir', help='Directory prefix within this knowledge base')
+            cmd.add_argument('--offset', type=int, help='Skip documents for paging')
+            cmd.add_argument('--include-deleted', action='store_true', help='Also list deleted document records')
+        if name == 'grep':
+            cmd.add_argument('--phrase', action='append', help='Phrase to locate; repeat for up to eight')
+            cmd.add_argument('--field', action='append', choices=('body', 'title', 'visual'))
+            cmd.add_argument('--in-doc', action='append', metavar='REF', help='Only documents named by D/S/G/F references')
+            cmd.add_argument('--rel-path', action='append', help='Exact path within the knowledge base')
         if name == "context":
             cmd.add_argument("--before", type=int, default=1, help="Chunks to read before the referenced one (default 1)")
             cmd.add_argument("--after", type=int, default=1, help="Chunks to read after the referenced one (default 1)")
@@ -1487,7 +1628,7 @@ def main(argv=None):
             method, data = "GET", None
         elif args.command in ("neighbors", "entities", "facts", "schema", "stats"):
             route, method, data = "/graph/" + args.command, "POST", payload(args, work)
-        elif args.command in ("search", "context", "crop"):
+        elif args.command in ("search", "context", "crop", "docs", "grep"):
             route, method, data = "/" + args.command, "POST", payload(args, work)
             if args.command == "crop" and args.ref:
                 tag = args.ref.replace(":", "-") + "-crop"
