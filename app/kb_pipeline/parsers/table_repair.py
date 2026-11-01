@@ -18,13 +18,14 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Callable
 
+from ..parse_cache import reusable_in_run, write_cache
 from ..models import ParsedBlock
 from ..vision.vlm import DEFAULT_MAX_PIXELS, _client_for, image_data_url
 from ..vision.images import file_hash
-from .common import grid_to_markdown, html_table_to_grid
+from .common import grid_to_markdown, html_table_to_grid, html_table_spans
 from .table_check import GLUED_KINDS, expand_glued_rows, high_confidence
 from .errors import JobCancelled
-from .pdf_evidence import normalize_ranges
+from .pdf_evidence import normalize_ranges, _span_present, _norm as _evidence_norm
 
 TABLE_ROWS_PROMPT = """This image is a table cropped from a document. Some cells contain several lines stacked vertically (one line per test condition), and an OCR pass merged those lines into one string.
 The table has {width} columns; its header row reads: {header}.
@@ -58,7 +59,7 @@ def transcribe_table(image: Path, *, prompt: str, base_url: str, api_key: str, m
             saved = json.loads(cache.read_text())
         except (OSError, ValueError):
             saved = {}
-        if isinstance(saved, dict) and saved.get("_cache") == identity:
+        if isinstance(saved, dict) and reusable_in_run(saved) and saved.get("_cache") == identity:
             return saved["data"]
     response = _client_for(base_url, api_key).chat.completions.create(model=model_id,
         messages=[{"role": "user", "content": [{"type": "text", "text": prompt},
@@ -74,7 +75,7 @@ def transcribe_table(image: Path, *, prompt: str, base_url: str, api_key: str, m
         return {}
     if result["rows"]:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps({"_cache": identity, "data": result}, ensure_ascii=False))
+        write_cache(cache, {"_cache": identity, "data": result})
     return result
 
 
@@ -190,6 +191,78 @@ def _verified_row_key(old: list[list[str]], new: list[list[str]], index: int, sp
     return True
 
 
+def _identity_columns(rows: list[list[str]]) -> int:
+    # A repeated first-column category is common. The shortest unique populated
+    # prefix identifies a row without depending on a domain or a model response.
+    if not rows or not rows[0]:
+        return 0
+    for width in range(1, min(3, len(rows[0])) + 1):
+        keys = [tuple(_norm(c).rstrip(":：") for c in row[:width]) for row in rows]
+        if all(all(k) for k in keys) and len(set(keys)) == len(keys):
+            return width
+    return 0
+
+
+def _expand_review_spans(old, new, html):
+    """Apply only source-declared merged positions; never infer spans from the VLM."""
+    out = [list(row) for row in new]
+    if len(old) != len(out) or any(len(a) != len(b) for a,b in zip(old,out)):
+        return out
+    for row, col, height, width in html_table_spans(html):
+        if row + height > len(out) or any(col + width > len(out[r]) for r in range(row, row+height)):
+            continue
+        value = out[row][col]
+        positions = [(r,c) for r in range(row,row+height) for c in range(col,col+width)]
+        if value and all(not out[r][c] or _norm(out[r][c]) == _norm(value) for r,c in positions):
+            for r,c in positions:
+                out[r][c] = value
+    return out
+
+
+def _native_row_text(rows, index, width, spans):
+    """Text in a row band anchored by a unique source key; empty when ambiguous."""
+    anchors = []
+    for row in rows:
+        choices = []
+        for cell in row[:width]:
+            key = _norm(cell).rstrip(":：")
+            found = [s for s in spans if key and s.get("bbox") and key in _norm(s.get("text", ""))]
+            if len(found) == 1:
+                choices.append(found[0])
+        anchor = min(choices, key=lambda s: s["bbox"][0]) if choices else None
+        anchors.append(anchor["bbox"] if anchor else None)
+    if anchors[index] is None:
+        return ""
+    centers = [(b[1]+b[3])/2 if b else None for b in anchors]
+    known = [y for y in centers if y is not None]
+    if any(a >= b for a,b in zip(known,known[1:])):
+        return ""
+    y = centers[index]
+    height = max(anchors[index][3]-anchors[index][1], 1)
+    lo = (centers[index-1]+y)/2 if index and centers[index-1] is not None else y-height
+    hi = (centers[index+1]+y)/2 if index+1<len(rows) and centers[index+1] is not None else y+height
+    return "\n".join(s.get("text", "") for s in spans if s.get("bbox")
+        and lo <= (s["bbox"][1]+s["bbox"][3])/2 < hi)
+
+
+def _review_row(old, new, native, row_native, native_cells=None):
+    # A cropped/duplicated OCR cell may be a substring of the full printed cell.
+    # Expansion needs independent evidence in this row; numbers and signs still
+    # go through the existing column-by-column checks.
+    # A value visible somewhere in the table is not proof that an empty cell
+    # owns it, especially with merged rows. Require aligned native cell evidence.
+    for j, (before, after) in enumerate(zip(old, new)):
+        if not before.strip() and after.strip():
+            if not native_cells or _norm(after) != _norm(native_cells[j]):
+                return False
+    expanded = list(old)
+    for j,(a,b) in enumerate(zip(old,new)):
+        if (a.strip() and _norm(a) != _norm(b) and not re.search(r"\d", a+b)
+                and _norm(a) in _norm(b) and _norm(b) in _norm(row_native)):
+            expanded[j] = b
+    return _review_preserves_rows([expanded], [new], native)
+
+
 def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                       model_id: str, cache_dir: Path, vlm_options: dict | None = None) -> dict[str, int]:
     stats = {"requested": 0, "accepted": 0, "unverified": 0}
@@ -202,8 +275,15 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
         original = block.table_markdown or block.text
         accepted = False
         old_grid = _pipe_grid(original)
-        keys = [_norm(row[0]).rstrip(":：") for row in old_grid if row]
-        alignable = bool(keys) and all(keys) and len(set(keys)) == len(keys)
+        identity_width = _identity_columns(old_grid)
+        alignable = identity_width > 0
+        native_grid = block.metadata.get("table_native_grid") or []
+        if (not identity_width or len(native_grid) != len(old_grid)
+                or any(len(a) != len(b) for a, b in zip(old_grid, native_grid))
+                or any([_norm(c).rstrip(":：") for c in a[:identity_width]] !=
+                       [_norm(c).rstrip(":：") for c in b[:identity_width]]
+                       for a,b in zip(old_grid,native_grid))):
+            native_grid = []
         if api_key and image.is_file() and alignable:
             stats["requested"] += 1
             prompt = TABLE_EVIDENCE_PROMPT + "\n" + json.dumps({"text": native, "legend": legend}, ensure_ascii=False)
@@ -219,12 +299,21 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
             new_grid = data.get("rows") or []
             if not all(isinstance(row, list) and all(isinstance(c, str) for c in row) for row in new_grid):
                 new_grid = []
+            new_grid = _expand_review_spans(old_grid, new_grid, str((block.metadata.get("source_item") or {}).get("table_body") or ""))
             verified = []
             if (not data.get("error") and len(new_grid) == len(old_grid)
                     and all(len(a) == len(b) for a, b in zip(old_grid, new_grid))):
-                verified = [_review_preserves_rows([a], [b], native) or
-                    _verified_row_key(old_grid, new_grid, i, block.metadata.get("table_native_spans") or [])
+                spans = block.metadata.get("table_native_spans") or []
+                verified = [(
+                    [_norm(c).rstrip(":：") for c in a[:identity_width]] ==
+                    [_norm(c).rstrip(":：") for c in b[:identity_width]] and
+                    _review_row(a, b, native, _native_row_text(old_grid, i, identity_width, spans),
+                                native_grid[i] if native_grid else None)) or
+                    _verified_row_key(old_grid, new_grid, i, spans)
                     for i, (a, b) in enumerate(zip(old_grid, new_grid))]
+            if verified and any(not ok and any(not a.strip() and b.strip() for a,b in zip(old,new))
+                                for old,new,ok in zip(old_grid,new_grid,verified)):
+                block.metadata["table_cell_alignment_unverified"] = True
             if verified and any(verified):
                 new_grid = [b if ok else a for a, b, ok in zip(old_grid, new_grid, verified)]
                 # Keep source caption/footnotes outside the actual grid.
@@ -236,7 +325,11 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 block.table_markdown = "\n".join(notes + [body] + (["LEGEND: " + legend] if legend and _norm(legend) not in _norm(existing) else [])
                                                 + ["VISUAL LEGEND: " + f for f in facts])
                 block.text = block.table_markdown
-                accepted = all(verified)
+                # Passing unchanged rows does not prove that missing source text
+                # was recovered. Preserve the review flag and source supplement
+                # until every originally missing span is represented.
+                accepted = all(verified) and all(_span_present(s, _evidence_norm(block.text).replace("|", ""))
+                    for s in block.metadata.get("table_missing_spans") or [])
                 block.metadata["table_review"] = {"status": "accepted" if accepted else "partial", "model": model_id,
                                                    "rows_verified": sum(verified), "rows_total": len(verified)}
                 if accepted:
@@ -249,6 +342,10 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
             # Retain independently read text as evidence, without inventing a cell
             # assignment. This also works when no VLM is configured.
             missing = block.metadata.get("table_missing_spans") or []
+            if block.metadata.get("table_cell_alignment_unverified") and native:
+                # Keep the source's labelled rows, including one-character values,
+                # when the model cannot establish which empty cell owns a value.
+                missing = [native]
             evidence = "\n".join(s for s in dict.fromkeys(missing + ([legend] if legend else []))
                                  if s and _norm(s) not in _norm(original))
             if evidence:
@@ -320,7 +417,7 @@ def transcribe_rows(image_path: Path, *, base_url: str, api_key: str, model_id: 
             cached = json.loads(cache_json.read_text(encoding="utf-8"))
         except Exception:
             cached = None
-        if isinstance(cached, dict) and cached.get("_cache") == identity:
+        if isinstance(cached, dict) and reusable_in_run(cached) and cached.get("_cache") == identity:
             return _parse_rows(json.dumps(cached.get("data") or {}))
     client = _client_for(base_url, api_key)
     resp = client.chat.completions.create(
@@ -334,8 +431,7 @@ def transcribe_rows(image_path: Path, *, base_url: str, api_key: str, model_id: 
     rows = _parse_rows(content)
     if cache_json and rows:
         cache_json.parent.mkdir(parents=True, exist_ok=True)
-        cache_json.write_text(json.dumps({"data": {"rows": rows}, "_cache": identity}, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+        write_cache(cache_json, {"data": {"rows": rows}, "_cache": identity})
     return rows
 
 

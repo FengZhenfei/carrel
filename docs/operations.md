@@ -20,6 +20,8 @@ language switch. Saving settings only stores configuration. Use full re-parse
 after changing chunking; parser version changes can requeue affected files
 automatically on the next scan.
 
+**Re-parse** and **Re-parse all** call the document parser and VLM again, including table review, replace their cached output, and replace each file’s active chunks and retrieval indexes. Normal incremental parsing still reuses caches. Automatic retries reuse work completed during the same task.
+
 Disabling a knowledge base deactivates its indexes and starts its retention
 lifecycle. Re-enabling during retention can restore it. Folder rename detection
 can retain the same ID; ambiguous matches can be resolved through the console's

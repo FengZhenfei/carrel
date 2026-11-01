@@ -310,16 +310,17 @@ const ZH_EN = {
   "全部状态": "All statuses",
   "待解析 / 排队": "Pending / queued",
   "解析中": "Parsing",
-  "有切块提示": "Chunking notes",
+  "有解析提示": "Parsing notes",
   "重新解析中,旧切片仍可用": "Re-parsing; the old chunks stay available",
   "等待重新解析": "Waiting to re-parse",
   "上次到:": "Last reached: ",
-  " · {0} 个有切块提示": " · {0} with chunking notes",
+  " · {0} 个有解析提示": " · {0} with parsing notes",
   "暂无文件(等待同步或扫描)": "No files yet (waiting for sync or scan)",
   "没有符合筛选条件的文件": "No files match the filter",
   "大小": "Size",
   "切片": "Chunks",
-  "切块诊断": "Chunk check",
+  "解析提示": "Parsing notes",
+  "无提示": "No notes",
   "入库时间": "Indexed at",
   "状态": "Status",
   "通过": "Passed",
@@ -340,13 +341,14 @@ const ZH_EN = {
   "未核验的粘连值:": "Unverified merged values: ",
   "表格粘连": "Merged table cells",
   " · {0} 片": " · {0} chunks",
-  "这份文件入库时还没有切块诊断": "This file was indexed before chunk checks existed",
-  "切块验收通过": "Chunk check passed",
+  "暂无解析诊断记录": "No parsing diagnostics recorded",
+  "无解析提示": "No parsing notes",
   "{0} 层×{1}": "level {0} ×{1}",
   "切片 / {0} 个块": "chunks / {0} blocks",
   "均长 token · σ {0}": "mean tokens · σ {0}",
   "最短 – 最长": "shortest – longest",
   "碎片": "Fragments",
+  "短文本": "Short text",
   "超预算": "over budget",
   "标题 · 补认 {0}": "headings · {0} inferred",
   " · 深度 {0}": " · depth {0}",
@@ -969,6 +971,48 @@ function t(s, ...args) {
   return args.length ? out.replace(/\{(\d+)\}/g, (m, i) => (args[+i] === undefined ? m : String(args[+i]))) : out;
 }
 
+// Diagnostics use stable backend keys; saved older records still have key/message.
+const DIAGNOSTIC_LABELS = {
+  no_chunks: ["未生成切片", "No chunks were produced"],
+  single_oversized: ["整份文档仅一个切片，共 {0} token，超过预算两倍", "The whole document is a single chunk of {0} tokens, over twice the budget"],
+  fragmented: ["{0}/{1} 个文本块不足 {2} token；长度较短不代表语义不完整", "{0}/{1} text chunks are under {2} tokens; short chunks can still be complete"],
+  all_tiny: ["最长切片仅 {0} token，预算为 {1}", "The longest chunk has only {0} tokens; the budget is {1}"],
+  oversized: ["{0} 个文本块超过 {2} token 预算的 {1} 倍", "{0} text chunks exceed {1}× the budget of {2} tokens"],
+  orphan_headings: ["{0} 个只有标题的碎片", "{0} heading-only fragments"],
+  long_visual: ["{0} 张图片的识别文本超过预算 {1} 倍", "{0} images have recognized text over {1}× the budget"],
+  headerless_tables: ["{0}/{1} 个表格切片缺少表头", "{0}/{1} table chunks have no header"],
+  table_source_alignment: ["{0} 处表格的部分行列归属未确认，原文已保留", "Source text retained; table regions with unverified cell alignment: {0}"],
+  visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留完整事实", "{0} visual responses reached the output limit; only complete facts were retained"]
+};
+// Length statistics alone do not establish missing or broken meaning.
+function diagnosticTone(reason) {
+  return ["fragmented", "all_tiny", "long_visual"].includes(reason?.key) ? "note" : "warn";
+}
+function diagnosticReasons(diag) {
+  const reasons = diag?.reason_details || diag?.reasons || [];
+  // A length note must not hide an alignment or content-loss warning.
+  return [...reasons].sort((a, b) => (diagnosticTone(a) === "note") - (diagnosticTone(b) === "note"));
+}
+function diagnosticLabel(reason, compact = false) {
+  if (typeof reason === "string") return t(reason);
+  if (!reason) return t("提示");
+  const templates = DIAGNOSTIC_LABELS[reason.key];
+  if (!templates) return t(reason.message || reason.key || "提示");
+  let args = Array.isArray(reason.params) ? reason.params : (String(reason.message || "").match(/\d+(?:\.\d+)?/g) || []);
+  if (!Array.isArray(reason.params) && ZH_RE.test(reason.message || "")) {
+    if (reason.key === "single_oversized" && args.length === 2) args = [args[1]];
+    if (reason.key === "oversized" && args.length === 3) args = [args[0], args[2], args[1]];
+  }
+  const en = I18N.lang === "en";
+  let template = templates[en ? 1 : 0];
+  if (compact && reason.key === "fragmented") template = en ? "Short text chunks: {0}/{1}" : "短文本 {0}/{1}";
+  if (compact && reason.key === "table_source_alignment") template = en ? "Unverified tables: {0}" : "{0} 处表格对齐未确认";
+  if (compact && reason.key === "visual_output_truncated") template = en ? "Visual output limit: {0}" : "{0} 处图片识别达上限";
+  // Unknown old argument layouts fall back to the readable saved message.
+  if ([...template.matchAll(/\{(\d+)\}/g)].some(m => args[+m[1]] == null)) return t(reason.message || reason.key);
+  return template.replace(/\{(\d+)\}/g, (_, i) => String(args[+i]));
+}
+
 // Static page: text nodes and placeholder / title / aria-label, multi-line values line by line. data-en
 // overrides when the same Chinese needs different English in different places
 function applyStatic(root) {
@@ -1012,4 +1056,4 @@ if (typeof document !== "undefined") {
     });
   }
 }
-if (typeof module !== "undefined" && module.exports) module.exports = { t, translate, translateSegments, translateZh, ZH_EN, ZH_EN_PATTERNS, EN_ZH, EN_ZH_PATTERNS, I18N };
+if (typeof module !== "undefined" && module.exports) module.exports = { diagnosticTone, diagnosticReasons, diagnosticLabel, DIAGNOSTIC_LABELS, t, translate, translateSegments, translateZh, ZH_EN, ZH_EN_PATTERNS, EN_ZH, EN_ZH_PATTERNS, I18N };

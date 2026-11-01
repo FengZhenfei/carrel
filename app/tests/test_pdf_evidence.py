@@ -247,7 +247,8 @@ def test_valid_table_review_fills_printed_cells_and_keeps_notes(tmp_path):
     p.write_bytes(b"fixture")
     b = block("Table 1\n| Item | Value |\n| --- | --- |\n| Alpha | |\nNote: calibrated.", "table", metadata={
         "table_review_reasons": ["native_text_missing"], "table_missing_spans": ["17 V"],
-        "table_source_text": "Item Value Alpha 17 V", "table_review_image": str(p)})
+        "table_source_text": "Item Value Alpha 17 V", "table_review_image": str(p),
+        "table_native_grid": [["Item", "Value"], ["Alpha", "17 V"]]})
     b.table_markdown = b.text
     with patch("kb_pipeline.parsers.table_repair.transcribe_table", return_value={
             "rows": [["Item", "Value"], ["Alpha", "17 V"]], "legend": []}):
@@ -335,7 +336,8 @@ def test_partial_table_review_retains_rejected_row_but_fills_supported_row(tmp_p
     p.write_bytes(b"fixture")
     b = block("| Item | Value |\n| --- | --- |\n| Alpha | |\n| Beta | 29 V |", "table", metadata={
         "table_review_reasons": ["native_text_missing"], "table_missing_spans": ["17 V"],
-        "table_source_text": "Item Value Alpha 17 V Beta 29 V", "table_review_image": str(p)})
+        "table_source_text": "Item Value Alpha 17 V Beta 29 V", "table_review_image": str(p),
+        "table_native_grid": [["Item", "Value"], ["Alpha", "17 V"], ["Beta", "29 V"]]})
     b.table_markdown = b.text
     with patch("kb_pipeline.parsers.table_repair.transcribe_table", return_value={
             "rows": [["Item", "Value"], ["Alpha", "17 V"], ["Beta", "29 A"]], "legend": []}):
@@ -368,3 +370,20 @@ def test_explanatory_footnote_is_not_automatically_a_symbol_legend(tmp_path):
     b.table_markdown = b.text
     add_pdf_region_evidence([b], path, tmp_path)
     assert "table_review_reasons" not in b.metadata
+
+
+
+def test_missing_table_text_follows_page_order_not_pdf_drawing_order(tmp_path):
+    import pymupdf
+    from kb_pipeline.parsers.pdf_evidence import add_pdf_region_evidence
+    p=tmp_path/'source.pdf';doc=pymupdf.open();page=doc.new_page(width=400,height=400)
+    page.insert_text((40,160),'second line')
+    page.insert_text((40,140),'first line')
+    page.insert_text((40,100),'Key Value')
+    doc.save(p);doc.close()
+    b=block('| Key | Value |\n| --- | --- |','table',page_idx=1,bbox=[50,150,950,500])
+    b.table_markdown=b.text
+    add_pdf_region_evidence([b],p,tmp_path)
+    assert b.metadata['table_missing_spans']==['first line','second line']
+    review_pdf_tables([b],base_url='fixture',api_key='',model_id='fixture',cache_dir=tmp_path)
+    assert 'first line\nsecond line' in b.text

@@ -285,10 +285,12 @@ def requeue_single_file(
     file_row: sqlite3.Row,
     reason: str = "manual retry from web console",
     priority: int = 50,
+    refresh_cache: bool = False,
 ) -> str | None:
     """Web-console retry for one file: enqueue a parse job for the file's
     current version+profile through the normal queue (same dedupe key and
     worker lease as the automatic pipeline, so no conflicting side channel).
+    refresh_cache marks an explicit full re-parse; automatic recovery keeps cache reuse.
     Returns None when an attempt is already queued/running."""
     from pathlib import Path as _Path
 
@@ -298,7 +300,10 @@ def requeue_single_file(
         return None
     profile = parser_profile_for_path(_Path(str(file_row["filename"])))
     dedupe_key = f"parse:{file_row['file_id']}:{file_row['content_version']}:{profile}"
-    if db.active_job_for_dedupe_key(con, dedupe_key) is not None:
+    active = db.active_job_for_dedupe_key(con, dedupe_key)
+    if active is not None:
+        if refresh_cache:
+            _refresh_queued_parse(con, active)
         return None
     return db.enqueue_job(
         con,
@@ -310,9 +315,25 @@ def requeue_single_file(
         job_type="parse",
         parser_profile=profile,
         priority=priority,
-        payload={"reason": reason, "source_path": str(file_row["source_path"])},
+        payload={"reason": reason, "source_path": str(file_row["source_path"]),
+                 **({"refresh_parse_cache": True} if refresh_cache else {})},
         dedupe_key=dedupe_key,
     )
+
+
+def _refresh_queued_parse(con: sqlite3.Connection, job: sqlite3.Row) -> None:
+    # Upgrade work that has not started without creating a duplicate job.
+    if str(job["status"]) not in {"queued", "retry"}:
+        return
+    try:
+        payload = json.loads(job["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["refresh_parse_cache"] = True
+    con.execute("UPDATE jobs SET payload_json=? WHERE job_id=? AND status IN ('queued','retry')",
+                (json.dumps(payload, ensure_ascii=False), str(job["job_id"])))
 
 
 RERUN_PRIORITY = 120      # a whole-KB re-parse comes after everyday parsing
@@ -352,8 +373,8 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
         dedupe_key = f"parse:{row['file_id']}:{row['content_version']}:{profile}"
         active = db.active_job_for_dedupe_key(con, dedupe_key)
         if active is not None:
-            # A queued job that has not started yet parses with the new configuration anyway; a running one
-            # has to go once more when it is done
+            # Queued work must refresh model output too; running work gets one fresh follow-up.
+            _refresh_queued_parse(con, active)
             if str(active["status"]) == "running" and _ask_rerun(con, active, reason):
                 requeued += 1
             continue
@@ -367,7 +388,7 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
             job_type="parse",
             parser_profile=profile,
             priority=RERUN_PRIORITY,
-            payload={"reason": reason, "source_path": str(row["source_path"])},
+            payload={"reason": reason, "source_path": str(row["source_path"]), "refresh_parse_cache": True},
             dedupe_key=dedupe_key,
         )
         requeued += 1

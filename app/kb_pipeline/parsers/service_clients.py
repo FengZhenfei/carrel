@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 import requests
 
+from ..parse_cache import reusable_in_run, write_cache
 from .mineru_backend import resolve_backend
 
 
@@ -44,7 +45,7 @@ def _load_cached_mineru(output_json: Path, input_path: Path, backend: str) -> di
         payload = json.loads(output_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not reusable_in_run(payload):
         return None
     stamp = payload.get("_kb_source")
     if isinstance(stamp, dict):
@@ -125,10 +126,9 @@ def call_mineru_sync(
         payload["_kb_source"] = {"name": input_path.name, "size": int(input_path.stat().st_size), "backend": backend}
     except (OSError, TypeError):
         pass
-    output_json.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    write_cache(output_json, payload)
     md = extract_markdown(payload)
-    if md:
-        output_md.write_text(md, encoding="utf-8")
+    output_md.write_text(md, encoding="utf-8")
     return payload
 
 

@@ -253,7 +253,7 @@ def _rerun_if_asked(con: sqlite3.Connection, job: sqlite3.Row) -> None:
         return
     queued = requeue_single_file(
         con, ingest_run_id=str(job["ingest_run_id"] or "") or "rerun", file_row=file_row,
-        reason=str(reason), priority=RERUN_PRIORITY,
+        reason=str(reason), priority=RERUN_PRIORITY, refresh_cache=True,
     )
     print(f"[worker] re-parse requested while job={job['job_id']} was running; queued={queued}", flush=True)
 

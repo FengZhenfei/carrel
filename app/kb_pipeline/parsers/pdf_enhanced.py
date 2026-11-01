@@ -17,6 +17,7 @@ from .table_repair import repair_ambiguous_tables
 from .table_repair import review_pdf_tables
 from .pdf_evidence import add_pdf_region_evidence, supplement_visible_forms
 from .pdf_code import recover_native_code
+from .pdf_table_layout import restore_ruled_continuation_columns
 from .visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text, tidy_visual_blocks
 
 
@@ -106,6 +107,7 @@ def parse_pdf_enhanced(
     if table_blocks:
         repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
                                cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
+    restore_ruled_continuation_columns(blocks, path)
     add_pdf_region_evidence(blocks, path, cache_dir)
     # Review original per-page tables before cross-page merging changes ownership.
     review_pdf_tables(blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
@@ -219,7 +221,8 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         # sign of a continuation, and separator lines are always stripped
         if first_b == header:
             body_b = [r for r in rows_b[1:] if not _is_separator(r)]        # repeated header: drop it
-        elif (not _is_separator(rows_b[0]) and _looks_like_data(first_b)
+        elif (not _is_separator(rows_b[0]) and (_looks_like_data(first_b)
+              or (len(rows_a) == 2 and block.metadata.get("native_continuation_columns")))
               and prev.bbox and block.bbox):
             body_b = [r for r in rows_b if not _is_separator(r)]           # header-less continuation
         else:
@@ -233,8 +236,11 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         prev.text = merged
         prev.metadata.setdefault("merged_tables", []).append(block.block_id)
         prev.metadata["table_end_bbox"] = block.bbox
-        prev.metadata.setdefault("table_source_regions", [{"page": prev.page_idx, "bbox": prev.bbox}]).append(
-            {"page": block.page_idx, "bbox": block.bbox})
+        from ..chunking.packing import source_regions
+        regions = source_regions(prev) + [r for r in source_regions(block) if r not in source_regions(prev)]
+        prev.metadata["table_source_regions"] = regions
+        if prev.metadata.get("source_regions"):
+            prev.metadata["source_regions"] = regions
         if (prev.metadata.get("source_tile") and block.metadata.get("source_tile")
                 and prev.page_idx == block.page_idx and prev.bbox and block.bbox):
             # Two tiles can be portions of one physical page. The merged table

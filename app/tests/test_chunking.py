@@ -246,7 +246,7 @@ class ChunkDiagnosticsTests(unittest.TestCase):
                 files = service.kb_files(src.kb_id)
             self.assertEqual(files[0]["dot"], "green")
             self.assertEqual(files[0]["chunk_diag"], {"ok": False, "chunks": 7, "tokens_mean": 33.0,
-                                                      "reasons": ["碎片过多"]})
+                                                      "reasons": ["碎片过多"], "reason_details": diag["reasons"]})
 
     def test_console_previews_stored_chunks_in_a_drawer(self) -> None:
         """2026-09-06 redesign: the chunk preview is no longer a tab and does not re-chunk; the "chunk preview"

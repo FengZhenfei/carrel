@@ -125,36 +125,37 @@ def chunk_diagnostics(
                                       + sum(int(b.metadata.get("inferred_headings") or 0) for b in blocks))
         stats["section_depths"] = {str(k): v for k, v in sorted(depths.items())}
 
-    reasons: list[dict[str, str]] = []
+    reasons: list[dict[str, Any]] = []
 
-    def flag(key: str, message: str) -> None:
-        reasons.append({"key": key, "message": message})
+    def flag(key: str, message: str, *params: int | float) -> None:
+        # Stable codes and numeric arguments serve both console languages.
+        reasons.append({"key": key, "message": message, "params": list(params)})
 
     if n == 0:
         flag("no_chunks", "No chunks were produced")
     elif n == 1 and total > 2 * max_tokens:
-        flag("single_oversized", f"The whole document is a single chunk of {total} tokens, over twice the budget")
+        flag("single_oversized", f"The whole document is a single chunk of {total} tokens, over twice the budget", total)
     if tiny > 2 and tiny * 4 > len(text_tokens):
-        flag("fragmented", f"{tiny}/{len(text_tokens)} text chunks are under {threshold} tokens: too fragmented")
+        flag("fragmented", f"{tiny}/{len(text_tokens)} text chunks are under {threshold} tokens: too fragmented", tiny, len(text_tokens), threshold)
     if n > 1 and total > max_tokens and stats["tokens_max"] < max_tokens // 4:
-        flag("all_tiny", f"The longest chunk has only {stats['tokens_max']} tokens, far below the budget of {max_tokens}")
+        flag("all_tiny", f"The longest chunk has only {stats['tokens_max']} tokens, far below the budget of {max_tokens}", stats['tokens_max'], max_tokens)
     if over:
-        flag("oversized", f"{over} text chunks exceed {OVER_TOLERANCE:g}× the budget of {max_tokens} tokens")
+        flag("oversized", f"{over} text chunks exceed {OVER_TOLERANCE:g}× the budget of {max_tokens} tokens", over, OVER_TOLERANCE, max_tokens)
     if orphan_headings >= 3:
-        flag("orphan_headings", f"{orphan_headings} heading-only fragments")
+        flag("orphan_headings", f"{orphan_headings} heading-only fragments", orphan_headings)
     if long_visual:
-        flag("long_visual", f"{long_visual} images whose recognized text exceeds {LONG_VISUAL_FACTOR:g}× the budget; VLM / MinerU output may have run away")
+        flag("long_visual", f"{long_visual} images whose recognized text exceeds {LONG_VISUAL_FACTOR:g}× the budget; VLM / MinerU output may have run away", long_visual, LONG_VISUAL_FACTOR)
     if headerless_tables and headerless_tables * 4 > len(table_chunks):
-        flag("headerless_tables", f"{headerless_tables}/{len(table_chunks)} table chunks have no header")
+        flag("headerless_tables", f"{headerless_tables}/{len(table_chunks)} table chunks have no header", headerless_tables, len(table_chunks))
     evidence_blocks = blocks if blocks is not None else list({c.block.block_id: c.block for c in chunks}.values())
     reviews = sum(1 for b in evidence_blocks if (b.metadata.get("table_review") or {}).get("status") in {"unverified", "partial"})
     stats["table_reviews_unverified"] = reviews
     if reviews:
-        flag("table_source_alignment", f"{reviews} tables retain source text whose cell alignment needs review")
+        flag("table_source_alignment", f"{reviews} tables retain source text whose cell alignment needs review", reviews)
     truncated = sum(bool(b.metadata.get("vlm_truncated")) for b in evidence_blocks)
     stats["visual_outputs_truncated"] = truncated
     if truncated:
-        flag("visual_output_truncated", f"{truncated} visual responses reached the output limit; only complete facts were retained")
+        flag("visual_output_truncated", f"{truncated} visual responses reached the output limit; only complete facts were retained", truncated)
     return {"ok": not reasons, "reasons": reasons, "stats": stats}
 
 

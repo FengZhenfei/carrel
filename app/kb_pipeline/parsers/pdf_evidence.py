@@ -131,11 +131,15 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                 if context:
                     block.metadata["visual_source_context"] = context
                 continue
-            got = _norm(block.table_markdown or block.text).replace("|", "")
+            got = _norm("\n".join([block.table_markdown or block.text, block.caption or "",
+                                    str(block.metadata.get("source_footnote") or "")])).replace("|", "")
             # get_text(sort=True) inserts spaces between cells. Compare individual
             # spans, not whole rows joined across Markdown column separators.
             native_spans = [s for b in page.get_text("dict", clip=rect).get("blocks", [])
                             for line in b.get("lines", []) for s in line.get("spans", [])]
+            # PDF drawing order can write a wrapped line bottom-first. Evidence
+            # supplements follow visible top-to-bottom, then left-to-right order.
+            native_spans.sort(key=lambda s: (s.get("bbox", [0,0,0,0])[1], s.get("bbox", [0,0,0,0])[0]))
             spans = [s.get("text", "").strip() for s in native_spans]
             missing = list(dict.fromkeys(s for s in spans if len(_norm(s)) >= 2
                 and not re.fullmatch(r"[\s\-‐‑‒–—]+", s) and not _span_present(s, got)))
@@ -158,6 +162,17 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
             if not missing and not legend:
                 continue
             reasons = (["native_text_missing"] if missing else []) + (["symbol_legend"] if legend else [])
+            # Native ruled cells are independent evidence for filling an OCR
+            # blank. Whole-table text cannot establish a row or column.
+            candidates = []
+            try:
+                for table in page.find_tables().tables:
+                    area = pymupdf.Rect(table.bbox)
+                    if (area & rect).get_area() / max(area.get_area(), rect.get_area(), 1) >= .85:
+                        candidates.append([[cell or "" for cell in row] for row in table.extract()])
+            except Exception:
+                pass
+            block.metadata["table_native_grid"] = candidates[0] if native and len(candidates) == 1 else []
             block.metadata["table_source_text"] = native
             block.metadata["table_native_spans"] = [{"text": s.get("text", ""), "bbox": list(s["bbox"])}
                 for s in native_spans if s.get("bbox") and native]

@@ -1521,36 +1521,37 @@ function renderFilesTable() {
   const start = (state.files.page - 1) * FILES_PAGE;
   const page = rows.slice(start, start + FILES_PAGE);
   const diagCount = all.filter(f => f.chunk_diag && !f.chunk_diag.ok).length;
-  $("#fl-count").textContent = t("{0} 个文件", `${rows.length}${rows.length !== all.length ? ` / ${all.length}` : ""}`) + (diagCount ? t(" · {0} 个有切块提示", diagCount) : "");
+  $("#fl-count").textContent = t("{0} 个文件", `${rows.length}${rows.length !== all.length ? ` / ${all.length}` : ""}`) + (diagCount ? t(" · {0} 个有解析提示", diagCount) : "");
   if (!all.length) { setHtml(wrap, `<div class="empty-state">${t("暂无文件(等待同步或扫描)")}</div>`); setHtml($("#fl-pager"), ""); return; }
   if (!rows.length) { setHtml(wrap, `<div class="empty-state">${t("没有符合筛选条件的文件")}</div>`); setHtml($("#fl-pager"), ""); return; }
   const th = (key, label, cls = "") => {
     const on = state.files.sort === key;
     return `<th class="sortable ${cls}" data-sort="${key}">${label}${on ? `<span class="arrow">${state.files.dir > 0 ? "▲" : "▼"}</span>` : ""}</th>`;
   };
-  const html = `<table><thead><tr>
+  const html = `<table class="files-table"><thead><tr>
       <th style="width:22px"></th>
       ${th("path", t("文件"))}
       ${th("size", t("大小"), "num")}
       ${th("chunks", t("切片"), "num")}
-      <th>${t("切块诊断")}</th>
+      <th>${t("解析提示")}</th>
       ${th("time", t("入库时间"))}
       ${th("status", t("状态"))}
       <th></th></tr></thead><tbody>` +
     page.map(f => {
       const diag = f.chunk_diag;
+      const reasons = diagnosticReasons(diag);
       const diagCell = !diag ? `<span class="faint">—</span>`
-        : diag.ok ? `<span class="badge ok">${t("通过")}</span>`
-        : `<span class="badge warn" title="${esc(diag.reasons.map(x => t(x)).join("\n"))}">⚠ ${esc(t(diag.reasons[0] || "提示"))}</span>`;
+        : diag.ok ? `<div class="parse-note"></div>`
+        : `<div class="parse-note" title="${esc(reasons.map(x => diagnosticLabel(x)).join("\n"))}"><div class="parse-note-content" tabindex="0"><div class="parse-note-lines">${(reasons.length ? reasons : ["提示"]).map(x => `<div>${esc(diagnosticLabel(x, true))}</div>`).join("")}</div></div></div>`;
       return `<tr>
         <td><span class="dot ${fileDot(f)}"></span></td>
-        <td class="path">${f.job_id ? `<span class="fn-link" data-job="${esc(f.job_id)}" title="${t("查看任务时间线")}">${esc(f.rel_path)}</span>` : esc(f.rel_path)}
-          ${f.indexed_profile ? `<div class="hint" style="margin:1px 0 0">${esc(f.indexed_profile)}${diag && diag.tokens_mean != null ? t(" · 均长 {0} token", diag.tokens_mean) : ""}</div>` : ""}</td>
+        <td class="path"><div class="file-cell"><div class="file-cell-body">${f.job_id ? `<span class="fn-link" data-job="${esc(f.job_id)}" title="${t("查看任务时间线")}">${esc(f.rel_path)}</span>` : esc(f.rel_path)}
+          ${f.indexed_profile ? `<div class="hint" style="margin:1px 0 0">${esc(f.indexed_profile)}${diag && diag.tokens_mean != null ? t(" · 均长 {0} token", diag.tokens_mean) : ""}</div>` : ""}</div></div></td>
         <td class="num">${fmtSize(f.size)}</td>
         <td class="num">${f.chunks != null ? f.chunks : "—"}</td>
         <td>${diagCell}</td>
         <td class="num">${f.indexed_at ? fmtTsShort(f.indexed_at) : "—"}</td>
-        <td>${fileStatusCell(f)}</td>
+        <td><div class="file-cell"><div class="file-cell-body">${fileStatusCell(f)}</div></div></td>
         <td><span class="act">
           ${f.dot === "green" ? `<button class="sm ghost" data-preview="${esc(f.file_id)}">${t("切块预览")}</button>` : ""}
           ${f.dot === "red" || f.dot === "green" ? `<button class="sm ghost" data-retry="${esc(f.file_id)}">${t("重新解析")}</button>` : ""}
@@ -1709,15 +1710,12 @@ function renderChunkPreview() {
   const params = [budget != null ? `max_tokens ${budget}` : "", r.overlap_tokens != null ? `overlap ${r.overlap_tokens}` : "",
                   r.file.parser_profile || ""].filter(Boolean).join(" / ");
   const head = `<div class="pv-file"><b>${esc(r.file.rel_path)}</b><span class="muted">${esc(params)}${r.file.chunks_total != null ? t(" · {0} 片", r.file.chunks_total) : ""}</span></div>`;
-  const verdict = !d ? `<div class="hint" style="margin-bottom:10px">${t("这份文件入库时还没有切块诊断")}</div>`
-    : d.ok ? `<div class="pv-verdict ok">✓ ${t("切块验收通过")}</div>`
-    : `<div class="pv-verdict warn">${d.reasons.map(x => "⚠ " + esc(t(x.message))).join("<br>")}</div>`;
   const depths = s ? Object.entries(s.section_depths || {}).map(([k, v]) => t("{0} 层×{1}", k, v)).join(" · ") : "";
   const stats = s ? `<div class="pv-stats">
     <div><b>${s.chunks}</b><span>${t("切片 / {0} 个块", s.blocks ?? "-")}</span></div>
     <div><b>${s.tokens_mean}</b><span>${t("均长 token · σ {0}", s.tokens_stddev)}</span></div>
     <div><b>${s.tokens_min}–${s.tokens_max}</b><span>${t("最短 – 最长")}</span></div>
-    <div><b>${s.tiny_count}</b><span>${t("碎片")} &lt;${s.tiny_threshold} token</span></div>
+    <div><b>${s.tiny_count}</b><span>${t("短文本")} &lt;${s.tiny_threshold} token</span></div>
     <div><b>${s.over_count}</b><span>${t("超预算")}</span></div>
     <div><b>${s.headings ?? "-"}</b><span>${t("标题 · 补认 {0}", s.inferred_headings ?? 0)}${depths ? t(" · 深度 {0}", esc(depths)) : ""}</span></div>
   </div>` : "";
@@ -1727,7 +1725,7 @@ function renderChunkPreview() {
   const ambiguous = r.chunks.filter(c => tableFlagsOf(c).length > 0).length;
   const filters = `<div class="pv-filters">
     ${chip("all", t("全部"), r.chunks.length)}
-    ${s ? chip("tiny", t("碎片"), s.tiny_count) : ""}
+    ${s ? chip("tiny", t("短文本"), s.tiny_count) : ""}
     ${ambiguous ? chip("ambiguous", t("表格粘连"), ambiguous) : ""}
     ${types.map(([k, n]) => chip("type:" + k, k, n)).join("")}
     <span class="pv-view"><span class="chip ${view === "md" ? "on" : ""}" data-v="md">${t("渲染")}</span><span class="chip ${view === "raw" ? "on" : ""}" data-v="raw">${t("原文")}</span></span>
@@ -1743,7 +1741,7 @@ function renderChunkPreview() {
         <span class="pv-peek">${esc(c.text.slice(0, 80).replace(/\s+/g, " "))}</span></summary>
       ${view === "raw" ? `<pre>${esc(c.text)}</pre>` : `<div class="pv-md">${chunkHtml(c.text)}</div>`}</details>`;
   }).join("");
-  const html = head + verdict + stats + filters + (cards || `<div class="empty-state">${t("没有符合筛选的切片")}</div>`) +
+  const html = head + stats + filters + (cards || `<div class="empty-state">${t("没有符合筛选的切片")}</div>`) +
     (r.truncated ? `<div class="hint">${t("只显示前 {0} 片", r.chunks.length)}</div>` : "");
   if (!setHtml($("#side-body"), html)) return;
   $$("#side-body .pv-filters .chip[data-f]").forEach(el => el.addEventListener("click", () => { state.preview.filter = el.dataset.f; renderChunkPreview(); }));

@@ -8,6 +8,9 @@ import re
 import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
+
+from ..parse_cache import reusable_in_run, write_cache
 from pathlib import Path
 from typing import Any
 
@@ -542,7 +545,7 @@ def caption_image(
             cached = None
         # An empty summary is now a legitimate answer, so identity is the only
         # thing that decides whether a cached caption can be reused.
-        if isinstance(cached, dict) and cached.get("_cache") == cache_identity:
+        if isinstance(cached, dict) and reusable_in_run(cached) and cached.get("_cache") == cache_identity:
             result = normalize_result(cached)
             if result.get("runaway"):
                 print(f"[vlm] cached caption looks like a repetition runaway ({result.get('runaway_dropped')} items dropped); re-captioning", flush=True)
@@ -627,7 +630,7 @@ def caption_image(
         cache_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {**data, "_cache": cache_identity}
         payload.pop("vlm_cache_hit", None)
-        cache_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_cache(cache_json, payload)
     elif cache_json:
         print(f"[vlm] not caching the {'truncated' if data.get('vlm_truncated') else 'degraded' if degraded else 'empty'} result; retried next time", flush=True)
     return data
@@ -663,7 +666,7 @@ def caption_images_parallel(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_id = {
             executor.submit(
-                caption_image,
+                copy_context().run, caption_image,
                 image_path=image_path,
                 base_url=base_url,
                 api_key=api_key,

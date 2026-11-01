@@ -12,6 +12,7 @@ from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_hea
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
 from .mineru_quality import recover_pdf_items
 from .pdf_code import repair_code_items
+from .pdf_table_layout import attach_table_notes
 
 # Block-level provenance tag, written into parser_profile in the chunk payload; whether a file is re-parsed is
 # decided by the route-level version (common.parser_profile_for_path). The tag does not name the MinerU
@@ -64,7 +65,7 @@ def mineru_pdf_blocks(
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     content = extract_content_list(payload)
     items = recover_pdf_items(content if content else list(walk_dicts(payload)), payload)
-    items = repair_code_items(items, path)
+    items = attach_table_notes(repair_code_items(items, path), path)
 
     blocks: list[ParsedBlock] = []
     seen: set[tuple] = set()
@@ -135,6 +136,9 @@ def mineru_pdf_blocks(
         }
         if footnote:
             metadata["source_footnote"] = footnote
+        if item.get("_pdf_table_note_sources"):
+            metadata["table_note_sources"] = item["_pdf_table_note_sources"]
+            metadata["source_regions"] = [{"page": page, "bbox": bbox(item)}] + item["_pdf_table_note_sources"]
         if item.get("_pdf_code_label_sources"):
             metadata["code_context_sources"] = [dict(r) for r in item["_pdf_code_label_sources"]]
         if item.get("_pdf_code_language"):

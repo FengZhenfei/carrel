@@ -165,6 +165,7 @@ class _TableReader(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: list[list[str]] = []
+        self.spans: list[tuple[int, int, int, int]] = []
         self._row: list[str] | None = None
         self._cell: list[str] | None = None
         self._span = (1, 1)
@@ -200,6 +201,8 @@ class _TableReader(HTMLParser):
             return
         value = re.sub(r"\s+", " ", "".join(self._cell)).strip().replace("|", "\\|")
         cols, rows = self._span
+        if cols > 1 or rows > 1:
+            self.spans.append((len(self.rows), self._col, rows, cols))
         for _ in range(cols):
             self._row.append(value)
             if rows > 1:
@@ -264,6 +267,19 @@ def html_table_to_grid(html: str) -> list[list[str]] | None:
     if width <= 0:
         return None
     return [row + [""] * (width - len(row)) for row in rows]
+
+
+def html_table_spans(html: str) -> list[tuple[int, int, int, int]]:
+    """Source-declared (row, column, row span, column span), without changing the grid."""
+    if not html or not _TABLE_TAG_RE.search(html):
+        return []
+    reader = _TableReader()
+    try:
+        reader.feed(_escape_bare_lt(html))
+        reader.close()
+    except Exception:
+        return []
+    return reader.spans
 
 
 def grid_to_markdown(rows: list[list[str]] | None) -> str | None:

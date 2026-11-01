@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import time
@@ -10,6 +11,7 @@ from typing import Any
 import sqlite3
 
 from .. import db
+from ..parse_cache import refresh_scope
 from .. import search_fts
 from ..chunking.chunker import blocks_to_chunks, embedding_context_for, embedding_input
 from ..chunking.diagnose import chunk_diagnostics, summarize_line
@@ -52,7 +54,13 @@ from ..parsers.errors import JobCancelled, NonRetryableParseError  # noqa: E402,
 def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.Row) -> str:
     committed = [False]
     try:
-        return _parse_and_index(con, settings, job, committed)
+        try:
+            payload = json.loads(job["payload_json"] or "{}") if "payload_json" in job.keys() else {}
+        except (TypeError, ValueError):
+            payload = {}
+        refresh = isinstance(payload, dict) and payload.get("refresh_parse_cache") is True
+        with refresh_scope(str(job["job_id"]) if refresh else None):
+            return _parse_and_index(con, settings, job, committed)
     except JobCancelled:
         raise
     except Exception:

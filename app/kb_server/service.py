@@ -864,6 +864,7 @@ def _chunk_diag_brief(raw) -> dict[str, Any] | None:
         "chunks": int(stats.get("chunks") or 0),
         "tokens_mean": stats.get("tokens_mean"),
         "reasons": [str(r.get("message") or r.get("key")) for r in diag.get("reasons") or []],
+        "reason_details": list(diag.get("reasons") or []),
     }
 
 
@@ -2170,7 +2171,7 @@ def retry_file(file_id: str) -> dict[str, Any]:
         if str(row["status"]) == "deleted":
             raise ValueError("This file has been removed from the source and cannot be re-parsed")
         run_id = db.begin_run(con, "web-retry", note=str(row["source_path"]))
-        job_id = requeue_single_file(con, ingest_run_id=run_id, file_row=row)
+        job_id = requeue_single_file(con, ingest_run_id=run_id, file_row=row, refresh_cache=True)
         db.finish_run(con, run_id, added_count=0, updated_count=1 if job_id else 0,
                       moved_count=0, deleted_count=0, failed_count=0)
     kick_worker()
