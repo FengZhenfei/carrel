@@ -93,7 +93,10 @@ def mineru_docx_blocks(
         # or picture that the original repeats (a "Solution" line under each of several questions, the same
         # parameter table in two sections) is content. Keyed on "type + first 160 characters", only the first
         # occurrence in the whole document used to be kept, and the copy in a later section was silently dropped
-        page = page_idx(item)
+        # Native OOXML parsing often assigns page_idx=0 to every item without
+        # laying out pages. Only a positioned block establishes a page citation.
+        region = bbox(item)
+        page = page_idx(item) if region else None
         count += 1
         blocks.append(
             ParsedBlock(
@@ -106,7 +109,7 @@ def mineru_docx_blocks(
                 latex=latex,
                 block_id=f"mineru-docx-{block_type}-{count:05d}",
                 page_idx=page,
-                bbox=bbox(item),
+                bbox=region,
                 caption=caption_of(item) or None,
                 visual_ref=image_path,
                 metadata={

@@ -230,6 +230,8 @@ Regression tests use service stubs and temporary data; the suite can run
 without live containers. Some checks skip when optional dependencies or
 installed systemd units are absent. Retrieval evaluation against a real
 deployment is a separate step, described in [Retrieval](retrieval.md#evaluate-retrieval).
+See [Test scope](testing.md) for the shared contracts, platform-specific
+checks, frontend runtime requirements, and private-deployment comparisons.
 
 - When parser output changes, update its profile/version in
   `parsers/common.py` so affected documents can be reprocessed.

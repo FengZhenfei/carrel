@@ -112,9 +112,7 @@ DEFAULT_TYPES = (
     ("document", "document", "a document, report or file referred to in the text"),
 )
 
-MAX_TYPES = 64              # 含 abstract 的中间层
-MAX_MENU_TYPES = 32         # 进抽取菜单的(非 abstract)类型
-MAX_PREDICATES = 28         # 含事件核心关系
+MAX_MENU_TYPES = 32         # Induction proposal size, not a lifetime registry quota.
 TYPE_NAME_MAX_LEN = 64
 DESCRIPTION_MAX_CHARS = 240
 LINKML_PREFIXES = {"linkml": "https://w3id.org/linkml/", "carrel": "urn:carrel:"}
@@ -178,7 +176,7 @@ def _ends(value: Any, types: dict[str, str]) -> list[str]:
             name = name or types.get(raw.casefold(), "")
         if name and name not in out:
             out.append(name)
-    return ["*"] if "*" in out else out[:12]
+    return ["*"] if "*" in out else out
 
 
 def normalize_model(raw: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
@@ -249,10 +247,6 @@ def normalize_model(raw: dict[str, Any] | None) -> tuple[dict[str, Any], list[st
     menu = [t for t in types if not t["abstract"]]
     if not menu:
         errors.append(SchemaIssue("no_concrete_types", "至少要有一个可抽取的(非 abstract)类型", "At least one non-abstract type is required", path="classes"))
-    if len(menu) > MAX_MENU_TYPES:
-        errors.append(SchemaIssue("too_many_concrete_types", f"可抽取的类型最多 {MAX_MENU_TYPES} 个(当前 {len(menu)} 个);中间层可以标 abstract", f"At most {MAX_MENU_TYPES} non-abstract types are allowed (got {len(menu)}); intermediate classes can be abstract", path="classes", limit=MAX_MENU_TYPES, actual=len(menu)))
-    if len(types) > MAX_TYPES:
-        errors.append(SchemaIssue("too_many_types", f"类型总数最多 {MAX_TYPES} 个(当前 {len(types)} 个)", f"At most {MAX_TYPES} types are allowed (got {len(types)})", path="classes", limit=MAX_TYPES, actual=len(types)))
     predicates: list[dict[str, Any]] = []
     seen_preds: set[str] = set()
     for item in raw.get("predicates") or []:
@@ -281,8 +275,6 @@ def normalize_model(raw: dict[str, Any] | None) -> tuple[dict[str, Any], list[st
                 predicates.append({**core, "source_parents": list(core["source_parents"]),
                                    "target_parents": list(core["target_parents"]), "multivalued": True, "core": True})
                 seen_preds.add(core["name"])
-    if len(predicates) > MAX_PREDICATES:
-        errors.append(SchemaIssue("too_many_relations", f"关系最多 {MAX_PREDICATES} 种(当前 {len(predicates)} 种,含事件核心关系)", f"At most {MAX_PREDICATES} relations are allowed (got {len(predicates)}, including event relations)", path="slots", limit=MAX_PREDICATES, actual=len(predicates)))
     profile = _normalize_profile(raw.get("profile"), lookup, seen_preds)
     if errors:
         raise SchemaError(errors)

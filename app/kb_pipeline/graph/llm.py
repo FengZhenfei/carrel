@@ -13,9 +13,8 @@ through this one. Trade-offs:
   are in the cache. The criterion comes straight from call results, no more guessing from upstream logs.
 · Concurrency: a thread pool, 8 workers by default (the ceiling measured on 2026-08-25 against the two models
   in use).
-· enable_thinking=false adaptively: reasoning models burn the output budget on thinking; a server that does not
-  recognize the parameter answers 4xx, in which case it is dropped, the request re-sent and that base_url
-  remembered.
+· Request parameters share the console/VLM compatibility policy. Explicit parameter rejections permit bounded
+  retries; successful adaptations are scoped to the endpoint, model, protocol and generation settings.
 """
 from __future__ import annotations
 
@@ -33,6 +32,8 @@ from typing import Any, Callable, Iterable
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from ..llm_compat import CompatibleRequest, endpoint_url, generation_parameters
 
 DEFAULT_TIMEOUT = 300
 DEFAULT_ATTEMPTS = 5
@@ -274,18 +275,6 @@ def cache_key(spec: LLMSpec, messages: list[dict[str, str]], params: dict[str, A
 # ── Single call ──────────────────────────────────────────────────────────
 
 _THINK_RE = re.compile(r"^.*?</think>", re.DOTALL)
-# Reasoning models burn the whole output budget on thinking when the input is table-heavy (finish_reason=length,
-# empty body), so the graph build always turns thinking off. The parameter differs per vendor, so all are sent
-# together: enable_thinking=False is the Qwen (Alibaba Cloud DashScope) / SGLang spelling; thinking.type=disabled is
-# DeepSeek's official one (since V4 in 2026 thinking is on by default with effort=high, and enable_thinking is
-# silently ignored; compared on the real box 2026-09-12). A server that does not recognize a parameter answers
-# 4xx naming it, in which case only the named one is dropped and this base_url remembers not to send it; when
-# none is named all are dropped and the request re-sent, remembered only if the resend really succeeds.
-# 2026-09-11 on the real box: a 400 from content moderation was once taken as "parameter rejected", the whole
-# process stopped turning thinking off, every unit's output budget was then eaten by reasoning and 20 empty
-# responses in a row tripped the circuit breaker.
-_NO_THINKING_PARAMS: dict[str, Any] = {"enable_thinking": False, "thinking": {"type": "disabled"}}
-_THINKING_PARAMS_REJECTED: dict[str, set[str]] = {}       # base_url → parameter names this server does not accept
 # The two "generation interrupted" finish_reason values in DeepSeek's docs: insufficient resources / aborted; retry
 _TRANSIENT_FINISH = {"insufficient_system_resource", "aborted"}
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -305,14 +294,6 @@ def _input_rejected(status: int, body: str) -> bool:
     if status in _RETRYABLE_STATUS or status < 400 or status >= 500:
         return False
     return status == 413 or bool(_INPUT_REJECTED_RE.search(body or ""))
-
-
-def _named_thinking_params(body: str, sent: dict[str, Any]) -> set[str]:
-    """Which thinking-off parameters the error body names (OpenAI's "Unrecognized request argument supplied: x"
-    and pydantic's "extra fields not permitted" both carry the field name, so it can be matched)."""
-    text = (body or "").lower()
-    # Match whole words: thinking is a substring of enable_thinking, naming the latter must not count the former
-    return {k for k in sent if re.search(r"(?<![a-z0-9_])" + re.escape(k.lower()) + r"(?![a-z0-9_])", text)}
 
 
 def _error_message(body: str) -> str:
@@ -379,53 +360,29 @@ def chat_once(
     base = spec.base_url.rstrip("/")
     headers = {"Content-Type": "application/json"}
     post = (session or requests).post
+    url = endpoint_url(base, spec.protocol)
+    body: dict[str, Any] = {
+        "model": spec.model_id,
+        "messages": messages,
+        **generation_parameters(spec.model_id, protocol=spec.protocol, base_url=base,
+                                max_tokens=max_tokens, temperature=temperature, disable_thinking=True),
+    }
     if spec.protocol == "anthropic":
-        url = base if base.endswith("/v1/messages") else base + "/v1/messages"
         headers["anthropic-version"] = "2023-06-01"
         if spec.api_key:
             headers["x-api-key"] = spec.api_key
         system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
-        body: dict[str, Any] = {
-            "model": spec.model_id,
-            "messages": [m for m in messages if m.get("role") != "system"],
-            "max_tokens": int(max_tokens),
-            "temperature": float(temperature),
-        }
+        body["messages"] = [m for m in messages if m.get("role") != "system"]
         if system:
             body["system"] = system
-        resp = post(url, headers=headers, json=body, timeout=timeout, allow_redirects=False)
     else:
-        url = base + "/chat/completions"
         if spec.api_key:
             headers["Authorization"] = f"Bearer {spec.api_key}"
-        body = {
-            "model": spec.model_id,
-            "messages": messages,
-            "max_tokens": int(max_tokens),
-            "temperature": float(temperature),
-        }
-        rejected = _THINKING_PARAMS_REJECTED.get(base, set())
-        sent = {k: v for k, v in _NO_THINKING_PARAMS.items() if k not in rejected}
-        body.update(sent)
-        resp = post(url, headers=headers, json=body, timeout=timeout, allow_redirects=False)
-        for _ in range(len(_NO_THINKING_PARAMS)):
-            if not (400 <= resp.status_code < 500 and resp.status_code not in _RETRYABLE_STATUS and sent
-                    and not _input_rejected(resp.status_code, resp.text)):
-                break        # retryable 4xx such as 429 are load problems, not parameter problems
-            # The server may not accept the thinking-off parameters: drop only the named one, or all of them when
-            # none is named, and resend. Named ones are remembered right away; unnamed ones only when the resend
-            # really succeeds, so content moderation and other parameter errors do not touch the process-wide switch
-            named = _named_thinking_params(resp.text, sent)
-            drop = named or set(sent)
-            for k in drop:
-                body.pop(k, None)
-                sent.pop(k, None)
-            retry = post(url, headers=headers, json=body, timeout=timeout, allow_redirects=False)
-            if named or retry.status_code == 200:
-                _THINKING_PARAMS_REJECTED.setdefault(base, set()).update(drop)
-                resp = retry
-            else:
-                break
+    request = CompatibleRequest(base, spec.model_id, spec.protocol, body)
+    while True:
+        resp = post(url, headers=headers, json=request.body, timeout=timeout, allow_redirects=False)
+        if not request.adapt(resp.status_code, resp.text):
+            break
     if 300 <= resp.status_code < 400:
         # Requests carrying credentials do not follow redirects (a cross-host one would hand over the key); this is
         # a configuration problem, not a load problem
@@ -460,13 +417,15 @@ def chat_once(
                 "Use a non-reasoning model, or one whose thinking can be disabled, for graph building"
             )
         raise LLMEmptyResponse("empty response" + (f" (finish_reason={finish})" if finish else ""))
+    request.accept()
     if meta is not None:
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         try:
             completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
         except (TypeError, ValueError):
             completion = 0
-        meta.update(finish_reason=finish, completion_tokens=completion, truncated=finish in ("length", "max_tokens"), cached=False)
+        meta.update(finish_reason=finish, completion_tokens=completion, truncated=finish in ("length", "max_tokens"),
+                    cached=False, request_parameters=request.parameters())
     return content
 
 
@@ -537,7 +496,9 @@ class ChatClient:
     # Sampling parameters in the cache key: everything that decides the output, nothing from the network layer
     # (timeout / base_url / key)
     def _params(self, max_tokens: int, temperature: float) -> dict[str, Any]:
-        return {"max_tokens": int(max_tokens), "temperature": float(temperature)}
+        params = generation_parameters(self.spec.model_id, protocol=self.spec.protocol, base_url=self.spec.base_url,
+                                       max_tokens=max_tokens, temperature=temperature, disable_thinking=True)
+        return CompatibleRequest(self.spec.base_url, self.spec.model_id, self.spec.protocol, params).parameters()
 
     def key_for(self, prompt_or_messages: str | list[dict[str, str]], *, max_tokens: int | None = None,
                 temperature: float | None = None) -> str:
@@ -591,11 +552,14 @@ class ChatClient:
                 raise LLMInterrupted("stop requested")
             try:
                 self._check_input_budget(nudged or messages)
+                call_meta: dict[str, Any] = {}
                 content = self._chat(
                     self.spec, nudged or messages,
                     timeout=(self.connect_timeout, self.timeout) if self.connect_timeout else self.timeout, max_tokens=max_tokens,
-                    temperature=temperature, session=self._session, meta=meta,
+                    temperature=temperature, session=self._session, meta=call_meta,
                 )
+                if meta is not None:
+                    meta.update(call_meta)
             except LLMInterrupted:
                 raise
             except Exception as exc:
@@ -627,7 +591,8 @@ class ChatClient:
                 nudged = messages + [{"role": "assistant", "content": content},
                                      {"role": "user", "content": correction or _MALFORMED_NUDGE}]
                 continue        # no backoff: format problems have nothing to do with service load
-            if use_cache and not (meta or {}).get("truncated"):
+            if use_cache and not call_meta.get("truncated"):
+                key = cache_key(self.spec, messages, call_meta.get("request_parameters", self._params(max_tokens, temperature)))
                 self.cache.put(key, self.spec.model_id, content)
             return content
         if isinstance(last, LLMMalformedResponse):

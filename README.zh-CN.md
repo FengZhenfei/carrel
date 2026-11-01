@@ -14,12 +14,12 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 ## 核心功能
 
-**0.3.1：** [更新内容与升级步骤](docs/releases/0.3.1.zh-CN.md)。
+**0.4.0（待发布）：** [更新内容与升级步骤](docs/releases/0.4.0.zh-CN.md)。
 
 - **多格式解析：** 支持 PDF、Word、PowerPoint、表格、图片、HTML、Markdown、Notebook、源代码及工作流文件，按文件格式采用相应的处理方式。[格式说明](docs/architecture.zh-CN.md#入库流程)。
 - **自动更新：** 定时发现文件变化，更新索引，并维护已启用的知识图谱。
 - **混合检索：** 结合向量、关键词、图谱和视觉检索，支持自动选择知识库、图文分路重排与排名融合。
-- **知识图谱：** 从资料中抽取实体类型、关系和事实，保留来源、时间信息和冲突标记。
+- **知识图谱：** 从资料中抽取实体类型、关系和事实，保留来源、时间信息和冲突标记，支持版本比较和限定证据范围的审定更正。
 - **智能体接口：** 支持检索、补取上下文、查看原图，以及按需追查图谱关系。
 - **Web 控制台：** 配置处理策略，预览切块与图谱，查看任务进度和服务状态，支持中英文切换。
 
@@ -46,7 +46,7 @@ Carrel 使用 MinerU 和原生解析器处理文档，通过 Qdrant 存储向量
 
 ## 设计思路
 
-Carrel 提供通用的知识存储、检索和证据接口。实体、关系和事实保留来源、时间信息及冲突，供智能体结合原文核对和使用。**Agent Loop 插件目前开发中，尚未实现**；其目标是利用这些接口持续学习企业本体，主动向相关人员求证，并维护更正规则。
+Carrel 提供通用的知识存储、检索和证据接口。实体、关系和事实保留来源、时间信息及冲突，供智能体结合原文核对和使用。默认检索保留历史和未来的原文声明；指定时间后筛选相应证据，审定更正记录其适用来源和实体身份。**Agent Loop 插件目前开发中，尚未实现**；其目标是利用这些接口持续学习企业本体，主动向相关人员求证，并维护更正规则。
 
 日常建图通过增量并入处理新增和变化内容，达到配置的时间或变化阈值后整库重建，兼顾更新成本与整体一致性。解析、索引和建图分别维护，重建图谱可以复用已有解析结果和切块，RAG 索引继续保留。
 
@@ -79,9 +79,9 @@ cd carrel
 
 ### 2. 配置模型接口
 
-编辑 `config/knowledge-base.env`，填写文本向量和图片描述模型的地址、模型名称及 API Key。初始地址指向本地模型服务，需另行按下述方式启动，或改为已有服务的地址。
+编辑 `config/knowledge-base.env`，填写向量及可选重排接口的地址、模型名称和 API Key。在控制台“模型列表”中注册支持图片输入的对话接口，再为各库选择“多模态模型”，图片、图表理解和表格复核共用该选择。也可通过 `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 配置全局默认接口。
 
-如果使用配套的本地模型，先准备模型权重，再运行 `./deploy.sh --with-local-models`。详见 [模型接口配置](docs/configuration.zh-CN.md#模型接口) 和 [本地模型部署](deployment/compose/README.md#local-model-servers-profile-local-models)。修改环境配置后，需要重启正在运行的应用服务。
+如果使用配套的四个向量与重排模型，先准备模型权重，再运行 `./deploy.sh --with-local-models`。详见 [模型接口配置](docs/configuration.zh-CN.md#模型接口) 和 [本地模型部署](deployment/compose/README.md#local-model-servers-profile-local-models)。修改环境配置后，需要重启正在运行的应用服务。
 
 ### 3. 添加资料
 
@@ -112,6 +112,7 @@ curl -sS http://127.0.0.1:9810/search \
 | [检索与 API](docs/retrieval.zh-CN.md) | 智能体接入、接口、证据状态与评测 |
 | [检索评测（0.3.0）](docs/evaluations/retrieval-evaluations-0.3.0.zh-CN.md) | 模型、测试条件、图谱与重排对照、耗时 |
 | [运维与开发](docs/operations.zh-CN.md) | 控制台、命令行、定时任务、排障和测试 |
+| [测试适用范围](docs/testing.zh-CN.md) | 通用回归契约、部署专项检查与真实服务评测 |
 | [部署实例](docs/example-setup.zh-CN.md) | 作者在 DGX Spark 上的实际部署、负责同步资料的 Mac，以及更轻量的做法 |
 | [Docker Compose](deployment/compose/README.md) | 基础设施、模型权重和容器配置（英文） |
 | [systemd](deployment/systemd/README.md) | Linux 服务与定时任务（英文） |

@@ -364,12 +364,12 @@ class KBDiscoveryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name in ("Catalog Library", "Components Library", "Reference Library"):
+            for name in ("Catalog Library", "Synthetic Eta", "Synthetic Zeta"):
                 (root / name).mkdir()
             state = root / "s.db"; db.init_db(state)
             with db.connect(state) as con:
                 a, _ = discovery.enroll(con, root, "Catalog Library")
-                b, _ = discovery.enroll(con, root, "Components Library")
+                b, _ = discovery.enroll(con, root, "Synthetic Eta")
                 self.assertEqual((a.kb_id, a.collection), ("kb_001", "kb_001"))
                 self.assertEqual((b.kb_id, b.collection), ("kb_002", "kb_002"))
                 # re-enrolling an existing row keeps its number
@@ -377,10 +377,10 @@ class KBDiscoveryTests(unittest.TestCase):
                 self.assertEqual((again.kb_id, outcome), ("kb_001", "already"))
                 # a forgotten (GC'd) directory starts over with a FRESH number
                 discovery.forget(con, "kb_002")
-                c, outcome = discovery.enroll(con, root, "Components Library")
+                c, outcome = discovery.enroll(con, root, "Synthetic Eta")
                 self.assertEqual((c.kb_id, outcome), ("kb_003", "new"))
                 # Folder names do not select domain-specific defaults.
-                lib, _ = discovery.enroll(con, root, "Reference Library")
+                lib, _ = discovery.enroll(con, root, "Synthetic Zeta")
                 self.assertEqual((lib.kb_id, lib.max_tokens), ("kb_004", a.max_tokens))
                 self.assertEqual(lib.block_merge_tokens, a.block_merge_tokens)
                 self.assertEqual(a.block_merge_tokens, 800)
@@ -435,14 +435,14 @@ class KBDiscoveryTests(unittest.TestCase):
                 row = discovery.known_sources(con)[0]
                 self.assertEqual(row["status"], "active"); self.assertIsNone(row["inactive_at"])
                 # per-KB config round-trip with unknown-key rejection
-                discovery.set_config(con, src.kb_id, {"max_tokens": 600, "vlm_prompt": "半导体图片重点识别时序"})
+                discovery.set_config(con, src.kb_id, {"max_tokens": 600, "vlm_prompt": "样例模块图片重点识别时序"})
                 cfg = discovery.get_config(con, src.kb_id)
                 self.assertEqual(cfg["max_tokens"], 600)
                 with self.assertRaises(ValueError):
                     discovery.set_config(con, src.kb_id, {"bogus": 1})
                 rebuilt = discovery.source_from_row(root, discovery.known_sources(con)[0])
                 self.assertEqual((rebuilt.kb_id, rebuilt.max_tokens, rebuilt.vlm_prompt),
-                                 (src.kb_id, 600, "半导体图片重点识别时序"))
+                                 (src.kb_id, 600, "样例模块图片重点识别时序"))
 
 
 class VectorLayoutTests(unittest.TestCase):
@@ -538,19 +538,26 @@ class ConfigLoadingTests(unittest.TestCase):
                  if "=" in line and not line.lstrip().startswith("#"))
         return {key.strip(): value.strip().strip("'\"") for key, value in pairs}
 
-    def test_missing_or_misspelled_keys_never_leave_this_host(self) -> None:
-        """Parsing is on and the key is set, only the name of the address key is misspelled: images and text
-        still go to the services on this host and nowhere else."""
+    def test_vlm_endpoint_requires_explicit_configuration(self) -> None:
+        """An unset or misspelled VLM URL stays empty; a configured endpoint and model are respected."""
         from urllib.parse import urlsplit
 
-        cfg = self._load("KB_PARSE_ENABLED=1\nVLM_API_KEY=local\nVLM_BASEURL=http://127.0.0.1:8105/v1\n")
-        self.assertTrue(cfg.parse_enabled)
-        self.assertEqual(cfg.vlm_api_key, "local")
-        for name in ("vlm_base_url", "embedding_base_url", "visual_embedding_base_url", "reranker_base_url",
-                     "visual_reranker_base_url", "mineru_url", "qdrant_url", "opensearch_url", "neo4j_uri"):
-            self.assertEqual(urlsplit(getattr(cfg, name)).hostname, "127.0.0.1", name)
+        for endpoint_line in ("", "VLM_BASEURL=https://vision.example.test/v1\n"):
+            with self.subTest(endpoint_line=endpoint_line):
+                cfg = self._load("KB_PARSE_ENABLED=1\nVLM_API_KEY=fixture-key\n" + endpoint_line)
+                self.assertTrue(cfg.parse_enabled)
+                self.assertEqual(cfg.vlm_api_key, "fixture-key")
+                self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id), ("", ""))
+                for name in ("embedding_base_url", "visual_embedding_base_url", "reranker_base_url",
+                             "visual_reranker_base_url", "mineru_url", "qdrant_url", "opensearch_url", "neo4j_uri"):
+                    self.assertEqual(urlsplit(getattr(cfg, name)).hostname, "127.0.0.1", name)
 
-    def test_defaults_match_the_example_file_and_the_served_models(self) -> None:
+        cfg = self._load("VLM_BASE_URL=https://vision.example.test/v1\n"
+                         "VLM_MODEL_ID=fixture-vision\nVLM_API_KEY=fixture-key\n")
+        self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id, cfg.vlm_api_key),
+                         ("https://vision.example.test/v1", "fixture-vision", "fixture-key"))
+
+    def test_defaults_match_the_example_file_and_bundled_models(self) -> None:
         cfg, example = self._load(), self._example()
         for key, name in (("EMBEDDING_BASE_URL", "embedding_base_url"), ("EMBEDDING_MODEL_ID", "embedding_model_id"),
                           ("VLM_BASE_URL", "vlm_base_url"), ("VLM_MODEL_ID", "vlm_model_id"),
@@ -563,8 +570,9 @@ class ConfigLoadingTests(unittest.TestCase):
         # step and the console hides the row); a value that is filled in must be the code default
         for key, name in (("RERANKER_BASE_URL", "reranker_base_url"), ("VISUAL_RERANKER_BASE_URL", "visual_reranker_base_url")):
             self.assertIn(example[key], ("", getattr(cfg, name)), key)
+        self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id), ("", ""))
         served = set(re.findall(r"--served-model-name\n\s+- (\S+)", _repo_file("deployment/compose/docker-compose.yml")))
-        self.assertLessEqual({cfg.embedding_model_id, cfg.vlm_model_id, cfg.visual_embedding_model_id}, served)
+        self.assertLessEqual({cfg.embedding_model_id, cfg.visual_embedding_model_id}, served)
 
     def test_legacy_vlm_variable_names_are_not_read(self) -> None:
         # The names stand in for the old fallback variables, which this tree no longer carries
@@ -573,14 +581,14 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(self._load("VLM_CONCURRENCY=\n").vlm_concurrency, 1)      # empty means the default
         self.assertEqual(self._load("VLM_CONCURRENCY=6\nVLM_API_KEY=k\n").vlm_concurrency, 6)
 
-    def test_graph_versions_kept_defaults_to_two_and_never_drops_below_one(self) -> None:
-        """Besides the current version the previous one is kept by default; 0 or a negative value still keeps
+    def test_graph_versions_kept_defaults_to_three_and_never_drops_below_one(self) -> None:
+        """Besides the current version two previous versions are kept by default; 0 or a negative value still keeps
         the current one. The example file and the code default agree."""
-        self.assertEqual(self._load().graph_gc_keep_versions, 2)
+        self.assertEqual(self._load().graph_gc_keep_versions, 3)
         self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=0\n").graph_gc_keep_versions, 1)
         self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=-3\n").graph_gc_keep_versions, 1)
         self.assertEqual(self._load("GRAPH_GC_KEEP_VERSIONS=1\n").graph_gc_keep_versions, 1)
-        self.assertEqual(self._example()["GRAPH_GC_KEEP_VERSIONS"], "2")
+        self.assertEqual(self._example()["GRAPH_GC_KEEP_VERSIONS"], "3")
 
     def test_tokenizer_cache_lives_under_the_runtime_dir(self) -> None:
         """tiktoken caches its encoding file in the system temp directory by default, which a reboot clears,
@@ -966,14 +974,14 @@ class KbRenameTests(unittest.TestCase):
         from kb_pipeline.localfs.scanner import list_source_files
         from kb_pipeline.pipeline.detect_changes import parser_profile_for
 
-        (root / "半导体").mkdir()
+        (root / "样例模块").mkdir()
         for name, body in (("a.md", "# A\n\nalpha " * 20), ("sub/b.md", "# B\n\nbeta " * 30), ("c.md", "# C\n\ngamma " * 10)):
-            p = root / "半导体" / name
+            p = root / "样例模块" / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(body, encoding="utf-8")
         db.init_db(state)
         with db.connect(state) as con:
-            src, _ = discovery.enroll(con, root, "半导体")
+            src, _ = discovery.enroll(con, root, "样例模块")
             for f in list_source_files(src, min_age_seconds=0, hash_content=True):
                 db.upsert_file(con, f, status="indexed")
                 db.mark_file_indexed(con, db.file_id_for(f.kb_id, f.file_key), f.content_version, parser_profile_for(f))
@@ -989,19 +997,19 @@ class KbRenameTests(unittest.TestCase):
             root = Path(tmp)
             state = root / "s.db"
             src = self._seed(root, state)
-            (root / "半导体").rename(root / "Components Library")
+            (root / "样例模块").rename(root / "Synthetic Eta")
             with db.connect(state) as con:
                 discovery.mark_inactive(con, src.kb_id)          # what the scan does after finding the directory gone
                 found = discovery.find_renamed_directories(con, root)
-                self.assertEqual([(f["kb_id"], f["old_dir"], f["dir"]) for f in found], [(src.kb_id, "半导体", "Components Library")])
+                self.assertEqual([(f["kb_id"], f["old_dir"], f["dir"]) for f in found], [(src.kb_id, "样例模块", "Synthetic Eta")])
                 self.assertEqual((found[0]["matched"], found[0]["total"], found[0]["verified"]), (3, 3, 3))
-                adopted = discovery.adopt_directory(con, root, src.kb_id, "Components Library")
-                self.assertEqual((adopted.kb_id, adopted.source_root, adopted.collection), (src.kb_id, "Components Library", src.collection))
+                adopted = discovery.adopt_directory(con, root, src.kb_id, "Synthetic Eta")
+                self.assertEqual((adopted.kb_id, adopted.source_root, adopted.collection), (src.kb_id, "Synthetic Eta", src.collection))
                 row = con.execute("SELECT status, source_root, inactive_reason FROM kb_sources WHERE kb_id=?", (src.kb_id,)).fetchone()
-                self.assertEqual((row["status"], row["source_root"], row["inactive_reason"]), ("active", "Components Library", None))
+                self.assertEqual((row["status"], row["source_root"], row["inactive_reason"]), ("active", "Synthetic Eta", None))
                 paths = {r["rel_path"]: (r["source_path"], r["physical_path"])
                          for r in con.execute("SELECT rel_path, source_path, physical_path FROM files WHERE kb_id=?", (src.kb_id,))}
-                self.assertEqual(paths["sub/b.md"], ("Components Library/sub/b.md", str(root / "Components Library" / "sub" / "b.md")))
+                self.assertEqual(paths["sub/b.md"], ("Synthetic Eta/sub/b.md", str(root / "Synthetic Eta" / "sub" / "b.md")))
                 # next scan round: files are recognised under the new path, content unchanged → metadata change only
                 # (metadata_update refreshes the path fields in the payload); none of them goes through parsing
                 changes = {f.rel_path: (c.change_type, c.job_type) for f in list_source_files(adopted, min_age_seconds=0, hash_content=True)
@@ -1030,11 +1038,11 @@ class KbRenameTests(unittest.TestCase):
                 self.assertEqual((report["matched"], report["total"]), (0, 3))
                 self.assertFalse(discovery.looks_like_rename(report))
                 # a KB the user closed (unenrolled) is not adopted automatically; left to the console, by hand
-                (root / "半导体").rename(root / "Components Library")
+                (root / "样例模块").rename(root / "Synthetic Eta")
                 discovery.mark_inactive(con, src.kb_id, reason="unenrolled")
                 self.assertEqual(discovery.find_renamed_directories(con, root), [])
-                adopted = discovery.adopt_directory(con, root, src.kb_id, "Components Library")     # manual adoption still works
-                self.assertEqual(adopted.source_root, "Components Library")
+                adopted = discovery.adopt_directory(con, root, src.kb_id, "Synthetic Eta")     # manual adoption still works
+                self.assertEqual(adopted.source_root, "Synthetic Eta")
                 # the new directory is already taken by another registry row
                 other, _ = discovery.enroll(con, root, "别的资料")
                 with self.assertRaises(ValueError):
@@ -1108,8 +1116,8 @@ class StateFixRegressionTests(unittest.TestCase):
                 con.executescript(db.SCHEMA); db.migrate_schema(con)
                 db.upsert_llm(con, name="gpu-a-qwen", base_url="http://gpu-a:8000/v1",
                               api_key="k1", model_id="qwen3.7-plus")
-                db.upsert_llm(con, name="本机", base_url="http://127.0.0.1:8105/v1",
-                              api_key="local", model_id="qwen3-vl-8b-instruct-fp8", builtin=True)
+                db.upsert_llm(con, name="内置模型", base_url="https://vision.example.test/v1",
+                              api_key="synthetic", model_id="vision-synthetic", builtin=True)
                 self.assertEqual(len(db.list_llms(con)), 2)
                 # blank api_key on update keeps the stored secret
                 db.upsert_llm(con, name="gpu-a-qwen", base_url="http://gpu-a:8000/v1",
@@ -1117,7 +1125,7 @@ class StateFixRegressionTests(unittest.TestCase):
                 row = db.get_llm(con, "gpu-a-qwen")
                 self.assertEqual((row["api_key"], row["model_id"]), ("k1", "qwen3.7-plus-v2"))
                 with self.assertRaises(ValueError):
-                    db.delete_llm(con, "本机")      # builtin protected
+                    db.delete_llm(con, "内置模型")      # builtin protected
                 self.assertTrue(db.delete_llm(con, "gpu-a-qwen"))
                 db.set_app_config(con, "some_setting", {"k": 1})
                 self.assertEqual(db.get_app_config(con, "some_setting"), {"k": 1})

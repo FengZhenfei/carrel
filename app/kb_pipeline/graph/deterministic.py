@@ -26,8 +26,9 @@ from typing import Any, Callable
 from .extract import ExtractionResult
 from .facts import fact_id, normalize_fact
 from .units import Unit
+from .import_resolution import ImportResolver
 
-VERSION = "det-v8"
+VERSION = "det-v10"
 
 TYPES = ("module", "class", "function", "method", "constant", "package", "repository", "skill", "instructions", "readme",
          "config_file", "document")
@@ -140,6 +141,8 @@ class DeterministicExtractor:
                 self.doc_of[u.rel_path] = u.doc_id
                 self.rel_of_doc[u.doc_id] = u.rel_path
         self.known_files = set(self.doc_of)
+        self.import_resolver = ImportResolver(self.known_files, file_for)
+        self.import_resolutions: dict[str, list[dict[str, Any]]] = {}
         # each document's first unit (order is KB-wide, not within the document): document-level entities and
         # facts hang off this unit only
         self.first_order: dict[str, int] = {}
@@ -149,6 +152,10 @@ class DeterministicExtractor:
         self._routes: dict[str, str] = {}
         self._code: dict[str, dict[str, Any]] = {}       # rel_path -> analysis result
         self._configs: dict[str, Any] = {}               # rel_path -> parsed configuration (None when it cannot be parsed)
+        self._field_facts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self.units_by_doc: dict[str, list[Unit]] = {}
+        for unit in sorted(units, key=lambda u: u.order):
+            self.units_by_doc.setdefault(unit.doc_id, []).append(unit)
         self._text_cache: dict[str, str] = {}
         self.route_counts: Counter = Counter()
 
@@ -221,117 +228,20 @@ class DeterministicExtractor:
         self._code[rel] = out
         return out
 
-    _EXT_CANDIDATES = ("", ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".go", ".java", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp",
-                       ".cs", ".php", ".rb", ".swift", ".kt", ".scala", ".sh", ".lua", "/index.js", "/index.ts", "/index.tsx", "/__init__.py",
-                       "/mod.rs", ".d.ts")
-
-    def _suffix_match(self, stem: str) -> str | None:
-        """Find the unique KB file that ends with stem (a/b/c) plus one of the extensions; if none, drop the first
-        segment and retry (package paths that carry a repository prefix)."""
-        parts = [p for p in stem.split("/") if p and p not in (".", "..")]
-        while parts:
-            tail = "/".join(parts)
-            hits: list[str] = []
-            for ext in self._EXT_CANDIDATES:
-                cand = tail + ext
-                hits += [f for f in self.known_files if f == cand or f.endswith("/" + cand)]
-            hits = list(dict.fromkeys(hits))
-            if len(hits) == 1:
-                return hits[0]
-            if len(hits) > 1:
-                # several candidates: prefer the same repository and the shortest path
-                return sorted(hits, key=lambda f: (len(f.split("/")), f))[0]
-            if len(parts) <= 1:
-                break
-            parts = parts[1:]
-        return None
-
     def _resolve_module(self, importer_rel: str, module: str, level: int) -> str | None:
-        """Module name in an import statement -> the file's rel_path in the KB (not found means an external package).
-        Path-style names (./x, ../y, lib/util.h, lib/util.sh) resolve as relative paths; dotted / double-colon /
-        backslash / go package paths match by suffix."""
-        repo = _repo_of(importer_rel)
-        module = str(module or "").strip().strip("\"'")
-        if not module or module.startswith("<"):
-            return None
-        base_dir = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
-        if module.startswith("./") or module.startswith("../") or module.endswith((".js", ".ts", ".h", ".hpp", ".sh", ".lua", ".php", ".rb")) or "/" in module:
-            rel_base = base_dir
-            m = module
-            while m.startswith("./") or m.startswith("../"):
-                if m.startswith("../"):
-                    rel_base = rel_base.rsplit("/", 1)[0] if "/" in rel_base else ""
-                    m = m[3:]
-                else:
-                    m = m[2:]
-            for cand_stem in ([f"{rel_base}/{m}" if rel_base else m] if (module.startswith(".") or level) else [f"{repo}/{m}" if repo else m, f"{rel_base}/{m}" if rel_base else m, m]):
-                for ext in self._EXT_CANDIDATES:
-                    cand = cand_stem.rstrip("/") + ext
-                    if cand in self.known_files:
-                        return cand
-            if "." in module.rsplit("/", 1)[-1] or module.startswith("."):
-                return None if module.startswith(".") else self._suffix_match(module)
-            return self._suffix_match(module)
-        if "::" in module or "\\" in module:
-            parts = [p for p in re.split(r"::|\\\\", module) if p and p not in _RUST_STD]
-            return self._suffix_match("/".join(parts)) if parts else None
-        if level:
-            base = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
-            for _ in range(level - 1):
-                base = base.rsplit("/", 1)[0] if "/" in base else ""
-            parts = [base] if base else []
-            if module:
-                parts.append(module.replace(".", "/"))
-            stem = "/".join(p for p in parts if p)
-        else:
-            stem = ((repo + "/") if repo else "") + module.replace(".", "/")
-        for cand in (stem + ".py", stem + "/__init__.py"):
-            if cand in self.known_files:
-                return cand
-        # absolute imports without a repository prefix (files at the KB root), and dotted paths of java / kotlin /
-        # scala / lua
-        if repo:
-            for cand in (module.replace(".", "/") + ".py", module.replace(".", "/") + "/__init__.py"):
-                if cand in self.known_files:
-                    return cand
-        return self._suffix_match(module.replace(".", "/")) if module and not level else None
+        return self.import_resolver.resolve(importer_rel, module, level).target
 
     def _resolve_submodule(self, importer_rel: str, module: str, name: str, level: int, target_rel: str | None) -> str | None:
-        """Look for c of ``from a.b import c`` as a submodule: only c.py / c/__init__.py below the package directory
-        of a.b. When a.b resolved to a package in the base (__init__.py) its directory is searched; a relative import
-        gets its directory from the level; when a.b is not in the base (a package without __init__.py) the whole
-        path a/b/c has to match. This must not go through _suffix_match: that strips leading segments one by one,
-        so ``from qdrant_client.http import models`` of an external package ends with just ``models`` and lands on
-        any models.py in the base, and the edge to the external package is lost as well (2026-09-29 audit)."""
-        name = str(name or "").strip()
-        if not name or name == "*":
+        if not name or name == "*" or (target_rel and not target_rel.endswith("/__init__.py")):
             return None
-        tails = (f"{name}.py", f"{name}/__init__.py")
-        if target_rel is not None:
-            if target_rel.rsplit("/", 1)[-1] != "__init__.py":
-                return None                                   # a.b is a module file, it has no submodules
-            stem = target_rel.rsplit("/", 1)[0] if "/" in target_rel else ""
-        elif level:
-            base = importer_rel.rsplit("/", 1)[0] if "/" in importer_rel else ""
-            for _ in range(level - 1):
-                base = base.rsplit("/", 1)[0] if "/" in base else ""
-            stem = "/".join(part for part in (base, str(module or "").replace(".", "/")) if part)
-        else:
-            path = str(module or "").replace(".", "/").strip("/")
-            if not path or ":" in path or "\\" in path:
-                return None
-            hits = [f for f in self.known_files for tail in tails if f == f"{path}/{tail}" or f.endswith(f"/{path}/{tail}")]
-            return sorted(set(hits), key=lambda f: (len(f.split("/")), f))[0] if hits else None
-        for tail in tails:
-            cand = f"{stem}/{tail}" if stem else tail
-            if cand in self.known_files:
-                return cand
-        return None
+        return self.import_resolver.resolve(importer_rel, module, level, name=name).target
 
     def _import_map(self, rel: str) -> dict[str, tuple[str | None, str | None, str | None]]:
         """Names in this file -> (in-KB module rel_path | None, symbol name | None, external package name | None)."""
         out: dict[str, tuple[str | None, str | None, str | None]] = {}
         mod = self._analysis(rel).get("module") or {}
+        diagnostics = []
+        self.import_resolutions[rel] = diagnostics
         for imp in mod.get("imports") or []:
             module, name, asname, level = imp.get("module") or "", imp.get("name"), imp.get("asname"), int(imp.get("level") or 0)
             if name:
@@ -342,18 +252,27 @@ class DeterministicExtractor:
                 local = asname or seg.rsplit(".", 1)[0] if "." in seg and "/" in module else (asname or seg)
                 if not local:
                     local = module.split(".")[0]
-            target_rel = self._resolve_module(rel, module, level)
+            resolved = self.import_resolver.resolve(rel, module, level)
+            target_rel = resolved.target
+            evidence = {"module": module, "name": name, "level": level, "status": resolved.status,
+                        "candidates": list(resolved.candidates), "project": self.import_resolver.root(rel)}
+            diagnostics.append(evidence)
             if name and (target_rel is None or name not in self._analysis(target_rel)["symbols"]):
                 # from a.b import c: when c is not a symbol defined in module a.b, try the submodule a/b/c.py first,
                 # for relative imports too (`from .. import db`, `from .graph import build` are the usual in-package
                 # forms; both used to lose their calls / imports edges).
                 sub = self._resolve_submodule(rel, module, str(name), level, target_rel)
+                sub_result = self.import_resolver.resolve(rel, module, level, name=str(name))
+                if sub_result.status == "ambiguous":
+                    evidence.update(status="ambiguous", candidates=list(sub_result.candidates))
+                    continue
                 if sub and sub != target_rel:
+                    evidence.update(status="internal", candidates=[sub])
                     out[local] = (sub, None, None)
                     continue
             if target_rel is not None:
                 out[local] = (target_rel, name, None)
-            else:
+            elif resolved.status == "external":
                 pkg = self._external_package(rel, module or name or "", level)
                 if pkg:
                     out[local] = (None, name, pkg)
@@ -419,6 +338,22 @@ class DeterministicExtractor:
                 safe_lookup = {re.sub(r"[^A-Za-z0-9_.]", "_", q)[:80]: q for q in symbols}
                 if qual in safe_lookup:
                     names_in_unit.append(safe_lookup[qual])
+        # Packed code chunks retain all source ranges, but have one owner block
+        # ID. Recover every definition whose declaration is in those ranges.
+        # Reading the same static symbol table avoids executing code or changing
+        # retrieval chunks merely to recover graph ownership.
+        ranges = []
+        for location in unit.source_locations:
+            locator = location.get("locator") or {}
+            if locator.get("kind") == "lines":
+                ranges.append(locator)
+            elif locator.get("kind") == "line_ranges":
+                ranges.extend(locator.get("ranges") or [])
+        for qual, meta in symbols.items():
+            line = meta.get("lineno")
+            if line is not None and any(int(r.get("start", 0)) <= line <= int(r.get("end", 0)) for r in ranges):
+                names_in_unit.append(qual)
+        names_in_unit = list(dict.fromkeys(names_in_unit))
         if not names_in_unit and not has_module_block:
             return ents, rels
         imports = self._import_map(rel)
@@ -489,10 +424,18 @@ class DeterministicExtractor:
                     ents.append(self._sym(tsyms[sym_name], sym_name, scope_doc=self.doc_of.get(target_rel)))
                     rels.append(_relation(source, sym_name, predicate, f"{source} {predicate} {sym_name} ({target_rel})"))
                     return True
-            elif pkg:
-                ents.append(_entity(pkg, "package", f"external package {pkg}"))
-                rels.append(_relation(source, pkg, predicate if predicate != "calls" else "calls", f"{source} {predicate} {name} from {pkg}"))
-                return True
+            elif pkg and sym_name:
+                # A call targets the imported symbol, not its package. Preserve
+                # the full import path so identically named external symbols do
+                # not collapse into one package-level endpoint.
+                imp = next((i for i in (self._analysis(rel).get("module") or {}).get("imports", [])
+                            if (i.get("asname") or i.get("name")) == name and i.get("name") == sym_name), None)
+                if imp:
+                    target = f"{imp.get('module') or pkg}.{sym_name}"
+                    kind = "class" if predicate == "inherits" else "function"
+                    ents.append(_entity(target, kind, f"external symbol imported as {name}"))
+                    rels.append(_relation(source, target, predicate, f"{source} {predicate} {target}"))
+                    return True
         # whole-file imports (C #include, bash source, go packages): look for a symbol of that name in the imported file
         for target_rel, sym_name, _pkg in imports.values():
             if target_rel and not sym_name and target_rel != rel:
@@ -573,17 +516,27 @@ class DeterministicExtractor:
         ents: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
         facts: list[dict[str, Any]] = []
-        is_first = "md-fm" in unit.block_ids or self.is_first_unit(unit)
+        is_first = self.is_first_unit(unit)
         if is_first:
             ents.append(_entity(title, etype, description, aliases=aliases))
-            for k, v in fields.items():
-                if k in ("name", "description", "title") or not str(v).strip():
-                    continue
-                fact = normalize_fact({"subject": title, "property": k, "value": str(v)[:120], "note": rel})
-                if fact:
-                    fact["id"] = fact_id(unit.unit_id, fact)
-                    fact["unit_id"] = unit.unit_id
-                    facts.append(fact)
+        frontmatter_units = [u for u in self.units_by_doc[unit.doc_id] if "md-fm" in u.block_ids]
+        for k, v in fields.items():
+            if k in ("name", "description", "title") or not str(v).strip():
+                continue
+            literal = re.sub(r"\s+", " ", f"{k}: {v}").strip()
+            matches = [u for u in frontmatter_units if literal in re.sub(r"\s+", " ", u.text)]
+            owner = (matches or frontmatter_units or self.units_by_doc[unit.doc_id])[0]
+            if owner.unit_id != unit.unit_id:
+                continue
+            fact = normalize_fact({"subject": title, "property": k, "value": str(v), "note": rel, "subject_origin": "explicit"})
+            if fact:
+                fact["id"] = fact_id(unit.unit_id, fact)
+                fact["unit_id"] = unit.unit_id
+                fact["evidence_unit_ids"] = [u.unit_id for u in matches]
+                fact["evidence_point_ids"] = list(dict.fromkeys(p for u in matches for p in u.point_ids))
+                fact["evidence_precision"] = "field" if matches else "document"
+                fact["source_locator"] = {"kind": "field", "container": "frontmatter", "field_path": [k]}
+                facts.append(fact)
         # files referenced in the body (only those that really exist in the KB)
         seen: set[str] = set()
         for ref in _REF_RE.findall(unit.text):
@@ -620,9 +573,9 @@ class DeterministicExtractor:
         ents: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
         facts: list[dict[str, Any]] = []
-        if not self.is_first_unit(unit):
-            return ents, rels, facts       # a config file's facts hang off the first unit only, no repeats
         if lower.endswith("requirements.txt"):
+            if not self.is_first_unit(unit):
+                return ents, rels, facts
             repo = _repo_of(rel) or "repository"
             ents.append(_entity(repo, "repository", f"repository {repo}"))
             for line in text.splitlines():
@@ -640,16 +593,64 @@ class DeterministicExtractor:
                     fact["id"] = fact_id(unit.unit_id, fact); fact["unit_id"] = unit.unit_id
                     facts.append(fact)
             return ents, rels, facts
-        data = self._config(rel)
-        ents.append(_entity(rel, "config_file", f"configuration file {rel}"))
-        if data is None:
-            return ents, rels, facts
-        for key_path, value in self._flatten(data)[:200]:
-            fact = normalize_fact({"subject": rel, "property": key_path, "value": str(value)[:120], "note": ""})
-            if fact:
-                fact["id"] = fact_id(unit.unit_id, fact); fact["unit_id"] = unit.unit_id
-                facts.append(fact)
+        if self.is_first_unit(unit):
+            ents.append(_entity(rel, "config_file", f"configuration file {rel}"))
+        if rel not in self._field_facts:
+            self._field_facts[rel] = self._configuration_facts(unit)
+        facts = self._field_facts[rel].get(unit.unit_id, [])
         return ents, rels, facts
+
+    def _configuration_facts(self, first: Unit) -> dict[str, list[dict[str, Any]]]:
+        from bisect import bisect_left, bisect_right
+        from ..parsers.config_source import config_fields, config_locations, field_name, overlaps
+        rel = first.rel_path
+        data = self._config(rel)
+        if data is None:
+            return {}
+        units = self.units_by_doc[first.doc_id]
+        locations = config_locations(self._text(rel), Path(rel).suffix.lower())
+        unit_order = {u.unit_id: i for i, u in enumerate(units)}
+        intervals = []
+        for u in units:
+            for loc in u.source_locations:
+                source = loc.get("locator") or {}
+                ranges = source.get("ranges", []) if source.get("kind") == "line_ranges" else [source]
+                for region in ranges:
+                    if "start" in region and "end" in region:
+                        lo = (region["start"], region.get("start_column", 0))
+                        hi = (region["end"], region.get("end_column", 10**12))
+                        intervals.append((lo, hi, u, loc))
+        intervals.sort(key=lambda item: item[0])
+        starts = [item[0] for item in intervals]
+        max_ends = []
+        for _, end, _, _ in intervals:
+            max_ends.append(max(end, max_ends[-1]) if max_ends else end)
+        by_unit: dict[str, list[dict[str, Any]]] = {}
+        for path, value in config_fields(data):
+            key_path = field_name(path)
+            raw_value = ", ".join(str(x) for x in value) if isinstance(value, list) and value else str(value) if value is not None else "null"
+            locator = locations.get(path)
+            matches = []
+            if locator:
+                lo = bisect_right(max_ends, (locator["start"], locator.get("start_column", 0)))
+                hi = bisect_left(starts, (locator["end"], locator.get("end_column", 10**12)))
+                matches = [(u, loc) for _, _, u, loc in intervals[lo:hi]
+                           if overlaps(loc.get("locator") or {}, locator)]
+            evidence_units = list(dict.fromkeys(u.unit_id for u, _ in matches))
+            owner = units[min((unit_order[uid] for uid in evidence_units), default=0)]
+            fact = normalize_fact({"subject": rel, "property": key_path, "value": raw_value,
+                                   "value_present": True, "subject_origin": "explicit"})
+            if fact:
+                fact["property"] = key_path
+                fact["value_json"] = json.dumps(value, ensure_ascii=False, default=str)
+                fact["id"] = fact_id(owner.unit_id, fact)
+                fact["unit_id"] = owner.unit_id
+                fact["evidence_unit_ids"] = evidence_units
+                fact["evidence_point_ids"] = list(dict.fromkeys(loc["point_id"] for _, loc in matches))
+                fact["evidence_precision"] = "field" if matches else "document"
+                fact["source_locator"] = locator or {"kind": "field", "field_path": list(path)}
+                by_unit.setdefault(owner.unit_id, []).append(fact)
+        return by_unit
 
     def _config(self, rel: str) -> Any:
         if rel not in self._configs:
@@ -681,19 +682,10 @@ class DeterministicExtractor:
 
     @staticmethod
     def _flatten(data: Any, prefix: str = "") -> list[tuple[str, Any]]:
-        out: list[tuple[str, Any]] = []
-        if isinstance(data, dict):
-            for k, v in data.items():
-                out.extend(DeterministicExtractor._flatten(v, f"{prefix}.{k}" if prefix else str(k)))
-        elif isinstance(data, list):
-            if all(not isinstance(x, (dict, list)) for x in data):
-                out.append((prefix or "(root)", ", ".join(str(x) for x in data)[:200]))
-            else:
-                for i, v in enumerate(data):
-                    out.extend(DeterministicExtractor._flatten(v, f"{prefix}[{i}]"))
-        elif data is not None and prefix:
-            out.append((prefix, data))
-        return out
+        from ..parsers.config_source import config_fields, field_name
+        return [(field_name(((prefix,) if prefix else ()) + path),
+                 ", ".join(str(x) for x in value) if isinstance(value, list) else value)
+                for path, value in config_fields(data)]
 
     # ── Public API ──
     def extract(self, unit: Unit) -> ExtractionResult:
@@ -710,7 +702,8 @@ class DeterministicExtractor:
         else:
             ents, rels = [], []
         return ExtractionResult(unit_id=unit.unit_id, entities=_dedupe(ents), relations=_dedupe_rel(rels), calls=0,
-                                stats={"builder": route, "records": len(ents) + len(rels), "unit_kind": "body", "malformed": 0})
+                                stats={"builder": route, "records": len(ents) + len(rels), "unit_kind": "body", "malformed": 0,
+                                       **({"import_resolutions": self.import_resolutions.get(unit.rel_path, [])} if route == "code" and self.is_first_unit(unit) else {})})
 
     def facts(self, unit: Unit) -> list[dict[str, Any]]:
         route = self.route(unit)

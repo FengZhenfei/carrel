@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, replace
@@ -44,8 +45,8 @@ _SCALAR_RE = re.compile(
     rf"\s*(?P<unit>[{_UNIT_CLASS}]*)(?:\s*[\(（][^\)）]{{0,40}}[\)）])?$"
 )
 _RANGE_RE = re.compile(
-    rf"^(?P<lo>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*\s*(?:to|~|–|—|-|至|到|\.\.\.?)\s*"
-    rf"(?P<hi>{_PLAIN_NUMBER})\s*[{_UNIT_CLASS}]*$"
+    rf"^(?P<lo>{_PLAIN_NUMBER})\s*(?P<lo_unit>[{_UNIT_CLASS}]*?)\s*(?:to|~|–|—|-|至|到|\.\.\.?)\s*"
+    rf"(?P<hi>{_PLAIN_NUMBER})\s*(?P<hi_unit>[{_UNIT_CLASS}]*)$"
 )
 # A currency sign directly in front of a number ($85,000, A$21,050) is its unit, not part of the number: the value
 # stays as written and the number is parsed as usual, so amounts can be compared and put in a series. When letters
@@ -90,7 +91,8 @@ from ..measure_units import _UNIT_ALIASES, canonical_unit, unit_key  # noqa: E40
 
 def _to_float(raw: str) -> float | None:
     try:
-        return float(raw.replace(",", "").replace(" ", ""))
+        value = float(raw.replace(",", "").replace(" ", ""))
+        return value if math.isfinite(value) else None
     except ValueError:
         return None
 
@@ -105,7 +107,39 @@ def _nfkc(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
-def classify_value(value: Any) -> dict[str, Any]:
+def _quantity_suffix(suffix: str, unit: str = "") -> tuple[float, str] | None:
+    """Validate a unit token before treating a number-prefixed string as a quantity.
+
+    A bare SI prefix has no dimension. It can scale an explicit base unit, but cannot
+    be silently discarded or assigned a binary magnitude from the document's domain.
+    """
+    if not suffix:
+        return 1.0, unit
+    prefixes = {"k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "B": 1e9,
+                "Ki": 1024., "Mi": 1024.**2, "Gi": 1024.**3}
+    if suffix in prefixes:
+        if unit == suffix:
+            return 1.0, unit
+        if unit and unit != suffix:
+            return prefixes[suffix], unit
+        return None
+    # C/F without degree signs also occur in identifiers. A separate unit field
+    # supplies measurement context; the scalar recognizer alone does not.
+    if suffix in {"C", "F", "L", "B"} and not unit:
+        return None
+    canon = canonical_unit(suffix)
+    known = suffix.casefold() in _UNIT_ALIASES or canon in {"bit", "bits", "B", "byte", "bytes", "Pa", "kPa", "MPa", "N", "J", "mol", "rpm"}
+    if not known:
+        known = any(suffix.startswith(prefix) and suffix[len(prefix):] in {"bit", "bits", "B", "byte", "bytes", "Hz", "W", "V", "A", "s", "g", "m", "Pa", "Ω"}
+                    for prefix in ("Ki", "Mi", "Gi", "k", "M", "G", "m", "µ", "μ", "n", "p"))
+    if not known and unit and canonical_unit(unit) == canon:
+        known = True  # an explicitly stated domain unit is not guessed from arbitrary suffix letters
+    if not known or (unit and canonical_unit(unit) != canon):
+        return None
+    return 1.0, canon
+
+
+def classify_value(value: Any, *, unit: str = "") -> dict[str, Any]:
     """What kind of thing a value field is:
       scalar     the whole string is one number (comparator, unit, footnote, bracketed remark allowed): '0.160',
                  '-40°C', '≤ 10', '10 mA (typ)'; also a number with a currency sign directly in front of it
@@ -116,23 +150,37 @@ def classify_value(value: Any) -> dict[str, Any]:
       text       anything else ('n/a', 'Max', '20/25/45', '12,50')
       empty
     Only scalar yields num; range yields lo / hi."""
-    text = _nfkc(str(value or "")).replace("−", "-").strip()
+    text = _nfkc(str(value if value is not None else "")).replace("−", "-").strip()
     text = _FOOTNOTE_RE.sub("", text).strip()
     if not text:
         return {"kind": "empty", "num": None}
     m = _SCALAR_RE.fullmatch(text)
     if m:
         num = _to_float(m.group("num"))
-        if num is not None:
-            out: dict[str, Any] = {"kind": "scalar", "num": num}
+        quantity = _quantity_suffix(m.group("unit"), unit)
+        if (not unit and len(m.group("unit")) == 1 and m.group("unit") != canonical_unit(m.group("unit"))
+                and not text[m.end("num"):m.start("unit")]):
+            quantity = None  # an attached case-mismatched symbol may be a revision suffix
+        if num is not None and quantity is not None and math.isfinite(num * quantity[0]):
+            factor, parsed_unit = quantity
+            out: dict[str, Any] = {"kind": "scalar", "num": num * factor}
+            if parsed_unit and m.group("unit"):
+                out["unit"] = parsed_unit
             if m.group("cmp"):
                 out["cmp"] = m.group("cmp")
             return out
     m = _RANGE_RE.fullmatch(text)
     if m:
         lo, hi = _to_float(m.group("lo")), _to_float(m.group("hi"))
-        if lo is not None and hi is not None:
-            return {"kind": "range", "num": None, "lo": lo, "hi": hi}
+        lower_unit = m.group("lo_unit") or m.group("hi_unit")
+        upper_unit = m.group("hi_unit") or m.group("lo_unit")
+        lower, upper = _quantity_suffix(lower_unit, unit), _quantity_suffix(upper_unit, unit)
+        if (lo is not None and hi is not None and lower is not None and upper is not None and lower[1] == upper[1]
+                and math.isfinite(lo * lower[0]) and math.isfinite(hi * upper[0])):
+            out = {"kind": "range", "num": None, "lo": lo * lower[0], "hi": hi * upper[0]}
+            if lower_unit and lower[1]:
+                out["unit"] = lower[1]
+            return out
     m = _MONEY_RE.fullmatch(text)
     if m:
         num = _to_float(m.group("num"))
@@ -303,7 +351,7 @@ def _clean(value: Any, limit: int = 200) -> str:
     return normalize_name(str(value if value is not None else ""))[:limit]
 
 
-def _clean_value(value: Any, limit: int = 200) -> str:
+def _clean_value(value: Any, limit: int | None = None) -> str:
     """Value, unit, conditions, note: full-width / half-width normalisation, surrounding quotes and whitespace
     stripped, whitespace collapsed, everything else as in the source.
     These fields are not names and skip the LaTeX restoration of entity names ("$85K" would lose its currency,
@@ -319,35 +367,37 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
     subject = _clean(raw.get("subject"), 160)
     prop = _clean(raw.get("property"), 160)
     symbol = _clean(raw.get("symbol"), 60)
-    value = _clean_value(raw.get("value"), 120)
-    lo, typ, hi = _clean_value(raw.get("min"), 60), _clean_value(raw.get("typ"), 60), _clean_value(raw.get("max"), 60)
+    value = _clean_value(raw.get("value"))
+    lo, typ, hi = _clean_value(raw.get("min")), _clean_value(raw.get("typ")), _clean_value(raw.get("max"))
     unit = _clean_value(raw.get("unit"), 40)
-    note = _clean_value(raw.get("note"), 300)
+    note = _clean_value(raw.get("note"))
     flag = _clean_value(raw.get("flag"), 40)
     ref_min, ref_max = _clean_value(raw.get("ref_min"), 60), _clean_value(raw.get("ref_max"), 60)
     period_text = _clean_value(raw.get("period_text"), 120)
     if not subject or not prop:
         return None
-    if not any((value, lo, typ, hi)):
+    if not any((value, lo, typ, hi)) and not raw.get("value_present"):
         return None
     conditions: dict[str, str] = {}
     raw_conditions = raw.get("conditions")
     if isinstance(raw_conditions, dict):
-        for k, v in list(raw_conditions.items())[:8]:
-            ck, cv = _clean_value(k, 60), _clean_value(v, 80)
+        for k, v in raw_conditions.items():
+            ck, cv = _clean_value(k), _clean_value(v)
             if ck and cv:
                 conditions[ck] = cv
     elif isinstance(raw_conditions, str) and raw_conditions.strip():
-        conditions["condition"] = _clean_value(raw_conditions, 120)
+        conditions["condition"] = _clean_value(raw_conditions)
     kinds: dict[str, str] = {}
     nums: dict[str, float | None] = {}
     ranges: dict[str, list[float]] = {}
     cmps: dict[str, str] = {}
     for field, text in (("value", value), ("min", lo), ("typ", typ), ("max", hi)):
-        info = classify_value(text)
+        info = classify_value(text, unit=unit)
         nums[field] = info["num"]
         if info.get("currency") and not unit:
             unit = str(info["currency"])              # empty unit field and the currency written in front of the number: the currency is the unit
+        if info.get("unit") and not unit:
+            unit = str(info["unit"])
         if info["kind"] != "empty":
             kinds[field] = info["kind"]
         if info["kind"] == "range":
@@ -365,21 +415,32 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
         out["ranges"] = ranges
     if cmps:
         out["cmps"] = cmps
+    if raw.get("subject_origin") in {"explicit", "context", "unresolved"}:
+        out["subject_origin"] = raw["subject_origin"]
+    if raw.get("fact_kind") in {"observation", "state", "reference"}:
+        out["fact_kind"] = raw["fact_kind"]
+    else:
+        out["fact_kind"] = "observation"
+    if raw.get("evidence"):
+        out["evidence"] = _clean_value(raw["evidence"], 800)
+    if out.get("subject_origin") == "unresolved":
+        out["quality"] = "needs_review"
     # Axis and bounds (2026-09-07): the document's own abnormal flags, reference ranges and validity period. Dates
     # are only accepted in the ISO form the model copied from the source (temporal.parse_date normalizes once
-    # more); a missing validity period is filled in by the build phase from the document axis value
+    # more). Publication time is kept separately from the fact's validity period.
     if flag:
         out["flag"] = flag
     if ref_min or ref_max:
         out["ref_min"], out["ref_max"] = ref_min, ref_max
         out["ref_min_num"], out["ref_max_num"] = parse_number(ref_min), parse_number(ref_max)
     from .temporal import parse_date
-    for field in ("valid_from", "valid_until"):
+    for field in ("valid_from", "valid_until", "observed_at"):
         text = _clean_value(raw.get(field), 40)
         parsed = parse_date(text) if text else None
         if parsed:
             out[field] = parsed
-    if period_text and (out.get("valid_from") or out.get("valid_until")):
+    out["time_basis"] = "explicit" if out.get("valid_from") or out.get("valid_until") else "reported" if out.get("observed_at") else "unknown"
+    if period_text:
         out["period_text"] = period_text
     return out
 
@@ -416,13 +477,15 @@ def comparable_number(fact: dict[str, Any]) -> float | None:
     ranges, expressions, comparator values (<1.3), text, multi-values (20/25/45) and facts flagged as evidence
     conflicts or glued sources all return None. The compile layer no longer guesses numbers out of strings (Codex
     review F04: V_CC + 0.5 was once taken as 0.5, 2.7 to 3.6 as 2.7, and <1.3 treated as equal to 1.3)."""
-    if fact.get("evidence_conflict") or str(fact.get("quality") or "") == "ambiguous_source":
+    from .quality import fact_quality
+
+    if fact_quality(fact) == "needs_review":
         return None
     for field in ("value", "typ"):
         raw = fact.get(field)
         if raw in (None, ""):
             continue
-        info = classify_value(raw)
+        info = classify_value(raw, unit=str(fact.get("unit") or ""))
         if info["kind"] == "scalar" and not info.get("cmp"):
             return info["num"]
         return None
@@ -522,6 +585,9 @@ def fact_id(unit_id: str, fact: dict[str, Any]) -> str:
         fact.get("value", ""), fact.get("min", ""), fact.get("typ", ""), fact.get("max", ""),
         str(fact.get("unit", "")).casefold().strip(),
         str(fact.get("valid_from") or ""),        # the same property split by period in one table (2024 / 2025 columns) is two facts
+        str(fact.get("valid_until") or ""),
+        str(fact.get("observed_at") or ""),
+        str(fact.get("fact_kind") or "observation"),
     ])
     return "f" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
@@ -531,7 +597,7 @@ def when_text(fact: dict[str, Any]) -> str:
     lo, hi = str(fact.get("valid_from") or ""), str(fact.get("valid_until") or "")
     if lo and hi and lo != hi:
         return f"{lo}~{hi}"
-    return lo or hi or str(fact.get("axis") or "")
+    return lo or hi or str(fact.get("observed_at") or fact.get("axis") or fact.get("observed") or "")
 
 
 def conditions_text(conditions: dict[str, Any] | None) -> str:
@@ -604,6 +670,30 @@ def value_text(fact: dict[str, Any]) -> str:
     return text[:400] or "(no value)"
 
 
+def retain_source_time(fact: dict[str, Any], unit: Unit) -> None:
+    """A legacy prompt's document-date fallback is provenance, not applicability."""
+    from .temporal import find_dates
+    doc_date = str(getattr(unit, "doc_date", "") or "")
+    if not doc_date or fact.get("valid_from") != doc_date:
+        return
+    quote = str(fact.get("period_text") or "").strip()
+    norm = lambda x: re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(x))).casefold()
+    if quote and norm(quote) in norm(unit.text):
+        # A quoted historical date must not become the report's publication date.
+        # Only a literal single date qualifies; ranges and relative time stay intact.
+        probe = {"period_text": quote}
+        recover_observation_date(probe, unit.text)
+        if (probe.get("observed_at") and probe["observed_at"] != doc_date
+                and not fact.get("valid_until") and fact.get("fact_kind", "observation") != "state"):
+            fact.pop("valid_from", None)
+            fact.update(observed_at=probe["observed_at"], time_basis="reported")
+        return
+    if doc_date in find_dates(unit.text):
+        return
+    fact.pop("valid_from", None)
+    fact["time_basis"] = "explicit" if fact.get("valid_until") else "reported" if fact.get("observed_at") else "unknown"
+
+
 def render_facts_prompt(unit: Unit, *, document: str, subjects: Iterable[str], max_facts: int = FACTS_MAX_PER_UNIT,
                         axis: str = "", narrative: bool = False) -> str:
     """表格 / 列表单元用 FACTS_PROMPT;narrative=True(按日期组织的资料里的叙述段)用 NARRATIVE_FACTS_PROMPT。
@@ -646,13 +736,13 @@ def wants_narrative_facts(unit: Unit, kind: str | None = None) -> bool:
 
 # 候选主体怎么挑也进指纹:候选写在提示词的 Likely subjects 行,规则变了,按旧候选抽出的单元不能沿用(提示词没变的
 # 单元重抽时走响应缓存,不花调用)。subjects-v2:小节标题点名的主题(改版十八)
-SUBJECT_CANDIDATES_VERSION = "subjects-v2"
+SUBJECT_CANDIDATES_VERSION = "subjects-v3-local-evidence"
 
 
 def facts_fingerprint(spec: LLMSpec) -> str:
-    # 版本标签跟着 normalize_fact 的产出走:落库的是规范化之后的事实,规范化变了旧行就不能复用。
-    # facts-v4:逗号只认千分位、取值类字段不再按实体名还原 LaTeX;facts-v5:有效期只收日期(版本在 axis 里)、带观察时间
-    raw = "|".join(["facts-v5", SUBJECT_CANDIDATES_VERSION, spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
+    # Unchanged prompts retain their extraction cache. Time provenance and IDs
+    # are recomputed for both cached and fresh rows before linking the graph.
+    raw = "|".join(["facts-v8", SUBJECT_CANDIDATES_VERSION, spec.model_id, spec.protocol, facts_prompt_hash(), str(FACTS_MAX_PER_UNIT)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -660,6 +750,35 @@ def facts_response_ok(text: str) -> bool:
     """For ChatClient.chat(validate=…): a response is acceptable only if a facts list can be parsed from it
     (complete, or truncated but recoverable)."""
     return parse_facts_response(text)["malformed"] == 0
+
+
+def recover_observation_date(fact: dict[str, Any], source_text: str) -> None:
+    """Recover an ISO observation date from a literal, single-date period quote.
+
+    A model sometimes fills period_text but omits the structured date. Relative
+    expressions, ranges and bounds such as 'before 2025' need interpretation and
+    are deliberately left unchanged. This never invents an effective interval.
+    """
+    if any(fact.get(k) for k in ("valid_from", "valid_until", "observed_at")):
+        return
+    period = str(fact.get("period_text") or "").strip()
+    norm = lambda s: re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(s))).casefold()
+    if not period or norm(period) not in norm(source_text):
+        return
+    if not re.fullmatch(r"(?:(?:in|on)\s+|[于在])?(?:19|20)\d{2}(?:(?:[-/.]\d{1,2}){0,2}|年(?:\d{1,2}月(?:\d{1,2}[日号])?)?)", period, re.I):
+        return
+    from .temporal import parse_date
+    date = parse_date(period)
+    if date:
+        fact["observed_at"] = date
+        fact["time_basis"] = "reported"
+
+
+FACTS_FORMAT_CORRECTION = (
+    "Return only a valid JSON object with a facts array. Preserve the source text in string values; "
+    "escape embedded double quotes, backslashes and control characters using JSON string escaping. "
+    "Do not place literal unescaped quotation marks inside evidence or other string values."
+)
 
 
 class FactExtractor:
@@ -676,12 +795,21 @@ class FactExtractor:
 
     def extract(self, unit: Unit, *, document: str = "", subjects: Iterable[str] = (), axis: str = "",
                 narrative: bool = False) -> FactResult:
+        from .tables import fact_request_parts
+        parts = fact_request_parts(unit, self.max_facts) if not narrative else []
+        if parts:
+            results = [self.extract(replace(unit, text=part), document=document, subjects=subjects, axis=axis)
+                       for part in parts]
+            facts = {f["id"]: f for r in results for f in r.facts}
+            stats = {k: sum(r.stats.get(k, 0) for r in results) for k in {k for r in results for k in r.stats}}
+            stats.update(facts=len(facts), split=sum(r.stats.get("split", 0) for r in results) + len(parts) - 1)
+            return FactResult(unit_id=unit.unit_id, facts=list(facts.values()), calls=sum(r.calls for r in results), stats=stats)
         prompt = render_facts_prompt(unit, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis,
                                      narrative=narrative)
         # 不是合格 JSON 的响应:客户端带纠正提示再要一次,仍不合格就抛 LLMMalformedResponse ——
         # 调用方把这个单元记成失败,不落 graph_facts、不进响应缓存(Codex 审查 F03)
         response = self.client.chat([{"role": "user", "content": prompt}], max_tokens=self.max_tokens,
-                                    validate=facts_response_ok)
+                                    validate=facts_response_ok, correction=FACTS_FORMAT_CORRECTION)
         parsed = parse_facts_response(response)
         calls = 1
         split = 0
@@ -689,7 +817,7 @@ class FactExtractor:
             # Cut off by max_tokens: ask again at twice the budget; if still truncated keep the recovered part and
             # record truncated
             bigger = self.client.chat([{"role": "user", "content": prompt}], max_tokens=self.max_tokens * 2,
-                                      validate=facts_response_ok)
+                                      validate=facts_response_ok, correction=FACTS_FORMAT_CORRECTION)
             calls += 1
             again = parse_facts_response(bigger)
             if not again["truncated"] or len(again["facts"]) > len(parsed["facts"]):
@@ -707,7 +835,7 @@ class FactExtractor:
                     sub_prompt = render_facts_prompt(sub, document=document, subjects=subjects, max_facts=self.max_facts, axis=axis,
                                                      narrative=narrative)
                     got = parse_facts_response(self.client.chat([{"role": "user", "content": sub_prompt}], max_tokens=self.max_tokens * 2,
-                                                                validate=facts_response_ok))
+                                                                validate=facts_response_ok, correction=FACTS_FORMAT_CORRECTION))
                     calls += 1
                     merged.extend(got["facts"])
                     still = still or bool(got["truncated"])
@@ -722,11 +850,15 @@ class FactExtractor:
         conflicted = 0
         glued = [str(v) for v in (getattr(unit, "ambiguous_values", None) or []) if str(v).strip()]
         value_conflicts = [c for c in (getattr(unit, "value_conflicts", None) or []) if isinstance(c, dict)]
-        for i, raw in enumerate(raw_facts[: self.max_facts * 2]):
+        # max_facts budgets one model request. It must not discard valid source
+        # facts recovered by retries or by splitting a dense unit.
+        for raw in raw_facts:
             fact = normalize_fact(raw)
             if fact is None:
                 dropped += 1
                 continue
+            retain_source_time(fact, unit)
+            recover_observation_date(fact, unit.text)
             if glued and mark_ambiguous_source(fact, glued):
                 ambiguous += 1
             if value_conflicts and mark_evidence_conflict(fact, value_conflicts):
@@ -741,9 +873,6 @@ class FactExtractor:
             if narrative:
                 fact["source_kind"] = "narrative"
             facts.append(fact)
-            if len(facts) >= self.max_facts:
-                capped = i + 1 < len(raw_facts)      # some left: stopping at the budget is not "input fully processed" (Codex re-review N03)
-                break
         partial = int(bool(parsed["truncated"]) or capped)
         return FactResult(unit_id=unit.unit_id, facts=facts, calls=calls,
                           stats={"facts": len(facts), "dropped": dropped, "malformed_json": malformed, "raw": len(raw_facts),
@@ -800,18 +929,22 @@ def link_facts(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, u
             f["doc_id"] = unit.doc_id
             f["rel_path"] = unit.rel_path
             f["section"] = unit.section_label
-            f["point_ids"] = list(unit.point_ids)
-            # 文档轴值:事实自己没写有效期就按文档日期算;版本只进 axis,不进 valid_from(有效期只收日期,
-            # 以前把 rev *L 这种版本串写进 valid_from,时间窗与新旧判断都把它当日期比)
+            f["point_ids"] = list(f["evidence_point_ids"] if "evidence_point_ids" in f else unit.point_ids)
+            # 文档日期/版本记录观察上下文,不补作事实生效时间。
             axis = str(getattr(unit, "axis", "") or "")
             doc_date = str(getattr(unit, "doc_date", "") or "")
             if axis:
                 f["axis"] = axis
             if doc_date:
                 f["observed"] = doc_date
-            default_from = axis if axis_value_kind(axis) == "date" else doc_date
-            if default_from and not f.get("valid_from") and not f.get("valid_until"):
-                f["valid_from"] = default_from
+            # A document date records when the assertion was observed, not when a
+            # rule or price became effective. Keep both forms of time distinct.
+            if f.get("valid_from") or f.get("valid_until"):
+                f["time_basis"] = "explicit"
+            elif f.get("observed_at"):
+                f["time_basis"] = "reported"
+            else:
+                f["time_basis"] = "document" if axis or doc_date else "unknown"
             if f.get("ref_min_num") is not None or f.get("ref_max_num") is not None:
                 dist = bound_distance(f)
                 if dist is not None:
@@ -868,12 +1001,12 @@ def unit_subjects(units: Iterable[Unit], entities: list[dict[str, Any]], *, per_
         rank = (_type_rank(e, priority), int(e.get("frequency") or 0))
         for uid in e.get("unit_ids") or []:
             in_unit.setdefault(str(uid), {})[str(e.get("title") or "")] = rank
-    topics = HeadingTopics(entities) if any(u.doc_id not in owner for u in units) else None
+    topics = HeadingTopics(entities)
     out: dict[str, list[str]] = {}
     for u in units:
         local = [t for t, _ in sorted((in_unit.get(u.unit_id) or {}).items(), key=lambda kv: (-kv[1][0], -kv[1][1]))]
-        topic = topics.topic(u) if topics is not None and u.doc_id not in owner else ""
-        names = [owner.get(u.doc_id, ""), *local, topic, *by_doc.get(u.doc_id, [])]
+        topic = topics.topic(u)
+        names = [*local, topic, owner.get(u.doc_id, ""), *by_doc.get(u.doc_id, [])]
         out[u.unit_id] = [t for t in dict.fromkeys(names) if t][:per_unit]
     return out
 
@@ -1098,41 +1231,14 @@ def _is_quantity(fact: dict[str, Any]) -> bool:
 
 def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, units_by_id: dict[str, Unit],
                            profile: dict[str, Any] | None = None, documents: dict[str, str] | None = None) -> dict[str, int]:
-    """确定性归位,在 link_facts 之后跑(缓存里的旧事实也能修):
-    · 属性名尾巴上的标记词(总胆固醇增高 / elevated)剥到 flag,概念才能并到「总胆固醇」;只剥取值是文字的,
-      原属性名记 property_raw;
-    · 条件里的时期(年份: 2024/07)搬到 valid_from / period_text,历年对照表的每一行各成一个时间点;
-    · 文档有归属人(路径 / 同目录序列证据定下的画像主体:某人文件夹里的报告、某器件目录下的资料)时,测量事实的主体
-      改成归属人:原主体是化验单 / 检查项目(上层 process)或指标本身(上层 property)或与属性同名、属性是「测量结果」
-      这类泛词的;日期轴的语料里,带参考范围或标记的测量即使挂在诊断名下(异常汇总表:肥胖 → 尿酸 479↑)也归受检者,
-      原主体记到 context。只按频次认出来的画像主体不归位,避免把文档中的不同对象归到最常出现的名字下。
-    · 文档主体由路径 / 同目录序列证据定下来(subject_evidence_by_doc)时,挂在本文档自己那个「主体类型」实体
-      (李先生_体检号、签发人名)名下的事实整个归到画像主体(resubjected_identity)。
-    不改数值,不删事实;改过主体的记 subject_raw。"""
+    """Normalize explicit markers and periods without assigning a document's owner to its facts.
+
+    Directory names and document-level frequency nominate extraction candidates; neither establishes
+    who owns a local value. Subject linking and alias resolution operate on the extracted subject.
+    """
     from .temporal import parse_date
 
-    profile = profile or {}
-    evidence = subject_evidence_by_doc(entities, profile.get("subject_types") or (), documents)
-    subj_by_doc = {doc: e for doc, (e, how) in evidence.items() if how in ("path", "series")}
-    priority = subject_type_priority(profile.get("subject_types") or ())
-    date_axis = str(profile.get("axis") or "") == "date"
-    lookup = _entity_lookup(entities)
-    stats = {"flag_words": 0, "period_conditions": 0, "resubjected_process": 0, "resubjected_indicator": 0,
-             "resubjected_generic": 0, "resubjected_context": 0, "resubjected_identity": 0, "identity_kept_shared": 0}
-    # How many subject-type entities carry facts in each document (excluding the profile subject itself): two or
-    # more means a comparison table / multi-subject document, and the path subject does not take everything over.
-    # A checkup report has the examinee as its only subject; a feature comparison table has one product per column
-    subjects_by_doc: dict[str, set[str]] = {}
-    for f in facts:
-        unit = units_by_id.get(str(f.get("unit_id") or ""))
-        doc = unit.doc_id if unit else str(f.get("doc_id") or "")
-        target = subj_by_doc.get(doc)
-        subject = str(f.get("subject") or "")
-        if target is None or not subject or subject.casefold() == str(target.get("title") or "").casefold():
-            continue
-        ent = lookup.get((doc, subject.casefold())) or lookup.get(("", subject.casefold()))
-        if ent is not None and _type_rank(ent, priority):
-            subjects_by_doc.setdefault(doc, set()).add(subject.casefold())
+    stats = {"flag_words": 0, "period_conditions": 0}
     for f in facts:
         prop = str(f.get("property") or "")
         m = _FLAG_SUFFIX_RE.search(prop)
@@ -1148,60 +1254,22 @@ def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str,
                 f["flag"] = _FLAG_SYMBOL.get(word, m.group(0).strip())
             stats["flag_words"] += 1
         conds = dict(f.get("conditions") or {})
-        # a validity inherited from the document axis (filled in by link_facts) is not one the fact states itself:
-        # a multi-year comparison table has each row's year in the conditions, and unless it is moved the whole
-        # table lands on the single point of the report date
-        inherited = not f.get("valid_until") and str(f.get("valid_from") or "") == str(f.get("axis") or "")
-        for k in list(conds):
-            if _PERIOD_KEY_RE.search(str(k)) and (inherited or not f.get("valid_from")):
-                parsed = parse_date(str(conds[k]))
-                if parsed:
-                    f["valid_from"] = parsed
+        # A date condition records an observation; it is not an effective start.
+        # Never replace explicit bounds or collapse a compound date to its first date.
+        if not any(f.get(k) for k in ("valid_from", "valid_until", "observed_at")):
+            for k in list(conds):
+                if not _PERIOD_KEY_RE.search(str(k)):
+                    continue
+                probe = {"period_text": str(conds[k])}
+                recover_observation_date(probe, str(conds[k]))
+                if probe.get("observed_at"):
+                    f["observed_at"] = probe["observed_at"]
+                    f["time_basis"] = "reported"
                     f["period_text"] = f"{k}: {conds[k]}"
                     conds.pop(k)
                     f["conditions"] = conds
                     stats["period_conditions"] += 1
                     break
-        unit = units_by_id.get(str(f.get("unit_id") or ""))
-        doc = unit.doc_id if unit else str(f.get("doc_id") or "")
-        target = subj_by_doc.get(doc)
-        if target is None:
-            continue
-        subject = str(f.get("subject") or "")
-        if not subject or subject.casefold() == str(target.get("title") or "").casefold() or f.get("subject_key") == target.get("key"):
-            continue
-        ent = lookup.get((doc, subject.casefold())) or lookup.get(("", subject.casefold()))
-        upper = str((ent or {}).get("upper") or "").casefold()
-        prop = str(f.get("property") or "")
-        generic = prop.casefold() in _GENERIC_PROPERTY_WORDS or not prop
-        same = prop.casefold() == subject.casefold()
-        measure = is_measurement(f)
-        rule = ""
-        identity_case = ent is not None and _type_rank(ent, priority) and evidence.get(doc, (None, ""))[1] in ("path", "series")
-        if identity_case and (not _document_own_entity(ent) or len(subjects_by_doc.get(doc, ())) > 1):
-            stats["identity_kept_shared"] += 1     # cross-document entity / component / multi-subject document: facts keep their own subject
-            identity_case = False
-        if identity_case:
-            rule = "resubjected_identity"          # 主体是本文档自己的「主体类型」实体,但路径 / 序列证据说文档属于画像主体
-        elif measure and upper in ("process", "event"):
-            rule = "resubjected_process"       # 化验单 / 检查项目 / 某次检查名下的读数归受检者;「反馈单的提交人是谁」这种业务事实留在原主体(Codex 2026-09-13 F03)
-        elif measure and (same or generic):
-            rule = "resubjected_generic"
-        elif measure and upper == "property":
-            rule = "resubjected_indicator"
-        elif measure and date_axis and (f.get("ref_min") or f.get("ref_max") or str(f.get("flag") or "").strip()) and not generic:
-            rule = "resubjected_context"
-        if not rule:
-            continue
-        f["subject_raw"] = subject
-        new_prop = subject if (rule in ("resubjected_generic", "resubjected_indicator") and (generic or same)) else prop
-        if new_prop.casefold() != subject.casefold():
-            f["context"] = subject            # original subject is not the measured property (lab sheet, diagnosis): kept as context, out of the grouping key
-        f["property"] = new_prop
-        f["subject"] = str(target.get("title") or subject)
-        f["subject_key"] = str(target.get("key") or "")
-        f["subject_keys"] = [f["subject_key"]]
-        stats[rule] += 1
     return stats
 
 

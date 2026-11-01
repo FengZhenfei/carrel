@@ -15,6 +15,7 @@ from collections import deque
 from typing import Any, Callable
 
 from ..models import ParsedBlock
+from .code_source import module_source, source_text
 
 PROFILE = "code-symbols-v2"
 MAX_CALLS = 40          # how many callee names are recorded per symbol
@@ -587,15 +588,15 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
         safe = re.sub(r"[^A-Za-z0-9_.]", "_", meta["qualname"])[:80]
         blocks.append(ParsedBlock(parser="tree-sitter", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
                                   text=text, title=meta["qualname"], block_id=f"sym-{idx:04d}-{safe}",
-                                  metadata={"section_path": list(section), "symbol": meta}))
-    rest = [lines[i - 1] for i in range(1, len(lines) + 1) if not covered[i]]
-    rest_text = "\n".join(rest).strip("\n")
+                                  metadata={"section_path": list(section), "symbol": meta,
+                                            "source_spans": source_text(lines, [(start, end)])[1]}))
+    rest_text, rest_spans = module_source(lines, covered)
     module_meta = {"kind": "module", "name": "", "qualname": "", "docstring": file_doc, "imports": imports,
                    "constants": constants[:60], "calls": top_calls[:MAX_CALLS], "language": language, "has_error": bool(root.has_error)}
     if rest_text.strip():
         blocks.insert(0, ParsedBlock(parser="tree-sitter", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
                                      text=rest_text, title="(module)", block_id="sym-0000-module",
-                                     metadata={"section_path": [], "symbol": module_meta}))
+                                     metadata={"section_path": [], "symbol": module_meta, "source_spans": rest_spans}))
     elif blocks:
         blocks[0].metadata["module"] = module_meta
     return blocks

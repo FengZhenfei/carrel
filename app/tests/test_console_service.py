@@ -88,7 +88,7 @@ class ClosePreservesConfigTests(unittest.TestCase):
     clearing it would just make the user rerun an extraction for nothing.
     """
 
-    TYPES = ["organization", "memory device", "signal"]
+    TYPES = ["organization", "sample module", "signal"]
 
     def _enrolled(self, tmp: str):
         from kb_pipeline import discovery
@@ -800,7 +800,7 @@ class LlmDeletionDecouplingTests(unittest.TestCase):
     But **referenced is not the same as in use** -- once the graph is off, the whole graph-fields block (three
     model slots + the label extraction button) is disabled, none of those names can run, yet they still locked
     the model registry. Hit for real on 2026-08-30: the graphs of all three KBs were off, and deleting a model
-    was still answered with "in use by: Semiconductors, Product docs, Library".
+    was still answered with "in use by: Synthetic Alpha, Synthetic Beta, Synthetic Gamma".
 
     Now decoupled: the delete goes through, and the KBs referencing it get that slot **cleared** (rather than
     keeping a dangling name pointing at a deleted model -- that would make the build report "not in the
@@ -1676,8 +1676,26 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 with mock.patch.object(service.requests, "post", return_value=resp(307, location="https://elsewhere.example/v1")):
                     with self.assertRaisesRegex(ValueError, "redirected"):
                         service.save_llm({"name": "r", "base_url": "http://a:8000/v1", "model_id": "x", "api_key": "sk-r"})
-        llm_src = _repo_file("app/kb_pipeline/graph/llm.py")
-        self.assertEqual(llm_src.count("allow_redirects=False"), 3)
+        # Both protocols and a compatibility retry must preserve redirect safety.
+        from kb_pipeline.graph.llm import LLMSpec, LLMInputRejected, chat_once
+        for protocol in ("openai", "anthropic"):
+            for after_parameter_error in (False, True):
+                with self.subTest(protocol=protocol, after_parameter_error=after_parameter_error):
+                    replies = []
+                    if after_parameter_error:
+                        rejected = resp(400)
+                        rejected.text = '{"error":{"param":"temperature","message":"Unsupported temperature"}}'
+                        replies.append(rejected)
+                    replies.append(resp(307, location="https://elsewhere.example/v1"))
+                    session = mock.Mock()
+                    session.post.side_effect = replies
+                    spec = LLMSpec("redirect-check", "https://original.example/v1", "test-key", "alias", protocol)
+                    with self.assertRaises(LLMInputRejected):
+                        chat_once(spec, [{"role":"user", "content":"test"}], session=session)
+                    self.assertEqual(session.post.call_count, len(replies))
+                    for call in session.post.call_args_list:
+                        self.assertFalse(call.kwargs["allow_redirects"])
+                        self.assertTrue(call.args[0].startswith("https://original.example/v1/"))
         self.assertIn("allow_redirects=False", _repo_file("app/kb_pipeline/embedding/visual.py"))
         self.assertIn("allow_redirects=False", _repo_file("app/kb_search/channels.py"))
 

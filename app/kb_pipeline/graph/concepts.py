@@ -22,11 +22,10 @@ from . import prompts
 from .extract import strip_latex
 from .llm import ChatClient, LLMCallError
 
-CONCEPT_EMBED_AUTO = 0.95          # cosine >= this value: merge directly
-CONCEPT_EMBED_ASK = 0.82           # cosine in [ASK, AUTO): ask the model
+CONCEPT_EMBED_AUTO = 0.95          # reporting threshold; similarity never proves identity
+CONCEPT_EMBED_ASK = 0.82           # cosine >= this value: propose to the model
 CONCEPT_MAX_NEIGHBOURS = 3
 CONCEPT_JUDGE_BATCH = 60
-CONCEPT_MAX_CANDIDATES = 600       # above this many concepts only normalise and auto-merge, never ask the model (cost fallback)
 _STRIP_RE = re.compile(r"[\s_\-·•.。,,;;:：()()\[\]【】/\\|\"'“”‘’]+")
 _TRAILING_WORDS = ("测量结果", "检查结果", "检测结果", "结果", "值", "数值", "参数", "指标", "measurement", "measured value", "value", "result", "parameter")
 _ANSWER_RE = re.compile(r"^\s*(\d+)\s*[\.:：\)]\s*(yes|no|是|否|y|n)\b", re.IGNORECASE | re.MULTILINE)
@@ -139,6 +138,9 @@ def compatible(a: dict[str, Any], b: dict[str, Any]) -> str:
     if bool(ia) != bool(ib):
         return "identity"                 # identity token on one side only (GENEX rs0000133 genotype / genotype): merging would drop the identity
     la, lb = re.sub(r"\s+", "", str(a["label"] or "")).casefold(), re.sub(r"\s+", "", str(b["label"] or "")).casefold()
+    from .resolution import polarity_conflict
+    if polarity_conflict(a["label"], b["label"]) or _negation_contrast(la, lb):
+        return "polarity"
     if la != lb and _contrast(la, lb):
         return "contrast"                 # differ by one short token: no auto-merge, the model decides
     if la != lb and re.findall(r"\d+", la) != re.findall(r"\d+", lb):
@@ -149,6 +151,15 @@ def compatible(a: dict[str, Any], b: dict[str, Any]) -> str:
     if ma and mb and ma != mb and ma not in mb and mb not in ma:
         return "measure"
     return "ok"
+
+
+def _negation_contrast(a: str, b: str) -> bool:
+    """A qualifier removed from one otherwise identical label reverses its meaning."""
+    for longer, shorter in ((a, b), (b, a)):
+        for match in re.finditer(r"不|非|未|无|not|without", longer):
+            if longer[:match.start()] + longer[match.end():] == shorter:
+                return True
+    return False
 
 
 def _unit_family(unit: str) -> str:
@@ -248,20 +259,12 @@ SHORT_SYMBOL_MAX_CHARS = 2         # symbols this short after normalisation (n /
 
 
 def _bucket_norm(f: dict[str, Any]) -> str:
-    """Which candidate bucket a fact goes into: the canonical key (symbol first); identity tokens in the property
-    (loci, part numbers) that are not in the symbol are added to the bucket key -- the same symbol with different
-    loci must not be merged already at bucketing (Codex re-review N05).
-    Short symbols (<= SHORT_SYMBOL_MAX_CHARS characters) also take the property name: principal quantum number n
-    vs period count N, node time t vs t value share a symbol but mean entirely different things; they used to
-    become one concept right at bucketing, and neither the compatibility check nor the judging could stop it
-    afterwards (Codex 2026-09-13 F02).
-    The same quantity with slightly different property spellings first lands in several buckets and is merged
-    back by vector similarity + judging later; when in doubt, keep one concept too many."""
+    """A symbol identifies an attribute only together with its property meaning and identity tokens. Semantic aliases are resolved after bucketing."""
     norm = concept_norm(f.get("property"), f.get("symbol"))
     if norm and f.get("symbol"):
         sym = str(f.get("symbol") or "").strip()
         sym_key = _STRIP_RE.sub("", strip_latex(unicodedata.normalize("NFKC", sym))).casefold()
-        if len(sym_key) <= SHORT_SYMBOL_MAX_CHARS:
+        if sym_key:
             prop = str(f.get("property") or "")
             # the property name ends with the symbol itself ("principal quantum number n", "node time t (years)"):
             # strip it before normalising so it shares the bucket with "principal quantum number"
@@ -320,7 +323,7 @@ def build_concepts(
             slot["docs"].add(str(f["doc_id"]))
         if not slot["example"]:
             from .facts import values_text
-            slot["example"] = f"{f.get('subject')}: {values_text(f)}"[:80]
+            slot["example"] = f"{f.get('subject')}: {values_text(f)}; {f.get('conditions') or {}}; {f.get('fact_kind') or 'observation'}"[:240]
     cands = list(groups.values())
     for c in cands:
         c["label"] = c["labels"].most_common(1)[0][0]
@@ -329,6 +332,7 @@ def build_concepts(
     stats["norms"] = len(cands)
     uf = _UnionFind(len(cands))
     root_ident: dict[int, set[str]] = {i: _identity_tokens(c["label"], c.get("symbols_text", "")) for i, c in enumerate(cands)}
+    root_members = {i: [i] for i in range(len(cands))}
 
     def merge(a: int, b: int, via: str, sim: float | None = None) -> bool:
         """Identity exclusion at the set level (the bridging path of Codex re-review N05): A (rs0000133) and C
@@ -340,13 +344,16 @@ def build_concepts(
             return True
         ia, ib = root_ident.get(ra, set()), root_ident.get(rb, set())
         extra = {"sim": round(sim, 3)} if sim is not None else {}
-        if ia and ib and ia.isdisjoint(ib):
+        if ((ia and ib and ia.isdisjoint(ib)) or any(
+                compatible(cands[x], cands[y]) in {"identity", "polarity"}
+                for x in root_members[ra] for y in root_members[rb])):
             stats["blocked_bridge"] += 1
             if len(blocked) < 200:
                 blocked.append({"a": cands[a]["label"], "b": cands[b]["label"], "reason": "bridge", **extra})
             return False
         uf.union(a, b)
         root_ident[uf.find(a)] = ia | ib
+        root_members[uf.find(a)] = root_members[ra] + root_members[rb]
         if len(merges) < 500:
             merges.append({"a": cands[a]["label"], "b": cands[b]["label"], "via": via, **extra})
         return True
@@ -375,18 +382,13 @@ def build_concepts(
                 if pa == pb or not (pa in pb or pb in pa):
                     continue
                 verdict = compatible(cands[a], cands[b])
-                if verdict == "identity":
+                if verdict in {"identity", "polarity"}:
                     stats["blocked_identity"] += 1
                     if len(blocked) < 200:
                         blocked.append({"a": cands[a]["label"], "b": cands[b]["label"], "reason": "identity", "via": "symbol_contain"})
                     continue
-                extra = (pb.replace(pa, "", 1) if pa in pb else pa.replace(pb, "", 1))
-                if verdict == "ok" or re.fullmatch(r"[a-z]{1,3}", extra):
-                    if merge(a, b, "symbol_contain"):
-                        stats["symbol_contained"] += 1
-                else:
-                    stats["symbol_to_judge"] += 1
-                    forced_ask.append((min(a, b), max(a, b)))
+                stats["symbol_to_judge"] += 1
+                forced_ask.append((min(a, b), max(a, b)))
 
     # 同一个属性名,有的事实写了符号、有的没写(「体重指数 BMI」与「体重指数」):分桶时有符号的按符号进桶,两边就成了
     # 两个概念,后面的向量相似和判同也不一定并得回来。没写符号的桶并进那个写了符号的桶 —— 前提是这个属性名只对上一个
@@ -432,19 +434,17 @@ def build_concepts(
                 if sim < ask_threshold:
                     continue
                 verdict = compatible(cands[i], cands[j])
-                if verdict == "identity":
+                if verdict in {"identity", "polarity"}:
                     stats["blocked_identity"] += 1
                     if len(blocked) < 200:
-                        blocked.append({"a": cands[i]["label"], "b": cands[j]["label"], "reason": "identity", "sim": round(sim, 3)})
+                        blocked.append({"a": cands[i]["label"], "b": cands[j]["label"], "reason": verdict, "sim": round(sim, 3)})
                     continue
-                if sim >= auto_threshold and verdict == "ok":
-                    if merge(i, j, "auto", sim):
-                        stats["auto_merged"] += 1
-                else:
-                    if sim >= auto_threshold:
-                        stats["contrast_to_judge" if verdict == "contrast" else "measure_to_judge"] += 1   # alike enough but measure word / token differs: model decides
-                    ask.append(pair)
-        if ask and client is not None and len(cands) <= CONCEPT_MAX_CANDIDATES:
+                if (cands[i]["numeric"] * 2 >= cands[i]["count"]) != (cands[j]["numeric"] * 2 >= cands[j]["count"]):
+                    continue
+                if sim >= auto_threshold:
+                    stats["contrast_to_judge" if verdict == "contrast" else "measure_to_judge"] += 1
+                ask.append(pair)
+        if ask and client is not None:
             stats["asked_pairs"] = len(ask)
             for start in range(0, len(ask), CONCEPT_JUDGE_BATCH):
                 batch = ask[start:start + CONCEPT_JUDGE_BATCH]

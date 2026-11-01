@@ -178,6 +178,8 @@ def _page_part(payload: dict[str, Any]) -> str:
             return f"pages {start}–{end}" if end > start else f"page {start}"
     locator = payload.get("source_locator") or {}
     if isinstance(locator, dict):
+        if locator.get("kind") == "line_ranges":
+            return ", ".join(f"lines {r['start']}–{r.get('end', r['start'])}" for r in locator.get("ranges", []) if "start" in r)
         if locator.get("kind") == "notebook":
             return f"cell {locator.get('cell')}" + (f" output {locator['output']}" if locator.get("output") is not None else "")
         if locator.get("line") is not None:

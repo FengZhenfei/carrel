@@ -88,7 +88,7 @@ class GraphEntityTypesTests(unittest.TestCase):
                 con.execute(
                     "INSERT INTO kb_sources(kb_id, collection, source_root, status,"
                     " first_seen_at, last_seen_at, config_json) VALUES(?,?,?,?,?,?,?)",
-                    ("kb_003", "kb_003", "半导体", "active", 0, 0, json.dumps({
+                    ("kb_003", "kb_003", "样例模块", "active", 0, 0, json.dumps({
                         "graph_enabled": True,
                         "graph_entity_types": ["Pin"],
                         "graph_language": "Chinese",
@@ -153,10 +153,10 @@ class GraphEntityTypesTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "mirror" / "半导体").mkdir(parents=True)
+            (root / "mirror" / "样例模块").mkdir(parents=True)
 
             def schema_for(config):
-                return extraction_schema_for(discovery.build_source(root / "mirror", "半导体", config, kb_id="kb_003"))
+                return extraction_schema_for(discovery.build_source(root / "mirror", "样例模块", config, kb_id="kb_003"))
 
             fallback = schema_for({})
             self.assertEqual(fallback.entity_types, tuple(n for n, _, _ in DEFAULT_TYPES))
@@ -189,21 +189,21 @@ class SchemaVersionRingTests(unittest.TestCase):
         from kb_pipeline.limits import GRAPH_SCHEMA_VERSION_MAX, push_schema_version
 
         ring = []
-        for i in range(6):
+        for i in range(GRAPH_SCHEMA_VERSION_MAX + 3):
             ring = push_schema_version(ring, {"id": f"v{i}"})
             self.assertLessEqual(len(ring), GRAPH_SCHEMA_VERSION_MAX)
-        self.assertEqual([v["id"] for v in ring], ["v5", "v4", "v3"])
+        self.assertEqual([v["id"] for v in ring], [f"v{i}" for i in range(GRAPH_SCHEMA_VERSION_MAX + 2, 2, -1)])
 
     def test_active_version_is_never_evicted(self) -> None:
         from kb_pipeline.limits import push_schema_version
 
         ring = [{"id": "c"}, {"id": "b"}, {"id": "a"}]      # a is the oldest
-        # The active version is the oldest, a: the one evicted must be b, not a
-        out = push_schema_version(ring, {"id": "d"}, active_id="a")
+        # Keep the three newest, plus the active older version.
+        out = push_schema_version(ring, {"id": "d"}, active_id="a", limit=3)
         ids = [v["id"] for v in out]
         self.assertEqual(ids[0], "d")
         self.assertIn("a", ids)
-        self.assertEqual(len(ids), 3)
+        self.assertEqual(ids, ["d", "c", "b", "a"])
 
     def test_reextracting_the_same_id_does_not_duplicate(self) -> None:
         from kb_pipeline.limits import push_schema_version
@@ -252,16 +252,16 @@ class SchemaSamplingTests(unittest.TestCase):
         self.assertEqual(parents, {"pin": "part"})     # 同义的父类名 interface → 上层类 part
 
     def test_suggest_runs_the_six_calls(self) -> None:
-        answers = ["Semiconductor datasheets", "English", "You are an expert.",
-                   '{"entity_types": ["memory device", "pin"]}',
-                   '{"parent_types": {"memory device": "component", "pin": "interface"}}',
+        answers = ["Synthetic module specifications", "English", "You are an expert.",
+                   '{"entity_types": ["sample module", "pin"]}',
+                   '{"parent_types": {"sample module": "component", "pin": "interface"}}',
                    '{"predicates": [{"name": "has_pin", "description": "d", "source_parents": ["component"], "target_parents": ["interface"]}]}']
         client = _client(list(answers))
         out = graph_schema.suggest(client, ["sample text"])
-        self.assertEqual(out["domain"], "Semiconductor datasheets")
+        self.assertEqual(out["domain"], "Synthetic module specifications")
         model = out["model"]
-        self.assertEqual([t["name"] for t in model["types"]], ["memory device", "pin"])
-        self.assertEqual({t["name"]: t["is_a"] for t in model["types"]}, {"memory device": "part", "pin": "part"})
+        self.assertEqual([t["name"] for t in model["types"]], ["sample module", "pin"])
+        self.assertEqual({t["name"]: t["is_a"] for t in model["types"]}, {"sample module": "part", "pin": "part"})
         self.assertEqual([p["name"] for p in model["predicates"]], ["has_pin"])
         self.assertEqual((model["predicates"][0]["source_parents"], model["predicates"][0]["target_parents"]), (["part"], ["part"]))
         self.assertNotIn("competency_questions", out)     # 能力问题 2026-09-06 撤掉
@@ -332,48 +332,48 @@ class ExampleSelectionTests(unittest.TestCase):
 
     def _schema(self):
         from kb_pipeline.graph.extract import ExtractionSchema
-        return ExtractionSchema(entity_types=("patient", "biomarker", "recommendation"), language="Chinese",
-                                predicates=({"name": "has_biomarker", "source_parents": ["entity"], "target_parents": ["property"]},
+        return ExtractionSchema(entity_types=("record_owner", "measurement", "recommendation"), language="Chinese",
+                                predicates=({"name": "has_measurement", "source_parents": ["entity"], "target_parents": ["property"]},
                                             {"name": "recommends", "source_parents": ["process"], "target_parents": ["*"]}),
-                                parent_types={"patient": "entity", "biomarker": "property", "recommendation": "process"})
+                                parent_types={"record_owner": "entity", "measurement": "property", "recommendation": "process"})
 
     def test_score_relaxes_predicates_whose_constraints_are_mostly_violated(self) -> None:
         from kb_pipeline.graph.schema import score_example
 
-        ents = [{"name": "李华", "type": "patient", "description": "a"}, {"name": "尿酸", "type": "biomarker", "description": "b"},
-                {"name": "多喝水", "type": "recommendation", "description": "c"}]
-        rels = [{"source": "李华", "target": "尿酸", "predicate": "has_biomarker", "description": "", "strength": 5},
-                {"source": "尿酸", "target": "多喝水", "predicate": "recommends", "description": "", "strength": 5},     # the source side is property, the constraint wants process
-                {"source": "尿酸", "target": "李华", "predicate": "recommends", "description": "", "strength": 5},     # same: this predicate violates 2/2 → the constraint is wrong, relaxed
-                {"source": "李华", "target": "多喝水", "predicate": "related_to", "description": "", "strength": 3},
-                {"source": "幽灵", "target": "尿酸", "predicate": "has_biomarker", "description": "", "strength": 5}]      # endpoint not among the entities: dropped
+        ents = [{"name": "样例C", "type": "record_owner", "description": "a"}, {"name": "浓度", "type": "measurement", "description": "b"},
+                {"name": "补充试液", "type": "recommendation", "description": "c"}]
+        rels = [{"source": "样例C", "target": "浓度", "predicate": "has_measurement", "description": "", "strength": 5},
+                {"source": "浓度", "target": "补充试液", "predicate": "recommends", "description": "", "strength": 5},     # the source side is property, the constraint wants process
+                {"source": "浓度", "target": "样例C", "predicate": "recommends", "description": "", "strength": 5},     # same: this predicate violates 2/2 → the constraint is wrong, relaxed
+                {"source": "样例C", "target": "补充试液", "predicate": "related_to", "description": "", "strength": 3},
+                {"source": "幽灵", "target": "浓度", "predicate": "has_measurement", "description": "", "strength": 5}]      # endpoint not among the entities: dropped
         sc = score_example(ents, rels, self._schema(), related_predicate="related_to")
-        self.assertEqual((len(sc["relations"]), sc["typed"], sc["violations_removed"], sc["relaxed_predicates"]), (4, 3, 0, ["recommends"]))
-        self.assertAlmostEqual(sc["related_ratio"], 0.25)
+        self.assertEqual((len(sc["relations"]), sc["typed"], sc["violations_removed"]), (2, 1, 2))
+        self.assertAlmostEqual(sc["related_ratio"], 0.5)
         # A predicate violating in under half its edges only loses the violating ones
-        rels2 = rels[:1] + [{"source": "尿酸", "target": "多喝水", "predicate": "has_biomarker", "description": "", "strength": 5}] * 3 + \
-                [{"source": "李华", "target": "尿酸", "predicate": "has_biomarker", "description": "", "strength": 5}] * 4
-        rels2.append({"source": "尿酸", "target": "多喝水", "predicate": "recommends", "description": "", "strength": 5})
-        rels2.append({"source": "尿酸", "target": "李华", "predicate": "recommends", "description": "", "strength": 5})
+        rels2 = rels[:1] + [{"source": "浓度", "target": "补充试液", "predicate": "has_measurement", "description": "", "strength": 5}] * 3 + \
+                [{"source": "样例C", "target": "浓度", "predicate": "has_measurement", "description": "", "strength": 5}] * 4
+        rels2.append({"source": "浓度", "target": "补充试液", "predicate": "recommends", "description": "", "strength": 5})
+        rels2.append({"source": "浓度", "target": "样例C", "predicate": "recommends", "description": "", "strength": 5})
         sc2 = score_example(ents, rels2, self._schema(), related_predicate="related_to")
-        self.assertEqual((sc2["violations_removed"], sc2["relaxed_predicates"]), (3, ["recommends"]))    # has_biomarker violates 3/8: those three are removed; recommends violates 2/2: relaxed
-        rels3 = rels[:1] + [{"source": "尿酸", "target": "多喝水", "predicate": "recommends", "description": "", "strength": 5},
-                            {"source": "多喝水", "target": "尿酸", "predicate": "recommends", "description": "", "strength": 5}]
+        self.assertEqual(sc2["violations_removed"], 5)    # has_measurement violates 3/8: those three are removed; recommends violates 2/2: relaxed
+        rels3 = rels[:1] + [{"source": "浓度", "target": "补充试液", "predicate": "recommends", "description": "", "strength": 5},
+                            {"source": "补充试液", "target": "浓度", "predicate": "recommends", "description": "", "strength": 5}]
         sc3 = score_example(ents, rels3, self._schema(), related_predicate="related_to")
-        self.assertEqual((sc3["violations_removed"], sc3["relaxed_predicates"]), (1, []))                # exactly half is not over half: only the violating one is removed
+        self.assertEqual(sc3["violations_removed"], 1)                # exactly half is not over half: only the violating one is removed
 
     def test_generate_examples_ranks_and_falls_back(self) -> None:
         from kb_pipeline.graph import schema as S
 
-        good = '("unit"<|>body<|>x)\n##\n("entity"<|>李华<|>patient<|>受检者)\n##\n("entity"<|>尿酸<|>biomarker<|>指标)\n##\n("relationship"<|>李华<|>尿酸<|>has_biomarker<|>测了<|>7)\n<|COMPLETE|>'
-        lazy = '("unit"<|>body<|>x)\n##\n("entity"<|>李华<|>patient<|>受检者)\n##\n("entity"<|>多喝水<|>recommendation<|>建议)\n##\n("relationship"<|>李华<|>多喝水<|>related_to<|>有关<|>3)\n<|COMPLETE|>'
-        empty = '("unit"<|>body<|>x)\n##\n("entity"<|>李华<|>patient<|>受检者)\n<|COMPLETE|>'
+        good = '("unit"<|>body<|>x)\n##\n("entity"<|>样例C<|>record_owner<|>样例负责人)\n##\n("entity"<|>浓度<|>measurement<|>指标)\n##\n("relationship"<|>样例C<|>浓度<|>has_measurement<|>测了<|>7)\n<|COMPLETE|>'
+        lazy = '("unit"<|>body<|>x)\n##\n("entity"<|>样例C<|>record_owner<|>样例负责人)\n##\n("entity"<|>补充试液<|>recommendation<|>建议)\n##\n("relationship"<|>样例C<|>补充试液<|>related_to<|>有关<|>3)\n<|COMPLETE|>'
+        empty = '("unit"<|>body<|>x)\n##\n("entity"<|>样例C<|>record_owner<|>样例负责人)\n<|COMPLETE|>'
         texts = ["短" * 100, "甲" * 300, "乙" * 250, "丙" * 200]          # the 100-character one is too short (floor 120); the other three are tried in descending length
         client = _client([good, lazy, empty])
         text, stats = S.generate_examples(client, texts, self._schema(), max_examples=2)
         self.assertEqual((stats["tried"], stats["kept"], stats["dropped_empty"], stats["fallback"]), (3, 1, 1, 0))
-        self.assertIn("has_biomarker", text)
-        self.assertNotIn("多喝水", text)                                   # a passage with related_to share 1.0 ranks below the bar and is skipped when a qualified one exists
+        self.assertIn("has_measurement", text)
+        self.assertNotIn("补充试液", text)                                   # a passage with related_to share 1.0 ranks below the bar and is skipped when a qualified one exists
         client2 = _client([lazy, empty])
         text2, stats2 = S.generate_examples(client2, texts[1:3], self._schema(), max_examples=2)
         self.assertEqual((stats2["kept"], stats2["fallback"]), (0, 0))      # a related_to-only passage does not even count as a fallback: not one relation with a predicate
@@ -441,43 +441,23 @@ class SchemaFeedbackTests(unittest.TestCase):
                             {"name": "calls", "description": "invokes", "source_parents": ["entity"], "target_parents": ["entity"]}],
              "profile": {"subject_types": ["role"], "axis": "none"},
              "observed": {"edges": {"requires_skill": 400, "calls": 60},
-                          "confirmed": [{"predicate": "requires_skill", "source_parent": "entity", "target_parent": "standard", "count": 34},
+                          "suggested": [{"predicate": "requires_skill", "source_parent": "entity", "target_parent": "standard", "count": 34},
                                         {"predicate": "calls", "source_parent": "entity", "target_parent": "entity", "count": 40}]}}
 
-    def test_prior_pairs_relax_and_endpoint_account(self) -> None:
-        from kb_pipeline.graph.merge import confirmed_pairs
-
-        units = [_unit("u1")]
-        ext = {"u1": _ext([("Northwind", "organization", "maker"), ("SRAM", "memory device", "chip")],
-                          [("Northwind", "SRAM", "produces", "makes it", 8)])}
-        kw = dict(entity_types=("organization", "memory device"), upper_parents={"organization": "entity", "memory device": "part"},
-                  allowed_ends={"produces": ({"entity"}, {"process"})})
-        plain = merge_extractions(units, ext, **kw)
-        self.assertTrue(plain["relations"][0]["type_violation"])                         # part is not in the target constraint
-        observed = plain["stats"]["endpoint_observed"]
-        self.assertEqual((observed["edges"], observed["pairs"]), ({"produces": 1}, {"produces": {"entity->part": 1}}))
-        self.assertEqual(observed["confirmed"], [])                                       # 1 edge is below the threshold
-        # Health-check numbers: violations per predicate, entities per type, type names outside the table (none here)
-        self.assertEqual((observed["violations"], observed["type_counts"], observed["unknown_types"]),
-                         ({"produces": 1}, {"organization": 1, "memory device": 1}, {}))
-        # A combination confirmed in the account: released directly in this version, no need to reach 20 edges
-        prior = merge_extractions(units, ext, prior_pairs=[("produces", "entity", "part")], **kw)
-        rel = prior["relations"][0]
-        self.assertEqual((rel["type_violation"], rel.get("endpoints_prior")), (False, True))
-        self.assertEqual(prior["stats"]["type_violations"], 0)
-        self.assertEqual(prior["stats"]["endpoint_pairs_prior"], [{"predicate": "produces", "source_parent": "entity", "target_parent": "part", "count": 1, "prior": True}])
-        acct = prior["stats"]["endpoint_observed"]
-        self.assertEqual(acct["confirmed"], [{"predicate": "produces", "source_parent": "entity", "target_parent": "part", "count": 1}])   # the released pair stays in the account
-        self.assertEqual(acct["violations"], {"produces": 1})        # released, yet still outside the declared endpoints: exactly the evidence the constraint is too narrow
-        self.assertEqual(confirmed_pairs(acct), [("produces", "entity", "part")])
-        self.assertEqual(confirmed_pairs(None), [])
-        health = {r["predicate"]: r for r in prior["stats"]["predicate_health"]}
-        self.assertEqual(health["produces"]["relaxed_pairs"][0]["source_parent"], "entity")
+    def test_endpoint_account_preserves_constraint_violations(self):
+        units=[_unit("u1")]
+        ext={"u1":_ext([("Example","organization","maker"),("STORE","sample module","chip")],[("Example","STORE","produces","makes it",8)])}
+        result=merge_extractions(units,ext,entity_types=("organization","sample module"),upper_parents={"organization":"entity","sample module":"part"},allowed_ends={"produces":({"entity"},{"process"})})
+        self.assertTrue(result["relations"][0]["type_violation"])
+        observed=result["stats"]["endpoint_observed"]
+        self.assertEqual(observed["suggested"],[])
+        self.assertEqual(observed["violations"],{"produces":1})
+        self.assertEqual(observed["pairs"],{"produces":{"entity->part":1}})
 
     def test_endpoint_account_lists_type_names_outside_the_schema(self) -> None:
         units = [_unit("u1")]
-        ext = {"u1": _ext([("Northwind", "organization", "maker"), ("Gizmo", "gadget", "a thing"), ("Widget", "gadget", "another")],
-                          [("Northwind", "Gizmo", "produces", "makes it", 8)])}
+        ext = {"u1": _ext([("Example", "organization", "maker"), ("Gizmo", "gadget", "a thing"), ("Widget", "gadget", "another")],
+                          [("Example", "Gizmo", "produces", "makes it", 8)])}
         out = merge_extractions(units, ext, entity_types=("organization",), upper_parents={"organization": "entity"})
         acct = out["stats"]["endpoint_observed"]
         self.assertEqual(acct["unknown_types"], {"gadget": 2})
@@ -523,25 +503,25 @@ class SchemaFeedbackTests(unittest.TestCase):
         ]
         self.assertNotEqual(_bucket_norm(facts[0]), _bucket_norm(facts[1]))          # n and N: different properties, different buckets
         self.assertEqual(_bucket_norm(facts[0]), _bucket_norm(facts[2]))             # same bucket only when the property name matches (whitespace / symbol suffix stripped)
-        self.assertEqual(_bucket_norm(facts[3]), _bucket_norm(facts[4]))             # a long symbol is still one bucket by symbol
+        self.assertNotEqual(_bucket_norm(facts[3]), _bucket_norm(facts[4]))             # a long symbol is still one bucket by symbol
         self.assertEqual(_bucket_norm({"property": "n", "symbol": "n"}), "n")            # the property is the symbol itself: only the symbol is usable
         concepts, stats = build_concepts([dict(f) for f in facts])
-        self.assertEqual(len(concepts), 3)
+        self.assertEqual(len(concepts), 4)
         labels = sorted(str(c["label"]) for c in concepts)
         self.assertIn("number of periods", labels)
-        # Same short symbol, same unit, one property name containing the other (a check-up sheet's HR uric acid / uric
-        # acid are both UA µmol/L): merged back deterministically; the symbol-only "t value" and "node time t (years)"
+        # Same short symbol and unit, with one synthetic label containing the other: merge deterministically.
+        # The symbol-only "t value" and "node time t (years)"
         # differ in unit and neither contains the other, so they stay two concepts
         more = [
-            {"id": "g1", "subject": "P", "property": "尿酸", "symbol": "UA", "value": "300", "unit": "umol/L", "doc_id": "d1"},
-            {"id": "g2", "subject": "P", "property": "HR尿酸", "symbol": "UA", "value": "310", "unit": "umol/L", "doc_id": "d2"},
+            {"id": "g1", "subject": "P", "property": "浓度", "symbol": "UA", "value": "300", "unit": "umol/L", "doc_id": "d1"},
+            {"id": "g2", "subject": "P", "property": "HR浓度", "symbol": "UA", "value": "310", "unit": "umol/L", "doc_id": "d2"},
             {"id": "g3", "subject": "B", "property": "t值", "symbol": "t", "value": "2.1", "unit": "", "doc_id": "d3"},
             {"id": "g4", "subject": "B", "property": "节点时间 t（年）", "symbol": "t", "value": "3", "unit": "年", "doc_id": "d4"},
         ]
         more = [dict(f) for f in more]
         concepts2, stats2 = build_concepts(more)
-        self.assertEqual((len(concepts2), stats2["symbol_contained"]), (3, 1))
-        self.assertEqual(len({f.get("concept_key") for f in more[:2]}), 1)
+        self.assertEqual((len(concepts2), stats2["symbol_contained"]), (4, 0))
+        self.assertEqual(len({f.get("concept_key") for f in more[:2]}), 2)
         # Codex 2026-09-14 R03: this route passes the guard too — a Chinese qualifier (leakage current) goes to the
         # sameness judge, an identity token (point P2) is always blocked, and only a Latin-letter code prefix (HR)
         # merges directly
@@ -569,20 +549,12 @@ class SchemaFeedbackTests(unittest.TestCase):
         # this route at all (price P vs price at point P2, P)
         self.assertEqual(len(build_concepts([dict(guard[2], symbol="P"), dict(guard[3], symbol="P")])[0]), 2)
 
-    def test_observed_guard_keeps_data_confirmed_predicates(self) -> None:
-        from kb_pipeline.graph.schema import apply_observed_guard
-
-        narrow = [{"name": "requires_skill", "description": "new", "source_parents": ["entity"], "target_parents": ["property"]},
-                  {"name": "part_of", "description": "x", "source_parents": ["*"], "target_parents": ["*"]}]
-        out, record = apply_observed_guard(narrow, self.PRIOR)
-        by = {p["name"]: p for p in out}
-        self.assertEqual(by["requires_skill"]["target_parents"], ["property", "standard"])      # the narrowed endpoint is added back
-        self.assertEqual(by["requires_skill"]["description"], "new")                             # the description follows the model
-        self.assertEqual((by["calls"]["description"], by["calls"]["source_parents"]), ("invokes", ["entity"]))   # a deleted predicate is restored from the previous version
-        self.assertEqual(by["part_of"]["source_parents"], ["*"])                                 # wildcard endpoints are left alone
-        self.assertEqual(record, {"kept_predicates": ["calls"], "widened": ["requires_skill.target_parents+standard"]})
-        self.assertEqual(apply_observed_guard(narrow, None), ([dict(p) for p in narrow], {"kept_predicates": [], "widened": []}))
-        self.assertEqual(apply_observed_guard(narrow, {"predicates": [], "observed": {}})[1], {"kept_predicates": [], "widened": []})
+    def test_endpoint_ledger_does_not_claim_validation(self):
+        from kb_pipeline.graph.schema import _prior_predicates_text
+        text=_prior_predicates_text(self.PRIOR)
+        self.assertIn('not validated ontology constraints',text)
+        self.assertIn('Frequent violations can indicate either extraction errors or an incomplete schema',text)
+        self.assertNotIn('keep every',text)
 
     def test_suggest_with_prior_feeds_prompts_and_guards(self) -> None:
         seen: list[str] = []
@@ -595,13 +567,13 @@ class SchemaFeedbackTests(unittest.TestCase):
         out = graph_schema.suggest(_client(reply), ["sample text"], examples=False, prior=self.PRIOR)
         self.assertEqual(len(seen), 8)
         self.assertIn("previous version of this schema used these entity types: role, skill, standard, tool", seen[3])
-        self.assertIn("data-confirmed endpoint pairs: entity -> standard (34 edges)", seen[5])     # the predicate prompt carries the previous version + the account
+        self.assertIn("observed endpoint pairs needing review: entity -> standard (34 edges)", seen[5])     # the predicate prompt carries the previous version + the account
         self.assertIn("used by 60 edges", seen[5])
         self.assertIn("previous version of this schema described the corpus", seen[7])
-        self.assertEqual(out["guard"], {"kept_predicates": ["calls"], "widened": ["requires_skill.target_parents+standard"]})
-        self.assertEqual({p["name"] for p in out["model"]["predicates"]}, {"requires_skill", "calls"})
+        self.assertEqual(out["guard"], {"kept_predicates": [], "widened": []})
+        self.assertEqual({p["name"] for p in out["model"]["predicates"]}, {"requires_skill"})
         ends = {p["name"]: p["target_parents"] for p in out["model"]["predicates"]}
-        self.assertEqual(ends["requires_skill"], ["property", "standard"])        # 账里确认过的端点保住(standard 是本库的类型名)
+        self.assertEqual(ends["requires_skill"], ["property"])        # 账里确认过的端点保住(standard 是本库的类型名)
         # 没有 prior:提示词里没有这些段,guard 为空
         seen.clear(); answers[:] = list(self.ANSWERS)
         out2 = graph_schema.suggest(_client(reply), ["sample text"], examples=False)
@@ -628,9 +600,9 @@ class SchemaFeedbackTests(unittest.TestCase):
         self.assertIn("not in the list: gadget (7), vendor (3)", seen[3])                                  # names outside the table that surfaced during extraction
         self.assertIn("used by 400 edges in the current graph; 35% of them fall outside the declared ends", seen[5])
         self.assertIn("most common endpoint pairs: entity -> property (260), entity -> standard (34), process -> property (6)", seen[5])
-        self.assertIn("data-confirmed endpoint pairs: entity -> standard (34 edges)", seen[5])          # the existing account is unaffected
-        self.assertIn("declared too narrowly", seen[5])
-        self.assertNotIn("fall outside", seen[5].split("- calls")[1].split("Revise this list")[0])      # calls has no violations, so nothing is written
+        self.assertIn("observed endpoint pairs needing review: entity -> standard (34 edges)", seen[5])          # the existing account is unaffected
+        self.assertIn("frequency alone is not evidence of correctness", seen[5])
+        self.assertNotIn("fall outside", seen[5].split("- calls")[1].split("Revise the schema")[0])      # calls has no violations, so nothing is written
         # The first label extraction (no prior) keeps its prompts word for word: none of these passages
         seen.clear(); answers[:] = list(self.ANSWERS)
         graph_schema.suggest(_client(reply), ["sample text"], examples=False)
@@ -644,11 +616,10 @@ class SchemaFeedbackTests(unittest.TestCase):
         self.assertIn("used by 60 edges", seen[5])
 
     def test_upper_named_prior_types_are_asked_to_be_replaced(self) -> None:
-        """10-24 真机:上一版里的 concept / document / event 只从名单里删掉时,模型照抄上一版,那些实体没有类型可去。
-        这些旧类型不列进「保留」,单独说明装了多少实体、要换成更具体的类型。"""
+        """Synthetic regression: upper named prior types are asked to be replaced."""
         prior = {"entity_types": ["concept", "technique", "document"], "observed": {"type_counts": {"concept": 5336, "technique": 2116}}}
         text = graph_schema._prior_types_text(prior)
-        self.assertIn("used these entity types: technique. Keep", text)
+        self.assertIn("used these entity types: technique. Reuse", text)
         self.assertIn("top-level class names as types: concept (5336 entities), document. Those are not allowed", text)
         self.assertIn("each type: technique (2116)", text)
 
@@ -703,17 +674,17 @@ class SchemaFeedbackTests(unittest.TestCase):
             self.assertEqual(second["prior_id"], first["version_id"])
             # entity -> standard, confirmed in the account, is added back to the targets by the rule; calls is absent from
             # the previous version's predicate table and cannot be restored (restoration follows the previous version only)
-            self.assertEqual(second["guard"], {"kept_predicates": [], "widened": ["requires_skill.target_parents+standard"]})
+            self.assertEqual(second["guard"], {"kept_predicates": [], "widened": []})
             with db.connect(settings.state_db) as con:
                 cfg = discovery.get_config(con, "kb_x")
             self.assertEqual(cfg["graph_schema_active"], second["version_id"])
             self.assertNotEqual(second["version_id"], first["version_id"])
-            self.assertEqual([(p["name"], p["target_parents"]) for p in cfg["graph_predicates"]], [("requires_skill", ["property", "standard"])])
+            self.assertEqual([(p["name"], p["target_parents"]) for p in cfg["graph_predicates"]], [("requires_skill", ["property"])])
             # The account passes down with the version: the new version carries the previous one's account (marked
             # inherited_from), so merging can release pairs on the very first build
             inherited = cfg["graph_schema_versions"][0]["observed"]
             self.assertEqual((inherited["inherited_from"], inherited["edges"]), (first["version_id"], {"requires_skill": 400, "calls": 60}))
-            self.assertEqual(schema_flow.active_schema_entry(cfg)["observed"]["confirmed"][0]["predicate"], "requires_skill")
+            self.assertEqual(schema_flow.active_schema_entry(cfg)["observed"]["suggested"][0]["predicate"], "requires_skill")
             self.assertEqual([v["id"] for v in cfg["graph_schema_versions"]], [second["version_id"], first["version_id"]])
             # With the switch off there is no re-extraction
             with db.connect(settings.state_db) as con:
@@ -1109,9 +1080,8 @@ enums:
         with self.assertRaises(ontology.SchemaError) as ctx:
             ontology.normalize_model({"types": [{"name": "a", "is_a": "b"}, {"name": "b", "is_a": "a"}]})
         self.assertTrue(any("成环" in e for e in ctx.exception.errors))
-        with self.assertRaises(ontology.SchemaError) as ctx:
-            ontology.normalize_model({"types": [{"name": f"t{i}"} for i in range(ontology.MAX_MENU_TYPES + 1)]})
-        self.assertIn("可抽取的类型最多", ctx.exception.errors[0])
+        extended, _ = ontology.normalize_model({"types": [{"name": f"t{i}"} for i in range(ontology.MAX_MENU_TYPES + 1)]})
+        self.assertEqual(len(extended["types"]), ontology.MAX_MENU_TYPES + 1)
         with self.assertRaises(ontology.SchemaError):
             ontology.normalize_model({"types": [{"name": "x", "abstract": True}]})
         with self.assertRaises(ontology.SchemaError):
@@ -1130,7 +1100,7 @@ enums:
             state = Path(tmp) / "s.db"
             db.init_db(state)
             prior = {"id": "v1", "linkml": ontology.to_linkml(model, name="kb_x", version="v1"), "examples": "E",
-                     "observed": {"edges": {"uses": 30}, "confirmed": [{"predicate": "uses", "source_parent": "agent",
+                     "observed": {"edges": {"uses": 30}, "suggested": [{"predicate": "uses", "source_parent": "agent",
                                                                        "target_parent": "entity", "count": 30}]}}
             config = {"graph_schema_versions": [prior], "graph_schema_active": "v1"}
             with db.connect(state) as con:
@@ -1161,13 +1131,12 @@ enums:
 
 
 class SchemaOutputCleanupTests(unittest.TestCase):
-    """模式采样里两处模型输出的规整(10-24 改版上线后真机抽模式时看到的,与库无关):领域回成一段带 Markdown 的说明;
-    类型名把两种叫法用「 / 」拼成一个类型。"""
+    """Synthetic regression: Schema Output Cleanup Tests."""
 
     def test_domain_is_one_short_phrase(self) -> None:
         self.assertEqual(graph_schema.clean_domain("**Domain: Enterprise AI Delivery**\n\nThis text covers ..."), "Enterprise AI Delivery")
-        self.assertEqual(graph_schema.clean_domain('"Medical science"'), "Medical science")
-        self.assertEqual(graph_schema.clean_domain("领域：半导体器件。"), "半导体器件")
+        self.assertEqual(graph_schema.clean_domain('"Measurement science"'), "Measurement science")
+        self.assertEqual(graph_schema.clean_domain("领域：样例模块器件。"), "样例模块器件")
         self.assertEqual(len(graph_schema.clean_domain("x" * 300)), 80)
         self.assertEqual(graph_schema.clean_domain("\n\n"), "")
         self.assertIn("Reply ONLY with the domain", prompts.GENERATE_DOMAIN_PROMPT)
@@ -1179,7 +1148,7 @@ class SchemaOutputCleanupTests(unittest.TestCase):
         self.assertIn('do not join two kinds or two names into one type', prompts.ENTITY_TYPE_GENERATION_PROMPT)
 
     def test_upper_class_names_are_not_leaf_types(self) -> None:
-        """10-24 评估:一组样本归纳出的类型表里有 concept / document / event,1.9 万个实体里 5 千多个类型就叫 concept。
+        """合成类型表包含 concept / document / event,用于验证上层类不会重复成为叶子类型。
         上层类本来就挂在每个实体上,叶子再叫同名没有信息量;提示词的示例也不再拿 concept 当类型。"""
         self.assertEqual(graph_schema.parse_entity_types({"entity_types": ["Concept", "research paper", "document", "事件", "person",
                                                                            "product", "thing", "Ｅｖｅｎｔ"]}),

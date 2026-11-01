@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from kb_pipeline import llm_compat
 from kb_pipeline.graph.llm import ChatClient, HTTPStatusError, LLMCache, LLMCallError, LLMCircuitOpen, LLMSpec, cache_count, cache_key
 
 from _support import SPEC, _client
@@ -145,7 +146,8 @@ class ProviderRejectionTests(unittest.TestCase):
         self.llm = llm_mod
         self.base = f"http://reject-{id(self)}/v1"
         self.spec = LLMSpec(name="m", base_url=self.base, api_key="", model_id="x", protocol="openai")
-        self.addCleanup(llm_mod._THINKING_PARAMS_REJECTED.pop, self.base, None)
+        llm_compat._ACCEPTED.clear()
+        self.addCleanup(llm_compat._ACCEPTED.clear)
 
     @staticmethod
     def _resp(status: int, payload: dict):
@@ -172,7 +174,7 @@ class ProviderRejectionTests(unittest.TestCase):
             self._ask(session)
         self.assertEqual(len(calls), 1)                                   # no second request with the parameter removed
         self.assertIn("data_inspection_failed", str(ctx.exception))
-        self.assertNotIn(self.base, self.llm._THINKING_PARAMS_REJECTED)
+        self.assertEqual(llm_compat._ACCEPTED, {})
         self.assertFalse(self.llm.is_retryable(ctx.exception))
         ok = {"choices": [{"message": {"content": "fine"}, "finish_reason": "stop"}]}
         session, calls = self._session([self._resp(200, ok)])
@@ -182,21 +184,17 @@ class ProviderRejectionTests(unittest.TestCase):
         self.assertEqual(calls[0]["enable_thinking"], False)
         self.assertEqual(calls[0]["thinking"], {"type": "disabled"})
 
-    def test_unknown_parameter_400_drops_the_flag_only_when_the_retry_succeeds(self) -> None:
+    def test_unnamed_400_does_not_guess_or_change_later_requests(self) -> None:
         generic = {"error": {"message": "invalid request", "type": "invalid_request_error"}}
         ok = {"choices": [{"message": {"content": "fine"}, "finish_reason": "stop"}]}
-        session, calls = self._session([self._resp(400, generic), self._resp(200, ok)])
-        self.assertEqual(self._ask(session), "fine")
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("enable_thinking", calls[1])
-        self.assertNotIn("thinking", calls[1])
-        self.assertEqual(self.llm._THINKING_PARAMS_REJECTED[self.base], {"enable_thinking", "thinking"})   # remembered only because the retry without it succeeded
-        self.llm._THINKING_PARAMS_REJECTED.pop(self.base)
-        session, calls = self._session([self._resp(400, generic), self._resp(400, generic)])
-        with self.assertRaises(self.llm.HTTPStatusError):                  # still 400 without it: the original error is raised, nothing remembered
+        session, calls = self._session([self._resp(400, generic)])
+        with self.assertRaises(self.llm.HTTPStatusError):
             self._ask(session)
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn(self.base, self.llm._THINKING_PARAMS_REJECTED)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(llm_compat._ACCEPTED, {})
+        session, calls = self._session([self._resp(200, ok)])
+        self.assertEqual(self._ask(session), "fine")
+        self.assertEqual(set(calls[0]) & {"enable_thinking", "thinking"}, {"enable_thinking", "thinking"})
 
     def test_400_naming_one_parameter_drops_only_that_one_and_remembers_it(self) -> None:
         named = {"error": {"message": "Unrecognized request argument supplied: thinking"}}
@@ -206,19 +204,25 @@ class ProviderRejectionTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 429)                       # the result of the resent request is raised as is (429 is retryable)
         self.assertNotIn("thinking", calls[1])
         self.assertEqual(calls[1]["enable_thinking"], False)              # the one not named is still sent
-        self.assertEqual(self.llm._THINKING_PARAMS_REJECTED[self.base], {"thinking"})
+        self.assertEqual(llm_compat._ACCEPTED, {})  # failed adaptations are not remembered
         ok = {"choices": [{"message": {"content": "fine"}, "finish_reason": "stop"}]}
+        session, calls = self._session([self._resp(400, named), self._resp(200, ok)])
+        self.assertEqual(self._ask(session), "fine")
+        self.assertIn("thinking", calls[0])
+        self.assertNotIn("thinking", calls[1])
         session, calls = self._session([self._resp(200, ok)])
         self.assertEqual(self._ask(session), "fine")
         self.assertEqual(set(calls[0]) & {"enable_thinking", "thinking"}, {"enable_thinking"})
         # the other way round, naming enable_thinking: "thinking" is a substring of it and must not be dropped too
-        self.llm._THINKING_PARAMS_REJECTED.pop(self.base)
+        llm_compat._ACCEPTED.clear()
         named = {"error": {"message": "Unrecognized request argument supplied: enable_thinking"}}
         session, calls = self._session([self._resp(400, named), self._resp(200, ok)])
         self.assertEqual(self._ask(session), "fine")
         self.assertNotIn("enable_thinking", calls[1])
         self.assertEqual(calls[1]["thinking"], {"type": "disabled"})
-        self.assertEqual(self.llm._THINKING_PARAMS_REJECTED[self.base], {"enable_thinking"})
+        session, calls = self._session([self._resp(200, ok)])
+        self.assertEqual(self._ask(session), "fine")
+        self.assertEqual(set(calls[0]) & {"enable_thinking", "thinking"}, {"thinking"})
 
     def test_deepseek_style_interrupted_generation_is_retried_with_backoff(self) -> None:
         """DeepSeek's official docs: finish_reason=insufficient_system_resource / aborted means generation was
@@ -284,7 +288,6 @@ class ResponseMetaTests(unittest.TestCase):
     def test_chat_once_fills_meta(self) -> None:
         from kb_pipeline.graph import llm as llm_mod
         spec = LLMSpec(name="m", base_url=f"http://meta-{id(self)}/v1", api_key="", model_id="x", protocol="openai")
-        self.addCleanup(llm_mod._THINKING_PARAMS_REJECTED.pop, spec.base_url, None)
         payload = {"choices": [{"message": {"content": "partial"}, "finish_reason": "length"}], "usage": {"completion_tokens": 4096}}
         session = SimpleNamespace(post=lambda *a, **k: SimpleNamespace(status_code=200, text=json.dumps(payload), json=lambda: payload))
         meta: dict = {}
@@ -354,8 +357,8 @@ class LlmCallAccountingTests(unittest.TestCase):
     def test_figure_units_are_body_not_conclusion_or_toc(self) -> None:
         from kb_pipeline.graph.units import classify_unit_text, unit_signals
 
-        figure = ("CAPTION: 逻辑框图[1、2、3]\nVISUAL SUMMARY: 这是一个静态随机存取存储器(SRAM)阵列的内部结构框图,展示了行解码器、列 I/O、控制单元等组件及其连接关系。\n"
-                  "FACTS: 静态 RAM 阵列规格为 2048 X 2048 X 2。;行解码器接收地址输入 A0 至 A19。\nENTITIES: STATIC RAM ARRAY, ROW DECODER\nKEYWORDS: SRAM\n"
+        figure = ("CAPTION: 逻辑框图[1、2、3]\nVISUAL SUMMARY: 这是一个样例缓存(STORE)阵列的内部结构框图,展示了行解码器、列 I/O、控制单元等组件及其连接关系。\n"
+                  "FACTS: 样例缓存阵列规格为 2048 X 2048 X 2。;行解码器接收地址输入 A0 至 A19。\nENTITIES: SAMPLE BUFFER ARRAY, ROW DECODER\nKEYWORDS: STORE\n"
                   "```mermaid\ngraph LR\n" + "\n".join(f'  N{i}["A{i}-A{i+1}"] --> N{i+1}["ROW {i}"]' for i in range(24)) + "\n```\n"
                   "FOOTNOTE: 勘误表:在器件中,AutoStore Disable 特性被禁用。")
         sig = unit_signals(figure, ["功能说明"])
@@ -363,7 +366,7 @@ class LlmCallAccountingTests(unittest.TestCase):
         self.assertLess(sig["toc"], 5)
         self.assertEqual(classify_unit_text(figure, ["功能说明"]), "body")
         self.assertEqual(classify_unit_text("CAPTION: 图 5. 读周期\nVISUAL SUMMARY: 时序图。", ["开关波形"]), "body")
-        self.assertEqual(classify_unit_text("异常结果汇总\n1. 总胆固醇偏高,建议复查。", ["异常结果汇总"]), "conclusion")   # a real conclusion section is unaffected
+        self.assertEqual(classify_unit_text("异常结果汇总\n1. 总组分浓度偏高,建议复查。", ["异常结果汇总"]), "conclusion")   # a real conclusion section is unaffected
         self.assertEqual(classify_unit_text("Summary\nThe device passed all tests.", ["Summary"]), "conclusion")
 
 

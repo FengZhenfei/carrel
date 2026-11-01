@@ -34,6 +34,8 @@ class KBSource:
     # Per-KB override of the VLM caption instruction paragraph; the JSON
     # field guide is always appended by vision.vlm.compose_prompt.
     vlm_prompt: str | None = None
+    # Registered model for image understanding and table review; empty uses the system VLM.
+    vlm_model: str | None = None
     graph_enabled: bool = False
     # The persistent intent written by "pause graph build"; the automatic rebuild must respect it.
     graph_paused: bool = False

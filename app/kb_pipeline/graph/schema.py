@@ -422,15 +422,10 @@ EXAMPLE_MIN_TEXT_CHARS = 120
 EXAMPLE_MAX_COUNT = 2
 EXAMPLE_MAX_TRIES = 8
 EXAMPLE_MAX_RELATED_RATIO = 0.3
-EXAMPLE_RELAX_RATIO = 0.5
 
 
 def score_example(ents: list[dict[str, Any]], rels: list[dict[str, Any]], schema: Any, *, related_predicate: str) -> dict[str, Any]:
-    """Quality of one sample extraction: among relations whose both ends are in the entities, the share of
-    related_to and the number of relations with a real predicate. Predicate endpoint constraints follow the same
-    rule as the pipeline's merge stage (merge.relax_bad_endpoints): when more than half of a predicate's relations
-    in this sample violate the ends, the constraint is wrong rather than the extraction, and the whole predicate
-    is let through; otherwise only the violating relations are removed."""
+    """Score source-grounded examples using the declared endpoints. Frequent violations do not validate an example."""
     allowed = schema.allowed_ends()
     names = {str(e["name"]).casefold(): str(e["type"]) for e in ents}
     well_formed = [r for r in rels if str(r["source"]).casefold() in names and str(r["target"]).casefold() in names]
@@ -445,29 +440,21 @@ def score_example(ents: list[dict[str, Any]], rels: list[dict[str, Any]], schema
         src_t, tgt_t = names[str(r["source"]).casefold()], names[str(r["target"]).casefold()]
         if not (schema.endpoint_ok(src_t, ends[0]) and schema.endpoint_ok(tgt_t, ends[1])):
             bad.setdefault(pred, []).append(idx)
-    relaxed = {p for p, idxs in bad.items() if len(idxs) / max(1, uses[p]) > EXAMPLE_RELAX_RATIO}
-    drop = {i for p, idxs in bad.items() if p not in relaxed for i in idxs}
+    drop = {i for idxs in bad.values() for i in idxs}
     kept = [r for i, r in enumerate(well_formed) if i not in drop]
     related = sum(1 for r in kept if str(r["predicate"]) == related_predicate)
     return {"relations": kept, "related_ratio": (related / len(kept)) if kept else 1.0, "typed": len(kept) - related,
-            "violations_removed": len(drop), "relaxed_predicates": sorted(relaxed)}
+            "violations_removed": len(drop)}
 
 
 def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_examples: int = EXAMPLE_MAX_COUNT) -> tuple[str, dict[str, Any]]:
-    """Generate few-shot examples from this KB's corpus (GraphRAG prompt tune's idea, with validation added): run
-    the current extraction prompt over a few samples, score them with score_example, prefer those with a
-    related_to share <= 0.3; if none qualifies take the ones with the most predicate-bearing relations (an example
-    from this corpus beats a news example), and only reject samples that yield no relations at all. Returns
-    (example text, stats). Returns an empty string when no sample survives (extraction then uses the generic
-    examples).
-    2026-09-08: one evaluation corpus used to keep no sample at all -- short chunks (mostly < 200 characters), the endpoint
-    constraints removed 12 of 12 relations, and the rest were all related_to; now the length floor is 120, the
-    endpoint constraints follow the pipeline's relaxation rule, and the hard threshold became a ranking."""
+    """Generate and rank corpus examples; retain typed relations that meet the declared endpoint constraints."""
     from . import prompts
     from .extract import parse_records, render_extract_prompt
+    from .quality import relation_semantics
 
     known = {t.casefold(): t for t in schema.entity_types}
-    stats: dict[str, Any] = {"tried": 0, "kept": 0, "dropped_empty": 0, "violations_removed": 0, "fallback": 0, "relaxed_predicates": []}
+    stats: dict[str, Any] = {"tried": 0, "kept": 0, "dropped_empty": 0, "violations_removed": 0, "fallback": 0}
     candidates = sorted((t for t in texts if EXAMPLE_MIN_TEXT_CHARS <= len(t) <= EXAMPLE_MAX_TEXT_CHARS * 2), key=len, reverse=True)
     scored: list[tuple[tuple[float, int, int], str, list[dict[str, Any]], list[dict[str, Any]]]] = []
     for text in candidates[:EXAMPLE_MAX_TRIES]:
@@ -485,9 +472,6 @@ def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_
         ents = [e for e in ents if str(e.get("type") or "").casefold() in known]
         sc = score_example(ents, rels, schema, related_predicate=prompts.DEFAULT_PREDICATE)
         stats["violations_removed"] += sc["violations_removed"]
-        for p in sc["relaxed_predicates"]:
-            if p not in stats["relaxed_predicates"]:
-                stats["relaxed_predicates"].append(p)
         if not ents or not sc["relations"]:
             stats["dropped_empty"] += 1
             continue
@@ -508,7 +492,7 @@ def generate_examples(client: ChatClient, texts: list[str], schema: Any, *, max_
         for r in kept_rels[:12]:
             period = f'{r.get("valid_from") or ""}..{r.get("valid_until") or ""}' if (r.get("valid_from") or r.get("valid_until")) else ""
             records.append(f'("relationship"<|>{r["source"]}<|>{r["target"]}<|>{r["predicate"]}<|>{r["description"]}'
-                           f'<|>{int(r.get("strength") or 5)}<|>{period})')
+                           f'<|>{int(r.get("strength") or 5)}<|>{period}<|>{json.dumps(relation_semantics(r), ensure_ascii=False)})')
         body = "\n##\n".join(records) + "\n" + prompts.COMPLETION_DELIMITER
         # the menus in the examples list names only: the main prompt already carries the full menu with definitions,
         # and repeating it in every example would add ten thousand characters of duplication
@@ -533,8 +517,9 @@ def _prior_types_text(prior: dict[str, Any] | None) -> str:
     observed = (prior or {}).get("observed") or {}
     lookup = {str(k).casefold(): int(v or 0) for k, v in (observed.get("type_counts") or {}).items()}
     text = ("\nThe previous version of this schema used these entity types: " + ", ".join(types)
-            + ". Keep every name that still fits this corpus (renaming a type invalidates the existing graph), "
-            "drop only types that do not occur in the corpus, and add what is missing.") if types else ""
+            + ". Reuse names for the same meanings. Source-supported previous definitions are preserved separately, "
+            "so this proposal need not repeat all of them. Cover the current samples and add missing categories, "
+            "including less frequent subjects; do not force unrelated subjects into the dominant domain.") if types else ""
     if upper_named:
         text += ("\nIt also used top-level class names as types: "
                  + ", ".join(f"{t} ({lookup[t.casefold()]} entities)" if t.casefold() in lookup else t for t in upper_named)
@@ -562,9 +547,9 @@ def _prior_predicates_text(prior: dict[str, Any] | None) -> str:
     edges = observed.get("edges") or {}
     violations = observed.get("violations") or {}
     pairs = observed.get("pairs") or {}
-    confirmed: dict[str, list[str]] = {}
-    for row in observed.get("confirmed") or []:
-        confirmed.setdefault(str(row.get("predicate") or ""), []).append(
+    suggested: dict[str, list[str]] = {}
+    for row in observed.get("suggested") or []:
+        suggested.setdefault(str(row.get("predicate") or ""), []).append(
             f"{row.get('source_parent')} -> {row.get('target_parent')} ({int(row.get('count') or 0)} edges)")
     lines = []
     for p in preds:
@@ -583,17 +568,23 @@ def _prior_predicates_text(prior: dict[str, Any] | None) -> str:
             if top:
                 line += "; most common endpoint pairs: " + ", ".join(
                     f"{str(k).replace('->', ' -> ')} ({int(v or 0)})" for k, v in top)
-            if confirmed.get(name):
-                line += "; data-confirmed endpoint pairs: " + "; ".join(confirmed[name])
+            if suggested.get(name):
+                line += "; observed endpoint pairs needing review: " + "; ".join(suggested[name])
             line += ")"
         lines.append(line)
     text = ("\n\nThe previous version of this schema defined these predicates (with the parent categories allowed at "
             "their source -> target ends, and how the current graph actually uses them):\n" + "\n".join(lines)
-            + "\nRevise this list rather than starting over: keep predicates that carry many edges, keep every "
-            "data-confirmed endpoint pair allowed, refine descriptions, drop predicates that never occur, add what is missing.")
+            + "\nRevise the schema using the sample evidence and predicate meaning. Usage counts describe extraction output, "
+            "not validated ontology constraints. Frequent violations can indicate either extraction errors or an incomplete schema.")
     if violations:
-        text += (" When most edges of a predicate fall outside its declared ends, the ends were declared too narrowly: "
-                 "widen them to the pairs the data shows (or split the predicate) rather than dropping it.")
+        text += " Widen an endpoint only when the sample supports its semantics; frequency alone is not evidence of correctness."
+    if (prior or {}).get("source_support"):
+        text += " Existing definitions supported by current conforming source assertions are retained across resampling: " + json.dumps(prior["source_support"], ensure_ascii=False)
+        text += (" To extend an existing predicate, preserve its description, direction, cardinality and existing endpoints. "
+                 "Include endpoint_evidence on that predicate: a list of {source, target, source_type, target_type, quote}. "
+                 "Use a verbatim sample quote explicitly asserting this relationship between the named endpoints. "
+                 "Do not use mere co-occurrence, examples of possible use, or frequency as evidence. "
+                 "Only the specific types supported by these quotes may be added; unsupported extensions remain deferred.")
     return text
 
 
@@ -605,48 +596,9 @@ def _prior_profile_text(prior: dict[str, Any] | None) -> str:
             "says otherwise:\n" + json.dumps(profile, ensure_ascii=False))
 
 
-def apply_observed_guard(predicates: Iterable[dict[str, Any]], prior: dict[str, Any] | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Data guard: endpoint pairs confirmed in the previous version's ledger (>= 20 edges and >= 5% at build time)
-    are kept by rule, not left to the model -- if the model dropped that predicate, the previous version's entry
-    is restored; if it narrowed the ends, the parent type is added back. Returns (predicate list, record)."""
-    from .merge import confirmed_pairs
-
-    out = [dict(p) for p in predicates]
-    record: dict[str, Any] = {"kept_predicates": [], "widened": []}
-    confirmed = confirmed_pairs((prior or {}).get("observed") or {})
-    if not confirmed:
-        return out, record
-    prior_preds = {normalize_predicate(str(p.get("name") or "")): p for p in ((prior or {}).get("predicates") or [])}
-    by_name = {normalize_predicate(str(p.get("name") or "")): p for p in out}
-    for pred, src, tgt in confirmed:
-        key = normalize_predicate(pred)
-        if key not in by_name:
-            base = prior_preds.get(key)
-            if base is None:
-                continue
-            row = {**base, "source_parents": list(base.get("source_parents") or ["*"]),
-                   "target_parents": list(base.get("target_parents") or ["*"])}
-            out.append(row)
-            by_name[key] = row
-            record["kept_predicates"].append(key)
-        row = by_name[key]
-        for side, parent in (("source_parents", src), ("target_parents", tgt)):
-            ends = [str(x).strip() for x in (row.get(side) or []) if str(x).strip()]
-            if not ends or "*" in ends or parent in ("", "-"):
-                continue
-            if parent.casefold() not in {e.casefold() for e in ends}:
-                ends.append(parent)
-                row[side] = ends
-                record["widened"].append(f"{key}.{side}+{parent}")
-    return out, record
-
-
 def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, examples: bool = True,
             prior: dict[str, Any] | None = None, progress=None) -> dict[str, Any]:
-    """九次调用:领域 → 语言 → 人设 → 类型表 → 父类 → 谓词 → 类型定义与作用域 → 场景画像 → 语料示例(≤2 段各一次)。
-    prior:现行模式版本(类型表、谓词表、画像、端点账),给了就让模型在它基础上修订;账里确认过的端点组合由
-    apply_observed_guard 按规则保住,不依赖模型听不听话。
-    返回 model(ontology.normalize_model 规范化过的模式字典)与领域、人设、语料示例等。"""
+    """Induce a schema from sampled text. Prior schema and endpoint usage inform the prompt; no usage threshold overrides the proposed constraints."""
     from ..ontology import SchemaError, normalize_model
 
     progress = progress or (lambda phase: None)
@@ -669,6 +621,7 @@ def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, e
     entity_types = parse_entity_types(parse_json_object(raw_types) or raw_types)
     parent_types: dict[str, str] = {}
     predicates: list[dict[str, Any]] = []
+    endpoint_evidence: dict[str, Any] = {}
     guard: dict[str, Any] = {}
     if entity_types:
         progress("parents")
@@ -687,7 +640,11 @@ def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, e
             persona=persona, domain=domain, parent_types=parents_text, input_text=joined,
             min_predicates=MIN_PREDICATES, max_predicates=MAX_PREDICATES), max_tokens=4096,
             validate=lambda t: bool(normalize_predicates(parse_json_object(t))))
-        predicates, guard = apply_observed_guard(normalize_predicates(parse_json_object(raw_predicates)), prior)
+        predicates = normalize_predicates(parse_json_object(raw_predicates))
+        endpoint_evidence = {normalize_predicate(str(p.get("name") or "")): p["endpoint_evidence"]
+                             for p in parse_json_object(raw_predicates).get("predicates", [])
+                             if isinstance(p, dict) and isinstance(p.get("endpoint_evidence"), list)}
+        guard = {"kept_predicates": [], "widened": []}
     type_definitions: dict[str, str] = {}
     type_scopes: dict[str, str] = {}
     profile: dict[str, Any] = {}
@@ -719,12 +676,22 @@ def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, e
             raise
         except Exception as exc:
             print(f"[schema] profile call failed: {exc!r}", flush=True)
-        try:
-            model, warnings = normalize_model({
+        from .schema_reuse import reuse_supported_model
+
+        def finish_proposal(names, parents):
+            proposal = {
                 "language": language,
-                "types": [{"name": t, "is_a": parent_types.get(t, "entity"), "description": type_definitions.get(t, ""),
-                           "scope": type_scopes.get(t, "")} for t in entity_types],
-                "predicates": predicates, "profile": profile})
+                "types": [{"name": t, "is_a": parents.get(t, "entity"), "description": type_definitions.get(t, ""),
+                           "scope": type_scopes.get(t, "")} for t in names],
+                "predicates": predicates, "profile": profile}
+            # Resolve old endpoint/type names against retained definitions before
+            # normalization; a new-topic proposal need not repeat those types.
+            reused, guard = reuse_supported_model(proposal, prior, endpoint_evidence=endpoint_evidence, samples=docs)
+            normalized, warnings = normalize_model(reused)
+            return normalized, warnings, guard
+
+        try:
+            model, warnings, guard = finish_proposal(entity_types, parent_types)
         except SchemaError as exc:
             # 归纳结果不合规(父类成环、类型太多):类型表截到上限、父类一律拉平到上层类再规范化一次,不让整轮抽取作废
             print(f"[schema] induced schema rejected ({exc}); retrying flattened and trimmed", flush=True)
@@ -732,11 +699,7 @@ def suggest(client: ChatClient, docs: list[str], *, domain: str | None = None, e
 
             kept = entity_types[:MAX_MENU_TYPES]
             flat = _uppers_of(entity_types, {t: p for t, p in parent_types.items() if p not in entity_types})
-            model, warnings = normalize_model({
-                "language": language,
-                "types": [{"name": t, "is_a": flat.get(t, "entity"), "description": type_definitions.get(t, ""),
-                           "scope": type_scopes.get(t, "")} for t in kept],
-                "predicates": predicates, "profile": profile})
+            model, warnings, guard = finish_proposal(kept, flat)
         if warnings:
             print(f"[schema] normalized with warnings: {warnings}", flush=True)
         if examples:

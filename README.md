@@ -21,7 +21,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-**0.3.1:** [Release notes and upgrade steps](docs/releases/0.3.1.md).
+**0.4.0 (release pending):** [Changes and upgrade steps](docs/releases/0.4.0.md).
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
@@ -32,7 +32,8 @@ Code and Codex to the retrieval service.
   with automatic knowledge-base selection and optional text/image reranking
   with rank fusion.
 - **Knowledge graphs:** extract entity types, relationships, and facts from
-  your documents; retain sources, time information, and conflict indicators.
+  your documents; retain sources, time information, and conflict indicators,
+  compare graph versions, and apply reviewed, evidence-scoped corrections.
 - **Agent access:** search through an API, fetch surrounding text or original
   images, and follow graph relationships when more evidence is needed.
 - **Web console:** configure processing, inspect chunks and graphs, track
@@ -72,6 +73,9 @@ See [Architecture](docs/architecture.md) for the pipeline and retrieval design.
 Carrel provides general knowledge storage, retrieval, and evidence interfaces.
 Entities, relationships, and facts retain sources, time information, and
 conflicts so agents can check and use them alongside the original documents.
+Default retrieval retains historical and future source claims. An explicit
+time query selects the relevant evidence; reviewed corrections record which
+sources and identities the decision applies to.
 **The Agent Loop plugin is in development and not yet implemented.** It is
 intended to use these interfaces to continuously learn an enterprise ontology,
 seek clarification from relevant people, and maintain correction rules.
@@ -118,11 +122,13 @@ startup commands. First startup downloads the parser models.
 
 ### 2. Configure model endpoints
 
-Edit `config/knowledge-base.env` to set the embedding and vision model URLs,
-model names, and API keys. The initial URLs point to local model servers;
-starting those servers requires the optional local model setup below.
+Edit `config/knowledge-base.env` to set embedding and optional reranking
+endpoints, model names, and API keys. In the console's model list, register a
+vision-capable chat endpoint and select it as the **Multimodal model** for each
+knowledge base. Images, charts and table review share this selection. A global
+vision default can also be set with `VLM_BASE_URL`, `VLM_MODEL_ID` and `VLM_API_KEY`.
 
-To use the bundled local models, prepare their weights and deploy with
+To use the four bundled embedding and reranking models, prepare their weights and deploy with
 `./deploy.sh --with-local-models`. See [Model configuration](docs/configuration.md#model-endpoints)
 and the [local model setup](deployment/compose/README.md#local-model-servers-profile-local-models).
 Restart running application services after changing their environment settings.
@@ -166,6 +172,7 @@ for authentication, response status, and citations.
 | [Retrieval and API](docs/retrieval.md) | Agent setup, endpoints, evidence status, and evaluation |
 | [Retrieval evaluation (0.3.0)](docs/evaluations/retrieval-evaluations-0.3.0.md) | Models, test conditions, graph and reranking comparisons, and latency |
 | [Operations and development](docs/operations.md) | Console, CLI, scheduling, troubleshooting, and tests |
+| [Test scope](docs/testing.md) | Shared regression contracts, deployment-specific checks, and live evaluations |
 | [Example setup](docs/example-setup.md) | The author's installation on a DGX Spark, a Mac that syncs the documents, and lighter alternatives |
 | [Docker Compose](deployment/compose/README.md) | Infrastructure, model weights, and container settings |
 | [systemd](deployment/systemd/README.md) | Linux services and timers |

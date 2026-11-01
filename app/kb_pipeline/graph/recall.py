@@ -22,6 +22,7 @@ from ..embedding.client import EmbeddingClient
 from ..models import KBSource
 from ..vector.qdrant import client as qdrant_client, graph_collection_alias, graph_collection_name
 from .neo4j_import import active_neo4j_graph_version, neo4j_driver
+from .quality import relation_semantics, traversable_relation
 
 
 def mention_weight(entity_score: float, *, count: int, df: int, n_chunks: int) -> float:
@@ -346,8 +347,11 @@ def fact_content_key(row: dict[str, Any]) -> tuple:
             conditions = {"_": conditions}
     kept = tuple(sorted((str(k).casefold(), str(v).casefold()) for k, v in dict(conditions).items()
                         if str(v).strip() and str(v).casefold() not in named))
-    values = tuple(str(row.get(k) or "").strip().casefold() for k in ("value", "min", "typ", "max", "unit"))
-    return subject, concept, values, str(row.get("valid_from") or row.get("axis") or ""), kept
+    from .reconcile import unit_of
+    from .quality import fact_quality
+    values = tuple(str(row.get(k) or "").strip().casefold() for k in ("value", "min", "typ", "max")) + (unit_of(row),)
+    return (subject, concept, values, str(row.get("valid_from") or row.get("axis") or ""), kept,
+            str(row.get("fact_kind") or "observation"), fact_quality(row))
 
 
 def collapse_duplicate_facts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -371,7 +375,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
                per_token: int = LEXICAL_PER_TOKEN, window: dict[str, str] | None = None,
                scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """限定事实种子:稠密检索(属性侧 / 值侧 / 整句)+ 记号精确匹配(主体 / 符号 / 属性)+ 时间窗加权 + 贪心覆盖。
-    按时间口径筛(scope,默认现行:序列里更早的档位、来源文档被取代或归档的、过了有效期的不作种子)。
+    按时间口径筛;默认保留历史声明,仅排除显式文档治理范围。
     集合不存在(旧图)就返回空。"""
     from qdrant_client.http import models as qm
 
@@ -525,7 +529,7 @@ def _query_points(q: Any, collection: str, vector: list[float], limit: int, quer
 SOURCE_SAMPLE = 16
 SERIES_MEMBERS_MAX = 40
 RELATION_TIME_KEYS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
-                      "lapses")
+                      "lapses", "polarity", "target_polarity", "modality", "conditions_json", "quality_state", "traversable")
 
 
 def spread(items: list[Any], limit: int) -> list[Any]:
@@ -563,7 +567,13 @@ def spec_result_row(sp: dict[str, Any]) -> dict[str, Any]:
         "evidence_conflict": sp.get("evidence_conflict"), "comparable": sp.get("comparable"), "confidence": sp.get("confidence"),
         "series_index": sp.get("series_index"), "series_len": sp.get("series_len"), "axis": sp.get("axis"), "values_text": sp.get("values_text"),
         "rel_path": sp.get("rel_path"), "section": sp.get("section"), "point_ids": list(sp.get("point_ids") or []),
+        "source_locator": sp.get("source_locator"), "evidence_precision": sp.get("evidence_precision"),
+        "evidence_unit_ids": sp.get("evidence_unit_ids"), "subject_origin": sp.get("subject_origin"),
+        "value_json": sp.get("value_json"),
         # 时间与状态(方案附录第 3 条):观察时间、被哪条取代、来源文档状态、出自表格 / 叙述
+        "fact_kind": sp.get("fact_kind"), "subject_origin": sp.get("subject_origin"),
+        "quality_state": sp.get("quality_state"), "flag_status": sp.get("flag_status"), "extraction_evidence": sp.get("extraction_evidence"),
+        "time_basis": sp.get("time_basis"), "observed_at": sp.get("observed_at"),
         "observed": sp.get("observed"), "superseded_by": sp.get("superseded_by"), "superseded_on": sp.get("superseded_on"),
         "doc_status": sp.get("doc_status"), "source_kind": sp.get("source_kind"), "lapses": sp.get("lapses"),
     }
@@ -711,7 +721,10 @@ def graph_query(
                 relation_scores[rid] = {"id": rid, "source": seed.get("source"), "target": seed.get("target"),
                                         "type": seed.get("type"), "description": seed.get("description"),
                                         "score": seed["_score"], "hop": 0, "via": seed.get("_via") or "vector",
-                                        **{k: seed.get(k) for k in RELATION_TIME_KEYS if seed.get(k)}}
+                                        **{k: seed.get(k) for k in RELATION_TIME_KEYS if seed.get(k) not in (None, "")},
+                                        **relation_semantics(seed)}
+                if not traversable_relation(seed):
+                    continue
                 for end in (seed.get("source_id"), seed.get("target_id")):
                     end = str(end or "")
                     if end and end not in entity_scores:
@@ -733,11 +746,14 @@ def graph_query(
                     UNWIND $ids AS eid
                     MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[r:RELATED_TO]-(n:Entity)
                     WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
+                      AND coalesce(r.traversable, false) = true
                       AND """ + cypher_in_scope("r", observed="observed_first", scope=scope) + """
                     WITH eid, r, n ORDER BY r.weight DESC
                     WITH eid, collect({rid: r.id, type: r.type, weight: r.weight, description: r.description,
                                        valid_from: r.valid_from, valid_until: r.valid_until, observed_first: r.observed_first,
                                        observed_last: r.observed_last, superseded_by: r.superseded_by, superseded_on: r.superseded_on,
+                                       polarity: r.polarity, target_polarity: r.target_polarity, modality: r.modality,
+                                       conditions_json: r.conditions_json, quality_state: r.quality_state, traversable: r.traversable,
                                        doc_status: r.doc_status, lapses: r.lapses,
                                        nid: n.id, title: n.title, ntype: n.type, nupper: n.upper, nkind: n.kind, scope: n.scope,
                                        pagerank: n.pagerank, degree: n.degree})[0..$k] AS neighbours
@@ -774,7 +790,8 @@ def graph_query(
                                 relation_scores[rid] = {"id": rid, "source": None, "target": None,
                                                         "type": nb.get("type"), "description": nb.get("description"),
                                                         "score": rscore, "hop": hop, "via": "expand",
-                                                        **{k: nb.get(k) for k in RELATION_TIME_KEYS if nb.get(k)}}
+                                                        **{k: nb.get(k) for k in RELATION_TIME_KEYS if nb.get(k) not in (None, "")},
+                                                        **relation_semantics(nb)}
                 frontier = next_frontier
             # Fill in missing titles
             missing = [eid for eid, s in entity_scores.items() if not s.get("title")]
@@ -793,21 +810,23 @@ def graph_query(
                     "RETURN rid, r.source AS source, r.target AS target", ids=rel_missing, kb=source.kb_id, gv=gv,
                 ).data():
                     relation_scores[str(row["rid"])].update({"source": row["source"], "target": row["target"]})
-            # 事实序列的全部档位:现行口径下更早的档位不作种子,现行那一条的 series_text 里仍要看得到它们
+            # 补齐同一查询范围内未进入事实排序结果的时间档位。
             series_keys = sorted({str(sp.get("series_key")) for sp in specs[:top_relations] if sp.get("series_key")})
             if series_keys:
                 for row in session.run(
-                    "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys "
+                    "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys AND "
+                    + cypher_in_scope("f", observed="observed", scope=scope) + " "
                     "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, "
                     "f.unit AS unit, f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.axis AS axis, "
+                    "f.observed_at AS observed_at, f.observed AS observed, f.time_basis AS time_basis, "
                     "f.series_index AS series_index ORDER BY series_key, coalesce(f.series_index, 0), f.id",
-                    kb=source.kb_id, gv=gv, keys=series_keys,
+                    kb=source.kb_id, gv=gv, keys=series_keys, day=scope["day"],
                 ).data():
                     members = series_of.setdefault(str(row["series_key"]), [])
                     if len(members) < SERIES_MEMBERS_MAX:
                         members.append({**{k: row.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical",
-                                                                    "valid_from", "series_index")},
-                                        "when": row.get("valid_from") or row.get("axis")})
+                                                                    "valid_from", "observed_at", "observed", "time_basis", "series_index")},
+                                        "when": row.get("valid_from") or row.get("observed_at") or row.get("axis") or row.get("observed")})
             page_doc_ids = sorted({str(d) for pg in pages for d in (pg.get("doc_ids") or [])})
             if page_doc_ids:
                 for row in session.run(

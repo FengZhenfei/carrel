@@ -530,23 +530,40 @@ def head(envelope, *parts):
     return TXT["dot"].join(b for b in bits + list(parts) if b)
 
 
+def relation_notes(row):
+    """Keep assertion qualifiers visible in compact graph views."""
+    notes = []
+    for field in ("polarity", "target_polarity"):
+        value = row.get(field)
+        if value and value != "affirmed":
+            notes.append(field + "=" + str(value))
+    if row.get("modality") and row["modality"] != "actual":
+        notes.append("modality=" + str(row["modality"]))
+    conditions = row.get("conditions") or {}
+    if isinstance(conditions, dict):
+        notes.extend(str(k) + "=" + str(v) for k, v in conditions.items())
+    if row.get("quality_state") == "needs_review" or row.get("type_violation"):
+        notes.append("needs_review")
+    return " [" + "; ".join(notes) + "]" if notes else ""
+
+
 def arrow(row):
     if not row.get("directed"):
-        return "—" + str(row.get("type")) + "—"
-    return ("→" if row.get("direction") == "out" else "←") + str(row.get("type"))
+        return "—" + str(row.get("type")) + "—" + relation_notes(row)
+    return ("→" if row.get("direction") == "out" else "←") + str(row.get("type")) + relation_notes(row)
 
 
 def link(row):
     """A relation matched by the question, source first. The arrow is drawn only when the service says the relation is
     directed; one it marks undirected, or gives no direction for, is joined neutrally."""
-    return str(row.get("source")) + " —" + str(row.get("type")) + ("→ " if row.get("directed") is True else "— ") + str(row.get("target"))
+    return str(row.get("source")) + " —" + str(row.get("type")) + ("→ " if row.get("directed") is True else "— ") + str(row.get("target")) + relation_notes(row)
 
 
 def fact_body(row):
     """"subject · property = value unit @ conditions · time", the form of the service's hint, also for the rows the
     service gave no hint (it composes one for the first few facts only); the stored text when the value is not a
     single one."""
-    unresolved = bool(row.get("evidence_conflict")) or row.get("quality") == "ambiguous_source"
+    unresolved = bool(row.get("evidence_conflict")) or row.get("quality") in {"ambiguous_source", "needs_review"} or row.get("quality_state") == "needs_review"
     if unresolved:
         head = TXT["dot"].join(str(x).strip() for x in (row.get("subject"), row.get("property") or row.get("concept")) if x)
         conflict = row.get("evidence_conflict")
@@ -559,7 +576,7 @@ def fact_body(row):
             value = row.get("value")
             readings.append("original extracted value: " + str(value) if value not in (None, "") else str(row.get("text") or "reading not provided"))
         unit = str(row.get("unit") or "").strip()
-        when = str(row.get("when") or row.get("valid_from") or "").strip()
+        when = fact_time(row)
         detail = "; ".join(readings)
         body = head + " · Awaiting verification (" + detail + (" " + unit if unit and unit.casefold() not in detail.casefold() else "") + ")"
         if row.get("conditions_text"):
@@ -575,8 +592,14 @@ def fact_body(row):
     body = head + " = " + value + (" " + unit if unit and unit.casefold() not in value.casefold() else "")
     if row.get("conditions_text"):
         body += " @ " + str(row["conditions_text"]).strip()
-    when = str(row.get("when") or row.get("valid_from") or "").strip()
+    when = fact_time(row)
     return body + (TXT["dot"] + when if when else "")
+
+
+def fact_time(row):
+    when = str(row.get("when") or row.get("valid_from") or row.get("observed_at") or row.get("observed") or "").strip()
+    label = {"reported": "reported observation", "document": "document date"}.get(row.get("time_basis"))
+    return when + (" (" + label + ")" if when and label else "")
 
 
 STATUS_TXT = {"superseded": "status_superseded", "ended": "status_ended", "not_started": "status_not_started",
@@ -597,7 +620,7 @@ def fact_line(row):
         flags.append("not directly comparable numerically")
     if str(row.get("confidence") or "").lower() == "low":
         flags.append("low confidence; check source")
-    if row.get("verified") is False:
+    if row.get("source_valid", row.get("verified")) is False:
         flags.append(TXT["stale"])
     if status_flag(row):
         flags.append(status_flag(row))

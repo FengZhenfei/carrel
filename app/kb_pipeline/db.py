@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .chunking.context import evidence_text
+
 import hashlib
 import json
 import os
@@ -13,6 +15,7 @@ from typing import Any, Iterable
 from .models import SourceFile
 from .models import UnifiedChunk
 from .utils import stable_json_hash
+from .progress import advance
 
 
 SCHEMA = """
@@ -374,6 +377,8 @@ def begin_graph_build(
                 started_at = ?,
                 finished_at = NULL,
                 manifest_json = '{}',
+                stage = NULL,
+                progress_json = '{}',
                 error = NULL,
                 cache_fingerprint = ?,
                 build_kind = ?,
@@ -636,10 +641,10 @@ def graph_phases_done(con: sqlite3.Connection, graph_build_id: str) -> list[str]
     ]
 
 
-def mark_graph_phase_done(con: sqlite3.Connection, graph_build_id: str, phase: str) -> None:
+def mark_graph_phase_done(con: sqlite3.Connection, graph_build_id: str, phase: str, *, started_at: int | None = None) -> None:
     con.execute(
-        "INSERT OR REPLACE INTO graph_build_phases(graph_build_id, phase, done_at) VALUES (?, ?, ?)",
-        (graph_build_id, phase, now_ts()),
+        "INSERT OR REPLACE INTO graph_build_phases(graph_build_id, phase, started_at, done_at) VALUES (?, ?, ?, ?)",
+        (graph_build_id, phase, started_at, now_ts()),
     )
     con.commit()
 
@@ -1389,6 +1394,9 @@ def latest_job_for_dedupe_key(con: sqlite3.Connection, dedupe_key: str) -> sqlit
 
 _JOBS_MIGRATIONS = (
     "ALTER TABLE jobs ADD COLUMN stage TEXT",
+    "ALTER TABLE jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE graph_builds ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE graph_build_phases ADD COLUMN started_at INTEGER",
     # Cooperative cancellation: set to 1 when a knowledge base is closed / deleted; the parse job exits on
     # its own at the next phase boundary. A flag is used instead of changing status directly because a
     # running row belongs to the worker -- changing status from outside would race with the worker's
@@ -1451,7 +1459,7 @@ def migrate_schema(con: sqlite3.Connection) -> None:
             raise
 
 
-def set_job_stage(con: sqlite3.Connection, job_id: str, stage: str) -> None:
+def set_job_stage(con: sqlite3.Connection, job_id: str, stage: str, *, models: dict[str, str] | None = None) -> None:
     """Progress checkpoint for the web console. Commits immediately so the
     poller sees it mid-parse; safe because parse jobs accumulate no other
     uncommitted writes until the final replace_chunks/mark_* block.
@@ -1462,18 +1470,23 @@ def set_job_stage(con: sqlite3.Connection, job_id: str, stage: str) -> None:
     rewrites the text of the latest stage event: previously only jobs.stage was updated and the timeline
     row stayed at the first-written "VLM 1/166" forever (found by the user on 2026-09-10); now it shows
     the current progress while running and 166/166 at the end."""
+    row = con.execute("SELECT progress_json, stage FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     last = con.execute(
         "SELECT rowid, text FROM job_events WHERE job_id = ? AND kind = 'stage' ORDER BY ts DESC, rowid DESC LIMIT 1",
         (job_id,),
     ).fetchone()
-    if last is not None and _stage_head(last["text"]) == _stage_head(stage):
+    if row is not None and row["stage"] is not None and last is not None and _stage_head(last["text"]) == _stage_head(stage):
         if str(last["text"]) != stage:
             con.execute("UPDATE job_events SET text = ? WHERE rowid = ?", (stage, last["rowid"]))
     else:
         con.execute("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'stage', ?)",
                     (job_id, now_ts(), stage))
-    con.execute("UPDATE jobs SET stage = ?, updated_at = ? WHERE job_id = ?", (stage, now_ts(), job_id))
+    ts = now_ts()
+    progress = advance(row[0] if row else None, stage, ts, models=models)
+    con.execute("UPDATE jobs SET stage = ?, progress_json = ?, updated_at = ? WHERE job_id = ?",
+                (stage, json.dumps(progress, ensure_ascii=False), ts, job_id))
     con.commit()
+    print(f"[progress] job={job_id} phase={progress['phase']} stage={stage}", flush=True)
 
 
 def _stage_head(stage: str | None) -> str:
@@ -1500,6 +1513,11 @@ def set_graph_build_stage(con: sqlite3.Connection, graph_build_id: str, stage: s
     """Graph build stage checkpoint, same semantics as set_job_stage: commits immediately so the polling
     console sees it at any time. Also refreshes the heartbeat that reconcile_stale_graph_builds uses to
     judge liveness."""
+    ts = now_ts()
+    row = con.execute("SELECT progress_json FROM graph_builds WHERE graph_build_id=?", (graph_build_id,)).fetchone()
+    progress = advance(row[0] if row else None, stage, ts)
+    con.execute("UPDATE graph_builds SET progress_json=? WHERE graph_build_id=?",
+                (json.dumps(progress, ensure_ascii=False), graph_build_id))
     try:
         con.execute(
             "UPDATE graph_builds SET stage = ?, heartbeat_at = ? WHERE graph_build_id = ?",
@@ -1508,6 +1526,7 @@ def set_graph_build_stage(con: sqlite3.Connection, graph_build_id: str, stage: s
     except sqlite3.OperationalError:  # old database where the migration has not run yet
         con.execute("UPDATE graph_builds SET stage = ? WHERE graph_build_id = ?", (stage, graph_build_id))
     con.commit()
+    print(f"[progress] build={graph_build_id} phase={progress['phase']} stage={stage}", flush=True)
 
 
 # ── LLM registry / app config (web console) ─────────────────────────────
@@ -1639,7 +1658,7 @@ def claim_job_for_types(
         """
         UPDATE jobs
         SET status = 'running', locked_by = ?, locked_until = ?, started_at = COALESCE(started_at, ?),
-            updated_at = ?, stage = NULL
+            updated_at = ?, stage = NULL, progress_json = '{}'
         WHERE job_id = ?
         """,
         (worker_id, until, ts, ts, row["job_id"]),
@@ -2156,7 +2175,7 @@ def replace_chunks(
           text_sha = excluded.text_sha
         """,
         [
-            (chunk.chunk_uid, file_id, content_version, chunk.chunk_index, point_id, collection, ts, chunk_text_sha(chunk.text))
+            (chunk.chunk_uid, file_id, content_version, chunk.chunk_index, point_id, collection, ts, chunk_text_sha(evidence_text(chunk.text, chunk.block.metadata)))
             for chunk, point_id in zip(chunks, point_ids, strict=True)
         ],
     )

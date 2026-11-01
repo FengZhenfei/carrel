@@ -227,12 +227,15 @@ def test_existing_library_retains_its_own_rules_on_save_and_reactivation(env):
     service.enroll("New Library")
     own_rules = OLD_RULES.replace("Previous Library", "New Library")
     env.path.write_text(own_rules, encoding="utf-8")
+    before_sha = corrections.effective_sha(corrections.load_corrections(env.path))
     assert service.enroll("New Library")["outcome"] == "already"
-    assert env.path.read_text(encoding="utf-8") == own_rules
+    migrated = env.path.read_text(encoding="utf-8")
+    assert corrections.load_corrections(env.path)["identity"]
+    assert corrections.effective_sha(corrections.load_corrections(env.path)) == before_sha
     with db.connect(env.cfg.state_db) as con:
         discovery.mark_inactive(con, "kb_001", reason="user_disabled")
     assert service.enroll("New Library")["outcome"] == "reactivated"
-    assert env.path.read_text(encoding="utf-8") == own_rules
+    assert env.path.read_text(encoding="utf-8") == migrated
 
 
 def test_reactivation_failure_keeps_status_and_config(env, monkeypatch):

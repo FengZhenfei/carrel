@@ -101,10 +101,8 @@ GRAPH_TUNE_SAMPLE_DEFAULT = 0
 # Cap on the type table length. The value of a closed type table lies in being "narrow": with many types
 # the model's attention is diluted when choosing, which is worse than giving no table at all (upstream's
 # default has only 4 types).
-# Cap on the historical versions of the entity labels. 3 are kept: enough to compare and roll back
-# between "just extracted", "previous" and "the one before", without turning the dropdown into an
-# archaeological dig. The active version is never pushed out.
-GRAPH_SCHEMA_VERSION_MAX = 3
+# Lightweight schema history; versions referenced by retained graphs remain protected.
+GRAPH_SCHEMA_VERSION_MAX = 10
 
 # Id of the "no version info" placeholder entry in the read-only view. It is never stored; selecting it
 # means "keep things as they are".
@@ -113,23 +111,13 @@ CURRENT_SCHEMA_VERSION_ID = "__current__"
 
 
 def push_schema_version(versions, entry, *, active_id=None, limit=GRAPH_SCHEMA_VERSION_MAX, protected_ids=()):
-    """新版本入环,最新的排最前,超出上限就淘汰最旧的 —— 但**绝不淘汰正在生效的
-    那一版**。淘汰掉生效版意味着下拉框里选不回当前建图用的标签,而图还是按它建的。
-    """
+    """Keep the newest versions plus any active or referenced older schema."""
     kept = [dict(v) for v in (versions or []) if str(v.get("id")) != str(entry.get("id"))]
     out = [dict(entry)] + kept
     if len(out) <= limit:
         return out
     protected = {str(active_id or ""), *map(str, protected_ids)}
-    trimmed = list(out)
-    # Evict from the oldest forward, skipping the active version
-    for index in range(len(trimmed) - 1, 0, -1):
-        if len(trimmed) <= limit:
-            break
-        if str(trimmed[index].get("id")) in protected:
-            continue
-        trimmed.pop(index)
-    return trimmed  # Referenced versions may temporarily exceed the display retention limit.
+    return [v for i, v in enumerate(out) if i < max(1, limit) or str(v.get("id")) in protected]
 
 
 GRAPH_ENTITY_TYPES_MAX = 32
@@ -170,11 +158,6 @@ def normalize_entity_types(value: Any) -> tuple[str, ...]:
 def validate_graph_tune_config(entity_types: Any, sample_size: Any) -> list[str]:
     errors: list[str] = []
     types = normalize_entity_types(entity_types)
-    if len(types) > GRAPH_ENTITY_TYPES_MAX:
-        errors.append(
-            f"At most {GRAPH_ENTITY_TYPES_MAX} entity types (currently {len(types)}); "
-            "a narrower type table extracts more precisely, and an empty one falls back to the global default"
-        )
     for name in types:
         if len(name) > GRAPH_ENTITY_TYPE_MAX_LEN:
             errors.append(
@@ -206,7 +189,7 @@ def normalize_predicate_name(value: Any) -> str:
     return _PREDICATE_NAME_RE.sub("", text).strip("_")
 
 
-def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX) -> tuple[dict[str, Any], ...]:
+def normalize_predicates(value: Any, *, limit: int | None = None) -> tuple[dict[str, Any], ...]:
     """谓词表:[{name, description, source_parents, target_parents, multivalued, core}];名字 lower_snake、
     去重、去掉兜底的 related_to,最多留 limit 条(None = 不截,校验数量时用)。端点是上层类、类型名或 "*",
     原样保留写法(类型名大小写有意义)。字符串形式(逗号/换行分隔的名字)也接受。"""
@@ -233,8 +216,8 @@ def normalize_predicates(value: Any, *, limit: int | None = GRAPH_PREDICATES_MAX
         out.append({
             "name": name,
             "description": str(item.get("description") or "").strip()[:200],
-            "source_parents": [str(p).strip() for p in (item.get("source_parents") or []) if str(p).strip()][:12],
-            "target_parents": [str(p).strip() for p in (item.get("target_parents") or []) if str(p).strip()][:12],
+            "source_parents": list(dict.fromkeys(str(p).strip() for p in (item.get("source_parents") or []) if str(p).strip())),
+            "target_parents": list(dict.fromkeys(str(p).strip() for p in (item.get("target_parents") or []) if str(p).strip())),
             # 没写就是多值:只有模式里显式声明单值的关系才做「新值取代旧值」(ontology 模块说明)
             "multivalued": multivalued is not False,
             "core": bool(item.get("core")),
@@ -373,8 +356,6 @@ def validate_graph_schema_config(predicates: Any, parent_types: Any) -> list[str
     if predicates not in (None, "", (), []):
         if not isinstance(predicates, (list, tuple, str)):
             errors.append("graph_predicates must be a list")
-        elif len(normalize_predicates(predicates, limit=None)) > GRAPH_PREDICATES_MAX:
-            errors.append(f"At most {GRAPH_PREDICATES_MAX} predicates")
     if parent_types not in (None, "", {}):
         if not isinstance(parent_types, dict):
             errors.append("graph_parent_types must be an object")

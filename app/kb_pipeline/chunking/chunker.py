@@ -14,23 +14,28 @@ Overhaul after the 2026-09-05 sampling audit:
     heading-only fragment right before a figure or table becomes that block's TITLE;
   · Code is grouped by class: class header + methods become one chunk when they fit, otherwise split by
     method;
-  · Decorative images never form their own chunk; only one description line is left in the preceding
-    prose chunk.
+  · Adjacent prose within the same structural section is packed in source order, preserving all member
+    locations. A listing's short introduction is indexed as context while its code remains literal;
+  · Images keep their own source identity even when the model labels them decorative.
 """
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any
 
 from ..headings import clean_heading_text, infer_heading_level, is_short_lead_in
 from ..models import ParsedBlock, UnifiedChunk
+from ..parsers.code_source import code_locator
 from ..utils import count_tokens, split_sentences
+from .context import evidence_text
+from .packing import combined_owner, owns_code_intro, pack_prose, source_regions
 
 VISUAL_TYPES = frozenset({"vision", "image", "chart"})
 TEXT_LIKE_TYPES = frozenset({"text", "title", "list", "equation", "page", "slide"})
 # How far a merged chunk may exceed the budget after chunking: used when gluing fragments into a neighbour
 GLUE_SLACK = 1.25
-_FENCE_OPEN_RE = re.compile(r"^\s*(```|~~~)")
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})([^\n]*)$")
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}")
 _CELL_BAR_RE = re.compile(r"(?<!\\)\|")          # the bars separating the cells of a pipe table; a bar inside a cell is written \|
@@ -70,14 +75,53 @@ def _split_long_sentence(sentence: str, max_tokens: int) -> list[str]:
     return parts
 
 
+def split_code(text: str, max_tokens: int) -> list[str]:
+    """Partition source characters exactly, preferring complete lines within the token budget.
+
+    Even a single oversized line is sliced without stripping spaces or inserting a newline.
+    Fragments remain source excerpts, not independently executable rewrites of the program.
+    """
+    if not text:
+        return []
+    budget = max(1, max_tokens)
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        # Bound tokenization work for minified files. Prefix tokens need not be monotonic,
+        # so every selected boundary is checked directly before it is emitted.
+        hi = min(len(text), start + max(16, budget * 8))
+        if count_tokens(text[start:hi]) <= budget:
+            best = hi
+        else:
+            low, best = start + 1, start + 1
+            while low <= hi:
+                mid = (low + hi) // 2
+                if count_tokens(text[start:mid]) <= budget:
+                    best, low = mid, mid + 1
+                else:
+                    hi = mid - 1
+        if best < len(text):
+            newline = text.rfind("\n", start, best)
+            if newline >= start and count_tokens(text[start:newline + 1]) <= budget:
+                best = newline + 1
+        parts.append(text[start:best])
+        start = best
+    return parts
+
+
 # ── Atomic segments: code fences, pipe tables ─────────────────────────────
+
+def _closes_fence(line: str, marker: str) -> bool:
+    match = _FENCE_OPEN_RE.match(line)
+    return bool(match and match[1][0] == marker[0] and len(match[1]) >= len(marker) and not match[2].strip())
+
 
 def _segments(text: str) -> list[tuple[str, str]]:
     """Split text into a sequence of ('prose' | 'fence' | 'table', segment text). Fences and runs of
     consecutive pipe-table lines are kept whole."""
     out: list[tuple[str, str]] = []
     prose: list[str] = []
-    lines = text.splitlines()
+    lines = text.split("\n")
     i = 0
 
     def flush_prose() -> None:
@@ -90,7 +134,7 @@ def _segments(text: str) -> list[tuple[str, str]]:
         if _FENCE_OPEN_RE.match(line):
             fence = _FENCE_OPEN_RE.match(line).group(1)
             j = i + 1
-            while j < len(lines) and not lines[j].strip().startswith(fence):
+            while j < len(lines) and not _closes_fence(lines[j], fence):
                 j += 1
             flush_prose()
             out.append(("fence", "\n".join(lines[i : min(j + 1, len(lines))])))
@@ -319,28 +363,17 @@ def _split_fence(text: str, max_tokens: int) -> list[str]:
     """A code fence that does not fit: split by line, each piece re-wrapped with the opening fence line and the
     closing fence. A single line over the budget (JSON squashed into one line, base64) is split by token into
     several lines."""
-    lines = text.splitlines()
+    lines = text.split("\n")
     if not lines:
         return []
     opener = lines[0]
-    closer = lines[-1] if len(lines) > 1 and _FENCE_OPEN_RE.match(lines[-1]) else "```"
-    body = lines[1:-1] if len(lines) > 1 and _FENCE_OPEN_RE.match(lines[-1]) else lines[1:]
+    marker = _FENCE_OPEN_RE.match(opener)[1]
+    closed = len(lines) > 1 and _closes_fence(lines[-1], marker)
+    closer = lines[-1] if closed else marker
+    body = "\n".join(lines[1:-1] if closed else lines[1:])
     overhead = count_tokens(opener) + count_tokens(closer) + 2
     budget = max(max_tokens // 4, max_tokens - overhead)
-    pieces: list[str] = []
-    cur: list[str] = []
-    cur_tokens = 0
-    for line in body:
-        for part in ([line] if count_tokens(line) + 1 <= budget else _split_long_sentence(line, budget)):
-            t = count_tokens(part) + 1
-            if cur and cur_tokens + t > budget:
-                pieces.append("\n".join([opener, *cur, closer]))
-                cur, cur_tokens = [], 0
-            cur.append(part)
-            cur_tokens += t
-    if cur:
-        pieces.append("\n".join([opener, *cur, closer]))
-    return pieces or [text]
+    return [opener + "\n" + part + "\n" + closer for part in split_code(body, budget)] or [text]
 
 
 # ── Prose ─────────────────────────────────────────────────────────────────
@@ -407,7 +440,7 @@ def _chunk_prose(
             # a chunk of its own, and the fragment fallback (_glue_pieces) merges it into a neighbouring chunk
             chunks.extend(flush())
             if atomic:
-                kind = "fence" if _FENCE_OPEN_RE.match(sentence) else "table"
+                kind = "fence" if _FENCE_OPEN_RE.match(sentence.split("\n", 1)[0]) else "table"
                 chunks.extend(_split_fence(sentence, max_tokens) if kind == "fence" else split_table_text(sentence, max_tokens))
             else:
                 chunks.extend(_split_long_sentence(sentence, max_tokens))
@@ -454,6 +487,9 @@ def chunk_text(
 
 
 def text_for_block(block: ParsedBlock) -> str:
+    if block.block_type == "code":
+        # Symbol names belong to metadata / embedding context, not copied source code.
+        return block.text
     parts: list[str] = []
     if block.title:
         parts.append(f"TITLE: {block.title}")
@@ -492,6 +528,18 @@ def _group_code_blocks(blocks: list[ParsedBlock], max_tokens: int) -> list[tuple
     (attributed to the class header block); otherwise pack greedily, and methods that do not fit become
     chunks of their own. Other code blocks are left as they are. Returns [(owner block, text)]."""
     out: list[tuple[ParsedBlock, str]] = []
+
+    def grouped(group: list[ParsedBlock]) -> tuple[ParsedBlock, str]:
+        text = ""
+        spans = []
+        for member in group:
+            if text:
+                text += "\n"
+            offset = len(text)
+            text += text_for_block(member)
+            spans.extend({**s, "offset": s["offset"] + offset} for s in member.metadata.get("source_spans", []))
+        owner = replace(group[0], metadata={**group[0].metadata, "source_spans": spans})
+        return owner, text
     i = 0
     while i < len(blocks):
         block = blocks[i]
@@ -516,12 +564,12 @@ def _group_code_blocks(blocks: list[ParsedBlock], max_tokens: int) -> list[tuple
         for member in members:
             t = count_tokens(text_for_block(member))
             if group_tokens + t > max_tokens and len(group) > 1:
-                out.append((group[0], "\n\n".join(text_for_block(b) for b in group)))
+                out.append(grouped(group))
                 group, group_tokens = [member], t
                 continue
             group.append(member)
             group_tokens += t
-        out.append((group[0], "\n\n".join(text_for_block(b) for b in group)))
+        out.append(grouped(group))
         i = j
     return out
 
@@ -556,6 +604,29 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
     def text_like(p: dict[str, Any]) -> bool:
         return p["block"].block_type in TEXT_LIKE_TYPES
 
+    def owned_heading(p, nxt) -> bool:
+        a, b = p["block"], nxt["block"]
+        if a.slide_idx is not None:
+            return _same_slide(a, b)
+        explicit = (a.block_type == "title" or infer_heading_level(p["text"]) is not None
+                    or p["text"] in (a.metadata.get("heading_lines") or []))
+        if not explicit or a.page_idx != b.page_idx:
+            return False
+        if a.bbox and b.bbox:
+            return (a.bbox[3] <= b.bbox[1] + 5 and min(a.bbox[2], b.bbox[2]) > max(a.bbox[0], b.bbox[0]))
+        return True
+
+    def owned_lead_in(p, cand, prepend) -> bool:
+        a, b = p["block"], cand["block"]
+        if a.slide_idx is not None:
+            return _same_slide(a, b)
+        if not prepend or a.page_idx != b.page_idx:
+            return False
+        # An explicit forward reference supplies evidence of ownership; brevity
+        # alone does not. This applies equally to PDF, DOCX and other documents.
+        return re.search(r"下[图表]|如下|以下[图表]|\bfollowing\s+(?:table|figure|diagram)\b|"
+                         r"\b(?:table|figure|diagram)\s+below\b", p["text"], re.I) is not None
+
     for _ in range(2):
         changed = False
         i = 0
@@ -568,10 +639,12 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             prev = pieces[i - 1] if i > 0 else None
             # A heading-only fragment right before a figure / table: becomes the TITLE of that block
             if (nxt is not None and nxt["block"].block_type in VISUAL_TYPES | {"table"} and _heading_only(p["text"])
-                    and _same_slide(p["block"], nxt["block"])):
+                    and _same_slide(p["block"], nxt["block"])
+                    and owned_heading(p, nxt)):
                 title = " ".join(clean_heading_text(l) for l in p["text"].splitlines()
                                  if l.strip() and not l.strip().startswith("TITLE:")).strip()
                 if title and not nxt["text"].startswith("TITLE:"):
+                    nxt["block"] = combined_owner(nxt["block"], [p["block"], nxt["block"]])
                     nxt["text"] = f"TITLE: {title}\n{nxt['text']}"
                     nxt["tokens"] = count_tokens(nxt["text"])
                     pieces.pop(i)
@@ -583,6 +656,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             # lets them through
             if (nxt is not None and text_like(nxt) and _same_section(p["block"], nxt["block"])
                     and _same_slide(p["block"], nxt["block"]) and p["tokens"] + nxt["tokens"] <= limit):
+                nxt["block"] = combined_owner(nxt["block"], [p["block"], nxt["block"]])
                 nxt["text"] = f"{p['text']}\n{nxt['text']}"
                 nxt["tokens"] = count_tokens(nxt["text"])
                 pieces.pop(i)
@@ -590,6 +664,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
                 continue
             if (prev is not None and text_like(prev) and _same_section(prev["block"], p["block"])
                     and _same_slide(prev["block"], p["block"]) and prev["tokens"] + p["tokens"] <= limit):
+                prev["block"] = combined_owner(prev["block"], [prev["block"], p["block"]])
                 prev["text"] = f"{prev['text']}\n{p['text']}"
                 prev["tokens"] = count_tokens(prev["text"])
                 pieces.pop(i)
@@ -605,7 +680,10 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             glued = False
             for cand, prepend in ((nxt, True), (prev, False)):
                 if (cand is not None and cand["block"].block_type in VISUAL_TYPES | {"table"}
+                        and owned_lead_in(p, cand, prepend)
+                        and _same_section(p["block"], cand["block"])
                         and _same_slide(p["block"], cand["block"]) and cand["tokens"] + p["tokens"] <= limit):
+                    cand["block"] = combined_owner(cand["block"], [p["block"], cand["block"]] if prepend else [cand["block"], p["block"]])
                     cand["text"] = f"{p['text']}\n{cand['text']}" if prepend else f"{cand['text']}\n{p['text']}"
                     cand["tokens"] = count_tokens(cand["text"])
                     pieces.pop(i)
@@ -619,6 +697,89 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
     return pieces
 
 
+def _embedded_code_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+    """Route fenced listings through the same literal-source splitter as code files.
+
+    Source offsets refer to the parsed parent block. Fences are presentation delimiters,
+    not code, and are recorded as metadata instead of being inserted into every excerpt.
+    """
+    out = []
+    for block in blocks:
+        if block.block_type not in TEXT_LIKE_TYPES or not any(_FENCE_OPEN_RE.match(line) for line in block.text.split("\n")):
+            out.append(block)
+            continue
+        cursor = 0
+        for i, (kind, text) in enumerate(_segments(block.text)):
+            start = block.text.find(text, cursor)
+            cursor = start + len(text)
+            if kind != "fence":
+                if text.strip():
+                    out.append(replace(block, text=text, block_id=f"{block.block_id}-part-{i}",
+                                       metadata={**block.metadata, "embedded_source": {
+                                           "block_id": block.block_id, "start": start, "end": cursor}}))
+                continue
+            opener, sep, body = text.partition("\n")
+            match = _FENCE_OPEN_RE.match(opener)
+            tail = body.rsplit("\n", 1)[-1]
+            if _closes_fence(tail, match[1]):
+                body = body[:-len(tail)] if tail else body
+            if not body:
+                continue
+            metadata = {k: v for k, v in block.metadata.items() if k not in ("source_spans", "source_locator")}
+            metadata.update({"code_language": match[2].strip(),
+                             "embedded_source": {"block_id": block.block_id, "start": start + len(opener) + len(sep),
+                                                 "end": start + len(opener) + len(sep) + len(body)}})
+            out.append(replace(block, block_type="code", text=body, title=None, caption=None,
+                               block_id=f"{block.block_id}-code-{i}", metadata=metadata))
+    return out
+
+
+def split_visual_text(text: str, max_tokens: int) -> list[str]:
+    """Pack complete visual facts; keep each fact's conditions in the same piece.
+
+    An individual fact longer than the budget remains atomic and is reported by
+    diagnostics. Source tables/fences use the existing structural splitter.
+    """
+    if count_tokens(text) <= max_tokens:
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    context = [line for line in text.splitlines() if line.startswith(("TITLE:", "CAPTION:"))]
+    prefix = "\n".join(context)
+    if count_tokens(prefix) <= max_tokens // 3:
+        text = "\n".join(line for line in text.splitlines() if line not in context)
+    else:
+        prefix = ""  # Keep an unusually long caption as body evidence, without truncation.
+
+    body_budget = max(1, max_tokens - count_tokens(prefix + "\n") if prefix else max_tokens)
+
+    def render(lines):
+        return "\n".join(([prefix] if prefix else []) + lines)
+
+    def add(value: str) -> None:
+        if current and count_tokens(render(current + [value])) > max_tokens:
+            parts.append(render(current))
+            current.clear()
+        current.append(value)
+
+    for kind, segment in _segments(text):
+        if kind in {"table", "fence"}:
+            for part in chunk_text(segment, body_budget, 0):
+                add(part)
+        else:
+            for line in segment.splitlines():
+                if not line.strip():
+                    continue
+                if line.startswith("FACTS: "):
+                    add(line)
+                else:
+                    for part in chunk_text(line, body_budget, 0):
+                        add(part)
+    if current:
+        parts.append(render(current))
+    return parts
+
+
 def blocks_to_chunks(
     *,
     kb_id: str,
@@ -629,53 +790,79 @@ def blocks_to_chunks(
     max_tokens: int,
     overlap_tokens: int,
 ) -> list[UnifiedChunk]:
+    from .sections import SectionSources, resolve_sections
+    sections = SectionSources(blocks)
     pieces: list[dict[str, Any]] = []
-    for block, text in _group_code_blocks(blocks, max_tokens):
+    for block, text in _group_code_blocks(_embedded_code_blocks(blocks), max_tokens):
         if not text:
             continue
         if block.block_type == "code":
-            parts = [text] if count_tokens(text) <= max_tokens else chunk_text(text, max_tokens, 0)
+            context = []
+            if block.title and not _symbol(block):
+                context.append(f"TITLE: {block.title}")
+            if block.caption:
+                context.append(f"CAPTION: {block.caption}")
+            attached = "\n".join(context)
+            context_sources = list(block.metadata.get("code_context_sources") or [])
+            if pieces and owns_code_intro(resolve_sections(pieces[-1]["block"]),
+                                          resolve_sections(sections.locate(block, text, advance=False))):
+                candidate = "\n".join(x for x in (pieces[-1]["text"], attached) if x)
+                if count_tokens(candidate) <= max_tokens // 4:
+                    intro = pieces.pop()
+                    attached = candidate
+                    context_sources = source_regions(intro["block"]) + context_sources
+            if attached and count_tokens(attached) > max_tokens // 4:
+                # A document's listing caption is evidence too. Keep it searchable without
+                # inserting prose into the copied code or assigning it source-code columns.
+                metadata = {k: v for k, v in block.metadata.items() if k not in ("source_spans", "source_locator", "code_fragment")}
+                caption = replace(block, block_type="text", block_id=block.block_id + "-caption", metadata=metadata)
+                for part in chunk_text(attached, max_tokens, overlap_tokens):
+                    pieces.append({"text": part, "block": caption, "tokens": count_tokens(part)})
+                attached = ""
+            if attached:
+                block = replace(block, metadata={**block.metadata, "code_context": attached,
+                                                 "code_context_sources": context_sources or source_regions(block)})
+            parts = split_code(text, max(1, max_tokens - count_tokens(attached + "\n") - 1) if attached else max_tokens)
         elif block.block_type == "table":
             parts = split_table_text(text, max_tokens)
         elif block.block_type in VISUAL_TYPES:
-            if block.metadata.get("decorative"):
-                # A decorative image never forms its own chunk: one description line is left in the preceding
-                # prose chunk. The original text absorbed into the title before the image (short lines like
-                # report date, testing lab, testing technique -- adopted_lead_in from pdf_enhanced.hand_over)
-                # is document body text and must not be folded away together with the stamp (Codex review
-                # F03: the "report date: 2023-11-06" on the first page of a nutrition-metabolism report was
-                # lost exactly that way): first flow it back as a body line, then append one description
-                # line; when there is no preceding chunk to attach to, keep it as a chunk of its own
-                line = str(block.visual_summary or block.caption or "").strip()
-                adopted = str(block.title or "").strip() if block.metadata.get("adopted_lead_in") else ""
-                if not line and not adopted:
-                    line = str(block.title or "").strip()
-                extra = "\n".join(x for x in ((adopted if adopted and adopted not in line else ""), f"IMAGE: {line}" if line else "") if x)
-                if not extra:
-                    continue
-                if pieces and pieces[-1]["block"].block_type in TEXT_LIKE_TYPES and pieces[-1]["tokens"] < int(max_tokens * GLUE_SLACK):
-                    pieces[-1]["text"] = f"{pieces[-1]['text']}\n{extra}"
-                    pieces[-1]["tokens"] = count_tokens(pieces[-1]["text"])
-                elif adopted:
-                    pieces.append({"text": extra, "block": block, "tokens": count_tokens(extra)})
-                continue
-            # VLM-derived figure text is bounded; keep one chunk per figure.
-            # Slide blocks are deliberately NOT here: merged per-slide text can
-            # exceed the budget (measured up to 725 tokens against a 400
-            # limit), so slides chunk like ordinary text.
-            parts = [text]
+            # Decoration is a model judgement, not permission to discard a
+            # source image or assign its content to the preceding paragraph.
+            # Preserve complete visual facts and split at fact boundaries.
+            # Merged slides use the ordinary text splitter.
+            parts = split_visual_text(text, max_tokens)
         else:
             parts = chunk_text(text, max_tokens, overlap_tokens,
                                headings=frozenset(block.metadata.get("heading_lines") or ()))
-        for part in parts:
-            pieces.append({"text": part, "block": block, "tokens": count_tokens(part)})
+        offset = 0
+        for part_index, part in enumerate(parts):
+            owner = block
+            if block.block_type in VISUAL_TYPES and len(parts) > 1:
+                # Each search hit returns its own facts, including late branches.
+                # The full block remains available in the parsed source artifact.
+                facts = [str(f) for f in block.metadata.get("visual_facts", []) if "FACTS: " + str(f) in part]
+                owner = replace(block, metadata={**block.metadata, "visual_facts": facts,
+                    "visual_fragment": {"index": part_index,
+                                        "total": len(parts)}})
+            if block.block_type == "code":
+                spans = block.metadata.get("source_spans") or []
+                if not spans:
+                    locator = block.metadata.get("source_locator") or {}
+                    if locator.get("kind") == "lines":
+                        spans = [{"start": locator.get("start", 1), "end": locator.get("end", 1), "offset": 0, "length": len(text)}]
+                location = code_locator(text, spans, offset, offset + len(part))
+                owner = replace(block, metadata={**block.metadata, **({"source_locator": location} if location else {}),
+                                                "code_fragment": {"start": offset, "end": offset + len(part)}})
+                offset += len(part)
+            owner = sections.locate(owner, part)
+            pieces.append({"text": part, "block": owner, "tokens": count_tokens(evidence_text(part, owner.metadata))})
 
-    pieces = _glue_pieces(pieces, max_tokens)
+    pieces = pack_prose(_glue_pieces(pieces, max_tokens), max_tokens)
 
     result: list[UnifiedChunk] = []
     per_block: dict[str, int] = {}
     for piece in pieces:
-        block = piece["block"]
+        block = resolve_sections(piece["block"])
         idx = per_block.get(block.block_id, 0)
         per_block[block.block_id] = idx + 1
         chunk_uid = f"{kb_id}:{file_key}:{content_version}:{parser_profile}:{block.block_id}:{idx}"
@@ -696,10 +883,19 @@ def blocks_to_chunks(
 EMBED_CONTEXT_MAX_CHARS = 200
 
 
+def _compact_code_label(caption: str) -> bool:
+    """A single listing label belongs with its code, not in a separate hit."""
+    return bool(caption and not re.search(r"\s", caption.strip()) and count_tokens(caption) <= 8)
+
+
 def embedding_context_for(chunk: UnifiedChunk, *, doc_name: str) -> str:
     """Embedding prefix: "document name > section path". Titles and captions are already written into the text
     by text_for_block and are not repeated here."""
     parts = [str(doc_name or "").strip()] + [str(x).strip() for x in (chunk.block.metadata.get("section_path") or []) if str(x).strip()]
+    if chunk.block.block_type == "code" and _compact_code_label(chunk.block.caption or ""):
+        # Keep the label searchable without modifying literal code or creating a
+        # tiny extra chunk. It also remains in the original caption payload.
+        parts.insert(0, str(chunk.block.caption))
     context = " > ".join(p for p in parts if p)
     return context[:EMBED_CONTEXT_MAX_CHARS]
 
@@ -707,4 +903,5 @@ def embedding_context_for(chunk: UnifiedChunk, *, doc_name: str) -> str:
 def embedding_input(chunk: UnifiedChunk) -> str:
     """The text actually sent for embedding = prefix + body; the text in the payload stays the original body."""
     context = getattr(chunk, "embedding_context", None)
-    return f"{context}\n{chunk.text}" if context else chunk.text
+    text = evidence_text(chunk.text, chunk.block.metadata)
+    return f"{context}\n{text}" if context else text

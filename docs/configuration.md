@@ -11,6 +11,9 @@
 | `config/knowledge-base.env` | Application paths, model endpoints, credentials, and processing settings |
 | `deployment/compose/.env` | Container images, parser backend policy, resource limits, and local model services |
 
+Upgrading from the bundled VLM setup removes its retired container settings
+and matching default endpoint. Custom vision endpoints are preserved.
+
 Use [knowledge-base.env.example](../config/knowledge-base.env.example) and
 [Compose settings](../deployment/compose/README.md) as references. The generated
 files hold credentials and are excluded from Git. Application settings prefer
@@ -27,15 +30,17 @@ restart. Its listening address and port, and the keys of the other sections
 (such as the model endpoints), still need one, and a key set explicitly in the
 service's environment takes precedence over the file.
 
+To run local embeddings and rerankers, use `./deploy.sh --with-local-models`. Add the vision endpoint to the console model list and select it for each knowledge base. A global default can also be configured with `VLM_BASE_URL`, `VLM_MODEL_ID`, and `VLM_API_KEY`.
+
 ## Model endpoints
 
-The default deployment starts the stores and MinerU. Five optional embedding,
-reranking, and vision model services are available with `--with-local-models`.
+The default deployment starts the stores and MinerU. Four optional embedding
+and reranking model services are available with `--with-local-models`.
 
 | Capability | Settings | Required when |
 |---|---|---|
 | Text embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL_ID`, `EMBEDDING_API_KEY`, `EMBEDDING_DIM` | Indexing and vector search |
-| Image descriptions | `VLM_BASE_URL`, `VLM_MODEL_ID`, `VLM_API_KEY`, `KB_IMAGE_MAX_PIXELS` | Processing images and figures; images are scaled down to the pixel budget before the call |
+| Image descriptions and table review | Select a multimodal model per knowledge base in the console; `VLM_BASE_URL`, `VLM_MODEL_ID`, `VLM_API_KEY` provide the global default; `KB_IMAGE_MAX_PIXELS` sets the image budget | Processing images and figures; the endpoint must accept image input |
 | Graph extraction and summaries | Register a chat model in the console, then select it per knowledge base | Graph building is enabled |
 | Text reranking | `RERANKER_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_API_KEY` | Optional; retrieval otherwise uses fusion order |
 | Visual embeddings | `VISUAL_EMBEDDING_ENABLED`, `VISUAL_EMBEDDING_BASE_URL`, `VISUAL_EMBEDDING_MODEL_ID`, `VISUAL_EMBEDDING_DIM`, other `VISUAL_EMBEDDING_*` | Optional pixel-level retrieval; the bundled integration uses local vLLM |
@@ -45,6 +50,32 @@ Text embeddings use an OpenAI-compatible embeddings API. Image descriptions
 and graph models use compatible chat APIs. Rerankers use a `/v1/rerank`
 endpoint; visual embedding requests use vLLM's multimodal pooling format.
 Configure each endpoint for the corresponding request format.
+
+Model registration keeps free-form URLs and model IDs. Connectivity checks,
+graph calls and image descriptions share parameter compatibility rules for
+output-token limits and sampling. An explicit unsupported-parameter response
+can trigger a bounded retry; successful adaptations are remembered within
+the process for that endpoint, model, protocol and request profile.
+
+Custom deployment aliases can use `KB_LLM_COMPAT_OVERRIDES` in the environment
+file. Entries match an exact `model_id`, with an optional `base_url` and a
+`protocol` (default `openai`). For example:
+
+```sh
+KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://models.example/v1","max_tokens_field":"max_completion_tokens","omit":["temperature","top_p"]}]'
+```
+
+`max_tokens_field` selects the output-limit field; `omit` removes optional
+generation parameters; `set` supplies values such as `{"reasoning_effort":"low"}`
+or `{"thinking":{"type":"disabled"}}`. Matching entries apply in order.
+Restart the application processes after changing this setting. Model probes
+require a completed response containing `OK`; an HTTP 400 is reported as an error.
+
+For a deployment with a different thinking-control format, use
+`"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`.
+These fields replace thinking controls only when the caller requests thinking
+to be disabled, such as graph extraction. Image descriptions and probes keep
+their existing thinking behavior. Use `set` for parameters intended for every call.
 
 For hosted text reranking, set `RERANKER_BASE_URL` to the API base or the full
 `/rerank` endpoint, `RERANKER_MODEL_ID` to the provider's model name, and
@@ -127,6 +158,7 @@ The console stores these settings with each knowledge-base registration:
 | Group | Main keys | Purpose |
 |---|---|---|
 | Chunking | `max_tokens`, `overlap_tokens` | Chunk size and overlap, within the embedding model's context limit |
+| Multimodal parsing | `vlm_model`, `vlm_prompt` | Registered model and optional description prompt shared by image, chart and table review stages |
 | Graph control | `graph_enabled`, `graph_auto_append`, `graph_profile` | Enable graphs, allow incremental updates, and store the inferred scenario profile |
 | Schema | `graph_schema_active`, `graph_language` | Select a versioned LinkML schema and output language; types and relationships are derived from the selected schema |
 | Extraction | `graph_unit_chunks`, `graph_max_gleanings` | Extraction unit size and supplementary extraction rounds; schema sampling is automatic |
@@ -171,3 +203,11 @@ are handled separately: the next scan can requeue affected files automatically.
   the deployment's credentials.
 - **Optional dependencies:** PDF original-image retrieval requires the
   `pdf-images` extra. Its license is listed in [third-party notices](../NOTICE.md).
+
+### Graph and schema history
+
+`GRAPH_GC_KEEP_VERSIONS=3` keeps the current graph and two completed predecessors, including their graph indexes and build artifacts. The newest resumable build is protected separately. Schema history keeps 10 versions plus any older schema referenced by a retained build. The console's **Version comparison** shows the latest 20 lightweight comparison reports, which remain after full graph artifacts are pruned.
+
+Comparisons separate source, schema, model, correction and pipeline changes. An assertion missing while its source is unchanged is marked for review; old assertions are not automatically restored. Increasing retention affects future cleanup and cannot recover versions already removed.
+
+See [scoped corrections](architecture.md#scoped-corrections) for the preview, commit and revoke API.

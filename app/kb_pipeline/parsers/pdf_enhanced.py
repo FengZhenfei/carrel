@@ -14,6 +14,9 @@ from .pdf_longpage import prepare_long_pages, restore_page_coordinates
 from ..vision.vlm import compose_prompt
 from .table_check import high_confidence
 from .table_repair import repair_ambiguous_tables
+from .table_repair import review_pdf_tables
+from .pdf_evidence import add_pdf_region_evidence, supplement_visible_forms
+from .pdf_code import recover_native_code
 from .visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text, tidy_visual_blocks
 
 
@@ -30,6 +33,17 @@ NOISE_SOURCE_TYPES = {"header", "footer", "page_header", "page_footer", "page_nu
 # table / image / chart remain non-mergeable: they are large on their own, have their own
 # 2048-dimensional visual vector, and retrieving them individually is meaningful.
 MERGEABLE_TYPES = {"text", "title", "page", "equation"}
+
+
+def _same_column_before(a: ParsedBlock, b: ParsedBlock) -> bool:
+    if a.page_idx != b.page_idx:
+        return False
+    if not a.bbox or not b.bbox:
+        return True  # Native document parsers supply order but not geometry.
+    x0, y0, x1, y1 = a.bbox
+    bx0, by0, bx1, by1 = b.bbox
+    overlap = max(0, min(x1, bx1) - max(x0, bx0))
+    return y1 <= by0 + 5 and overlap >= min(x1 - x0, bx1 - bx0) * .5
 
 
 def parse_pdf_enhanced(
@@ -86,6 +100,16 @@ def parse_pdf_enhanced(
               f"recovered={layer_info['recovered']} still_lost={layer_info['lost']}"
               + (f" error={layer_info['error']}" if layer_info.get("error") else "") + f" file={path.name}", flush=True)
 
+    recover_native_code(blocks, path)
+    blocks = supplement_visible_forms(blocks, path)
+    table_blocks = [b for b in blocks if b.block_type == "table" and b.metadata.get("table_flags")]
+    if table_blocks:
+        repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
+                               cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
+    add_pdf_region_evidence(blocks, path, cache_dir)
+    # Review original per-page tables before cross-page merging changes ownership.
+    review_pdf_tables(blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
+                      cache_dir=cache_dir, vlm_options=vlm_options)
     blocks = merge_mineru_text_blocks(blocks, target_tokens=merge_target_tokens)
     blocks = merge_split_tables(blocks)
     if layer_info.get("lost"):
@@ -109,13 +133,6 @@ def parse_pdf_enhanced(
     )
     tidy_visual_blocks(image_blocks, max_tokens=max(100, merge_target_tokens // 2))
     ensure_visual_blocks_have_text(image_blocks, doc_name=path.name)
-    # Tables flagged as having merged cells: give the VLM MinerU's table screenshot and have it
-    # transcribe only those rows; split them only when the concatenation matches (F02)
-    table_blocks = [b for b in blocks if b.block_type == "table" and b.metadata.get("table_flags")]
-    if table_blocks:
-        stats = repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
-                                        cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
-        print(f"[parser] pdf table-repair {stats} file={path.name}", flush=True)
     if segments:
         # Keep re-parsed blocks distinct from the old whole-page OCR, even when
         # source bytes did not change. No global route-profile bump: historical
@@ -172,6 +189,21 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         if block.page_idx is not None and prev_end is not None and block.page_idx not in (prev_end, prev_end + 1):
             out.append(block)
             continue
+        # Matching column counts alone do not establish table identity. On one
+        # page separate tables remain separate unless they are long-page tiles.
+        tiled = bool(prev.metadata.get("source_tile") and block.metadata.get("source_tile"))
+        if block.page_idx == prev_end and not tiled:
+            out.append(block)
+            continue
+        if prev.metadata.get("section_path") != block.metadata.get("section_path"):
+            out.append(block)
+            continue
+        if prev.bbox and block.bbox and not tiled:
+            last_box = prev.metadata.get("table_end_bbox") or prev.bbox
+            aligned = max(abs(last_box[0] - block.bbox[0]), abs(last_box[2] - block.bbox[2])) <= 40
+            if not aligned or last_box[3] < 700 or block.bbox[1] > 300:
+                out.append(block)
+                continue
         pre_a, rows_a, post_a = _table_lines(prev.table_markdown)
         pre_b, rows_b, post_b = _table_lines(block.table_markdown)
         if len(rows_a) < 2 or not rows_b or not _is_separator(rows_a[1]):
@@ -187,7 +219,8 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         # sign of a continuation, and separator lines are always stripped
         if first_b == header:
             body_b = [r for r in rows_b[1:] if not _is_separator(r)]        # repeated header: drop it
-        elif not _is_separator(rows_b[0]) and _looks_like_data(first_b):
+        elif (not _is_separator(rows_b[0]) and _looks_like_data(first_b)
+              and prev.bbox and block.bbox):
             body_b = [r for r in rows_b if not _is_separator(r)]           # header-less continuation
         else:
             out.append(block)
@@ -199,6 +232,9 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         prev.table_markdown = merged
         prev.text = merged
         prev.metadata.setdefault("merged_tables", []).append(block.block_id)
+        prev.metadata["table_end_bbox"] = block.bbox
+        prev.metadata.setdefault("table_source_regions", [{"page": prev.page_idx, "bbox": prev.bbox}]).append(
+            {"page": block.page_idx, "bbox": block.bbox})
         if (prev.metadata.get("source_tile") and block.metadata.get("source_tile")
                 and prev.page_idx == block.page_idx and prev.bbox and block.bbox):
             # Two tiles can be portions of one physical page. The merged table
@@ -266,7 +302,7 @@ def merge_mineru_text_blocks(
     adopted = 0
     footnoted = 0
     dropped_labels = 0
-    dropped_icons = 0
+    preserved_icons = 0
 
     def rendered(block: ParsedBlock) -> str:
         """What goes into the buffer is the **rendered** text, not block.text.
@@ -279,7 +315,9 @@ def merge_mineru_text_blocks(
         return text_for_block(block).strip()
 
     def is_lead_in(block: ParsedBlock) -> bool:
-        return block.block_type == "title" or is_short_lead_in(rendered(block))
+        # Short conclusions, key/value fields and advice are body evidence.
+        # A colon or a short length does not establish ownership of the next image.
+        return block.block_type == "title"
 
     def emit(run: list[ParsedBlock]) -> None:
         """Emit a buffer run as one merged block; if it is too short and directly follows the previous
@@ -297,17 +335,38 @@ def merge_mineru_text_blocks(
         # and the chunker relies on this list to know where to break (headings of chunker.chunk_text)
         heading_lines = [rendered(block) for block in run if block.block_type == "title" and rendered(block)]
         inferred_headings = sum(1 for block in run if block.metadata.get("heading_inferred"))
+        section_spans = []
+        offset = 0
+        for block in run:
+            part = rendered(block)
+            if not part:
+                continue
+            section_spans.append({"start": offset, "end": offset + len(part),
+                                  "section_path": list(block.metadata.get("section_path") or [])})
+            offset += len(part) + 2
 
         previous = merged[-1] if merged else None
-        if tokens < floor_tokens and previous is not None and previous.metadata.get("merged"):
+        if (
+            tokens < floor_tokens
+            and previous is not None
+            and previous.metadata.get("merged")
+            and list(previous.metadata.get("section_path") or []) == list(run[0].metadata.get("section_path") or [])
+        ):
             # Fold back into the previous merged block. One block fewer, and the block_id stays the
             # previous one -- downstream chunk_uid is keyed by block_id, so no new id may be invented here.
             folded += 1
+            offset = len(previous.text) + (2 if previous.text else 0)
+            previous.metadata.setdefault("section_spans", []).extend(
+                {**s, "start": s["start"] + offset, "end": s["end"] + offset} for s in section_spans)
             previous.text = f"{previous.text}\n\n{text}" if previous.text else text
             previous.metadata["merged_block_count"] += len(run)
             previous.metadata["source_block_ids"].extend(block.block_id for block in run)
             previous.metadata["source_types"].extend(source_types)
             previous.metadata.setdefault("heading_lines", []).extend(heading_lines)
+            previous.metadata.setdefault("source_regions", []).extend({"page": b.page_idx, "bbox": b.bbox} for b in run)
+            previous.metadata.setdefault("source_fields", []).extend(
+                {"field": b.metadata["source_field"], "page": b.page_idx, "bbox": b.bbox}
+                for b in run if b.metadata.get("source_field"))
             previous.metadata["inferred_headings"] = previous.metadata.get("inferred_headings", 0) + inferred_headings
             if pages:
                 starts = [p for p in (previous.metadata.get("page_start"), min(pages)) if p is not None]
@@ -330,6 +389,7 @@ def merge_mineru_text_blocks(
                 title=template.title,
                 metadata={
                     "section_path": list(template.metadata.get("section_path") or []),
+                    "section_spans": section_spans,
                     "merged": True,
                     "merged_block_count": len(run),
                     "source_block_ids": [block.block_id for block in run],
@@ -338,6 +398,9 @@ def merge_mineru_text_blocks(
                     "inferred_headings": inferred_headings,
                     "page_start": min(pages) if pages else None,
                     "page_end": max(pages) if pages else None,
+                    "source_regions": [{"page": b.page_idx, "bbox": b.bbox} for b in run],
+                    "source_fields": [{"field": b.metadata["source_field"], "page": b.page_idx, "bbox": b.bbox}
+                                      for b in run if b.metadata.get("source_field")],
                 },
             )
         )
@@ -394,6 +457,7 @@ def merge_mineru_text_blocks(
                 not prose_tail
                 and not (target.title or "").strip()
                 and (has_title or not (target.caption or "").strip())
+                and all(_same_column_before(b, target) for b in tail)
             )
             if can_adopt:
                 text = "\n\n".join(part for part in (rendered(block) for block in tail) if part)
@@ -431,10 +495,11 @@ def merge_mineru_text_blocks(
             dropped_noise += 1
             continue
         if is_inline_icon(block):
-            # Inline icons (under ICON_MAX_PERMILLE on both sides): nothing retrievable in them, and they
-            # would cut a paragraph in half and steal the preceding heading as their TITLE. The VLM side
-            # filters by size the same way, so here they simply are not boundaries
-            dropped_icons += 1
+            # Small figures can be labels, symbols or status indicators. Keep
+            # their pixels and position, without adopting a preceding heading.
+            flush()
+            merged.append(block)
+            preserved_icons += 1
             continue
         if not is_mergeable_text_block(block):
             hand_over(block)
@@ -480,7 +545,7 @@ def merge_mineru_text_blocks(
     print(
         f"[parser] pdf merge-text output={len(merged)} dropped_noise={dropped_noise} "
         f"folded_short={folded} adopted_lead_in={adopted} footnotes_attached={footnoted} "
-        f"label_only_dropped={dropped_labels} icons_dropped={dropped_icons} target_tokens={target_tokens} floor_tokens={floor_tokens}",
+        f"label_only_dropped={dropped_labels} icons_preserved={preserved_icons} target_tokens={target_tokens} floor_tokens={floor_tokens}",
         flush=True,
     )
     return merged

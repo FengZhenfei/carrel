@@ -318,17 +318,17 @@ function renderKbNav() {
         const round = reparseRound(kb.kb_id, reparsing);
         const frac = running.length ? running.reduce((s, j) => s + stageFraction(j.stage, j, kb.parse_stage_weights), 0) / running.length : 0;
         bar = Math.min(Math.round(((round - reparsing) + frac) / round * 100), 99);
-        text = t("重新解析") + (round > 1 ? ` ${round - reparsing}/${round}` : "") + ` · ${bar}%`;
-        tip = running.length ? shortStage(running[0].stage) : t("排队中");
+        text = t("重新解析") + (round > 1 ? ` ${round - reparsing}/${round}` : "") + ` · ≈${bar}%`;
+        tip = running.length ? progressLabel(running[0].progress, running[0].stage) : waitingLabel(jobs[0]?.progress);
       } else if (busy) {
         const p = parseProgress(kb, jobs);
         bar = p.pct;
-        text = t("解析 {0}/{1} · {2}%", p.done, p.total, p.pct);
-        tip = running.length ? shortStage(running[0].stage) : t("排队中");
-      } else if (gs === "running") {
-        bar = graphPctFloor(kb.kb_id, gb.started_at, graphStagePct(gb.stage, gb.stage_weights));
-        text = t("建图 · {0}%", bar);
-        tip = shortStage(gb.stage);
+        text = t("解析 {0}/{1} · ≈{2}%", p.done, p.total, p.pct);
+        tip = running.length ? progressLabel(running[0].progress, running[0].stage) : waitingLabel(jobs[0]?.progress);
+      } else if (kb.schema_suggest || gs === "running") {
+        bar = kb.schema_suggest ? null : graphPctFloor(kb.kb_id, gb.started_at, graphStagePct(gb.stage, gb.stage_weights));
+        text = kb.schema_suggest ? t("标签抽取") : t("建图 · ≈{0}%", bar);
+        tip = kb.schema_suggest ? t(SCHEMA_PHASES[kb.schema_suggest.phase] || "选择样本") : progressLabel(gb.progress, gb.stage);
       } else {
         text = "";      // idle: no status text, the two dots already say how parse and build are doing; text only while work runs
       }
@@ -363,6 +363,46 @@ function shortStage(stage) {
   const name = s.match(/^(.+?)(?:\s*[(（·]|\s+\d+\s*\/|$)/);
   const n = s.match(/(\d+)\s*\/\s*(\d+)/);
   return name ? t(name[1]) + (n ? ` ${n[1]}/${n[2]}` : "") : t(s);
+}
+
+const PROGRESS_LABELS = {
+  parse: "文档解析", vision: "图片理解", chunk: "切块", embed_text: "文本向量化",
+  embed_visual: "视觉向量化", write_vectors: "写入向量库", keyword: "关键词索引",
+  schema: "标签准备", prepare: "准备语料", extract: "实体抽取", resolve: "实体归并",
+  summarize: "描述摘要", attribute: "来源归属", facts: "结构化事实", concepts: "属性概念归一",
+  compile: "编译视图页", import: "图谱库导入", publish: "发布图谱", cleanup: "清理旧版本", done: "完成",
+};
+const PROGRESS_PARTS = { entities: ["实体", "Entities"], relations: ["关系", "Relations"],
+  facts: ["事实", "Facts"], pages: ["页面", "Pages"], subjects: ["主体", "Subjects"],
+  timelines: ["时间线", "Timelines"], sources: ["来源", "Sources"], narration: ["叙述", "Narration"] };
+
+function progressLabel(p, fallback) {
+  if (!p?.phase || !PROGRESS_LABELS[p.phase]) return t(fallback || "解析中");
+  let label = t(PROGRESS_LABELS[p.phase]);
+  if (p.subphase) label += " · " + (PROGRESS_PARTS[p.subphase]?.[I18N.lang === "en" ? 1 : 0] || p.subphase);
+  if (Number.isFinite(p.completed) && Number.isFinite(p.total) && p.total > 0) {
+    const unit = p.phase === "embed_text" || p.phase === "resolve" ? "批"
+      : ["vision", "embed_visual"].includes(p.phase) ? "张" : "";
+    label += ` ${p.completed}/${p.total}` + (unit ? " " + t(unit) : "");
+  }
+  return label;
+}
+
+function waitingLabel(p) {
+  if (p?.wait_reason === "stopping") return t("正在停止");
+  if (p?.wait_reason === "retry") return t("等待重试");
+  if (p?.wait_reason === "service") {
+    if (["embed_text", "embed_visual"].includes(p.phase)) return t("等待向量服务");
+    if (p.phase === "vision") return t("等待多模态接口");
+    return t("等待服务");
+  }
+  return t("排队中");
+}
+
+function modelRows(models) {
+  const labels = { vision: "多模态模型", embed_text: "文本向量模型", embed_visual: "视觉向量模型",
+    extract: "实体抽取", summarize: "描述摘要", facts: "结构化事实", compile: "编译视图页", schema: "标签抽取" };
+  return Object.entries(models || {}).map(([key, value]) => [t(labels[key] || key), value]);
 }
 
 // How many files are in this re-parse round: files_reparsing drops as files finish and grows as new ones
@@ -490,6 +530,14 @@ function llmOptions(selectedName, { fallback = false } = {}) {
   if (!picked && fallback) picked = defaultGraphLlm();
   return `<option value="">${t("(未选择)")}</option>` +
     state.llms.map(m => `<option value="${esc(m.name)}" ${picked === m.name ? "selected" : ""}>${esc(m.name)}</option>`).join("");
+}
+
+function vlmOptions(selectedName) {
+  const models = state.llms.filter(m => (m.protocol || "openai") === "openai");
+  const missing = selectedName && !models.some(m => m.name === selectedName);
+  return `<option value="">${t("系统默认")}</option>` +
+    (missing ? `<option value="${esc(selectedName)}" selected>${esc(selectedName)} (${t("不可用")})</option>` : "") +
+    models.map(m => `<option value="${esc(m.name)}" ${selectedName === m.name ? "selected" : ""}>${esc(m.name)}</option>`).join("");
 }
 
 async function renderConfig() {
@@ -638,6 +686,7 @@ async function renderConfig() {
         setOverlapHint();   // must come after max_tokens is filled in: the bound is computed from it
         $("#cfg-graph").checked = !!c.graph_enabled;
         $("#cfg-prompt").value = cfg.config.vlm_prompt || "";
+        $("#cfg-vlm").innerHTML = vlmOptions(c.vlm_model);
         $("#cfg-guc").value = String(c.graph_unit_chunks ?? 3);
         $("#cfg-ggl").value = String(c.graph_max_gleanings ?? 1);
         // All three model slots preselect the default model when empty
@@ -687,6 +736,7 @@ async function renderConfig() {
       setOverlapHint();
       $("#cfg-graph").checked = false;   // enabling a KB does not enable the graph: the knowledge graph must be switched on explicitly
       $("#cfg-prompt").value = "";
+      $("#cfg-vlm").innerHTML = vlmOptions(dd.vlm_model);
       $("#cfg-guc").value = String(dd.graph_unit_chunks ?? 3);
       $("#cfg-ggl").value = String(dd.graph_max_gleanings ?? 1);
       $("#cfg-ge").innerHTML = llmOptions(null, { fallback: true });
@@ -708,6 +758,7 @@ async function renderConfig() {
     } else {
       $("#cfg-max").value = 400; $("#cfg-ov").value = 80;
       $("#cfg-graph").checked = false; $("#cfg-prompt").value = "";
+      $("#cfg-vlm").innerHTML = vlmOptions(null);
       $("#cfg-ri-n").value = ""; $("#cfg-ri-u").value = "d";
       $("#cfg-rp-n").value = ""; $("#cfg-rp-u").value = "p"; $("#cfg-ro").value = "or";
       setSchemaView(null);
@@ -891,13 +942,13 @@ const draftCache = new Map();
 let formBase = null;
 
 function parseFormValues() {
-  return { prompt: $("#cfg-prompt").value, max: $("#cfg-max").value, ov: $("#cfg-ov").value };
+  return { prompt: $("#cfg-prompt").value, max: $("#cfg-max").value, ov: $("#cfg-ov").value, vlm: $("#cfg-vlm").value };
 }
 
 function stashDraft(dir) {
   if (!dir || !formBase || formBase.dir !== dir) return;
   const now = parseFormValues();
-  if (now.prompt === formBase.prompt && now.max === formBase.max && now.ov === formBase.ov) draftCache.delete(dir);
+  if (now.prompt === formBase.prompt && now.max === formBase.max && now.ov === formBase.ov && now.vlm === formBase.vlm) draftCache.delete(dir);
   else draftCache.set(dir, now);
 }
 
@@ -907,6 +958,7 @@ function restoreDraft(dir) {
   $("#cfg-prompt").value = d.prompt;
   $("#cfg-max").value = d.max;
   $("#cfg-ov").value = d.ov;
+  $("#cfg-vlm").innerHTML = vlmOptions(d.vlm);
   return true;
 }
 
@@ -918,6 +970,7 @@ function collectParseConfig() {
     max_tokens: requireInt("#cfg-max", "chunk max_tokens"),
     overlap_tokens: requireInt("#cfg-ov", "chunk overlap_tokens"),
     vlm_prompt: $("#cfg-prompt").value.trim() || null,
+    vlm_model: $("#cfg-vlm").value || null,
   };
 }
 
@@ -1446,8 +1499,10 @@ function fileDot(f) {
 }
 
 function fileStatusCell(f) {
-  if (f.job_status === "running") return `<span class="stage">${esc(t(f.stage || "解析中"))}</span>${f.dot === "green" ? `<div class="hint" style="margin:2px 0 0">${t("重新解析中,旧切片仍可用")}</div>` : ""}`;
-  if (f.job_status === "queued" || f.job_status === "retry") return `<span class="badge">${t("排队中")}</span>${f.dot === "green" ? `<div class="hint" style="margin:2px 0 0">${t("等待重新解析")}</div>` : f.stage ? `<div class="hint" style="margin:2px 0 0">${t("上次到:")}${esc(t(f.stage))}</div>` : ""}`;
+  if (f.progress?.wait_reason === "stopping") return `<span class="badge">${t("正在停止")}</span>`;
+  if (f.job_status === "paused") return `<span class="badge">${t("已暂停")}</span>`;
+  if (f.job_status === "running") return `<span class="stage">${esc(progressLabel(f.progress, f.stage))}</span>${f.dot === "green" ? `<div class="hint" style="margin:2px 0 0">${t("旧切片可用")}</div>` : ""}`;
+  if (f.job_status === "queued" || f.job_status === "retry") return `<span class="badge">${esc(waitingLabel(f.progress))}</span>${f.progress?.next_attempt_at ? `<div class="hint" style="margin:2px 0 0">${esc(t("下次重试 {0}", fmtTs(f.progress.next_attempt_at)))}</div>` : ""}`;
   if (f.dot === "green") return `<span class="badge ok">${t("已入库")}</span>`;
   if (f.dot === "red") return `<span class="badge bad">${t("失败")}</span>${f.error ? `<div class="err" style="margin-top:3px">${esc(t(f.error).slice(0, 160))}</div>` : ""}`;
   return `<span class="badge">${t("待解析")}</span>`;
@@ -1649,7 +1704,7 @@ function renderChunkPreview() {
   const d = r.diagnostics, s = (d && d.stats) || null;
   const budget = r.max_tokens;
   const isVisual = c => ["table", "image", "chart", "vision"].includes(c.block_type);
-  const tinyOf = c => !!s && c.tokens < s.tiny_threshold && !isVisual(c);
+  const tinyOf = c => !!s && c.tokens < s.tiny_threshold && !isVisual(c) && !["code", "slide"].includes(c.block_type);
   const overOf = c => budget != null && c.tokens > budget * ((s && s.over_tolerance) || 1) && !isVisual(c);
   const params = [budget != null ? `max_tokens ${budget}` : "", r.overlap_tokens != null ? `overlap ${r.overlap_tokens}` : "",
                   r.file.parser_profile || ""].filter(Boolean).join(" / ");
@@ -1734,6 +1789,44 @@ async function openMergesDrawer() {
 }
 let mergesReqSeq = 0;
 
+let comparisonReqSeq = 0;
+async function openComparisonDrawer(version = "") {
+  const kb = selectedEntry();
+  if (!kb || kb.state !== "active") return;
+  state.side = { kind: "comparisons", fileId: null };
+  openSide("comparisons", t("版本对比"));
+  const out = $("#side-body"), seq = ++comparisonReqSeq;
+  const stale = () => seq !== comparisonReqSeq || state.side.kind !== "comparisons" || selectedEntry()?.kb_id !== kb.kb_id;
+  setHtml(out, `<div class="empty-state">${t("载入中...")}</div>`);
+  try {
+    const base = `/kbs/${encodeURIComponent(kb.kb_id)}/graph_comparisons`;
+    const index = await api(base);
+    if (stale()) return;
+    const reports = index.reports || [];
+    if (!reports.length) { setHtml(out, `<div class="empty-state">${t("下次建图后生成版本对比")}</div>`); return; }
+    const chosen = version || reports[0].after;
+    const r = await api(`${base}?version=${encodeURIComponent(chosen)}`);
+    if (stale()) return;
+    const names = { entities: "实体", relations: "关系", facts: "事实" };
+    const changes = { sources: "来源", schema: "标签模式", models: "模型", corrections: "更正规则", pipeline: "建图流程" };
+    const selector = `<select id="comparison-version">${reports.map(x => `<option value="${esc(x.after)}" ${x.after === chosen ? "selected" : ""}>${esc(x.after)}</option>`).join("")}</select>`;
+    const rows = Object.entries(r.kinds || {}).map(([kind, n]) => `<tr><td>${t(names[kind] || kind)}</td><td>${n.before}</td><td>${n.after}</td><td>${n.added}</td><td>${n.removed}</td><td>${n.changed}</td><td>${n.removed_with_unchanged_source}</td></tr>`).join("");
+    const status = { no_previous_version: "还没有可比较的旧版本", baseline_unavailable: "旧版本产物已清理", error: "版本对比未完成" };
+    setHtml(out, selector + `<p>${esc(r.before || "")} → ${esc(r.after || "")}</p>` + (rows
+      ? `<p>${t("输入变化")}: ${esc((r.changed_inputs || []).map(k => t(changes[k] || k)).join(", ") || t("无"))}</p><div class="tbl-wrap"><table><thead><tr>${["类型", "之前", "之后", "新增", "减少", "变化", "原文未变的减少项"].map(x => `<th>${t(x)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div><p class="hint">${t("原文未变的减少项可结合来源核对")}</p>`
+      : `<div class="empty-state">${t(status[r.status] || "版本对比未完成")}</div>`));
+    if (r.unknown_inputs?.length) {
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = `${t("历史记录未提供完整信息")}: ${r.unknown_inputs.map(k => t(changes[k] || k)).join(", ")}`;
+      out.appendChild(note);
+    }
+    $("#comparison-version")?.addEventListener("change", e => openComparisonDrawer(e.target.value));
+  } catch (e) {
+    if (!stale()) setHtml(out, `<div class="empty-state">${esc(t(e.message))}</div>`);
+  }
+}
+
 function renderMerges() {
   const { r, q } = state.merges || {};
   const host = $("#side-body");
@@ -1809,7 +1902,7 @@ function marqueeMergeCells(host) {
 
 /* ── job timeline drawer: opened by clicking a file name in the file table; shows this parse's phases,
    durations and errors; can cancel and retry ── */
-const JOB_STATUS_ZH = { queued: "排队中", retry: "等待重试", running: "解析中", done: "已完成", failed: "失败", cancelled: "已取消" };
+const JOB_STATUS_ZH = { queued: "排队中", retry: "等待重试", running: "解析中", paused: "已暂停", done: "已完成", failed: "失败", cancelled: "已取消" };
 
 function openJob(jobId) {
   state.jobs.selected = jobId;
@@ -1828,10 +1921,12 @@ async function refreshJobDetail() {
   catch (e) { setHtml(host, `<div class="empty-state" style="color:var(--red-text)">${esc(t(e.message))}</div>`); return; }
   if (state.jobs.selected !== jobId) return;
   const j = d.job, f = d.file || {};
+  const p = j.progress || {};
+  const statusLabel = p.wait_reason ? waitingLabel(p) : t(JOB_STATUS_ZH[j.status] || j.status);
   const end = j.finished_at || (j.status === "running" ? Math.floor(Date.now() / 1000) : null);
   const meta = [
-    [t("状态"), t(JOB_STATUS_ZH[j.status] || j.status) + (j.cancel_requested ? t(" · 已请求取消") : "")],
-    [t("当前阶段"), t(j.stage) || "—"],
+    [t("状态"), statusLabel],
+    [t("当前阶段"), progressLabel(p, j.stage || "—")],
     [t("开始"), fmtTs(j.started_at)], [t("结束"), fmtTs(j.finished_at)],
     [t("时长"), j.started_at && end ? fmtDur(end - j.started_at) : "—"],
     [t("重试次数"), j.retry_count ?? 0],
@@ -1839,22 +1934,28 @@ async function refreshJobDetail() {
     [t("文件大小"), f.size != null ? fmtSize(f.size) : "—"],
     [t("任务 id"), j.job_id],
   ];
+  if (p.updated_at) meta.push([t("进度更新"), fmtTs(p.updated_at)]);
+  if (j.status === "running" && p.elapsed_seconds != null) meta.push([t("阶段用时"), fmtDur(p.elapsed_seconds)]);
+  if (p.next_attempt_at) meta.push([t("下次重试"), fmtTs(p.next_attempt_at)]);
+  meta.push(...modelRows(p.models));
   const ev = d.events || [];
   const timeline = ev.length ? ev.map((e, i) => {
-    const next = ev[i + 1];
+    const next = ev.slice(i + 1).find(n => n.kind === "stage" || ["done", "error", "retry", "cancelled"].includes(n.kind));
     const dur = e.kind === "stage" ? fmtDur((next ? next.ts : (end || e.ts)) - e.ts) : "";
     const ts = new Date(e.ts * 1000).toLocaleTimeString(I18N.locale, { hour12: false });
     const tag = e.kind === "error" ? "[ERROR] " : e.kind === "retry" ? "[RETRY] " : "";
     return `<div class="${esc(e.kind)}${e.synthesized ? " synth" : ""}"><span class="ts">${ts}</span><span class="dur">${dur}</span><span class="tx">${tag}${esc(t(e.text))}</span></div>`;
   }).join("") : `<div class="muted">${t("还没有时间线记录")}</div>`;
   const canCancel = ["queued", "retry", "running"].includes(j.status) && !j.cancel_requested;
-  const canRetry = ["failed", "cancelled", "done"].includes(j.status) && f.file_id;
+  const canRetry = ["failed", "paused", "cancelled", "done"].includes(j.status) && f.file_id;
   const html = `
     <div style="display:flex;align-items:baseline;gap:10px">
       <b style="flex:1;min-width:0;word-break:break-all;font-size:14px">${esc(f.rel_path || j.file_id || jobId)}</b>
-      <span class="badge ${j.status === "failed" ? "bad" : j.status === "done" ? "ok" : j.status === "running" ? "info" : ""}">${esc(t(JOB_STATUS_ZH[j.status] || j.status))}</span>
+      <span class="badge ${j.status === "failed" ? "bad" : j.status === "done" ? "ok" : j.status === "running" ? "info" : ""}">${esc(statusLabel)}</span>
     </div>
     <div class="job-meta">${meta.map(([k, v]) => `<div><span>${k}</span><b>${esc(v)}</b></div>`).join("")}</div>
+    ${j.error && ["retry", "failed", "paused"].includes(j.status) ? `<div class="err small">${esc(t(j.error))}</div>` : ""}
+    ${(d.followups || []).map(task => `<div class="hint">${t("关键词索引")} · ${esc(t(JOB_STATUS_ZH[task.status] || task.status))}${task.error ? `<div class="err small">${esc(t(task.error))}</div>` : ""}</div>`).join("")}
     ${d.synthesized ? `<div class="hint" style="margin:0 0 6px">${t("这条任务早于时间线记录,下面是按开始/结束时间合成的概要")}</div>` : ""}
     <div class="timeline">${timeline}</div>
     <div class="row-actions" style="justify-content:flex-end;margin-top:12px">
@@ -1884,10 +1985,8 @@ async function refreshJobDetail() {
 }
 
 /* ── graph tab: status card + build records ──────────────────────── */
-/* Parse progress does not jump in four steps by file count: a file being parsed is interpolated to a
-   0~1 fraction by pipeline phase. Phase weights are roughly tuned by real time share (MinerU and the VLM
-   dominate), and within the VLM phase a second interpolation follows n/m images, so an image-heavy PDF
-   shows progress climbing even in the slowest step. */
+/* The overall bar is an estimate. Within a stage only reported counts move it; elapsed time is
+   displayed in task details and never poses as completed work. */
 const STAGE_SPANS = [
   ["Parsing document",  0.00, 0.35],
   ["Describing images", 0.35, 0.70],
@@ -1907,28 +2006,29 @@ const STAGE_SPANS = [
 const STAGE_DEFAULT_SECONDS = { "Parsing document": 60, "Describing images": 40, "Chunking": 2, "Text embedding": 8, "Visual embedding": 5, "Writing vectors": 3, "Keyword indexing": 2 };
 
 function parseStageSpans(weights) {
+  weights = Object.fromEntries(Object.entries(weights || {}).map(([k, v]) => [translate(k), v]));
   const secs = STAGE_SPANS.map(([name]) => Math.max(1, Number((weights && weights[name]) ?? STAGE_DEFAULT_SECONDS[name] ?? 3)));
   const total = secs.reduce((a, b) => a + b, 0);
   let at = 0;
   return STAGE_SPANS.map(([name], i) => { const row = [name, at, at + secs[i] / total, secs[i]]; at += secs[i] / total; return row; });
 }
 
-// job: the entry from overview.active_jobs (with stage_elapsed: seconds spent in the current phase,
-// computed server-side); weights: this KB's phase duration table. Interpolate within the phase by elapsed
-// time, capped at 95%, and move on when the phase changes -- image description follows n/m when available.
+// job: overview.active_jobs, with actual progress counters. Weights estimate the relative cost of stages.
 function stageFraction(stage, job, weights) {
+  stage = translate(stage);
   if (!stage) return 0.02;
   if (stage === "Done") return 1;
   const spans = (job || weights) ? parseStageSpans(weights) : STAGE_SPANS.map(s => [...s, STAGE_DEFAULT_SECONDS[s[0]] || 3]);
   for (const [name, lo, hi, secs] of spans) {
     if (stage.startsWith(name)) {
+      if (job?.progress?.total > 0 && Number.isFinite(job.progress.completed)) {
+        return lo + (hi - lo) * Math.min(1, job.progress.completed / job.progress.total);
+      }
       if (name === "Describing images") {
         const m = stage.match(/VLM (\d+)\/(\d+)/);
         if (m && +m[2] > 0) return lo + (hi - lo) * (+m[1] / +m[2]);
       }
-      const elapsed = job && Number.isFinite(Number(job.stage_elapsed)) ? Number(job.stage_elapsed) : null;
-      if (elapsed != null && secs > 0) return lo + (hi - lo) * Math.min(0.95, elapsed / secs);
-      return lo + (hi - lo) * 0.5;
+      return lo;
     }
   }
   return 0.02;
@@ -1985,8 +2085,14 @@ function graphStagesFor(weights) {
 }
 
 function graphStagePct(stg, weights) {
+  stg = translate(stg);
   if (!stg) return 2;
+  if (stg === "Preparing labels") return 0;
   if (stg === "Done") return 100;
+  const aliases = { "Merge & resolution": "Entity resolution",
+    "Computing weights and chunk attribution": "Description summaries",
+    "Normalizing property concepts": "Structured facts" };
+  stg = aliases[stg] || stg;
   const row = graphStagesFor(weights).find(([n]) => stg.startsWith(n));
   if (!row) return 2;
   let [name, lo, hi] = row;
@@ -2028,6 +2134,9 @@ function renderGraphPanel() {
   const kb = selectedEntry();
   if (!kb || kb.state !== "active") return;
   const b = kb.graph_build || {};
+  const p = b.progress || {};
+  const schema = kb.schema_suggest;
+  const detailsOpen = !!host.querySelector("details[open]");
   const st = kb.graph_status;
   if (!st || st === "disabled") {
     setHtml(host, `<div class="gstat"><span class="dot gray"></span><span class="big">${t("未开启知识图谱")}</span>
@@ -2038,11 +2147,18 @@ function renderGraphPanel() {
   // status, phase and the resumability note
   let text = "", extra = "";
   const fail = st === "failed";
-  if (st === "running") {
-    text = t(b.stage || "构建中");
+  if (schema) {
+    text = t("标签抽取") + " · " + t(SCHEMA_PHASES[schema.phase] || "选择样本");
+    extra = schema.seconds != null ? t("已运行 {0}", fmtDur(schema.seconds)) : "";
+  } else if (st === "running") {
+    const kind = b.resumed ? "断点续跑" : b.build_kind === "append" ? "增量并入" : "全量建图";
+    text = t(kind) + " · " + (p.wait_reason ? waitingLabel(p) : progressLabel(p, b.stage || "构建中"));
     extra = b.started_at ? t("已运行 {0}", fmtDur(Math.floor(Date.now() / 1000) - b.started_at)) : "";
+    if (p.next_attempt_at) extra += " · " + t("下次重试 {0}", fmtTs(p.next_attempt_at));
   } else if (st === "ok") {
-    text = "";                                    // a built graph speaks only through the three cards below
+    text = p.phase === "cleanup" ? t(b.cleanup_running ? "已发布 · 清理中" : "已发布") : "";
+    if (p.phase === "cleanup" && !b.cleanup_running) extra = t("收尾待确认");
+    if (b.post_publish_error) extra = t("收尾未完成");
   } else if (st === "failed") {
     text = t("失败于「{0}」", t(b.stage || "未知步骤"));
     extra = b.error ? t(String(b.error)).slice(0, 220) : "";
@@ -2057,9 +2173,8 @@ function renderGraphPanel() {
              b.paused ? t("自动重建已跳过") : ""].filter(Boolean).join(" · ");
   } else {
     text = t("待构建");
-    extra = t("首次开启无条件构建(每 2 小时检查一次,解析忙时让路);之后新增内容自动并入,达到重建条件整库重来");
+    extra = "";
   }
-  const phases = (b.phases_done || []);
   // Size of the current graph: three cards for entities / relations / units plus an "updated" line; while
   // building, failed or paused a status line appears above
   const c = b.counts || null;
@@ -2071,15 +2186,40 @@ function renderGraphPanel() {
   // Units whose extraction failed (at <=5% the build still completes) used to be invisible in the UI: say
   // how many and how many documents are involved (health check R3)
   const failedUnits = b.extract_failed_units
-    ? `<div class="hint" style="margin-top:6px">${t("{0} 个单元抽取失败", fmtNum(b.extract_failed_units))}${(b.extract_failed_documents || []).length ? t("(涉及 {0} 份文档)", b.extract_failed_documents.length) : ""}${t(",已成功的都在图里;下次建图只补这些")}</div>`
+    ? `<div class="hint" style="margin-top:6px">${t("{0} 个单元抽取失败", fmtNum(b.extract_failed_units))}${(b.extract_failed_documents || []).length ? t("(涉及 {0} 份文档)", b.extract_failed_documents.length) : ""}</div>`
     : "";
+  const phaseNames = { prepare_input: "准备语料", extract: "实体抽取", merge: "实体归并",
+    facts: "结构化事实", compile: "编译视图页", enrich: "写入向量库", neo4j_import: "图谱库导入" };
+  const meta = schema ? [[t("当前版本"), b.active_graph_version || "—"], [t("任务 id"), schema.task_id || "—"]] : [
+    [t("当前版本"), b.active_graph_version || "—"],
+    [t("任务版本"), b.graph_version || "—"],
+    [t("标签版本"), b.schema_version || "—"],
+    [t("任务 id"), b.graph_build_id || schema?.task_id || "—"],
+    ...modelRows(b.models),
+  ];
+  if (!schema && p.updated_at) meta.push([t("进度更新"), fmtTs(p.updated_at)]);
+  if (!schema && p.cached != null) meta.push([t("复用单元"), fmtNum(p.cached)]);
+  if (schema?.sampled != null) meta.push([t("采样片段"), fmtNum(schema.sampled)]);
+  if (schema?.model_id) meta.push([t("标签抽取"), schema.model_id]);
+  if (schema?.progress_at) meta.push([t("进度更新"), fmtTs(schema.progress_at)]);
+  const history = (schema ? [] : b.phase_history || []).map(e => {
+    const reused = (b.resumed_phases || []).includes(e.phase);
+    const duration = e.started_at != null && !reused ? fmtDur(Math.max(0, e.finished_at - e.started_at)) : "";
+    return `<div><span class="ts">${esc(fmtTs(e.finished_at))}</span><span class="dur">${esc(duration)}</span><span class="tx">${esc(t(phaseNames[e.phase] || e.phase))}${reused ? " · " + t("已复用") : ""}</span></div>`;
+  }).join("");
+  const details = b.graph_build_id || schema ? `<details class="pipeline-details"${detailsOpen ? " open" : ""}>
+    <summary>${t("任务详情")}</summary>
+    <div class="job-meta">${meta.map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>
+    ${history ? `<div class="timeline">${history}</div>` : ""}
+    ${!schema && b.post_publish_error ? `<div class="err small">${esc(t(b.post_publish_error))}</div>` : ""}
+  </details>` : "";
   // The number of units the facts phase still could not finish after split retries stays only in the API
   // field facts_partial_units; the status card no longer shows that note (2026-09-12, user decision)
   setHtml(host, `
     ${text ? `<div class="gstat"><span class="dot ${graphDot(kb)}"></span><span class="big">${esc(text)}</span></div>` : ""}
     ${extra ? `<div class="${fail ? "err" : "muted"} small" style="word-break:break-all">${esc(extra)}</div>` : ""}
-    ${phases.length ? `<div class="phases">${phases.map(p => `<span class="phase done">✓ ${esc(t(p))}</span>`).join("")}<span class="muted small" style="align-self:center">${t("续跑时跳过")}</span></div>` : ""}
-    ${cards || (st === "ok" ? `<div class="muted small">${t("已建成")}</div>` : "")}${failedUnits}`);
+    ${(schema || st === "running" || st === "failed" || st === "stopped") && b.active_graph_version ? `<div class="muted small">${esc(t("当前可用 {0}", b.active_graph_version))}</div>` : ""}
+    ${cards || (st === "ok" ? `<div class="muted small">${t("已建成")}</div>` : "")}${failedUnits}${details}`);
 }
 
 /* ── graph preview: entities and relations of the current version, drawn as a force-directed graph ───────
@@ -2551,7 +2691,12 @@ gpCanvas.addEventListener("mousemove", ev => {
   const byKey = new Map(d.nodes.map(x => [x.key, x]));
   const rels = d.edges.filter(e => e.source === n.key || e.target === n.key).slice(0, 6).map(e => {
     const other = byKey.get(e.source === n.key ? e.target : e.source);
-    return `${e.source === n.key ? "→" : "←"} ${esc(e.predicate)} ${esc(other ? other.title : "")}`;
+    const qualifiers = [e.polarity === "negated" ? t("否定关系") : "",
+      e.target_polarity === "negated" ? t("否定目标行为") : "",
+      e.modality && e.modality !== "actual" ? t(({recommended:"建议", planned:"计划", hypothetical:"假设", uncertain:"不确定"})[e.modality] || e.modality) : "",
+      e.type_violation || e.polarity === "uncertain" ? t("待核实") : "",
+      ...Object.entries(e.conditions || {}).map(([k, v]) => `${k}: ${v}`)].filter(Boolean);
+    return `${e.source === n.key ? "→" : "←"} ${esc(e.predicate)} ${esc(other ? other.title : "")}${qualifiers.length ? ` [${esc(qualifiers.join("; "))}]` : ""}`;
   });
   const total = d.edges.filter(e => e.source === n.key || e.target === n.key).length;
   const sameName = d.nodes.filter(x => x.title === n.title && x.key !== n.key).length;
@@ -2698,6 +2843,7 @@ gpCanvas.addEventListener("touchcancel", () => { gpTouch = null; });
 $("#gp-q").addEventListener("keydown", ev => { if (ev.key === "Enter") gpGo({ q: ev.target.value.trim() }); });
 $("#gp-limit").addEventListener("change", () => gpLoadView());     // count changed: re-fetch the same level in place (no "whole graph" state since 2026-09-12)
 $("#gp-merges")?.addEventListener("click", () => openMergesDrawer());
+$("#gp-comparisons")?.addEventListener("click", () => openComparisonDrawer());
 $("#gp-cluster")?.addEventListener("click", () => {
   try { localStorage.setItem("gp.cluster", gpClusterOn() ? "0" : "1"); } catch (e) { /* no storage in private mode: this session uses the default */ }
   gpSyncClusterButton();
@@ -2715,7 +2861,6 @@ const SERVICES = [
   ["解析服务",       "mineru",           h => h.mineru],
   ["文本向量服务",   "embedding",        h => h.embedding],
   ["跨模态向量服务", "visual_embedding", h => h.visual_embedding],  // null when disabled, the row is filtered out
-  ["多模态服务",     "vlm",              h => h.vlm],
   // Text rerank + cross-modal rerank, used only by retrieval; null when neither address is configured, the
   // whole row hidden
   ["重排序服务",     "reranker",         h => h.reranker == null && h.visual_reranker == null ? null
@@ -2911,23 +3056,22 @@ function renderGraphSchema() {
     if (!list.length) {
       preds.innerHTML = `<div class="empty-state" style="padding:12px">${types.length ? t("这一版没有谓词表:关系一律记为 related_to(重抽一次会补上)") : t("尚未抽取")}</div>`;
     } else {
-      // 端点账(建图结束写回这一版):数据里够 20 条、占谓词 5% 以上的端点组合。下次归并直接放行,
-      // 下次重抽标签时由规则保住,不用人改。
+      // Endpoint usage is diagnostic evidence for schema induction.
       const observed = (current && current.observed) || {};
-      const confirmed = {};
-      for (const row of (observed.confirmed || [])) {
-        (confirmed[row.predicate] ||= []).push(`${row.source_parent}→${row.target_parent} ×${row.count}`);
+      const suggested = {};
+      for (const row of (observed.suggested || [])) {
+        (suggested[row.predicate] ||= []).push(`${row.source_parent}→${row.target_parent} ×${row.count}`);
       }
       const edges = observed.edges || {};
       const account = pr => {
-        const items = confirmed[pr.name] || [];
+        const items = suggested[pr.name] || [];
         const used = edges[pr.name] != null ? t("{0} 条", edges[pr.name]) : "";
         if (!items.length) return used ? `<span class="muted">${esc(used)}</span>` : "";
         return `${used ? `<span class="muted">${esc(used)} · </span>` : ""}${items.map(x => esc(x).replace("→", "→<wbr>")).join("<br>")}`;   // on phones, allow a line break after the arrow
       };
       const accountHead = observed.graph_version
-        ? `<th title="${t("建图 {0} 结束时写回的端点账:这个谓词实际用了多少条边;够 20 条且占 5% 以上的端点组合列在这里,下次归并直接放行、重抽标签时规则保住", esc(observed.graph_version))}">${t("数据放行")}</th>`
-        : `<th title="${t("这一版还没建过图,没有端点账")}">${t("数据放行")}</th>`;
+        ? `<th title="${t("建图 {0} 的端点使用统计;高频组合供模式归纳参考，约束仍按谓词定义校验", esc(observed.graph_version))}">${t("端点观察")}</th>`
+        : `<th title="${t("这一版还没建过图,没有端点账")}">${t("端点观察")}</th>`;
       const endText = v => (Array.isArray(v) ? v : [v]).map(x => x === "*" ? t("任意") : (UPPER_ZH[x] ? gpUpperText(x) : String(x || ""))).join(t("、"));
       // 单值:同一个起点同一时间只有一个终点(新说法取代旧说法);事件核心关系是固定带上的
       const marks = pr => [pr.multivalued === false ? t("单值") : "", pr.core ? t("核心") : ""].filter(Boolean).join(" · ");
@@ -3071,7 +3215,8 @@ async function onBulkService(action) {
   }
   const settled = () => {
     const h = state.health || {};
-    const states = SERVICES.map(([, , fn]) => fn(h)).filter(v => v !== null && v !== undefined);
+    const managed = new Set(h.managed || []);
+    const states = SERVICES.filter(([, key]) => managed.has(key)).map(([, , fn]) => fn(h)).filter(v => v !== null && v !== undefined);
     return action === "stop" ? states.every(v => v === false) : states.every(v => v === true);
   };
   const poll = async () => {
@@ -3202,14 +3347,14 @@ function renderLlmView(div, m) {
     // first -- decoupled does not mean silent.
     const used = m.used_by || [];
     const detail = used.length
-      ? t("\n\n以下知识图谱在引用它,删除后对应栏位会清空,需要重新选:\n")
-        + used.map(u => `· ${u.source_root} — ${(u.steps || []).join(t("、"))}`).join("\n")
+      ? t("\n\n以下知识库在引用它,删除后对应栏位会清空;多模态模型恢复系统默认:\n")
+        + used.map(u => `· ${u.source_root} — ${(u.steps || []).map(s => t(s)).join(t("、"))}`).join("\n")
       : "";
     if (!(await confirmDialog(t("删除模型「{0}」?", m.name) + detail, t("确认删除")))) return;
     try {
       const r = await api(`/llms/${encodeURIComponent(m.name)}`, { method: "DELETE" });
       const n = (r.cleared || []).length;
-      toast(n ? t("已删除;{0} 个知识图谱的对应栏位已清空", n) : t("已删除"));
+      toast(n ? t("已删除;{0} 个知识库的对应栏位已清空", n) : t("已删除"));
       refreshLlms();
       renderConfig();          // the model dropdowns in the config section must be redrawn too
     } catch (e) { toast(t("删除失败: ") + t(e.message)); }
@@ -3285,6 +3430,11 @@ async function refreshLlms() {
     }
     state.llms.forEach(m => host.appendChild(llmCard(m)));
     scheduleNameMarquee(host);
+    const vlm = $("#cfg-vlm");
+    if (vlm) {
+      const cur = vlm.value;
+      vlm.innerHTML = vlmOptions(state.llms.some(m => m.name === cur) ? cur : null);
+    }
     // The model dropdowns in the config card are rendered from state.llms and rebuilt only when cfgKey
     // changes: a newly registered model would not appear, and a just-deleted one would still show and fail
     // on save with "not in the registry".

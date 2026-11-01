@@ -301,7 +301,7 @@ def test_search_applies_table_preference_before_dual_fusion(monkeypatch):
         return original(cfg, ss, question, cands, **kwargs)
 
     def scores(documents):
-        return [0.9 if "尿酸 433" in doc else 0.8 if "甘油" in doc else 0.1 for doc in documents]
+        return [0.9 if "浓度 433" in doc else 0.8 if "添加剂" in doc else 0.1 for doc in documents]
 
     monkeypatch.setattr(service, "visual_rerank_active", lambda *args: True)
     monkeypatch.setattr(service, "rerank_images", Mock(return_value={"scores": {"p3": 0.8}, "errors": [], "requested": 1}))

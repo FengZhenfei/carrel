@@ -563,8 +563,7 @@ class ScanBoundaryTests(unittest.TestCase):
         return code, out.getvalue()
 
     def test_a_scan_that_did_nothing_leaves_no_run_record(self) -> None:
-        """The scan runs every minute and in most rounds nothing happens, yet every round used to write an
-        ingest_runs row (over 1,200 all-zero records a day)."""
+        """A scan with no changes must not append an empty ingest run."""
         with tempfile.TemporaryDirectory() as tmp:
             root, state, settings, src = self._one_kb(tmp)
 
@@ -989,8 +988,11 @@ def _parse_harness(tmp: str):
         def __init__(self, **kwargs) -> None:
             pass
 
-        def embed(self, texts):
+        def embed(self, texts, *, progress_cb=None):
             step("embed")()
+            if progress_cb is not None:
+                progress_cb(0, 1)
+                progress_cb(1, 1)
             return [[0.0] * 4 for _ in texts]
 
     stubs = {
@@ -1341,7 +1343,9 @@ class VisualEmbedRejectionTests(unittest.TestCase):
             def __init__(self, **kwargs) -> None:
                 pass
 
-            def embed_images(self, jobs):
+            def embed_images(self, jobs, *, progress_cb=None):
+                if progress_cb is not None:
+                    progress_cb(len(jobs), len(jobs))
                 return [None for _ in jobs]
 
         with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:

@@ -346,6 +346,8 @@ td.path{word-break:break-all;min-width:220px}
 .timeline .done .tx{color:var(--green-text)}
 .timeline .cancelled .tx{color:var(--amber-text)}
 .timeline .synth .tx{color:var(--muted)}
+.pipeline-details{margin-top:10px;font-size:12px}
+.pipeline-details summary{cursor:pointer;color:var(--muted)}
 
 /* ── graph tab ── */
 .gstat{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -606,6 +608,7 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
               <option value="2000">2000 个</option>
               <option value="3000">3000 个</option></select>
             <button id="gp-cluster" class="ghost on" title="按上层本体分区排布:同类聚成一团、类与类分开;再点一次回到纯力导向">分区</button>
+            <button id="gp-comparisons" class="ghost">版本对比</button>
             <button id="gp-merges" class="ghost" title="这一版实体归并的账:每一对并掉的实体并进了谁、走的哪一路、依据是什么;以及被规则或第二道判定挡下的对">实体归并审计</button>
           </div>
           <div class="pv-filters" id="gp-legend"></div>
@@ -637,6 +640,8 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
               <div><label class="f">chunk overlap_tokens</label>
                 <input type="number" id="cfg-ov" value="80">
                 <div class="hint" id="cfg-ov-hint"></div></div>
+              <div><label class="f" for="cfg-vlm">多模态模型</label>
+                <select id="cfg-vlm"><option value="">系统默认</option></select></div>
             </div>
             <div style="margin-top:14px"><label class="f">多模态结构化描述提示词(留空 = 内置默认)</label>
               <textarea id="cfg-prompt" placeholder="内置默认(自定义后替换此段):
@@ -807,7 +812,7 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 </dialog>
 <script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
 <script src="vendor/katex.min.js?v=20261001-1"></script>
-<script src="i18n.js?v=20261026-2"></script>
-<script src="app.js?v=20261026-2"></script>
+<script src="i18n.js?v=20261101-2"></script>
+<script src="app.js?v=20261101-2"></script>
 </body>
 </html>

@@ -172,8 +172,6 @@ def page_allowed(settings, source, page, scope, *, paths=None):
     """Compiled text cannot be partially filtered; require all its source paths in scope."""
     if scope.get("mode") == "as_of" and page.get("compiled_day") != scope.get("day"):
         return False
-    if scope.get("mode") == "current" and page.get("time_mode") == "history":
-        return False
     rels = list(page.get("source_paths") or page.get("docs") or [])
     ids = page.get("doc_ids") or []
     if paths is not None:

@@ -3,6 +3,8 @@ scored per window taking the max; when the service is unavailable the caller fal
 order."""
 from __future__ import annotations
 
+from kb_pipeline.chunking.context import payload_text
+
 from typing import Any
 import hashlib
 import math
@@ -105,7 +107,7 @@ def rerank_images(settings: Any, question: str, candidates: list[dict[str, Any]]
             if path.stat().st_size > 20_000_000:
                 raise ValueError("image exceeds input byte budget")
             url = _visual_data_url(path.read_bytes())
-            text = truncate_tokens(clean_for_rerank(str(payload.get("text") or "")), 384)
+            text = truncate_tokens(clean_for_rerank(payload_text(payload)), 384)
             docs.append({"content": [{"type": "text", "text": head_line(payload) + "\n" + text},
                                      {"type": "image_url", "image_url": {"url": url}}]})
             ids.append(str(cand["point_id"]))
@@ -140,7 +142,7 @@ def rerank_documents(candidates: list[dict[str, Any]], *, window_tokens: int, ov
     for i, cand in enumerate(candidates):
         payload = cand.get("payload") or {}
         head = head_line(payload)
-        body = clean_for_rerank(str(payload.get("text") or ""))
+        body = clean_for_rerank(payload_text(payload))
         for win in windows(body, window_tokens=window_tokens, overlap_tokens=overlap_tokens):
             docs.append(f"{head}\n{win}" if head else win)
             owner.append(i)

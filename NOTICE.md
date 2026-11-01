@@ -47,8 +47,7 @@ them; each is used unmodified over its network API.
 Weights are downloaded by the user or by the parser container at first start
 and are never committed. Check each model's license before use:
 MinerU2.5 (OpenDataLab, AGPL-3.0), Qwen3-Embedding, Qwen3-Reranker,
-Qwen3-VL-Embedding, Qwen3-VL-Reranker and Qwen3-VL-8B-Instruct (Alibaba
-Cloud, Apache-2.0).
+Qwen3-VL-Embedding and Qwen3-VL-Reranker (Alibaba Cloud, Apache-2.0).
 
 ## Python dependencies
 

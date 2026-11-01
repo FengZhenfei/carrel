@@ -257,11 +257,11 @@ class EvidenceTests(unittest.TestCase):
     def test_select_hits_quota_then_mmr(self) -> None:
         def c(pid, score, text, bucket=None):
             return {"point_id": pid, "score_final": score, "bucket": bucket, "payload": {"text": text}}
-        ordered = [c("a1", 0.9, "尿酸 433 参考 208-428", "尿酸"), c("a2", 0.85, "尿酸 433 参考 208-428 复查", "尿酸"),
-                   c("a3", 0.8, "尿酸 433 参考 208-428。", "尿酸"), c("b1", 0.2, "血糖 5.3 空腹", "血糖"), c("x1", 0.5, "甘油三酯 1.7", None)]
-        hits, stats = select_hits(ordered, 4, buckets={"mode": "subject", "keys": ["尿酸", "血糖"]}, min_hits=2, mmr_lambda=0.7)
+        ordered = [c("a1", 0.9, "浓度 433 参考 208-428", "浓度"), c("a2", 0.85, "浓度 433 参考 208-428 复查", "浓度"),
+                   c("a3", 0.8, "浓度 433 参考 208-428。", "浓度"), c("b1", 0.2, "液温 5.3 静置", "液温"), c("x1", 0.5, "添加剂量 1.7", None)]
+        hits, stats = select_hits(ordered, 4, buckets={"mode": "subject", "keys": ["浓度", "液温"]}, min_hits=2, mmr_lambda=0.7)
         ids = [h["point_id"] for h in hits]
-        self.assertEqual(ids[:2], ["a1", "a2"]); self.assertIn("b1", ids); self.assertEqual(stats["quota_filled"], {"尿酸": 2, "血糖": 1})
+        self.assertEqual(ids[:2], ["a1", "a2"]); self.assertIn("b1", ids); self.assertEqual(stats["quota_filled"], {"浓度": 2, "液温": 1})
         self.assertIn("x1", ids); self.assertEqual(ids, sorted(ids, key=lambda i: -next(c["score_final"] for c in ordered if c["point_id"] == i)))   # selection fixed; presentation ordered by score
         self.assertNotIn("a3", ids)                                                                 # MMR: a3, a duplicate of what is already selected, yields to different content
         self.assertGreater(stats["avg_redundancy"], 0.0)
@@ -287,7 +287,7 @@ class EvidenceTests(unittest.TestCase):
                 chosen.append(best); remaining.remove(best)
             return sorted((ordered[i]["point_id"] for i in chosen))
 
-        words = ["尿酸", "血糖", "肌酐", "甘油三酯", "参考范围", "复查", "空腹", "偏高", "正常", "报告"]
+        words = ["浓度", "液温", "黏度", "添加剂量", "参考范围", "复查", "静置", "偏高", "正常", "报告"]
         for seed in range(5):
             rnd = random.Random(seed)
             ordered = sorted(({"point_id": f"p{i}", "score_final": round(rnd.random(), 3),
@@ -308,18 +308,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertLessEqual(sum(int(r["token_count"]) for r in rows2), 100); self.assertEqual(len(rows2), 4)
 
     def test_spec_rows_verify_source_points(self) -> None:
-        specs = [{"subject": "李", "property": "尿酸", "value": "433", "point_ids": ["p1"], "score": 0.9},
-                 {"subject": "李", "property": "肌酐", "value": "78", "point_ids": ["zz"], "score": 0.8}]
+        specs = [{"subject": "李", "property": "浓度", "value": "433", "point_ids": ["p1"], "score": 0.9},
+                 {"subject": "李", "property": "黏度", "value": "78", "point_ids": ["zz"], "score": 0.8}]
         rows = spec_rows(specs, source_ns={"p1": 1}, limit_hints=8, point_active={"p1": True, "zz": False})
-        self.assertEqual((rows[0]["verified"], rows[0]["sources_active"], rows[0]["hint"]), (True, "1/1", "李 · 尿酸 = 433"))
-        self.assertEqual((rows[1]["verified"], rows[1]["sources_active"], rows[1]["hint"]), (False, "0/1", None))     # source deactivated: no hint (S03)
+        self.assertEqual((rows[0]["source_valid"], rows[0]["sources_active"], rows[0]["hint"]), (True, "1/1", "李 · 浓度 = 433"))
+        self.assertEqual((rows[1]["source_valid"], rows[1]["sources_active"], rows[1]["hint"]), (False, "0/1", None))     # source deactivated: no hint (S03)
 
     def test_spec_rows_hints_series_and_conflicts(self) -> None:
-        specs = [{"subject": "李", "property": "尿酸", "value": "433", "unit": "umol/L", "when": "2024", "series_key": "s1", "series_index": 0, "point_ids": ["p1"], "score": 0.9},
-                 {"subject": "李", "property": "尿酸", "value": "401", "unit": "umol/L", "when": "2025", "series_key": "s1", "series_index": 1, "point_ids": ["p9"], "conflict_group": "g1", "score": 0.8},
+        specs = [{"subject": "李", "property": "浓度", "value": "433", "unit": "umol/L", "when": "2024", "series_key": "s1", "series_index": 0, "point_ids": ["p1"], "score": 0.9},
+                 {"subject": "李", "property": "浓度", "value": "401", "unit": "umol/L", "when": "2025", "series_key": "s1", "series_index": 1, "point_ids": ["p9"], "conflict_group": "g1", "score": 0.8},
                  {"subject": "器件", "property": "tAS", "symbol": "tAS", "min": "5", "max": "10", "unit": "ns", "conditions_text": "VCC=3.3V", "quality": "ambiguous_source", "point_ids": [], "score": 0.7}]
         rows = spec_rows(specs, source_ns={"p1": 1}, limit_hints=8)
-        self.assertEqual(rows[0]["hint"], "李 · 尿酸 = 433 umol/L · 2024"); self.assertEqual(rows[0]["sources"], [1])
+        self.assertEqual(rows[0]["hint"], "李 · 浓度 = 433 umol/L · 2024"); self.assertEqual(rows[0]["sources"], [1])
         self.assertEqual(rows[0]["series_text"], "433 umol/L(2024)、401 umol/L(2025)")
         self.assertTrue(rows[1]["conflict"]); self.assertIn("Conflicting", rows[1]["conflict_note"]); self.assertFalse(rows[0]["conflict"])
         self.assertIsNone(rows[2]["hint"])                                                          # a fact with unclear provenance gets no hint
@@ -327,9 +327,9 @@ class EvidenceTests(unittest.TestCase):
     def test_page_rows_budget_and_subject_first(self) -> None:
         pages = [{"kind": "source", "title": "报告 A", "score": 0.9, "text": "来源页正文", "series": []},
                  {"kind": "timeline", "title": "李 时间线", "score": 0.7, "text": "\n".join(f"2024-0{i} 指标 {i}" for i in range(1, 9)), "series": ["x"]},
-                 {"kind": "subject", "title": "尿酸", "score": 0.6, "text": "主体页正文 " * 50, "series": ["a", "b"]}]
-        rows = page_rows(pages, subjects=["尿酸"], text_budget_tokens=40)
-        self.assertEqual(rows[0]["title"], "尿酸"); self.assertTrue(all(r["compiled"] for r in rows))
+                 {"kind": "subject", "title": "浓度", "score": 0.6, "text": "主体页正文 " * 50, "series": ["a", "b"]}]
+        rows = page_rows(pages, subjects=["浓度"], text_budget_tokens=40)
+        self.assertEqual(rows[0]["title"], "浓度"); self.assertTrue(all(r["compiled"] for r in rows))
         self.assertIsNone([r for r in rows if r["kind"] == "source"][0].get("text"))                   # source pages only get the overview
         tl = [r for r in rows if r["kind"] == "timeline"][0]
         self.assertTrue(tl.get("text") is None or tl.get("text_truncated") or len(tl["text"]) < 200)   # over budget: lines are trimmed first
@@ -449,10 +449,10 @@ class EvalsetTests(unittest.TestCase):
                         "retrieval_summary": {"rerank": "below_threshold", "rerank_max": 0.02, "low_confidence": True, "evidence_state": "diagnostic",
                                               "no_relevant_content": True, "timings_ms": {"total_ms": 100}}}
             return {"kbs": ["kb_001"], "sources": [{"role": "hit", "point_id": "p2", "doc_id": "d2", "rel_path": "x/d2.pdf", "doc": "d2.pdf", "text": "无关"},
-                                                     {"role": "hit", "point_id": "p1", "doc_id": "d1", "rel_path": "x/d1.pdf", "doc": "d1.pdf", "text": "尿酸 433 umol/L"},
+                                                     {"role": "hit", "point_id": "p1", "doc_id": "d1", "rel_path": "x/d1.pdf", "doc": "d1.pdf", "text": "浓度 433 umol/L"},
                                                      {"role": "neighbor", "point_id": "n1", "doc_id": "d1", "text": "参考范围 208-428"}],
-                    "specs": [{"hint": "李 · 尿酸 = 433"}], "pages": [], "retrieval_summary": {"rerank": "ok", "rerank_max": 0.9, "low_confidence": False, "timings_ms": {"total_ms": 300}}}
-        items = [{"q": "尿酸多少", "gold_point_ids": ["p1"], "gold_docs": ["x/d2.pdf"], "expect": ["433"], "expect_all": ["433", "参考范围"], "min_docs": 2, "tag": "t"},
+                    "specs": [{"hint": "李 · 浓度 = 433"}], "pages": [], "retrieval_summary": {"rerank": "ok", "rerank_max": 0.9, "low_confidence": False, "timings_ms": {"total_ms": 300}}}
+        items = [{"q": "浓度多少", "gold_point_ids": ["p1"], "gold_docs": ["x/d2.pdf"], "expect": ["433"], "expect_all": ["433", "参考范围"], "min_docs": 2, "tag": "t"},
                  {"q": "负例问题", "negative": True, "tag": "neg"},
                  {"q": "报错的题", "gold_point_ids": ["p9"], "tag": "err"}]
 
@@ -590,18 +590,18 @@ class FusionTests(unittest.TestCase):
 
 class ChannelTests(unittest.TestCase):
     def test_bm25_query_boosts_identifiers_as_phrases(self) -> None:
-        body = channels.bm25_query("ZK7C4021KV13 的 tAS 是多少", ["ZK7C4021KV13", "tAS"])
+        body = channels.bm25_query("ZX8D4021KV13 的 tAS 是多少", ["ZX8D4021KV13", "tAS"])
         should = body["bool"]["should"]
         phrases = [s for s in should if s["multi_match"].get("type") == "phrase"]
         self.assertGreaterEqual(len(phrases), 2)
         self.assertTrue(all(s["multi_match"]["boost"] == channels.IDENTIFIER_BOOST for s in phrases))
-        self.assertIn("ZK7C4021KV13", [s["multi_match"]["query"] for s in phrases])
-        self.assertEqual(channels.question_identifiers("VCC 是 3.3 V,型号 ZK7C4021KV13")[:2], ["VCC", "ZK7C4021KV13"])
+        self.assertIn("ZX8D4021KV13", [s["multi_match"]["query"] for s in phrases])
+        self.assertEqual(channels.question_identifiers("VCC 是 3.3 V,型号 ZX8D4021KV13")[:2], ["VCC", "ZX8D4021KV13"])
 
     def test_query_text_instruction_form(self) -> None:
-        self.assertEqual(channels.query_text("尿酸多少", None), "尿酸多少")
-        self.assertEqual(channels.query_text("尿酸多少", "Given a question, retrieve passages that answer it"),
-                         "Instruct: Given a question, retrieve passages that answer it\nQuery: 尿酸多少")
+        self.assertEqual(channels.query_text("浓度多少", None), "浓度多少")
+        self.assertEqual(channels.query_text("浓度多少", "Given a question, retrieve passages that answer it"),
+                         "Instruct: Given a question, retrieve passages that answer it\nQuery: 浓度多少")
 
     def test_hints_parse_and_filters(self) -> None:
         used, ignored = channels.parse_hints({"doc_ids": ["d1", " "], "block_types": "table", "content_version": "v1", "subject": "李", "rel_paths": []})
@@ -690,9 +690,9 @@ class RerankTemplateTests(unittest.TestCase):
         return env.from_string(src).render(messages=[{"role": "query", "content": query}, {"role": "document", "content": document}])
 
     def test_text_reranker_prompt_matches_the_model_card(self) -> None:
-        out = self._render("qwen3_reranker.jinja", "尿酸多少", "尿酸 433 umol/L")
+        out = self._render("qwen3_reranker.jinja", "浓度多少", "浓度 433 umol/L")
         self.assertEqual(out, self.SYSTEM + "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n"
-                         "<Query>: 尿酸多少\n<Document>: 尿酸 433 umol/L<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                         "<Query>: 浓度多少\n<Document>: 浓度 433 umol/L<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
     def test_visual_reranker_prompt_ends_with_the_generation_prefix(self) -> None:
         out = self._render("qwen3_vl_reranker.jinja", "架构图", "一张架构图")
@@ -784,12 +784,12 @@ class _GraphQdrant:
     def query_points(self, collection_name, query, limit, with_payload, query_filter=None, using=None, **kw):
         self.calls.append(f"query:{collection_name}")
         if collection_name.endswith("_entity"):
-            return SimpleNamespace(points=[SimpleNamespace(id="ge1", score=0.8, payload={"gr_id": "e1", "title": "尿酸", "type": "biomarker", "graph_version": "v1"})])
+            return SimpleNamespace(points=[SimpleNamespace(id="ge1", score=0.8, payload={"gr_id": "e1", "title": "浓度", "type": "measurement", "graph_version": "v1"})])
         if collection_name.endswith("_relation"):
-            return SimpleNamespace(points=[SimpleNamespace(id="gr1", score=0.6, payload={"gr_id": "r1", "source": "尿酸", "target": "痛风", "type": "indicates",
+            return SimpleNamespace(points=[SimpleNamespace(id="gr1", score=0.6, payload={"gr_id": "r1", "source": "浓度", "target": "堵塞", "type": "indicates",
                                                                                         "source_id": "e1", "target_id": "e2", "graph_version": "v1"})])
         if collection_name.endswith("_page"):
-            return SimpleNamespace(points=[SimpleNamespace(id="gp1", score=0.3, payload={"gr_id": "pg1", "kind": "timeline", "title": "尿酸 时间线", "text": "2024 433",
+            return SimpleNamespace(points=[SimpleNamespace(id="gp1", score=0.3, payload={"gr_id": "pg1", "kind": "timeline", "title": "浓度 时间线", "text": "2024 433",
                                                                                         "point_ids": [f"s{i}" for i in range(40)] * 2})])
         raise RuntimeError("collection not found")
 
@@ -799,7 +799,7 @@ class _GraphQdrant:
 
     def retrieve(self, collection_name, ids, with_payload, with_vectors, **kw):
         self.calls.append(f"retrieve:{collection_name}")
-        return [SimpleNamespace(id=i, payload={"chunk_uid": f"u{i[1:]}", "rel_path": "a.pdf", "text": "尿酸 433 umol/L", "section_path": ["S"]},
+        return [SimpleNamespace(id=i, payload={"chunk_uid": f"u{i[1:]}", "rel_path": "a.pdf", "text": "浓度 433 umol/L", "section_path": ["S"]},
                                 vector={"text": [1.0, 0.0]}) for i in ids]
 
 
@@ -812,7 +812,7 @@ class GraphRecallTests(unittest.TestCase):
 
         source = SimpleNamespace(kb_id="kb_001", collection="kb_001")
         settings = SimpleNamespace(qdrant_url="http://q", qdrant_api_key=None)
-        return recall.graph_query(settings, source, "尿酸多少", hops=1, chunk_limit=5, candidate_limit=5, vector=[1.0, 0.0], **kw)
+        return recall.graph_query(settings, source, "浓度多少", hops=1, chunk_limit=5, candidate_limit=5, vector=[1.0, 0.0], **kw)
 
     def test_shared_client_and_driver_are_used_and_left_open(self) -> None:
         from kb_pipeline.graph import recall
@@ -897,7 +897,7 @@ class BackendLimitTests(unittest.TestCase):
 
         class Indices:
             def exists(self, index, request_timeout=None): seen.append(("exists", request_timeout)); return True
-            def analyze(self, body, request_timeout=None): seen.append(("analyze", request_timeout)); return {"tokens": [{"token": "尿酸"}]}
+            def analyze(self, body, request_timeout=None): seen.append(("analyze", request_timeout)); return {"tokens": [{"token": "浓度"}]}
 
         class FakeOS:
             indices = Indices()
@@ -905,8 +905,8 @@ class BackendLimitTests(unittest.TestCase):
             def msearch(self, body, request_timeout=None): seen.append(("msearch", request_timeout)); return {"responses": []}
 
         with mock.patch.object(channels, "os_client", return_value=FakeOS()):
-            channels.bm25_channel("http://os", "尿酸", "kb_001", limit=5, timeout=3.5)
-            channels.lexical_profile("http://os", "尿酸", ["kb_001"], timeout=3.5)
+            channels.bm25_channel("http://os", "浓度", "kb_001", limit=5, timeout=3.5)
+            channels.lexical_profile("http://os", "浓度", ["kb_001"], timeout=3.5)
         self.assertEqual(seen, [("exists", 3.5), ("search", 3.5), ("exists", 3.5), ("analyze", 3.5), ("msearch", 3.5)])
 
     def test_qdrant_calls_carry_whole_second_timeouts(self) -> None:
@@ -932,7 +932,7 @@ class BackendLimitTests(unittest.TestCase):
         driver = _GraphDriver()
         source = SimpleNamespace(kb_id="kb_001", collection="kb_001")
         with mock.patch.dict(recall._version_stats, {}, clear=True):
-            recall.graph_query(SimpleNamespace(), source, "尿酸多少", hops=1, chunk_limit=5, vector=[1.0, 0.0], q=_GraphQdrant(), driver=driver, timeout=7)
+            recall.graph_query(SimpleNamespace(), source, "浓度多少", hops=1, chunk_limit=5, vector=[1.0, 0.0], q=_GraphQdrant(), driver=driver, timeout=7)
         timed = [t for text, t, _ in driver.log if "active_graph_version" not in text]
         self.assertGreaterEqual(len(timed), 5); self.assertEqual(set(timed), {7.0})
 
@@ -974,7 +974,7 @@ class CatalogTests(unittest.TestCase):
     def test_lexical_evidence_uses_density_and_cross_library_rarity(self) -> None:
         cols = {"kb_001": "kb_001", "kb_002": "kb_002", "kb_003": "kb_003"}
         profile = {"sizes": {"kb_001": 500, "kb_002": 10000, "kb_003": 200},
-                   "terms": {"尿酸": {"kb_001": 20},                                   # only one KB has it: max weight; kb_001 = 1 after density normalisation
+                   "terms": {"浓度": {"kb_001": 20},                                   # only one KB has it: max weight; kb_001 = 1 after density normalisation
                              "企业": {"kb_001": 2, "kb_002": 3000, "kb_003": 60},      # every KB has it: weight 0
                              "workwidget": {"kb_002": 900, "kb_003": 8},                 # two KBs have it: kb_002 density 0.09 far above kb_003 at 0.04
                              "不存在": {}}}
@@ -1128,19 +1128,19 @@ class OrchestrationTests(unittest.TestCase):
     returning only ids that need backfilling, the visual channel hitting an image chunk; rerank working and
     failing; multi-subject / multi-document quotas, boilerplate downweighting, widening."""
 
-    def _run(self, *, rerank_fn=None, kbs=None, settings_over=None, question="我的尿酸多少", graph_entities=None, extra_vec=None, extra_bm25=None,
+    def _run(self, *, rerank_fn=None, kbs=None, settings_over=None, question="我的浓度多少", graph_entities=None, extra_vec=None, extra_bm25=None,
              image=None, visual_fn=None, vec_delay=None, graph_specs=None, hints=None, graph_delay=None, broken=(),
              visual_query_fn=None, entries=None, graph_relations=None, graph_pages=None, hoods=None, history=False, as_of=None,
              doc_dates=None):
-        docs = {"p1": _payload("p1", "d1", 2, "尿酸 433 umol/L,参考范围 208-428。" * 12),
-                "p2": _payload("p2", "d1", 3, "甘油三酯 1.7 mmol/L。" * 20),
-                "p3": _payload("p3", "d2", 0, "封装类型 361-ball FCBGA。" * 15, visual_ref="parse/x.jpg", visual_summary="图", visual_value_conflicts=[{"a": 1}], visual_confidence="high"),
-                "p4": _payload("p4", "d2", 1, "血糖 5.3 mmol/L,空腹。" * 15),
+        docs = {"p1": _payload("p1", "d1", 2, "浓度 433 umol/L,参考范围 208-428。" * 12),
+                "p2": _payload("p2", "d1", 3, "添加剂量 1.7 mmol/L。" * 20),
+                "p3": _payload("p3", "d2", 0, "封装类型 256-pin EXBOX。" * 15, visual_ref="parse/x.jpg", visual_summary="图", visual_value_conflicts=[{"a": 1}], visual_confidence="high"),
+                "p4": _payload("p4", "d2", 1, "液温 5.3 mmol/L,静置。" * 15),
                 "p5": _payload("p5", "d1", 0, "第一章 …… 1;第二章 …… 5" * 10, section_path=["目录"]),
-                "n1": _payload("n1", "d1", 1, "血常规检查结果如下。"), "n3": _payload("n3", "d1", 4, "尿常规正常。"),
+                "n1": _payload("n1", "d1", 1, "常规检测检查结果如下。"), "n3": _payload("n3", "d1", 4, "密封检测正常。"),
                 "p9": _payload("p9", "d9", 0, "产品部署手册:安装步骤。" * 20),
                 "p8": _payload("p8", "d8", 0, "架构图。", visual_ref="parse/y.jpg", visual_summary="架构图", visual_confidence="high")}
-        src = SimpleNamespace(kb_id="kb_001", collection="kb_001", source_root="health-samples", graph_language="Chinese", graph_entity_types=[], graph_profile={})
+        src = SimpleNamespace(kb_id="kb_001", collection="kb_001", source_root="synthetic-alpha", graph_language="Chinese", graph_entity_types=[], graph_profile={})
         src2 = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="Catalog Library", graph_language="Chinese", graph_entity_types=[], graph_profile={})
         settings = SimpleNamespace(sources={"kb_001": src, "kb_002": src2}, opensearch_url="http://os", reranker_base_url="http://rr/v1",
                                    embedding_base_url="", embedding_api_key="", embedding_model_id="", embedding_dim=2, qdrant_url="", qdrant_api_key=None,
@@ -1149,14 +1149,14 @@ class OrchestrationTests(unittest.TestCase):
         ss = _settings(**(settings_over or {}))
         entries = entries or [{"kb_id": "kb_001", "has_graph": True}, {"kb_id": "kb_002", "has_graph": False}]
         calls = {"rerank_docs": [], "rerank_calls": [], "graph": [], "visual_query": 0}
-        ents = graph_entities if graph_entities is not None else [{"title": "尿酸", "type": "biomarker", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d1.pdf"]}]
+        ents = graph_entities if graph_entities is not None else [{"title": "浓度", "type": "measurement", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d1.pdf"]}]
 
         def fake_rerank(self, query, documents):
             calls["rerank_docs"] = list(documents)
             calls["rerank_calls"].append(list(documents))
             if rerank_fn:
                 return rerank_fn(documents)
-            return [0.9 if "尿酸 433" in d else (0.5 if "甘油" in d else (0.3 if "血糖" in d else 0.1)) for d in documents]
+            return [0.9 if "浓度 433" in d else (0.5 if "添加剂" in d else (0.3 if "液温" in d else 0.1)) for d in documents]
 
         def fake_graph(settings, source, question, *, limit, hops, vector=None, lexical_only=False, **kw):
             calls["graph"].append(source.kb_id)
@@ -1164,10 +1164,10 @@ class OrchestrationTests(unittest.TestCase):
             if graph_delay:
                 import time as _t
                 _t.sleep(graph_delay)
-            return {"chunks": [{"point_id": "p1", "score": 0.4, "rel_path": "dir/d1.pdf", "entities": ["尿酸"], "relations": []}], "entities": ents,
+            return {"chunks": [{"point_id": "p1", "score": 0.4, "rel_path": "dir/d1.pdf", "entities": ["浓度"], "relations": []}], "entities": ents,
                     "relations": graph_relations or [],
-                    "specs": graph_specs if graph_specs is not None else [{"id": "s1", "subject": "李", "property": "尿酸", "value": "433", "score": 0.9, "point_ids": ["p1"]}],
-                    "pages": graph_pages if graph_pages is not None else [{"kind": "subject", "title": "尿酸", "score": 0.8, "summary": "主体页", "text": "尿酸 时间线 433", "series": ["x"], "point_ids": ["p1"]}],
+                    "specs": graph_specs if graph_specs is not None else [{"id": "s1", "subject": "李", "property": "浓度", "value": "433", "score": 0.9, "point_ids": ["p1"]}],
+                    "pages": graph_pages if graph_pages is not None else [{"kind": "subject", "title": "浓度", "score": 0.8, "summary": "主体页", "text": "浓度 时间线 433", "series": ["x"], "point_ids": ["p1"]}],
                     "graph_version": "001-v", "seeds": {"entities": 1}}
 
         def fake_visual_query(settings, *, text=None, image_bytes=None, timeout=20.0):
@@ -1188,7 +1188,7 @@ class OrchestrationTests(unittest.TestCase):
         def fake_profile(url, question, collections, **kw):
             if "profile" in broken:
                 raise RuntimeError("opensearch timed out")
-            return {"sizes": {"kb_001": 5, "kb_002": 1}, "terms": {"尿酸": {"kb_001": 2}}}
+            return {"sizes": {"kb_001": 5, "kb_002": 1}, "terms": {"浓度": {"kb_001": 2}}}
 
         def fake_meta(q, c, ids, **kw):
             if "meta" in broken:
@@ -1257,7 +1257,7 @@ class OrchestrationTests(unittest.TestCase):
     def test_search_facts_carry_the_chunks_they_rest_on(self) -> None:
         """Facts of /search carry their source chunks: locators enough for /context, the chunk that holds the value first
         when that can be told; a failed lookup is only a degraded note and the facts are returned all the same."""
-        specs = [{"id": "s1", "subject": "李", "property": "尿酸", "value": "433", "score": 0.9, "point_ids": ["p1"]},
+        specs = [{"id": "s1", "subject": "李", "property": "浓度", "value": "433", "score": 0.9, "point_ids": ["p1"]},
                  {"id": "s2", "subject": "系统", "property": "结构", "value": "架构图", "score": 0.8, "point_ids": ["p1", "p8"]}]
         out, calls = self._run(graph_specs=specs)
         by = {sp["id"]: sp for sp in out["specs"]}
@@ -1277,14 +1277,14 @@ class OrchestrationTests(unittest.TestCase):
         """A search carries the one-hop neighbourhood of its subjects: the caller reads it and decides whether to call the
         neighbours endpoint and walk on. These are leads that come along: switching them off, a scoped query or a failure
         to fetch them leaves the search itself untouched."""
-        block = {"kb_id": "kb_001", "id": "e1", "title": "尿酸", "type": "biomarker", "named": True, "relations": 3, "facts": 2,
+        block = {"kb_id": "kb_001", "id": "e1", "title": "浓度", "type": "measurement", "named": True, "relations": 3, "facts": 2,
                  "predicates": [{"type": "measured_in", "count": 3}],
                  "neighbors": [{"relation_id": "r1", "type": "measured_in", "direction": "out", "directed": True, "weight": 2.0,
-                                "other": {"id": "e2", "title": "血液", "type": "specimen", "degree": 9}}]}
+                                "other": {"id": "e2", "title": "试液", "type": "specimen", "degree": 9}}]}
         out, calls = self._run(hoods=[block])
         self.assertEqual(out["neighborhoods"], [{"n": 1, **block}])
         self.assertEqual((calls["hoods"]["kbs"], calls["hoods"]["seeds"], calls["hoods"]["graph_versions"], calls["hoods"]["limit"]),
-                         (["kb_001"], ["尿酸"], {"kb_001": "001-v"}, 4))                             # only knowledge bases with a graph; the graph route's entity rows are the seeds that fill up
+                         (["kb_001"], ["浓度"], {"kb_001": "001-v"}, 4))                             # only knowledge bases with a graph; the graph route's entity rows are the seeds that fill up
         self.assertLessEqual(calls["hoods"]["timeout"], service.NEIGHBORHOOD_TIMEOUT)               # a slow graph database does not hold the request up
         self.assertIn("neighborhood_ms", out["retrieval_summary"]["timings_ms"]); self.assertEqual(out["retrieval_summary"]["degraded"], [])
         off, calls_off = self._run(hoods=[block], settings_over={"neighborhoods": 0})
@@ -1322,9 +1322,9 @@ class OrchestrationTests(unittest.TestCase):
         hits = [r for r in out["sources"] if r["role"] == "hit"]
         self.assertEqual([h["point_id"] for h in hits], ["p1", "p2", "p3"])                       # the rerank score decides the order
         self.assertEqual(hits[0]["scores"], {"score_text": 0.8, "score_bm25": 7.0, "score_graph": 0.4, "score_rerank": 0.9, "score_final": 0.9})
-        self.assertEqual(hits[0]["recall_sources"], ["text", "bm25", "graph"]); self.assertEqual(hits[0]["entities"], ["尿酸"])
+        self.assertEqual(hits[0]["recall_sources"], ["text", "bm25", "graph"]); self.assertEqual(hits[0]["entities"], ["浓度"])
         self.assertEqual(hits[2]["recall_sources"], ["text", "visual"])                            # RRF of the visual and text channels
-        self.assertEqual(hits[1]["scores"]["score_bm25"], 9.0); self.assertIn("甘油三酯 1.7 mmol/L。", hits[1]["text"])   # the id-only hit got its text backfilled
+        self.assertEqual(hits[1]["scores"]["score_bm25"], 9.0); self.assertIn("添加剂量 1.7 mmol/L。", hits[1]["text"])   # the id-only hit got its text backfilled
         # the short chunk was stitched with its neighbours; the next short hit in the same document finds them taken and
         # stays as it is, so each neighbour is printed once
         self.assertEqual([pc["point_id"] for pc in hits[0]["stitched"]["pieces"]], ["n1", "p1", "n3"]); self.assertEqual(hits[0]["stitched"]["own_chars"], 324)
@@ -1335,10 +1335,10 @@ class OrchestrationTests(unittest.TestCase):
         nbs = [r for r in out["sources"] if r["role"] == "neighbor"]
         self.assertTrue(all(r["doc_id"] in ("d1", "d2") for r in nbs)); self.assertGreaterEqual(s["sources"]["stitched"], 2)   # short chunks stitched their neighbours in
         self.assertEqual(hits[2]["visual"]["value_conflicts"], 1); self.assertIn("conflicts", hits[2]["visual"]["note"])
-        self.assertEqual(out["specs"][0]["n"], 1); self.assertEqual(out["specs"][0]["hint"], "李 · 尿酸 = 433"); self.assertEqual(out["specs"][0]["sources"], [1])
-        self.assertEqual((out["specs"][0]["verified"], out["specs"][0]["id"]), (True, "s1")); self.assertEqual(s["evidence_state"], "accepted")
+        self.assertEqual(out["specs"][0]["n"], 1); self.assertEqual(out["specs"][0]["hint"], "李 · 浓度 = 433"); self.assertEqual(out["specs"][0]["sources"], [1])
+        self.assertEqual((out["specs"][0]["source_valid"], out["specs"][0]["id"]), (True, "s1")); self.assertEqual(s["evidence_state"], "accepted")
         self.assertTrue(all(h["accepted"] for h in hits)); self.assertFalse(s["no_relevant_content"]); self.assertEqual(s["graph_versions"], {"kb_001": "001-v"})
-        self.assertEqual(out["entities"][0]["title"], "尿酸"); self.assertTrue(out["pages"][0]["compiled"]); self.assertEqual(out["pages"][0]["text"], "尿酸 时间线 433")
+        self.assertEqual(out["entities"][0]["title"], "浓度"); self.assertTrue(out["pages"][0]["compiled"]); self.assertEqual(out["pages"][0]["text"], "浓度 时间线 433")
         self.assertEqual(out["doc_aggs"][0]["doc"], "d1.pdf"); self.assertEqual(out["doc_aggs"][0]["hits"], 2)
         self.assertTrue(all("|" not in d for d in calls["rerank_docs"]))
         self.assertIn("avg_redundancy", s["selection"]); self.assertEqual(s["downweighted"], {"boilerplate": 0, "visual_low": 0, "hinted_blocks": 0})
@@ -1360,7 +1360,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual((r["mode"], r["probed"], out["kbs"]), ("auto", ["kb_001", "kb_002"], ["kb_001"]))
         self.assertEqual(r["scores"]["kb_001"], {"vec": 0.7, "lex": 1.0, "score": 1.0})           # both KBs probed; the one with weak evidence loses
         self.assertEqual(r["scores"]["kb_002"]["lex"], 0.0); self.assertLess(r["scores"]["kb_002"]["score"], 0.8)
-        self.assertEqual(r["terms"], ["尿酸"])
+        self.assertEqual(r["terms"], ["浓度"])
         self.assertFalse(r["widened"]); self.assertEqual(calls["graph"], ["kb_001"])                  # the graph channel only runs on the chosen KB
         self.assertNotIn("kb_002", out["retrieval_summary"]["channels"])
 
@@ -1400,46 +1400,46 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(p8["accepted"]); self.assertGreaterEqual(s["selection"]["priority_filled"], 1)
 
     def test_lexical_tiebreak_in_final_score(self) -> None:
-        out, _ = self._run(kbs=["kb_001"], question="尿酸 433 参考范围", settings_over={"final_lex_weight": 0.2, "top_k": 3})
+        out, _ = self._run(kbs=["kb_001"], question="浓度 433 参考范围", settings_over={"final_lex_weight": 0.2, "top_k": 3})
         hits = [r for r in out["sources"] if r["role"] == "hit"]
         p1 = next(r for r in hits if r["point_id"] == "p1")
         self.assertIn("score_lex", p1["scores"]); self.assertGreater(p1["scores"]["score_lex"], 0.5)
         self.assertAlmostEqual(p1["scores"]["score_final"], round(0.8 * 0.9 + 0.2 * p1["scores"]["score_lex"], 4), places=3)
 
-    def test_stale_graph_sources_are_marked_unverified(self) -> None:
-        specs = [{"id": "s1", "subject": "李", "property": "尿酸", "value": "433", "score": 0.9, "point_ids": ["p1"]},
-                 {"id": "s2", "subject": "李", "property": "肌酐", "value": "78", "score": 0.8, "point_ids": ["gone"]}]
+    def test_stale_graph_sources_are_marked_unsource_valid(self) -> None:
+        specs = [{"id": "s1", "subject": "李", "property": "浓度", "value": "433", "score": 0.9, "point_ids": ["p1"]},
+                 {"id": "s2", "subject": "李", "property": "黏度", "value": "78", "score": 0.8, "point_ids": ["gone"]}]
         out, _ = self._run(kbs=["kb_001"], graph_specs=specs)
         by = {sp["id"]: sp for sp in out["specs"]}
-        self.assertEqual((by["s1"]["verified"], by["s2"]["verified"], by["s2"]["sources_active"]), (True, False, "0/1"))
+        self.assertEqual((by["s1"]["source_valid"], by["s2"]["source_valid"], by["s2"]["sources_active"]), (True, False, "0/1"))
         self.assertIsNone(by["s2"].get("hint")); self.assertIn("verify_ms", out["retrieval_summary"]["timings_ms"])
 
     def test_entities_relations_and_pages_from_deleted_documents_are_marked(self) -> None:
-        ents = [{"id": "e1", "title": "尿酸", "type": "biomarker", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d1.pdf"], "point_ids": ["p1", "gone"]},
+        ents = [{"id": "e1", "title": "浓度", "type": "measurement", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d1.pdf"], "point_ids": ["p1", "gone"]},
                 {"id": "e2", "title": "旧套餐", "type": "product", "score": 0.6, "hop": 0, "via": "vector", "docs": ["dir/deleted.xlsx"], "point_ids": ["gone", "gone2"]},
-                {"id": "e3", "title": "痛风", "type": "disease", "score": 0.5, "hop": 1, "via": "expand", "docs": [], "point_ids": []}]
-        rels = [{"id": "r1", "source": "尿酸", "type": "indicates", "target": "痛风", "score": 0.6, "hop": 0, "via": "vector", "point_ids": ["p2"]},
+                {"id": "e3", "title": "堵塞", "type": "fault", "score": 0.5, "hop": 1, "via": "expand", "docs": [], "point_ids": []}]
+        rels = [{"id": "r1", "source": "浓度", "type": "indicates", "target": "堵塞", "score": 0.6, "hop": 0, "via": "vector", "point_ids": ["p2"]},
                 {"id": "r2", "source": "旧套餐", "type": "includes", "target": "权益", "score": 0.5, "hop": 0, "via": "vector", "point_ids": ["gone"]}]
         pages = [{"id": "pg1", "kind": "timeline", "title": "旧套餐 时间线", "score": 0.9, "summary": "概述", "text": "旧套餐 2024 99 元", "series": ["x"], "point_ids": ["gone"]},
-                 {"id": "pg2", "kind": "timeline", "title": "尿酸 时间线", "score": 0.8, "summary": "概述", "text": "尿酸 2024 433", "series": ["x"], "point_ids": ["p1"]}]
+                 {"id": "pg2", "kind": "timeline", "title": "浓度 时间线", "score": 0.8, "summary": "概述", "text": "浓度 2024 433", "series": ["x"], "point_ids": ["p1"]}]
         out, _ = self._run(kbs=["kb_001"], graph_entities=ents, graph_relations=rels, graph_pages=pages)
         e = {r["id"]: r for r in out["entities"]}; r = {x["id"]: x for x in out["relationships"]}; pg = {x["id"]: x for x in out["pages"]}
-        self.assertEqual((e["e1"]["verified"], e["e1"]["sources_active"]), (True, "1/2"))
-        self.assertEqual((e["e2"]["verified"], e["e2"]["sources_active"]), (False, "0/2"))          # only from deleted documents: marked, not a current basis
-        self.assertNotIn("verified", e["e3"]); self.assertNotIn("point_ids", e["e1"])                # rows without source point information are not marked
-        self.assertEqual((r["r1"]["verified"], r["r2"]["verified"], r["r2"]["sources_active"]), (True, False, "0/1"))
-        self.assertEqual((pg["pg1"]["verified"], pg["pg1"].get("text"), pg["pg1"]["summary"]), (False, None, "概述"))   # a page whose sources are gone gets no body text
-        self.assertEqual((pg["pg2"]["verified"], pg["pg2"]["text"]), (True, "尿酸 2024 433"))
+        self.assertEqual((e["e1"]["source_valid"], e["e1"]["sources_active"]), (True, "1/2"))
+        self.assertEqual((e["e2"]["source_valid"], e["e2"]["sources_active"]), (False, "0/2"))          # only from deleted documents: marked, not a current basis
+        self.assertNotIn("source_valid", e["e3"]); self.assertNotIn("point_ids", e["e1"])                # rows without source point information are not marked
+        self.assertEqual((r["r1"]["source_valid"], r["r2"]["source_valid"], r["r2"]["sources_active"]), (True, False, "0/1"))
+        self.assertEqual((pg["pg1"]["source_valid"], pg["pg1"].get("text"), pg["pg1"]["summary"]), (False, None, "概述"))   # a page whose sources are gone gets no body text
+        self.assertEqual((pg["pg2"]["source_valid"], pg["pg2"]["text"]), (True, "浓度 2024 433"))
 
     def test_source_check_failure_leaves_derived_evidence_unmarked(self) -> None:
-        ents = [{"id": "e1", "title": "尿酸", "type": "biomarker", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d9.pdf"], "point_ids": ["x1"]}]
-        specs = [{"id": "s1", "subject": "李", "property": "肌酐", "value": "78", "score": 0.9, "point_ids": ["x2"]}]
-        pages = [{"id": "pg1", "kind": "timeline", "title": "肌酐 时间线", "score": 0.9, "summary": "概述", "text": "肌酐 2024 78", "series": ["x"], "point_ids": ["x3"]}]
+        ents = [{"id": "e1", "title": "浓度", "type": "measurement", "score": 0.7, "hop": 0, "via": "lexical", "docs": ["dir/d9.pdf"], "point_ids": ["x1"]}]
+        specs = [{"id": "s1", "subject": "李", "property": "黏度", "value": "78", "score": 0.9, "point_ids": ["x2"]}]
+        pages = [{"id": "pg1", "kind": "timeline", "title": "黏度 时间线", "score": 0.9, "summary": "概述", "text": "黏度 2024 78", "series": ["x"], "point_ids": ["x3"]}]
         out, _ = self._run(kbs=["kb_001"], graph_entities=ents, graph_specs=specs, graph_pages=pages, broken=("meta",))
         self.assertIn("kb_001:point_meta: RuntimeError", out["retrieval_summary"]["degraded"])
-        self.assertNotIn("verified", out["entities"][0])                                              # not checked means "unknown", not "no longer valid"
-        self.assertNotIn("verified", out["specs"][0]); self.assertEqual(out["specs"][0]["hint"], "李 · 肌酐 = 78")
-        self.assertNotIn("verified", out["pages"][0]); self.assertEqual(out["pages"][0]["text"], "肌酐 2024 78")
+        self.assertNotIn("source_valid", out["entities"][0])                                              # not checked means "unknown", not "no longer valid"
+        self.assertNotIn("source_valid", out["specs"][0]); self.assertEqual(out["specs"][0]["hint"], "李 · 黏度 = 78")
+        self.assertNotIn("source_valid", out["pages"][0]); self.assertEqual(out["pages"][0]["text"], "黏度 2024 78")
 
     def test_slow_channel_is_dropped_at_the_deadline(self) -> None:
         import time as _t
@@ -1522,16 +1522,16 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(hits, ["p1", "p3"]); self.assertTrue(s["low_confidence"])                # p2 carries only an id and its text cannot be fetched; the rest as usual
 
     def test_subject_buckets_guarantee_each_subject_a_slot(self) -> None:
-        ents = [{"title": "尿酸", "type": "biomarker", "score": 0.7, "hop": 0, "via": "lexical"}, {"title": "血糖", "type": "biomarker", "score": 0.6, "hop": 0, "via": "vector"},
-                {"title": "肌酐", "type": "biomarker", "score": 0.2, "hop": 1, "via": "expand"}, {"title": "空腹血糖", "type": "biomarker", "score": 0.5, "hop": 0, "via": "vector"}]
-        out, _ = self._run(kbs=["kb_001"], question="尿酸和血糖分别是多少", graph_entities=ents,
+        ents = [{"title": "浓度", "type": "measurement", "score": 0.7, "hop": 0, "via": "lexical"}, {"title": "液温", "type": "measurement", "score": 0.6, "hop": 0, "via": "vector"},
+                {"title": "黏度", "type": "measurement", "score": 0.2, "hop": 1, "via": "expand"}, {"title": "静置液温", "type": "measurement", "score": 0.5, "hop": 0, "via": "vector"}]
+        out, _ = self._run(kbs=["kb_001"], question="浓度和液温分别是多少", graph_entities=ents,
                            extra_vec=[{"point_id": "p4", "score": 0.2, "payload": None}], settings_over={"top_k": 3})
         s = out["retrieval_summary"]
-        self.assertEqual(s["buckets"], {"mode": "subject", "keys": ["尿酸", "血糖"]})                      # entities from 2-hop expansion or absent from the question are not subjects
+        self.assertEqual(s["buckets"], {"mode": "subject", "keys": ["浓度", "液温"]})                      # entities from 2-hop expansion or absent from the question are not subjects
         hits = [r["point_id"] for r in out["sources"] if r["role"] == "hit"]
-        self.assertIn("p4", hits); self.assertEqual(hits[0], "p1"); self.assertEqual(s["selection"]["quota_filled"], {"尿酸": 1, "血糖": 1})
-        self.assertEqual(next(r for r in out["sources"] if r["point_id"] == "p4")["bucket"], "血糖")
-        self.assertEqual(out["pages"][0]["title"], "尿酸")
+        self.assertIn("p4", hits); self.assertEqual(hits[0], "p1"); self.assertEqual(s["selection"]["quota_filled"], {"浓度": 1, "液温": 1})
+        self.assertEqual(next(r for r in out["sources"] if r["point_id"] == "p4")["bucket"], "液温")
+        self.assertEqual(out["pages"][0]["title"], "浓度")
 
     def test_doc_buckets_for_cross_document_questions(self) -> None:
         out, _ = self._run(kbs=["kb_001"], question="两份报告分别怎么说", settings_over={"top_k": 2, "quota_min_hits": 1})
@@ -1556,15 +1556,15 @@ class OrchestrationTests(unittest.TestCase):
 
     def _run_with_embed_error(self):
         calls = {"graph": [], "lexical_only": None}
-        docs = {"p1": _payload("p1", "d1", 2, "尿酸 433 umol/L。" * 20), "p2": _payload("p2", "d1", 3, "甘油三酯 1.7 mmol/L。" * 20)}
-        src = SimpleNamespace(kb_id="kb_001", collection="kb_001", source_root="health-samples", graph_language="Chinese", graph_entity_types=[], graph_profile={})
+        docs = {"p1": _payload("p1", "d1", 2, "浓度 433 umol/L。" * 20), "p2": _payload("p2", "d1", 3, "添加剂量 1.7 mmol/L。" * 20)}
+        src = SimpleNamespace(kb_id="kb_001", collection="kb_001", source_root="synthetic-alpha", graph_language="Chinese", graph_entity_types=[], graph_profile={})
         settings = SimpleNamespace(sources={"kb_001": src}, opensearch_url="http://os", reranker_base_url="http://rr/v1", embedding_base_url="", embedding_api_key="",
                                    embedding_model_id="", embedding_dim=2, qdrant_url="", qdrant_api_key=None, state_db=":memory:", visual_embedding_enabled=False)
         ss = _settings(visual_enabled=False)
 
         def fake_graph(settings, source, question, *, limit, hops, vector=None, lexical_only=False, **kw):
             calls["graph"].append(source.kb_id); calls["lexical_only"] = lexical_only
-            return {"chunks": [{"point_id": "p1", "score": 0.4, "entities": ["尿酸"], "relations": []}], "entities": [], "relations": [], "specs": [], "pages": [], "graph_version": "v"}
+            return {"chunks": [{"point_id": "p1", "score": 0.4, "entities": ["浓度"], "relations": []}], "entities": [], "relations": [], "specs": [], "pages": [], "graph_version": "v"}
 
         with mock.patch.object(service, "runtime", return_value=(settings, ss, object())), \
                 mock.patch.object(catalog_mod, "get_catalog", return_value=[{"kb_id": "kb_001", "has_graph": True}]), \
@@ -1579,7 +1579,7 @@ class OrchestrationTests(unittest.TestCase):
                 mock.patch.object(graphwalk, "neighborhoods", return_value=[]), \
                 mock.patch.object(graphwalk, "point_payloads", return_value={}), \
                 mock.patch.object(Reranker, "score", lambda self, query, documents: [0.8] * len(documents)):
-            out = service.search("尿酸多少", kbs=["kb_001"])
+            out = service.search("浓度多少", kbs=["kb_001"])
         return out, calls
 
 
@@ -1604,8 +1604,8 @@ class GraphWalkTests(unittest.TestCase):
 
     ENTITIES = [
         {"id": "e1", "title": "ZK200", "type": "product", "aliases": ["ZK 200 Pro"], "degree": 50},
-        {"id": "e2", "title": "Northwind Gateway", "type": "product", "aliases": ["Gateway"], "degree": 30},
-        {"id": "e3", "title": "Northwind", "type": "vendor", "aliases": [], "degree": 99},
+        {"id": "e2", "title": "Example Gateway", "type": "product", "aliases": ["Gateway"], "degree": 30},
+        {"id": "e3", "title": "Example", "type": "vendor", "aliases": [], "degree": 99},
         {"id": "e4", "title": "网关", "type": "module", "aliases": [], "degree": 7},
         {"id": "e5", "title": "网关", "type": "module", "aliases": [], "degree": 70},
         {"id": "e6", "title": "AI", "type": "capability", "aliases": [], "degree": 5},
@@ -1701,18 +1701,18 @@ class GraphWalkTests(unittest.TestCase):
         self.assertEqual(again[1]["evidence"], [{"point_id": "p5"}, {"point_id": "p6"}])
 
     def test_excerpt_takes_the_sentences_that_name_the_other_end(self) -> None:
-        sentence = "ZK200 通过 Northwind 网关接入,延迟低于 5 ms。"
+        sentence = "ZK200 通过 Example 网关接入,延迟低于 5 ms。"
         text = "前言。" * 40 + sentence + "后记。" * 100
-        body, match = graphwalk.excerpt_of(text, ["Northwind 网关", "NW-GW"], ["ZK200"])
+        body, match = graphwalk.excerpt_of(text, ["Example 网关", "NW-GW"], ["ZK200"])
         self.assertEqual(match, "both")
         self.assertTrue(body.startswith(sentence)); self.assertTrue(body.endswith("后记。")); self.assertNotIn("…", body)   # from the start of a sentence to the end of one
         self.assertLessEqual(len(body), graphwalk.EXCERPT_CHARS)
-        self.assertEqual(graphwalk.excerpt_of("Northwind 网关支持双机热备。", ["Northwind 网关"], ["ZK200"]), ("Northwind 网关支持双机热备。", "other"))
-        self.assertEqual(graphwalk.excerpt_of("ZK200 的外壳\n是铝合金。", ["Northwind 网关"], ["ZK200"]), ("ZK200 的外壳 是铝合金。", "center"))   # a line break becomes a space
+        self.assertEqual(graphwalk.excerpt_of("Example 网关支持双机热备。", ["Example 网关"], ["ZK200"]), ("Example 网关支持双机热备。", "other"))
+        self.assertEqual(graphwalk.excerpt_of("ZK200 的外壳\n是铝合金。", ["Example 网关"], ["ZK200"]), ("ZK200 的外壳 是铝合金。", "center"))   # a line break becomes a space
         # no sentence boundary on either side: the cut sides get an ellipsis
-        body, match = graphwalk.excerpt_of("甲" * 300 + "Northwind 网关" + "乙" * 300, ["Northwind 网关"], [])
-        self.assertEqual(match, "other"); self.assertTrue(body.startswith("…甲") and body.endswith("乙…")); self.assertIn("Northwind 网关", body)
-        self.assertEqual(graphwalk.excerpt_of("丙" * 500, ["Northwind 网关"], ["ZK200"]), ("丙" * graphwalk.EXCERPT_CHARS + "…", "none"))   # neither found: the head of the chunk
+        body, match = graphwalk.excerpt_of("甲" * 300 + "Example 网关" + "乙" * 300, ["Example 网关"], [])
+        self.assertEqual(match, "other"); self.assertTrue(body.startswith("…甲") and body.endswith("乙…")); self.assertIn("Example 网关", body)
+        self.assertEqual(graphwalk.excerpt_of("丙" * 500, ["Example 网关"], ["ZK200"]), ("丙" * graphwalk.EXCERPT_CHARS + "…", "none"))   # neither found: the head of the chunk
         # a name of letters / digits does not match inside a longer word; for a name written with spaces the spelling without them counts
         self.assertEqual(graphwalk.excerpt_of("FAIL 指示灯亮起表示故障。AI 模块负责推理。", ["AI"], []), ("AI 模块负责推理。", "other"))
         self.assertEqual(graphwalk.excerpt_of("ZK200 支持热插拔。", ["ZK 200"], [])[1], "other")
@@ -1721,17 +1721,17 @@ class GraphWalkTests(unittest.TestCase):
         self.assertEqual(graphwalk.excerpt_of(far, ["网关"], ["ZK200"]), ("ZK200 内置网关,支持冗余。", "both"))
 
     def test_excerpt_prefers_document_text_over_picture_descriptions(self) -> None:
-        payloads = {"a": {"is_active": True, "rel_path": "x.pdf", "text": "FACTS: ZK200 与 Northwind 网关的连接示意图。", "visual_ref": "parse/a.jpg", "block_type": "image"},
-                    "b": {"is_active": True, "rel_path": "x.pdf", "text": "Northwind 网关支持双机热备。", "block_type": "text"},
+        payloads = {"a": {"is_active": True, "rel_path": "x.pdf", "text": "FACTS: ZK200 与 Example 网关的连接示意图。", "visual_ref": "parse/a.jpg", "block_type": "image"},
+                    "b": {"is_active": True, "rel_path": "x.pdf", "text": "Example 网关支持双机热备。", "block_type": "text"},
                     "c": {"is_active": True, "rel_path": "x.pdf", "text": "ZK200 的外壳是铝合金。", "block_type": "text"},
-                    "d": {"is_active": False, "rel_path": "old.pdf", "text": "ZK200 通过 Northwind 网关接入。", "block_type": "text"}}
+                    "d": {"is_active": False, "rel_path": "old.pdf", "text": "ZK200 通过 Example 网关接入。", "block_type": "text"}}
 
         class Q:
             def retrieve(self, collection_name, ids, with_payload, with_vectors):
                 return [SimpleNamespace(id=i, payload=payloads[i]) for i in ids if i in payloads]
 
         def pick(*points):
-            rows = [{"relation_id": "r1", "_names": ["Northwind 网关"], "evidence": [{"point_id": p} for p in points]}]
+            rows = [{"relation_id": "r1", "_names": ["Example 网关"], "evidence": [{"point_id": p} for p in points]}]
             graphwalk.backfill_evidence(Q(), "kb_005", rows, anchors=["ZK200"])
             first = rows[0]["evidence"][0]
             return first["point_id"], first.get("excerpt_match"), first.get("visual", False)
@@ -1742,7 +1742,7 @@ class GraphWalkTests(unittest.TestCase):
         self.assertEqual(pick("c", "a"), ("a", "both", True))
         self.assertEqual(pick("c"), ("c", "center", False))
         self.assertEqual(pick("d", "c"), ("c", "center", False))                    # deactivated evidence is not excerpted
-        rows = [{"relation_id": "r1", "_names": ["Northwind 网关"], "evidence": [{"point_id": "b"}]}]
+        rows = [{"relation_id": "r1", "_names": ["Example 网关"], "evidence": [{"point_id": "b"}]}]
         graphwalk.backfill_evidence(Q(), "kb_005", rows)                           # no excerpt wanted (the facts route): the text is not fetched
         self.assertNotIn("excerpt", rows[0]["evidence"][0])
 
@@ -1750,8 +1750,8 @@ class GraphWalkTests(unittest.TestCase):
         log: list = []
         with self._driver(log).session() as session:
             index = graphwalk.name_index(session, "kb_005", "v1")
-        named = graphwalk.named_entities("zk200 和 northwind gateway 的网关延迟对比,FAIL 时怎么热备份", index)
-        # case and spaces are ignored; names covered by a longer one (Northwind, Gateway) do not count; AI does not match inside FAIL;
+        named = graphwalk.named_entities("zk200 和 example gateway 的网关延迟对比,FAIL 时怎么热备份", index)
+        # case and spaces are ignored; names covered by a longer one (Example, Gateway) do not count; AI does not match inside FAIL;
         # of same-named entities the one with more relations is taken (e5); names with letters or digits, or of four characters and
         # more, come first, three-character ones next, two-character words without letters last
         self.assertEqual([(e["id"], e["_rank"]) for e in named], [("e1", 2), ("e2", 2), ("e8", 1), ("e5", 0), ("e7", 0)])
@@ -1766,11 +1766,11 @@ class GraphWalkTests(unittest.TestCase):
         log: list = []
         sources = {"kb_005": SimpleNamespace(kb_id="kb_005", collection="kb_005")}
         seed = lambda eid, title, score: {"kb_id": "kb_005", "id": eid, "title": title, "score": score}
-        seeds = [seed("e3", "Northwind", 0.9), seed("e1", "ZK200", 0.8), seed("zz", "not in the graph", 0.7)]
+        seeds = [seed("e3", "Example", 0.9), seed("e1", "ZK200", 0.8), seed("zz", "not in the graph", 0.7)]
         run = lambda question, seeds, gv="v1", limit=3: graphwalk.neighborhoods(SimpleNamespace(), sources, {"kb_005": gv}, question, seeds, limit=limit,
                                                                                 driver=self._driver(log))
-        out = run("zk200 和 northwind gateway 对比", seeds)
-        # the two the question names come first (Northwind, the best-scoring graph route seed, does not get ahead of them); a seed
+        out = run("zk200 和 example gateway 对比", seeds)
+        # the two the question names come first (Example, the best-scoring graph route seed, does not get ahead of them); a seed
         # used to fill up that is connected to nothing takes no slot
         self.assertEqual([(b["kb_id"], b["id"], b["named"], b["relations"], b["facts"]) for b in out],
                          [("kb_005", "e1", True, 3, 12), ("kb_005", "e2", True, 0, 0)])
@@ -1788,7 +1788,7 @@ class GraphWalkTests(unittest.TestCase):
         # seeds that fill up: of those sharing a name within one knowledge base only the first is taken
         self.assertEqual([(b["id"], b["named"], b["relations"]) for b in run("今天天气怎么样", [seed("e4", "网关", 0.6), seed("e5", "网关", 0.5)])],
                          [("e4", False, 1)])
-        self.assertEqual([b["id"] for b in run("zk200 和 northwind gateway 的热备份", seeds, limit=1)], ["e1"])   # the total across knowledge bases is capped
+        self.assertEqual([b["id"] for b in run("zk200 和 example gateway 的热备份", seeds, limit=1)], ["e1"])   # the total across knowledge bases is capped
         # the names stay in the process: the same graph version is not read again, a new one is
         loads = lambda: sum(1 for c, _ in log if "e.aliases AS aliases" in c)
         self.assertEqual(loads(), 1)
@@ -1901,16 +1901,16 @@ class ApiTests(unittest.TestCase):
 
         out = Out()
         with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), _settings(token="secret"), None)), \
-                mock.patch.object(service, "search", return_value={"question": "我的尿酸多少", "retrieval_summary": summary}):
+                mock.patch.object(service, "search", return_value={"question": "我的浓度多少", "retrieval_summary": summary}):
             client = TestClient(create_app())
             with contextlib.redirect_stdout(out):
-                r = client.post("/search", json={"question": "我的尿酸多少"}, headers={"Authorization": "Bearer secret"})
+                r = client.post("/search", json={"question": "我的浓度多少"}, headers={"Authorization": "Bearer secret"})
             with contextlib.redirect_stdout(Broken()):
-                r2 = client.post("/search", json={"question": "我的尿酸多少"}, headers={"Authorization": "Bearer secret"})
+                r2 = client.post("/search", json={"question": "我的浓度多少"}, headers={"Authorization": "Bearer secret"})
         self.assertEqual((r.status_code, r2.status_code), (200, 200))                               # failing to write the log does not affect the response
         lines = [w for w in out.writes if w.startswith("[search.request] ")]
         self.assertEqual(len(lines), 1); self.assertTrue(lines[0].endswith("}\n"))                  # the whole line is written at once, so concurrent lines do not run together
-        self.assertNotIn("尿酸", lines[0])
+        self.assertNotIn("浓度", lines[0])
         self.assertEqual(json.loads(lines[0][len("[search.request] "):]),
                          {"timings_ms": summary["timings_ms"], "kbs": 2, "widened": True, "rerank": "below_threshold", "evidence_state": "diagnostic",
                           "hits": 3, "image_query": False, "ranking": summary["ranking"],
@@ -2031,10 +2031,10 @@ class ApiTests(unittest.TestCase):
                 elif "MENTIONED_IN" in text:
                     rows = [{"eid": "e1", "docs": ["a/whitepaper.pdf", "b/manual.pdf", "c/comparison.xlsx"], "doc_count": 7}]
                 else:
-                    rows = [{"id": "e1", "title": "Northwind Suite", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
+                    rows = [{"id": "e1", "title": "Example Suite", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
                              "kind": "instance", "scope": None, "description": "An office suite. " * 40, "pagerank": 0.9, "degree": 40,
                              "aliases": ["NW Suite"], "external_ids": ["sku:W365"], "doc_count": 11},
-                            {"id": "e2", "title": "Northwind Notes", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
+                            {"id": "e2", "title": "Example Notes", "type": "product", "upper": "entity", "type_path": ["product", "entity"],
                              "kind": "instance", "scope": None, "description": None, "pagerank": 0.5, "degree": 12, "aliases": []}]
                 return SimpleNamespace(data=lambda: rows)
 
@@ -2042,11 +2042,11 @@ class ApiTests(unittest.TestCase):
         src = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
         with mock.patch("kb_pipeline.graph.neo4j_import.neo4j_driver", side_effect=AssertionError("must not create a Neo4j driver")), \
                 mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="005-v"):
-            out = graphwalk.list_entities(SimpleNamespace(), src, types=["Product", " product "], uppers=["Entity"], name=" Northwind ",
+            out = graphwalk.list_entities(SimpleNamespace(), src, types=["Product", " product "], uppers=["Entity"], name=" Example ",
                                           limit=2, offset=0, driver=driver, timeout=7.0)
             page2 = graphwalk.list_entities(SimpleNamespace(), src, types=["product"], kind="bogus", limit=999, offset=2, driver=driver)
         self.assertEqual((out["kb_name"], out["graph_version"], out["total"], out["count"], out["has_more"]), ("products", "005-v", 3, 2, True))
-        self.assertEqual(out["filters"], {"types": ["product"], "uppers": ["entity"], "kind": "all", "name": "northwind"})   # 不分大小写、去重;默认都列
+        self.assertEqual(out["filters"], {"types": ["product"], "uppers": ["entity"], "kind": "all", "name": "example"})   # 不分大小写、去重;默认都列
         self.assertEqual(page2["filters"]["kind"], "all")                                                         # 认不出的 kind 按默认
         self.assertEqual([e["id"] for e in out["entities"]], ["e1", "e2"])
         self.assertEqual((out["entities"][0]["upper"], out["entities"][0]["kind"], out["entities"][0]["external_ids"]),
@@ -2158,8 +2158,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([(e["point_id"], e["active"]) for e in f1["evidence"]], [("p1", True), ("p1b", False), ("p1c", False)])      # at most three evidence chunks per fact
         self.assertEqual((f1["evidence"][0]["doc_id"], f1["evidence"][0]["chunk_index"], f1["evidence"][0]["position"], f1["evidence"][0]["place"]),
                          ("d1", 4, "page 2 · DC Characteristics", "page 2"))
-        self.assertEqual((f1["verified"], f1["sources_active"]), (True, "1/3"))
-        self.assertEqual((f2["verified"], f2["sources_active"], f2.get("hint")), (False, "0/1", None))                             # every source point inactive: no hint, not a current fact
+        self.assertEqual((f1["source_valid"], f1["sources_active"]), (True, "1/3"))
+        self.assertEqual((f2["source_valid"], f2["sources_active"], f2.get("hint")), (False, "0/1", None))                             # every source point inactive: no hint, not a current fact
         self.assertEqual((f3["id"], f3["value"], f3["evidence"]), ("f3", "3.5", [])); self.assertNotIn("text", f3)               # payload not fetched: only the basic graph-database fields
         self.assertEqual(out["degraded"], ["spec_payload_missing: 1"])
         self.assertNotIn("properties", out)                                                                                      # the property list only on the first page
@@ -2172,7 +2172,7 @@ class ApiTests(unittest.TestCase):
         page = next(t for t, kw in log if "AS row" in t)
         self.assertIn("MATCH (f:Spec {kb_id: $kb, graph_version: $gv})", page); self.assertIn("ORDER BY coalesce(f.subject, ''),", page)
         self.assertEqual((cross["subject"], cross["property"]["matched"], [f["n"] for f in cross["facts"]]), (None, "contains", [1, 2, 3]))
-        self.assertNotIn("properties", cross); self.assertTrue(all(f["evidence"] == [] and f.get("verified") is None for f in cross["facts"]))
+        self.assertNotIn("properties", cross); self.assertTrue(all(f["evidence"] == [] and f.get("source_valid") is None for f in cross["facts"]))
         self.assertFalse([t for t, kw in log if " = $p" in t])                                                                   # match=contains does not try exact first
         # the name did not match: vector candidates, no fact query
         with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv), \
@@ -2599,7 +2599,7 @@ class ApiTests(unittest.TestCase):
             self.assertNotIn("conflict_group", props)
             counted = [t for t, kw in log if "count(f) AS total" in t]
             self.assertEqual(len(counted), 2)                    # 同样条件下的全部条数与按口径的条数:差就是 time.hidden
-            self.assertNotIn("superseded_by", counted[0]); self.assertIn("f.superseded_on", counted[1])
+            self.assertNotIn("superseded_by", counted[0]); self.assertIn("f.doc_status", counted[1])
             self.assertEqual(out["time"]["mode"], "current")
             self.assertEqual(out["filters"], {"doc_id": "kb_002:1", "conflict_only": True})
             self.assertEqual(out["properties"], [{"concept": "rated power", "concept_key": "c-power", "count": 2}])
@@ -2618,7 +2618,7 @@ class ApiTests(unittest.TestCase):
             listing = next(t for t, kw in log if "AS row" in t)
             self.assertIn("e.id AS subject_id ORDER BY coalesce(f.conflict_group, ''), coalesce(f.concept, f.property, '')", listing)
             self.assertNotIn("OPTIONAL MATCH", listing)
-            self.assertIn("f.superseded_on", next(t for t, kw in log if "count(f) AS n" in t))   # 属性清单按取代的生效日期计数
+            self.assertIn("f.doc_status", next(t for t, kw in log if "count(f) AS n" in t))   # 属性清单遵循同一文档治理范围
             self.assertEqual(out3["filters"], {"conflict_only": True})
             # none of the new conditions: behaviour as before, no filters, no conflict-group ordering
             log.clear()
@@ -2712,13 +2712,13 @@ class SkillClientTests(unittest.TestCase):
         self.assertEqual(old_service["sources"][0]["cite"], "datasheets/a.pdf")          # a service without `place`: the path alone, nothing guessed from the position
 
     SEARCH = {"call_id": "aaaaaa", "operation": "search", "result": {
-        "question": "compare ZK200 and Northwind Gateway", "kbs": ["kb_005"], "kb_names": {"kb_005": "products"},
+        "question": "compare ZK200 and Example Gateway", "kbs": ["kb_005"], "kb_names": {"kb_005": "products"},
         "sources": [
             {"n": 1, "role": "hit", "accepted": True, "kb_id": "kb_005", "point_id": "p1", "doc_id": "d1", "content_version": "v1", "chunk_index": 7,
              "doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "place": "page 6", "text": "ZK200 supports hot standby.",
              "stitched": {"chunk_from": 6, "chunk_to": 7}},
             {"n": 2, "role": "hit", "accepted": False, "kb_id": "kb_005", "point_id": "p2", "doc_id": "d2", "content_version": "v3", "chunk_index": 0,
-             "doc": "board.pdf", "rel_path": "vendor/board.pdf", "place": "page 1", "text": "FACTS: a wiring diagram.\nENTITIES: ZK200, Northwind\nKEYWORDS: wiring",
+             "doc": "board.pdf", "rel_path": "vendor/board.pdf", "place": "page 1", "text": "FACTS: a wiring diagram.\nENTITIES: ZK200, Example\nKEYWORDS: wiring",
              "visual": {"confidence": "high", "value_conflicts": 2}},
             {"n": 3, "role": "neighbor", "of": 1, "accepted": None, "kb_id": "kb_005", "point_id": "p3", "doc_id": "d1", "content_version": "v1",
              "chunk_index": 8, "doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "place": "page 6", "text": "The standby unit takes over in 2 s."}]
@@ -2726,7 +2726,7 @@ class SkillClientTests(unittest.TestCase):
             "doc": "notes.md", "rel_path": "vendor/notes.md", "place": "Setup", "text": ("Step %d of the setup. " % n) * 12} for n in (4, 5, 6)],
         "doc_aggs": [{"doc": "manual.pdf", "rel_path": "vendor/manual.pdf", "source_ns": [1]}, {"doc": "board.pdf", "rel_path": "vendor/board.pdf", "source_ns": [2]}],
         "specs": [{"n": 1, "kb_id": "kb_005", "hint": "ZK200 · failover time = 2 s", "rel_path": "vendor/manual.pdf", "sources": [1], "conflict": True},
-                  {"n": 2, "kb_id": "kb_005", "text": "ZK200 · weight: 3 kg", "rel_path": "vendor/sheet.pdf", "sources": [], "verified": False,
+                  {"n": 2, "kb_id": "kb_005", "text": "ZK200 · weight: 3 kg", "rel_path": "vendor/sheet.pdf", "sources": [], "source_valid": False,
                    "series_text": "3 kg (2024), 2.8 kg (2025)"},
                   {"n": 3, "kb_id": "kb_005", "subject": "ZK200", "property": "standby power", "value": "3", "unit": "W", "conditions_text": "mode: idle",
                    "when": "2025-03", "text": "ZK200 · standby power: 3 W | mode: idle | when: 2025-03", "rel_path": "vendor/manual.pdf", "sources": [],
@@ -2736,11 +2736,11 @@ class SkillClientTests(unittest.TestCase):
                                  "active": True}]}],
         "pages": [{"n": 1, "kb_id": "kb_005", "kind": "subject", "title": "ZK200", "summary": "A gateway controller.", "sources_active": "2/2",
                    "docs": ["vendor/manual.pdf", "vendor/sheet.pdf"], "text": "# ZK200\nReleased in 2024."},
-                  {"n": 2, "kb_id": "kb_005", "kind": "source", "title": "manual.pdf", "summary": "manual.pdf · ZK200, Northwind", "docs": ["vendor/manual.pdf"]}],
+                  {"n": 2, "kb_id": "kb_005", "kind": "source", "title": "manual.pdf", "summary": "manual.pdf · ZK200, Example", "docs": ["vendor/manual.pdf"]}],
         "neighborhoods": [{"n": 1, "kb_id": "kb_005", "id": "e1", "title": "ZK200", "type": "product", "named": True, "relations": 30, "facts": 12,
                            "predicates": [{"type": "part_of", "count": 20}, {"type": "supports", "count": 10}],
                            "neighbors": [{"relation_id": "r1", "type": "part_of", "direction": "in", "directed": True, "other": {"id": "e7", "title": "Control module", "degree": 4}},
-                                         {"relation_id": "r2", "type": "related_to", "direction": "out", "directed": False, "other": {"id": "e2", "title": "Northwind Gateway", "degree": 9}}]}],
+                                         {"relation_id": "r2", "type": "related_to", "direction": "out", "directed": False, "other": {"id": "e2", "title": "Example Gateway", "degree": 9}}]}],
         "entities": [{"n": 1, "kb_id": "kb_005", "id": "e1", "title": "ZK200", "type": "product"},
                      {"n": 2, "kb_id": "kb_005", "id": "e9", "title": "ZK200", "type": "product"}],
         "relationships": [{"n": 1, "kb_id": "kb_005", "source": "ZK200", "type": "supports", "target": "hot standby"},
@@ -2754,7 +2754,7 @@ class SkillClientTests(unittest.TestCase):
             {"type": "part_of", "direction": "in", "directed": True, "type_violation": True, "other": {"id": "e7", "title": "Control module", "type": "module", "degree": 4},
              "evidence": [{"point_id": "p8", "doc_id": "d1", "content_version": "v1", "chunk_index": 3, "rel_path": "vendor/manual.pdf", "place": "page 2",
                            "active": True, "excerpt": "The control module is part of ZK200.", "excerpt_match": "both"}]},
-            {"type": "supports", "direction": "out", "directed": True, "other": {"id": "e2", "title": "Northwind Gateway", "type": "product", "degree": 9},
+            {"type": "supports", "direction": "out", "directed": True, "other": {"id": "e2", "title": "Example Gateway", "type": "product", "degree": 9},
              "evidence": [{"point_id": "p9", "doc_id": "d1", "content_version": "v1", "chunk_index": 5, "rel_path": "vendor/manual.pdf", "place": "page 2",
                            "active": True, "excerpt": "A block diagram.", "excerpt_match": "center", "visual": True}]},
             {"type": "requires", "direction": "out", "directed": True, "other": {"id": "e3", "title": "Power unit", "type": "module", "degree": 1},
@@ -2816,7 +2816,7 @@ class SkillClientTests(unittest.TestCase):
         self.assertFalse([line for line in view if line.startswith("[P2]")])                           # a source page without body text is left out
         self.assertIn("[P1] subject · ZK200 · sources active 2/2: A gateway controller. (has body text, show aaaaaa:P1) — products/vendor/manual.pdf (one of 2 documents)", view)
         self.assertIn("[H1] ZK200 (product) · named in the question · 30 relations · 12 facts · part_of 20, supports 10", view)
-        self.assertIn("     H1.1 ←part_of Control module (4); H1.2 —related_to— Northwind Gateway (9)", view)
+        self.assertIn("     H1.1 ←part_of Control module (4); H1.2 —related_to— Example Gateway (9)", view)
         # entities and relations that read the same are listed once; a matched relation comes without a direction, so
         # its two ends are joined neutrally instead of by an arrow
         self.assertIn("Entities: [E1] ZK200 (product)", view)
@@ -2841,9 +2841,9 @@ class SkillClientTests(unittest.TestCase):
         self.assertEqual(near[0], "call bbbbbb · neighbors · knowledge base: products (kb_005) · ZK200 (product) · 30 relations in all, 3 here (by weight) · 12 facts under it")
         self.assertIn("relations by kind: part_of 20 (one kind only: --type <predicate>)", near)
         self.assertIn("other entities with this name: ZK200 (module · 2 relations · id=e9)", near)
-        self.assertEqual(near[near.index("[N1] ←part_of Control module (module · 4 relations)   (the end types do not fit this kind of relation; judge it by the excerpt)"):][1],
+        self.assertEqual(near[near.index("[N1] ←part_of [needs_review] Control module (module · 4 relations)   (the end types do not fit this kind of relation; judge it by the excerpt)"):][1],
                          '     "The control module is part of ZK200." — products/vendor/manual.pdf · page 2')
-        self.assertEqual(near[near.index("[N2] →supports Northwind Gateway (product · 9 relations)"):][1],
+        self.assertEqual(near[near.index("[N2] →supports Example Gateway (product · 9 relations)"):][1],
                          '     "A block diagram." (picture description; the excerpt did not locate the far end; context --ref bbbbbb:N2 when needed) — same citation as N1')
         # an excerpt shared by several relations is printed once
         self.assertEqual(near[near.index("[N3] →requires Power unit (module · 1 relations)"):][1],
@@ -3231,12 +3231,12 @@ class TimeAwareSearchTests(unittest.TestCase):
             if "id: $id" in text:
                 return []
             if "$id IN coalesce(e.ids, [])" in text:
-                return [{"id": "e1", "title": "张三", "type": "person", "upper": "agent", "type_path": ["person", "agent"], "kind": "instance",
+                return [{"id": "e1", "title": "样例A", "type": "person", "upper": "agent", "type_path": ["person", "agent"], "kind": "instance",
                          "degree": 4, "pagerank": 0.5}]
             return []
 
         driver, session = self._driver(handler)
-        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Project Library")
+        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Synthetic Delta")
         with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
             out = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="old-id", driver=driver)
             back = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="old-id", driver=driver, as_of="2025-06")
@@ -3250,7 +3250,7 @@ class TimeAwareSearchTests(unittest.TestCase):
         self.assertEqual(rows_q[-1]["day"], "2025-06-30")                                            # 回看:只给到月就是那月的最后一天
         self.assertEqual(back["time"]["mode"], "as_of")
         with self.assertRaises(ValueError):
-            graphwalk.neighbors(SimpleNamespace(), src, entity="张三", entity_id=None, driver=driver, as_of="去年")
+            graphwalk.neighbors(SimpleNamespace(), src, entity="样例A", entity_id=None, driver=driver, as_of="去年")
 
     def test_only_lapsing_periods_count_as_ended(self) -> None:
         """一段状态(2014–2016 在某公司)过了止期标「已结束」;某天做的一次检查(起止都是那天)照样算数。
@@ -3268,13 +3268,13 @@ class TimeAwareSearchTests(unittest.TestCase):
             if "HAS_SPEC" in text:
                 return [{"n": 0}]
             if "id: $id" in text:
-                return [{"id": "e1", "title": "张三", "type": "person", "upper": "agent", "kind": "instance", "degree": 2}]
+                return [{"id": "e1", "title": "样例A", "type": "person", "upper": "agent", "kind": "instance", "degree": 2}]
             return []
 
         driver, session = self._driver(handler)
-        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Project Library")
+        src = SimpleNamespace(kb_id="kb_004", collection="kb_004", source_root="Synthetic Delta")
         with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
-            out = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="e1", driver=driver, history=True)
+            out = graphwalk.neighbors(SimpleNamespace(), src, entity=None, entity_id="e1", driver=driver, history=True, as_of="2026-01-01")
         self.assertEqual({nb["relation_id"]: nb["status"] for nb in out["neighbors"]}, {"r1": "ended", "r2": "current"})
         self.assertFalse(any("lapses" in nb for nb in out["neighbors"]))
         rows_q = next(text for text, kw in session.calls if "LIMIT $limit" in text and "RELATED_TO" in text)
@@ -3288,14 +3288,14 @@ class TimeAwareSearchTests(unittest.TestCase):
         by_name = session.calls[-1][0]
         self.assertIn("ENDS WITH ':' + $name", by_name)                                              # 只给编号、不给体系也算
 
-    def test_facts_list_current_values_with_the_whole_series(self) -> None:
+    def test_facts_list_keeps_old_values_and_the_whole_series(self) -> None:
         def handler(text, kw):
             if "RETURN DISTINCT f.concept_key" in text:
-                return [{"key": "c-ldl"}]
+                return [{"key": "c-ldc"}]
             if "count(f) AS total" in text:
-                return [{"total": 1 if "superseded_by" in text else 3}]
+                return [{"total": 3}]
             if "AS row" in text:
-                return [{"row": {"id": "f3", "subject": "我", "property": "LDL", "value": "3.1", "unit": "mmol/L", "valid_from": "2025-05",
+                return [{"row": {"id": "f3", "subject": "我", "property": "LDC", "value": "3.1", "unit": "mmol/L", "valid_from": "2025-05",
                                  "series_key": "s1", "series_index": 2, "observed": "2025-05-10", "doc_id": "kb:3"}, "subject_id": "e1"}]
             if "f.series_key IN $keys" in text:
                 return [{"series_key": "s1", "id": f"f{i}", "value": v, "unit": "mmol/L", "valid_from": d, "series_index": i - 1}
@@ -3305,13 +3305,13 @@ class TimeAwareSearchTests(unittest.TestCase):
         driver, session = self._driver(handler)
         src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="Example Collection A")
         with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value="v1"):
-            out = graphwalk.list_facts(SimpleNamespace(), src, prop="LDL", driver=driver, fields=service.FACT_FIELDS)
-            hist = graphwalk.list_facts(SimpleNamespace(), src, prop="LDL", driver=driver, history=True, fields=service.FACT_FIELDS)
+            out = graphwalk.list_facts(SimpleNamespace(), src, prop="LDC", driver=driver, fields=service.FACT_FIELDS)
+            hist = graphwalk.list_facts(SimpleNamespace(), src, prop="LDC", driver=driver, history=True, fields=service.FACT_FIELDS)
         f = out["facts"][0]
         self.assertEqual((f["status"], f["observed"]), ("current", "2025-05-10"))
-        self.assertEqual(f["series_text"], "3.6 mmol/L(2023-05)、3.4 mmol/L(2024-05)、3.1 mmol/L(2025-05)")   # 更早的档位不单列,但看得到
+        self.assertEqual(f["series_text"], "3.6 mmol/L(2023-05)、3.4 mmol/L(2024-05)、3.1 mmol/L(2025-05)")   # 序列保留各个原文时间点
         self.assertNotIn("series_members", f)
-        self.assertEqual(out["time"]["hidden"], 2)
+        self.assertEqual(out["time"]["hidden"], 0)
         self.assertNotIn("hidden", hist["time"]); self.assertEqual(hist["time"]["mode"], "history")
         probe = next(text for text, kw in session.calls if "RETURN DISTINCT f.concept_key" in text)
         self.assertNotIn("superseded_by", probe)                                                    # 属性试探只认写法,不受口径影响
@@ -3326,19 +3326,19 @@ class TimeAwareSearchTests(unittest.TestCase):
             state = root / "state.sqlite3"
             dbm.init_db(state)
             mirror = root / "mirror"
-            (mirror / "Project Library" / ".carrel").mkdir(parents=True)
+            (mirror / "Synthetic Delta" / ".carrel").mkdir(parents=True)
             with dbm.connect(state) as con:
-                src, _ = discovery.enroll(con, mirror, "Project Library")
+                src, _ = discovery.enroll(con, mirror, "Synthetic Delta")
                 for i, rel in enumerate(("报价/2024 报价.xlsx", "报价/2025 报价.xlsx", "归档/旧方案.docx", "合同/框架协议.pdf", "旧/删掉的.pdf")):
-                    row = {"file_id": f"{src.kb_id}:{i + 1}", "kb_id": src.kb_id, "collection": src.collection, "source_root": "Project Library",
-                           "source_type": "local", "file_key": i + 1, "source_path": "Project Library/" + rel, "rel_path": rel,
-                           "filename": rel.rsplit("/", 1)[-1], "dir": rel.rsplit("/", 1)[0], "physical_path": str(mirror / "Project Library" / rel),
+                    row = {"file_id": f"{src.kb_id}:{i + 1}", "kb_id": src.kb_id, "collection": src.collection, "source_root": "Synthetic Delta",
+                           "source_type": "local", "file_key": i + 1, "source_path": "Synthetic Delta/" + rel, "rel_path": rel,
+                           "filename": rel.rsplit("/", 1)[-1], "dir": rel.rsplit("/", 1)[0], "physical_path": str(mirror / "Synthetic Delta" / rel),
                            "mime_type": "application/pdf", "size": 1, "mtime": 1, "content_version": "v1", "metadata_fingerprint": "m",
                            "first_seen_at": 1, "last_seen_at": 1, "status": "deleted" if rel.startswith("旧/") else "indexed"}
                     con.execute(f"INSERT INTO files ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
                 con.commit()
             # 库文件夹下的旧位置不再读(2026-10-25 起更正文件放在 config/corrections/<kb_id>.yaml)
-            (mirror / "Project Library" / ".carrel" / "corrections.yaml").write_text(
+            (mirror / "Synthetic Delta" / ".carrel" / "corrections.yaml").write_text(
                 "documents:\n  - path: 报价/\n    status: archived\n", encoding="utf-8")
             (root / "corrections").mkdir()
             (root / "corrections" / f"{src.kb_id}.yaml").write_text(
@@ -3382,8 +3382,7 @@ class TimeAwareSearchTests(unittest.TestCase):
         self.assertEqual(query_scope()["mode"], "current")
 
     def test_the_real_graph_channel_takes_what_the_service_passes(self) -> None:
-        """编排测试里的图路是假的(收 **kw):真函数的签名得收得下服务传的每个参数,不然图路每次都被当成失败跳过
-        (10-24 上线后真机:graph_channel() got an unexpected keyword argument 'history')。graph_query 同理。"""
+        """Synthetic regression: the real graph channel takes what the service passes."""
         import inspect
 
         from kb_pipeline.graph.recall import graph_query
@@ -3459,11 +3458,11 @@ class TimeAwareSearchTests(unittest.TestCase):
                  "entities": {"total": 40}, "facts": {"total": 12}, "relations": {"related_to_share": 0.2},
                  "types": [{"type": "person", "upper": "agent", "entities": 5, "docs": 7, "weeks": 3}],
                  "predicates": [{"predicate": "works_on", "edges": 8, "pairs": [{"source_type": "person", "target_type": "project", "count": 6}]}],
-                 "subjects": [{"title": "张三"}]}
+                 "subjects": [{"title": "样例A"}]}
         with mock.patch("kb_search.graphwalk.version_stats", return_value=("v1", stats)):
             view, err = cat._overview(object(), "kb_004")
         self.assertIsNone(err)
         self.assertEqual((view["documents"], view["types"][0], view["predicates"][0]["pair"], view["subjects"]),
-                         (9, {"type": "person", "upper": "agent", "entities": 5, "docs": 7}, "person -> project", ["张三"]))
+                         (9, {"type": "person", "upper": "agent", "entities": 5, "docs": 7}, "person -> project", ["样例A"]))
         with mock.patch("kb_search.graphwalk.version_stats", side_effect=RuntimeError("down")):
             self.assertEqual(cat._overview(object(), "kb_004"), ({}, "neo4j: RuntimeError"))

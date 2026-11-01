@@ -21,15 +21,15 @@ _MONTHS = {
     "september": 9, "october": 10, "november": 11, "december": 12,
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
-_ISO_RE = re.compile(r"(?<!\d)(?P<y>(?:19|20)\d{2})[-/.](?P<m>0?[1-9]|1[0-2])(?:[-/.](?P<d>0?[1-9]|[12]\d|3[01]))?(?!\d)")
-_COMPACT_RE = re.compile(r"(?<!\d)(?P<y>(?:19|20)\d{2})(?P<m>0[1-9]|1[0-2])(?P<d>0[1-9]|[12]\d|3[01])(?!\d)")
-_CJK_RE = re.compile(r"(?P<y>(?:19|20)\d{2})\s*年\s*(?:(?P<m>0?[1-9]|1[0-2])\s*月\s*(?:(?P<d>0?[1-9]|[12]\d|3[01])\s*[日号])?)?")
-_EN_MDY_RE = re.compile(r"\b(?P<mon>[A-Za-z]{3,9})\.?\s+(?P<d>0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?,?\s+(?P<y>(?:19|20)\d{2})\b")
-_EN_DMY_RE = re.compile(r"\b(?P<d>0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?\s+(?P<mon>[A-Za-z]{3,9})\.?,?\s+(?P<y>(?:19|20)\d{2})\b")
+_ISO_RE = re.compile(r"(?<!\d)(?P<y>(?:19|20)\d{2})[-/.](?P<m>\d{1,2})(?:[-/.](?P<d>\d{1,2}))?(?!\d|[-/.]\d)")
+_COMPACT_RE = re.compile(r"(?<!\d)(?P<y>(?:19|20)\d{2})(?P<m>\d{2})(?P<d>\d{2})(?!\d)")
+_CJK_RE = re.compile(r"(?P<y>(?:19|20)\d{2})\s*年\s*(?:(?P<m>\d{1,2})\s*月\s*(?:(?P<d>\d{1,2})\s*[日号])?)?")
+_EN_MDY_RE = re.compile(r"\b(?P<mon>[A-Za-z]{3,9})\.?\s+(?P<d>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<y>(?:19|20)\d{2})\b")
+_EN_DMY_RE = re.compile(r"\b(?P<d>\d{1,2})(?:st|nd|rd|th)?\s+(?P<mon>[A-Za-z]{3,9})\.?,?\s+(?P<y>(?:19|20)\d{2})\b")
 _EN_MY_RE = re.compile(r"\b(?P<mon>[A-Za-z]{3,9})\.?,?\s+(?P<y>(?:19|20)\d{2})\b")
 _YEAR_RE = re.compile(r"(?<![\d.])(?P<y>(?:19|20)\d{2})(?![\d.])")
 _VERSION_RE = re.compile(
-    r"(?:\brev(?:ision)?\.?\s*(?P<rev>\*?[A-Za-z0-9]{1,4}(?:\.[0-9]{1,3})*)\b)|"
+    r"(?:\brev(?:ision)?(?:\.\s*|\s+|(?=[\d*]))(?P<rev>\*?[A-Za-z0-9]{1,4}(?:\.[0-9]{1,3})*)\b)|"
     r"(?:\bv(?:ersion)?\.?\s*(?P<ver>\d{1,3}(?:\.\d{1,3}){0,3})\b)|"
     r"(?:版本\s*[::]?\s*(?P<cver>[A-Za-z]?\d{1,3}(?:\.\d{1,3}){0,3}))",
     re.IGNORECASE)
@@ -56,25 +56,12 @@ def parse_date(text: Any) -> str | None:
     """The first date in a text, normalised to YYYY / YYYY-MM / YYYY-MM-DD; None when nothing is recognised.
     Only year-first forms and forms with a month name / Chinese date units count; ambiguous ones like 01/02/2024
     are not interpreted."""
-    s = str(text or "")
-    for rx in (_ISO_RE, _COMPACT_RE, _CJK_RE):
-        m = rx.search(s)
-        if m:
-            out = _iso(m.group("y"), m.group("m"), m.group("d"))
-            if out:
-                return out
-    for rx in (_EN_MDY_RE, _EN_DMY_RE, _EN_MY_RE):
-        m = rx.search(s)
-        if m and m.group("mon").lower() in _MONTHS:
-            out = _iso(m.group("y"), str(_MONTHS[m.group("mon").lower()]), m.groupdict().get("d"))
-            if out:
-                return out
-    m = _YEAR_RE.search(s)
-    return _iso(m.group("y")) if m else None
+    values = find_dates(text)
+    return values[0] if values else None
 
 
 # 文件名里的日期比正文更严:夹在字母数字中间的四位数是编号(ZX8C2048KV17 不是 2048 年)、晚于明年的不是文档日期
-_NAME_COMPACT_RE = re.compile(r"(?<![A-Za-z\d])(?P<y>(?:19|20)\d{2})(?P<m>0[1-9]|1[0-2])(?P<d>0[1-9]|[12]\d|3[01])(?![A-Za-z\d])")
+_NAME_COMPACT_RE = re.compile(r"(?<![A-Za-z\d])(?P<y>(?:19|20)\d{2})(?P<m>\d{2})(?P<d>\d{2})(?![A-Za-z\d])")
 _NAME_YEAR_RE = re.compile(r"(?<![A-Za-z\d.])(?P<y>(?:19|20)\d{2})(?![A-Za-z\d])")
 _EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,6}$")
 
@@ -84,6 +71,7 @@ def name_date(name: Any, *, today: date | None = None) -> str | None:
     编号里夹着的四位数、晚于明年的年份都不算。"""
     stem = _EXT_RE.sub("", str(name or ""))
     limit = (today or date.today()).year + 1
+    occupied = []
 
     def ok(value: str | None) -> str | None:
         return value if value and int(value[:4]) <= limit else None
@@ -92,16 +80,21 @@ def name_date(name: Any, *, today: date | None = None) -> str | None:
         for m in rx.finditer(stem):
             if rx is _ISO_RE and ((m.start() and stem[m.start() - 1].isalpha()) or (m.end() < len(stem) and stem[m.end()].isalpha())):
                 continue
+            occupied.append(m.span())
             out = ok(_iso(m.group("y"), m.group("m"), m.group("d")))
             if out:
                 return out
     for rx in (_EN_MDY_RE, _EN_DMY_RE, _EN_MY_RE):
-        m = rx.search(stem)
-        if m and m.group("mon").lower() in _MONTHS:
+        for m in rx.finditer(stem):
+            if m.group("mon").lower() not in _MONTHS or any(a < m.end() and m.start() < b for a, b in occupied):
+                continue
+            occupied.append(m.span())
             out = ok(_iso(m.group("y"), str(_MONTHS[m.group("mon").lower()]), m.groupdict().get("d")))
             if out:
                 return out
     for m in _NAME_YEAR_RE.finditer(stem):
+        if any(a <= m.start() < b for a, b in occupied):
+            continue
         out = ok(_iso(m.group("y")))
         if out:
             return out
@@ -115,9 +108,10 @@ def find_dates(text: Any) -> list[str]:
     spans: list[tuple[int, int]] = []
 
     def add(value: str | None, span: tuple[int, int]) -> None:
-        if value and not any(a <= span[0] < b or a < span[1] <= b for a, b in spans):
+        if not any(not (span[1] <= a or span[0] >= b) for a, b in spans):
             spans.append(span)
-            found.append((span[0], value))
+            if value:
+                found.append((span[0], value))
 
     for rx in (_ISO_RE, _COMPACT_RE, _CJK_RE):
         for m in rx.finditer(s):
@@ -162,7 +156,41 @@ def document_axis(rel_path: str, head_text: str = "", *, kind: str = "auto") -> 
     head = str(head_text or "")[:1500]
     from_name = name_date(name)
     limit = date.today().year + 1
-    head_dates = [d for d in find_dates(head) if len(d) > 4 and int(d[:4]) <= limit]
+    # A date in a URL, example or table row does not date the document. Explicit
+    # revision/publication metadata wins over dates mentioned in the narrative.
+    clean = re.sub(r"https?://[^\s<>\"']+", "", head)
+    clean = re.sub(r"```.*?(?:```|\Z)|~~~.*?(?:~~~|\Z)", "", clean, flags=re.S)
+    from ..parsers.code_symbols import language_for
+    if name.lower().endswith((".py", ".sql", ".nf", ".wdl")) or language_for(name):
+        clean = "\n".join(line for line in clean.splitlines() if re.match(r"\s*(?:#|//|/\*|\*|--)", line))
+    metadata = re.compile(
+        r"(?:\b(?:last[ _-]+)?(?:updated?|modified|revised|published|issued|date)\b|"
+        r"更新时间|更新日期|修订日期|发布日期|发布于|报告时间|报告日期|检查日期|日期)"
+        r"\s*[*_:：=-]*\s*(.{0,55})", re.I)
+    matches = sorted(metadata.finditer(clean), key=lambda m: (
+        0 if re.search(r"updated?|modified|revised|更新|修订", m.group(0), re.I) else 1, m.start()))
+    explicit = [d for m in matches for d in find_dates(m.group(1))[:1]]
+    structured = name.lower().endswith((".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl", ".xml", ".xsd",
+                                       ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".ipynb"))
+    candidates = explicit if not structured else []
+    if not candidates and not structured:
+        # Publication bylines are document metadata even without a "Date:"
+        # label. Restrict this fallback to short leading attribution lines.
+        leading = [line.strip() for line in clean.splitlines() if line.strip()][:8]
+        candidates = [d for line in leading if len(line) <= 180
+                      and re.match(r"^(?:原创|作者|撰文|By\b|Author\b|Posted\b)", line, re.I)
+                      for d in find_dates(line) if len(d) == 10]
+    if not candidates and not structured:
+        # Undated prose may have a standalone date heading. A filename year may
+        # be completed by a matching source date, without borrowing another year.
+        candidates = [d for d in find_dates(clean) if from_name and d.startswith(from_name)]
+        if not candidates:
+            for line in clean.splitlines():
+                line = line.strip().lstrip("#* ")
+                if re.match(r"(?:19|20)\d{2}[-/.年]", line):
+                    candidates = find_dates(line)[:1]
+                    break
+    head_dates = [d for d in candidates if len(d) > 4 and int(d[:4]) <= limit]
     head_date = head_dates[0] if head_dates else None
     date_value = from_name or ""
     if from_name and head_date and head_date.startswith(from_name) and len(head_date) > len(from_name):
@@ -203,7 +231,7 @@ def axis_sort_key(value: Any) -> tuple:
         return (2, ())
     if kind == "date":
         return (0, (s,))
-    parts = tuple(int(p) if p.isdigit() else p.lower() for p in re.findall(r"\d+|[A-Za-z*]+", s))
+    parts = tuple((0, int(p)) if p.isdigit() else (1, p.lower()) for p in re.findall(r"\d+|[A-Za-z*]+", s))
     return (1, parts)
 
 

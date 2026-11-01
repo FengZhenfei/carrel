@@ -51,9 +51,9 @@ Output:
 ##
 ("entity"<|>Market Strategy Committee<|>ORGANIZATION<|>The Central Institution committee makes key decisions about interest rates and the growth of Verdantis's money supply<|>instance)
 ##
-("relationship"<|>Martin Smith<|>Central Institution<|>chairs<|>Martin Smith is the Chair of the Central Institution and will answer questions at a press conference on 2024-06-13<|>9<|>)
+("relationship"<|>Martin Smith<|>Central Institution<|>chairs<|>Martin Smith is the Chair of the Central Institution and will answer questions at a press conference on 2024-06-13<|>9<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Market Strategy Committee<|>Central Institution<|>member_of<|>The Market Strategy Committee is a committee of the Central Institution that sets the benchmark interest rate<|>7<|>)
+("relationship"<|>Market Strategy Committee<|>Central Institution<|>member_of<|>The Market Strategy Committee is a committee of the Central Institution that sets the benchmark interest rate<|>7<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 <|COMPLETE|>
 
 ######################
@@ -77,9 +77,9 @@ Output:
 ##
 ("entity"<|>premium smartphones<|>PRODUCT<|>Premium smartphones, 85% of which are powered by TechGlobal's chips<|>class)
 ##
-("relationship"<|>TechGlobal<|>Vision Holdings<|>owned_by<|>Vision Holdings took TechGlobal private in 2014 and owned it until its new listing<|>5<|>2014..)
+("relationship"<|>TechGlobal<|>Vision Holdings<|>owned_by<|>Vision Holdings took TechGlobal private in 2014 and owned it until its new listing<|>5<|>2014..<|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>TechGlobal<|>premium smartphones<|>supplies<|>TechGlobal's chips power 85% of premium smartphones<|>6<|>)
+("relationship"<|>TechGlobal<|>premium smartphones<|>supplies<|>TechGlobal's chips power 85% of premium smartphones<|>6<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 <|COMPLETE|>
 
 ######################
@@ -123,31 +123,31 @@ Output:
 ##
 ("entity"<|>Meggie Tazbah<|>PERSON<|>Bratinas national and environmentalist who was held hostage<|>instance)
 ##
-("relationship"<|>Firuzabad<|>Aurelia<|>negotiated_with<|>Firuzabad negotiated a hostage exchange with Aurelia<|>2<|>)
+("relationship"<|>Firuzabad<|>Aurelia<|>negotiated_with<|>Firuzabad negotiated a hostage exchange with Aurelia<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Quintara<|>Aurelia<|>negotiated_with<|>Quintara brokered the hostage exchange between Firuzabad and Aurelia<|>2<|>)
+("relationship"<|>Quintara<|>Aurelia<|>negotiated_with<|>Quintara brokered the hostage exchange between Firuzabad and Aurelia<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Quintara<|>Firuzabad<|>negotiated_with<|>Quintara brokered the hostage exchange between Firuzabad and Aurelia<|>2<|>)
+("relationship"<|>Quintara<|>Firuzabad<|>negotiated_with<|>Quintara brokered the hostage exchange between Firuzabad and Aurelia<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Tiruzia<|>Firuzabad<|>located_in<|>Tiruzia is the capital of Firuzabad<|>8<|>)
+("relationship"<|>Tiruzia<|>Firuzabad<|>located_in<|>Tiruzia is the capital of Firuzabad<|>8<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Krohaara<|>Quintara<|>located_in<|>Krohaara is the capital of Quintara<|>8<|>)
+("relationship"<|>Krohaara<|>Quintara<|>located_in<|>Krohaara is the capital of Quintara<|>8<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Cashion<|>Aurelia<|>located_in<|>Cashion is the capital of Aurelia<|>8<|>)
+("relationship"<|>Cashion<|>Aurelia<|>located_in<|>Cashion is the capital of Aurelia<|>8<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Samuel Namara<|>Alhamia Prison<|>held_in<|>Samuel Namara was a prisoner at Alhamia prison<|>8<|>)
+("relationship"<|>Samuel Namara<|>Alhamia Prison<|>held_in<|>Samuel Namara was a prisoner at Alhamia prison<|>8<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Samuel Namara<|>Meggie Tazbah<|>related_to<|>Samuel Namara and Meggie Tazbah were exchanged in the same hostage release<|>2<|>)
+("relationship"<|>Samuel Namara<|>Meggie Tazbah<|>related_to<|>Samuel Namara and Meggie Tazbah were exchanged in the same hostage release<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Samuel Namara<|>Durke Bataglani<|>related_to<|>Samuel Namara and Durke Bataglani were exchanged in the same hostage release<|>2<|>)
+("relationship"<|>Samuel Namara<|>Durke Bataglani<|>related_to<|>Samuel Namara and Durke Bataglani were exchanged in the same hostage release<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Meggie Tazbah<|>Durke Bataglani<|>related_to<|>Meggie Tazbah and Durke Bataglani were exchanged in the same hostage release<|>2<|>)
+("relationship"<|>Meggie Tazbah<|>Durke Bataglani<|>related_to<|>Meggie Tazbah and Durke Bataglani were exchanged in the same hostage release<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Samuel Namara<|>Firuzabad<|>held_in<|>Samuel Namara was a hostage in Firuzabad<|>2<|>)
+("relationship"<|>Samuel Namara<|>Firuzabad<|>held_in<|>Samuel Namara was a hostage in Firuzabad<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Meggie Tazbah<|>Firuzabad<|>held_in<|>Meggie Tazbah was a hostage in Firuzabad<|>2<|>)
+("relationship"<|>Meggie Tazbah<|>Firuzabad<|>held_in<|>Meggie Tazbah was a hostage in Firuzabad<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 ##
-("relationship"<|>Durke Bataglani<|>Firuzabad<|>held_in<|>Durke Bataglani was a hostage in Firuzabad<|>2<|>)
+("relationship"<|>Durke Bataglani<|>Firuzabad<|>held_in<|>Durke Bataglani was a hostage in Firuzabad<|>2<|><|>{"polarity":"affirmed","target_polarity":"affirmed","modality":"actual","conditions":{}})
 <|COMPLETE|>"""
 
 GRAPH_EXTRACTION_PROMPT = """
@@ -172,7 +172,11 @@ For each pair of related entities, extract the following information:
 - relationship_description: explanation as to why you think the source entity and the target entity are related to each other
 - relationship_strength: a numeric score from 1 to 10 indicating strength of the relationship between source entity and target entity
 - relationship_period: when the text states when the relationship began or ended (joined in 2021, the contract runs until June 2025, was responsible for it from March to May), write start..end with each side as YYYY-MM-DD, YYYY-MM or YYYY, leaving a side empty when it is not stated (2021.. or ..2025-06). Leave the field empty when the text gives no time for the relationship; never guess.
-Format each relationship as ("relationship"<|><source_entity><|><target_entity><|><relationship_predicate><|><relationship_description><|><relationship_strength><|><relationship_period>)
+- Read the predicate literally from source to target. A person who performs a procedure is the target of performed_by, not its source. Do not reverse an edge to fit a preferred subject.
+- Include a final JSON metadata field on EVERY relationship: {{"polarity":"affirmed|negated|uncertain","target_polarity":"affirmed|negated|uncertain","modality":"actual|recommended|planned|hypothetical|uncertain","conditions":{{}}}}.
+- polarity describes whether the relationship itself holds. target_polarity describes a negated target action: "recommends not doing X" has affirmed polarity and negated target_polarity; "does not recommend X" has negated polarity and affirmed target_polarity. Preserve the exact distinction in the description. Do not express either as an ordinary positive recommendation.
+- modality distinguishes an actual statement from a recommendation, plan or hypothetical example. Preserve restrictions (mode, location, population, configuration, prerequisite) in conditions. Uncertainty must remain uncertain. Explicit negative statements are knowledge, not missing edges.
+Format each relationship as ("relationship"<|><source_entity><|><target_entity><|><relationship_predicate><|><relationship_description><|><relationship_strength><|><relationship_period><|><metadata_json>)
 
 3. Dates: the Document date line gives the date of the document when it is known. Turn relative or incomplete dates (next week, end of the month, last Friday, 下周, 月底, a day and month without a year) into absolute dates based on it, in descriptions, event names and periods alike. When the document date is unknown, keep such dates as written.
 
@@ -207,6 +211,14 @@ Section: {section}
 Text: {input_text}
 ######################
 Output:"""
+
+# Table rows can state relationships without prose; leave ordinary prose prompts unchanged.
+TABLE_GRAPH_EXTRACTION_PROMPT = (
+    GRAPH_EXTRACTION_PROMPT
+    .replace('An entity must be a THING that can recur across documents. Do NOT emit entities for identifiers or literal values (part numbers used as codes, dates, URLs, file names, page numbers, plain numeric values); mention those inside descriptions instead.\n', 'An entity must be a THING that can recur across documents. A named object remains an entity when its name includes an identifier. Do not create separate entities for standalone literal values (unexplained codes, dates, URLs, file names, page numbers, plain numbers); mention those inside descriptions instead.\n\nRead table headers together with their cells. A row can explicitly state a relationship or attribute without a prose sentence. Extract the named objects and relationships stated by that row, preserving direction, negation and conditions. Merely sharing a row or column does not establish a relationship.\n')
+    .replace('- body: narrative or specification content, including any table whose cells describe or define something (specification, characteristic, result, comparison or configuration tables)\n', '- body: narrative or specification content, including tables stating relationships or attributes through headers and cells, even when the cells are brief (specification, characteristic, result, comparison or configuration tables)\n')
+    .replace('- listing: a bare enumeration with no descriptions at all, such as a code list, a parts or item list, a grid of positions or an index\n', '- listing: a bare enumeration with no stated attributes or relationships, such as unexplained codes or an index; short cells alone do not make a table a listing\n')
+)
 
 CONTINUE_PROMPT = (
     "MANY entities and relationships were missed in the last extraction. Remember to ONLY emit "
@@ -246,18 +258,21 @@ Document: {document}
 Document date, if known: {document_date}
 Document version, if known: {document_version}
 Section: {section}
-Likely subjects (things named in this part of the document first, then the document's main subjects): {subjects}
+Candidate subjects (local objects first; document-level candidates are hints, not owners of every value): {subjects}
 
 Text:
 {input_text}
 
 Return JSON only, in this exact shape:
-{{"facts": [{{"subject": "...", "property": "...", "symbol": "...", "value": "...", "min": "...", "typ": "...", "max": "...", "unit": "...", "conditions": {{"...": "..."}}, "flag": "...", "ref_min": "...", "ref_max": "...", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
+{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "...", "value": "...", "min": "...", "typ": "...", "max": "...", "unit": "...", "conditions": {{"...": "..."}}, "flag": "...", "ref_min": "...", "ref_max": "...", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
 
 Rules:
 - One fact per (subject, property, set of conditions). When columns or rows differ by a condition (grade, range, mode, period, variant, temperature, version, configuration...), emit one fact per condition and spell the condition out in "conditions" as {{"condition name": "condition value"}}.
-- "subject" is the thing the value belongs to. Prefer the most specific name over a generic class word (a product name over "device", a person's name over "patient", a company name over "the company"). When the text names only a generic class or nothing at all, use the likely subject above that the values belong to.
-- Skip advice addressed to the reader (what someone should eat, take, do or avoid) and reference rows that explain every possible grade or case instead of giving this subject's own result (what each risk level means, what to do at each level). A recommended value or setting of a thing (a recommended operating voltage) is a fact.
+- "subject" is the local thing the value actually belongs to. Read the row/column header, caption and surrounding sentence before the document title. A population statistic belongs to that population; device settings to that device; an example to the example object. Do not turn a class or group into a named individual, or infer ownership from the document's directory or candidate order.
+- Ownership follows roles, not the nearest name: authors, operators, reviewers and issuers are not automatically the subject being described. Use the document's main subject when the passage unambiguously describes that subject, while keeping locally identified objects separate.
+- Use "subject_origin": "explicit" when locally named, "context" when an unambiguous reference identifies it, "unresolved" when ownership cannot be resolved. Retain the local generic subject when its exact identity is unknown; never force it onto a candidate.
+- "evidence" is a short exact passage supporting the value and its ownership. "fact_kind": "observation" for measurements/events or experiment results, "state" for a continuing assignment/status/configuration explicitly in force, "reference" for specifications, population statistics, examples and general statements. A later observation does not invalidate an earlier one.
+- Preserve reference rows under their own class, population or example subject as "reference", with every grade/case condition. Do not attribute them to the document owner. Advice expressed as actions belongs in relationships; a recommended numeric specification can be a reference fact.
 - "property" is what the value describes, in the text's own wording; "symbol" is its short symbol if the text shows one (e.g. tAS, HbA1c, ROE), otherwise "".
 - Put a single value in "value"; ranges or min / typ / max columns in "min" / "typ" / "max"; the unit separately in "unit"; keep numbers exactly as written; leave fields you do not have as "".
 - "flag": the document's own marker attached to this value (an arrow ↑ / ↓, H / L, 异常, out of range, exceeds the limit, changed since the previous version), copied as written; otherwise "".
@@ -267,22 +282,25 @@ Rules:
 """
 
 # ── 叙述句里的状态事实(按日期组织的资料:周报、纪要、记录;方案第 7 条)。只对画像轴是 date 的库开,控制成本 ──
-NARRATIVE_FACTS_PROMPT = """You extract state facts from narrative text in a dated document (a report, a set of minutes, a record or a log).
+NARRATIVE_FACTS_PROMPT = """You extract factual observations, continuing states and reference statements from narrative text in a dated document (a report, a set of minutes, a record or a log).
 Document: {document}
 Document date, if known: {document_date}
 Section: {section}
-Likely subjects (things named in this part of the document first, then the document's main subjects): {subjects}
+Candidate subjects (local objects first; document-level candidates are hints, not owners of every value): {subjects}
 
 Text:
 {input_text}
 
-A state fact says what something's state, assignment or measured value IS at a time: who is responsible for or assigned to something, its status or progress, a deadline or due date, a decision taken, a quantity, price, amount or measurement stated in the text, a condition or diagnosis found. Opinions, advice and recommendations, plans without a commitment, definitions and aliases, and general background that holds for every case rather than for the things this document is about are not state facts.
+A fact records a stated observation, assignment, status, progress, deadline, decision, quantity or attribute. Reference statements describe specifications, examples or populations rather than an individual observation or current state. Preserve these distinctions. Advice and uncommitted plans are not completed events or current states; preserve their qualification when recording a concrete reference value. Definitions and aliases belong in the entity/relationship extraction.
 
 Return JSON only, in this exact shape:
-{{"facts": [{{"subject": "...", "property": "...", "symbol": "", "value": "...", "min": "", "typ": "", "max": "", "unit": "...", "conditions": {{}}, "flag": "...", "ref_min": "", "ref_max": "", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
+{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "", "value": "...", "min": "", "typ": "", "max": "", "unit": "...", "conditions": {{}}, "flag": "...", "ref_min": "", "ref_max": "", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
 
 Rules:
-- "subject" is the specific thing the state belongs to (a project, a task, a person, a product, a customer), by its name in the text; when the text does not name one, use the likely subject above that the state belongs to.
+- "subject" is the specific local object the value belongs to. Population statistics, equipment settings, examples and other people's results do not belong to the document owner. Candidate names are only hints; use the local generic subject if no individual is identified.
+- Ownership follows roles, not the nearest name: authors, operators, reviewers and issuers are not automatically the subject being described. Use the document's main subject when the passage unambiguously describes that subject, while keeping locally identified objects separate.
+- "subject_origin": "explicit" for a locally named subject, "context" for an unambiguous local reference, "unresolved" otherwise. "evidence" is a short verbatim supporting passage.
+- "fact_kind": "state" for a continuing assignment/status/configuration explicitly in force; "observation" for measurements, events or experiment results; "reference" for specifications, examples or general statistics. Do not interpret a new observation as replacing an old one.
 - "property" is what the state is about, in a short phrase in the text's own wording (owner, status, progress, due date, decision, budget, blood pressure ...). Use the same phrase for the same kind of state, so that states at different dates can be compared.
 - "value" is the state itself, copied from the text (a person's name, a status word, a percentage, a date, a number); put a separate unit in "unit"; leave fields you do not have as "".
 - "valid_from": the date the state applies from when the text states one; otherwise the document date. "valid_until": only when the text states an end. Turn relative or year-less dates (next week, end of the month, 下周, 月底, 3月5日) into absolute dates (YYYY-MM-DD, YYYY-MM or YYYY) using the document date; "period_text" is the time expression copied verbatim.
@@ -316,9 +334,10 @@ Rules:
 
 GENERATE_DOMAIN_PROMPT = """
 You are an intelligent assistant that helps a human to analyze the information in a text document.
-Given a sample text, help the user by assigning a descriptive domain that summarizes what the text is about.
+Given sample texts, assign a descriptive domain or a short list of domains covering what they are about.
+Include distinct subjects represented in the samples. A dominant subject does not redefine unrelated objects.
 Example domains are: "Social studies", "Algorithmic analysis", "Medical science", among others.
-Reply ONLY with the domain: a short noun phrase of a few words, with no explanation.
+Reply ONLY with the domain description: a short noun phrase or a few short phrases, with no explanation.
 
 Text: {input_text}
 Domain:"""
@@ -345,7 +364,8 @@ persona description:"""
 # feature ID, which yielded 7,847 entities, 64% of them occurring once with a median degree of 1 -- an
 # identifier type is a unique string in every document and only becomes a node connected to nothing.
 ENTITY_TYPE_TASK = """
-Identify the relations and structure of the community of interest, specifically within the {domain} domain.
+Identify the relations and structure of the community of interest. The sampled domains are: {domain}.
+Use each object's meaning in its source context, including general-purpose objects and less frequent subjects.
 
 An entity type must name a CATEGORY OF THINGS that recurs across many different documents,
 so that separate mentions can be merged into one node and linked to other nodes.
@@ -508,6 +528,7 @@ CONCEPT_JUDGE_PROMPT = """Below are pairs of measured properties or attributes t
 For each pair decide whether the two names denote the SAME property (the same measured quantity or attribute, possibly written differently, abbreviated, or in another language), so that their values could be compared on one timeline.
 Different quantities that merely belong to the same topic (total cholesterol vs LDL cholesterol; setup time vs hold time; revenue vs net profit) are NOT the same.
 Two names that differ only in a side marker (left vs right), a grade (mild vs severe), a numbering or sign (I vs II, +1/2 vs -1/2), a version suffix, or an identifier that appears on one side only denote DIFFERENT properties, however similar they look.
+Opposite polarity or applicability (suitable vs not suitable), different measurement conditions, and a measurement versus its interpretation are not synonyms. A shared symbol or high textual similarity alone does not establish identity. When evidence is insufficient, answer no.
 Answer one line per pair in the form "<index>. yes" or "<index>. no", nothing else.
 
 {pairs}
@@ -516,7 +537,7 @@ Answer one line per pair in the form "<index>. yes" or "<index>. no", nothing el
 # ── View-layer narration (compile.py): the subject page's overview, using only what the page contains ──
 PAGE_NARRATE_PROMPT = """Below is a compiled reference page about "{title}", assembled from a knowledge base: its facts grouped by property and ordered by date or version, its relationships, and its source documents.
 Write a concise narrative overview of "{title}" in {language}, 80 to 200 words, in plain prose (no headings, no bullet lists, no tables).
-Use ONLY what the page says. Name the properties that changed over time and how (first value to last value, with dates or versions), point out flagged or out-of-range values and which document they come from, and mention the most informative relationships. Do not invent values, do not add general knowledge, do not repeat the tables.
+Use ONLY what the page says. Name the properties that changed over time and how (first value to last value, with dates or versions), point out flagged or out-of-range values and which document they come from, and mention the most informative relationships. Do not invent values, do not add general knowledge, do not repeat the tables. Attribute differing claims to their source dates; do not decide which claim is authoritative, superseded or in force merely because it is newer.
 
 Page:
 {page}

@@ -545,6 +545,10 @@ def _drop_graph_data(settings: Settings, con, *, kb_id: str, collection: str, er
         short = graph_collection_short_name(collection)
         removed: list[str] = []
         work = settings.graph_work_dir / "work" / short
+        reports = settings.graph_work_dir / "reports" / short
+        if reports.is_dir():
+            shutil.rmtree(reports)
+            removed.append(str(reports))
         if work.exists():
             shutil.rmtree(work, ignore_errors=True)
             removed.append(str(work))

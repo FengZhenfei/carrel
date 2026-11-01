@@ -12,7 +12,7 @@ Carrel 的组件比较多，完整的本地部署对机器也有一定要求。�
 
 ## 服务器上的服务
 
-共九个容器，即 [deployment/compose](../deployment/compose/README.md) 中启用本地模型 profile 后的全部服务：
+共八个容器，即 [deployment/compose](../deployment/compose/README.md) 中启用本地模型 profile 后的全部服务：
 
 | 容器 | 作用 |
 |---|---|
@@ -22,9 +22,8 @@ Carrel 的组件比较多，完整的本地部署对机器也有一定要求。�
 | `carrel-reranker` | 文本重排序，Qwen3-Reranker-0.6B |
 | `carrel-vl-embedding` | 视觉向量，Qwen3-VL-Embedding-2B |
 | `carrel-vl-reranker` | 视觉重排序，Qwen3-VL-Reranker-2B |
-| `carrel-vlm` | 图片描述，Qwen3-VL-8B-Instruct-FP8 |
 
-只有建图用的是远程模型：通过 DeepSeek 的 OpenAI 兼容接口调用 DeepSeek Flash，并在控制台的模型注册表中登记。解析、向量化和图片描述都在服务器上完成，只有建图会把文本发送给这家服务商。
+建图通过 DeepSeek 的 OpenAI 兼容接口调用 DeepSeek Flash，并在控制台的模型列表中登记。图片描述和表格复核使用各知识库从同一模型列表选择的多模态模型，接口可以部署在其他机器或使用服务商提供的接口；MinerU 和检索模型继续运行在知识库服务器上。
 
 定时任务按 [默认频率](../deployment/systemd/README.md#units) 运行：扫描每分钟一次，解析队列每五分钟一次，图谱检查每两小时一次，另有按天、按周、按月的清理任务。
 

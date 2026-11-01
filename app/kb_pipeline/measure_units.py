@@ -13,6 +13,12 @@ from typing import Any
 # Unit normalization: alias → canonical spelling (spelling only, no conversion; conversion applies only to
 # whitelisted dimensions, see reconcile)
 _UNIT_ALIASES = {
+    "second": "s", "seconds": "s", "sec": "s", "secs": "s",
+    "minute": "min", "minutes": "min", "min": "min", "mins": "min", "分钟": "min",
+    "hour": "h", "hours": "h", "hr": "h", "hrs": "h", "h": "h", "小时": "h",
+    "day": "day", "days": "day", "week": "week", "weeks": "week", "month": "month", "months": "month",
+    "year": "year", "years": "year", "item": "item", "items": "item",
+    "bit": "bit", "bits": "bit", "byte": "B", "bytes": "B", "bp": "bp", "pt": "pt", "°": "°",
     "ma": "mA", "毫安": "mA", "milliamp": "mA", "milliamps": "mA", "ua": "µA", "μa": "µA", "µa": "µA", "微安": "µA",
     "a": "A", "安": "A", "mv": "mV", "毫伏": "mV", "v": "V", "伏": "V", "伏特": "V", "kv": "kV",
     "ns": "ns", "纳秒": "ns", "ps": "ps", "us": "µs", "μs": "µs", "µs": "µs", "微秒": "µs", "ms": "ms", "毫秒": "ms", "s": "s", "秒": "s",

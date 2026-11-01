@@ -7,6 +7,8 @@ conflicts are marked, and compiled pages are labelled separately from source chu
 by number."""
 from __future__ import annotations
 
+from kb_pipeline.chunking.context import payload_text
+
 from typing import Any, Callable
 
 from kb_pipeline.utils import count_tokens
@@ -29,6 +31,8 @@ def visual_block(payload: dict[str, Any]) -> dict[str, Any] | None:
     conflicts = payload.get("visual_value_conflicts") or []
     return {
         "kind": payload.get("visual_kind"), "confidence": payload.get("visual_confidence"),
+        "truncated": bool(payload.get("vlm_truncated")),
+        "decorative": bool(payload.get("visual_decorative")),
         "summary": payload.get("visual_summary"), "text": str(payload.get("visual_text") or "")[:VISUAL_TEXT_LIMIT],
         "facts": list(payload.get("visual_facts") or [])[:VISUAL_FACTS_LIMIT],
         "ref": payload.get("visual_ref"), "sha256": payload.get("visual_sha256"),
@@ -38,7 +42,7 @@ def visual_block(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: str = "hit", of: int | None = None) -> dict[str, Any]:
-    text = str(payload.get("text") or "")
+    text = payload_text(payload)
     row = {
         "n": n, "role": role, "of": of,
         "kb_id": cand.get("kb_id") or payload.get("kb_id"), "point_id": cand.get("point_id") or payload.get("point_id"),
@@ -48,7 +52,14 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "position": position(payload), "place": place(payload), "page_idx": payload.get("page_idx"),
         "page_end": payload.get("page_end"),
         "section_path": list(payload.get("section_path") or []),
+        "section_paths": list(payload.get("section_paths") or []),
         "source_locator": payload.get("source_locator"),
+        "source_regions": payload.get("source_regions"),
+        "code_context_sources": payload.get("code_context_sources"),
+        "source_field": payload.get("source_field"),
+        "source_fields": payload.get("source_fields"),
+        "table_review": payload.get("table_review"),
+        "visual_fragment": payload.get("visual_fragment"),
         "block_type": payload.get("block_type"), "block_id": payload.get("block_id"), "text": text,
         "token_count": int(payload.get("token_count") or 0) or count_tokens(text),
         "scores": dict(cand.get("scores") or {}), "recall_sources": list(cand.get("recall_sources") or []),
@@ -327,8 +338,8 @@ def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "scor
         scores = [float(c.get(score_key) or 0.0) for c in rest]
         top = max(scores) if scores else 0.0
         rel = [s / top if top > 0 else 0.0 for s in scores]
-        toks = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in rest]
-        chosen_toks = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in picked]
+        toks = [body_token_set(payload_text(c.get("payload") or {})) for c in rest]
+        chosen_toks = [body_token_set(payload_text(c.get("payload") or {})) for c in picked]
         remaining = list(range(len(rest)))
         # Each candidate's highest similarity to the entries already picked: every newly picked entry is compared
         # once, instead of recomputing against all picked entries in every round
@@ -339,7 +350,7 @@ def select_hits(ordered: list[dict[str, Any]], k: int, *, score_key: str = "scor
             remaining.remove(best_i)
             for i in remaining:
                 sim[i] = max(sim[i], jaccard(toks[i], toks[best_i]))
-    toks_all = [body_token_set(str((c.get("payload") or {}).get("text") or "")) for c in picked]
+    toks_all = [body_token_set(payload_text(c.get("payload") or {})) for c in picked]
     pairs = [(i, j) for i in range(len(toks_all)) for j in range(i + 1, len(toks_all))]
     redundancy = round(sum(jaccard(toks_all[i], toks_all[j]) for i, j in pairs) / len(pairs), 4) if pairs else 0.0
     # Quotas and MMR decide "which ones"; the presentation order still follows the final score: a
@@ -412,9 +423,10 @@ def spec_hint(sp: dict[str, Any]) -> str | None:
         cond = ", ".join(f"{k}={v}" for k, v in sp["conditions"].items())
     if cond:
         tail.append(f"@ {cond}")
-    when = str(sp.get("when") or sp.get("valid_from") or "").strip()
+    when = str(sp.get("when") or sp.get("valid_from") or sp.get("observed_at") or sp.get("observed") or "").strip()
     if when:
-        tail.append(f"· {when}")
+        basis = {"document": "document date", "reported": "reported observation"}.get(sp.get("time_basis"))
+        tail.append(f"· {when}" + (f" ({basis})" if basis else ""))
     return f"{head} = {value}" + (" " + " ".join(tail) if tail else "")
 
 
@@ -423,7 +435,7 @@ def spec_rows(specs: list[dict[str, Any]], *, source_ns: dict[str, int], limit_h
     """Fact table (Q11): with hint string, source chunk numbers, the other values of the same series
     ("30(2024), 31(2025)") and conflict markers; numeric filtering trusts only fields whose kinds is
     scalar, and kinds is passed through as-is here. point_active: whether the source points are still
-    active (Codex S03): a fact whose source points are all deactivated is marked verified=False and
+    active (Codex S03): a fact whose source points are all deactivated is marked source_valid=False and
     gets no hint, rather than silently passing as a current fact. Conclusions rest only on source points
     that were actually checked: when none could be checked (the main store did not return them) the
     answer is "unknown", not "no longer valid"."""
@@ -442,10 +454,10 @@ def spec_rows(specs: list[dict[str, Any]], *, source_ns: dict[str, int], limit_h
         if checked:
             active = [p for p in checked if point_active.get(p, True)]
             row["sources_active"] = f"{len(active)}/{len(checked)}"
-            row["verified"] = bool(active)
+            row["source_valid"] = bool(active)
         else:
-            row["verified"] = None if not pids else bool(row["sources"]) or None
-        hint = spec_hint(sp) if hints_given < limit_hints and row.get("verified") is not False else None
+            row["source_valid"] = None if not pids else bool(row["sources"]) or None
+        hint = spec_hint(sp) if hints_given < limit_hints and row.get("source_valid") is not False else None
         if hint:
             hints_given += 1
         row["hint"] = hint
@@ -470,7 +482,7 @@ def page_rows(pages: list[dict[str, Any]], *, subjects: list[str], text_budget_t
     for timeline pages and subject pages with series rows, cut to the total budget, the rest get only
     the overview; every row is marked compiled=True as a reminder that it is second-hand knowledge,
     and answers cite pages together with chunks. A page whose source points are all deactivated
-    (verified=False) gets no body text: it was compiled from content that has since been deleted or
+    (source_valid=False) gets no body text: it was compiled from content that has since been deleted or
     replaced, so only the overview is kept as a lead."""
     subj = [s.casefold() for s in subjects if s]
 
@@ -488,10 +500,10 @@ def page_rows(pages: list[dict[str, Any]], *, subjects: list[str], text_budget_t
         if checked:                                 # conclusions rest only on checked source points; a page none of whose points were checked is not marked
             active = [p for p in checked if point_active[p]]
             row["sources_active"] = f"{len(active)}/{len(checked)}"
-            row["verified"] = bool(active)
+            row["source_valid"] = bool(active)
         kind = str(pg.get("kind") or "")
         text = str(pg.get("text") or "")
-        wants_text = text and row.get("verified") is not False and (kind == "timeline" or (kind == "subject" and (pg.get("series") or [])))
+        wants_text = text and row.get("source_valid") is not False and (kind == "timeline" or (kind == "subject" and (pg.get("series") or [])))
         if wants_text:
             n = count_tokens(text)
             if used + n <= text_budget_tokens:

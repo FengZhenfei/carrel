@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .structured_eval import CHECKS, evaluate_structured
+
 HIT_KS = (3, 5, 12)
 
 
@@ -146,6 +148,7 @@ def evaluate_item(item: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
         # rejection. When the top rerank score falls between the floor and the threshold the service returns
         # accepted evidence, and a low score alone must not count as a correct rejection
         res["negative"] = bool(summary.get("no_relevant_content"))
+    res.update(evaluate_structured(item, out))
     return res
 
 
@@ -163,7 +166,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         out[f"doc_hit@{k}"] = f"{got}/{tot}" if tot else None
     ranked = [r for r in rows if "rr" in r]
     out["mrr"] = round(sum(float(r["rr"]) for r in ranked) / len(ranked), 4) if ranked else None
-    for key in ("expect", "expect_all", "min_docs", "negative"):
+    for key in ("expect", "expect_all", "min_docs", "negative") + CHECKS:
         got, tot = rate(key)
         out[key] = f"{got}/{tot}" if tot else None
     lat = [int(r["total_ms"]) for r in rows if r.get("total_ms") is not None]
@@ -180,7 +183,8 @@ def evaluate(items: list[dict[str, Any]], search_fn: Callable[..., dict[str, Any
     rows = []
     for it in items:
         try:
-            out = search_fn(it["q"], kbs=None if auto else (it.get("kbs") or kbs), top_k=top_k)
+            scope = {key: it[key] for key in ("as_of", "history") if key in it}
+            out = search_fn(it["q"], kbs=None if auto else (it.get("kbs") or kbs), top_k=top_k, **scope)
             rows.append(evaluate_item(it, out))
         except Exception as exc:
             # A question that errored counts in the denominator as "not answered" (Codex S08); it must
@@ -195,7 +199,7 @@ def evaluate(items: list[dict[str, Any]], search_fn: Callable[..., dict[str, Any
             if it.get("gold_docs"):
                 for k in HIT_KS:
                     row[f"doc_hit@{k}"] = False
-            for key in ("expect", "expect_all", "min_docs", "negative"):
+            for key in ("expect", "expect_all", "min_docs", "negative") + CHECKS:
                 if it.get(key):
                     row[key] = False
             rows.append(row)
@@ -221,7 +225,7 @@ def compare(current: dict[str, Any], previous: dict[str, Any] | None) -> list[tu
     cur, prev = current.get("summary") or {}, (previous or {}).get("summary") or {}
     rows = []
     for key in ("n", "errors", "stale_gold", "hit@3", "hit@5", "hit@12", "doc_hit@3", "doc_hit@5", "doc_hit@12", "mrr", "expect", "expect_all", "min_docs",
-                "negative", "avg_ms", "low_confidence"):
+                "negative", "avg_ms", "low_confidence") + CHECKS:
         a, b = cur.get(key), prev.get(key)
         na, nb = _num(a), _num(b)
         delta = "" if na is None or nb is None else f"{na - nb:+.3f}"
@@ -245,7 +249,7 @@ def run_eval(set_path: str, *, out_path: str | None = None, kbs: list[str] | Non
     if search_fn is None:
         from . import service
 
-        search_fn = lambda q, kbs=None, top_k=12: service.search(q, kbs=kbs, top_k=top_k)   # noqa: E731
+        search_fn = service.search
         gold_active = gold_active or _active_points(kbs)
     items = load_set(set_path)
     if gold_active is not None:
@@ -361,7 +365,7 @@ def cli_eval(args: Any) -> int:
         print(f"!! chunk gold is stale for {stale} question(s) (point_ids change after a re-parse): they are left out of hit@k / MRR "
               "and marked (s) below; document gold and expect are judged as usual. Run make-set again to restore the chunk basis.")
     for r in result["items"]:
-        flag = "ERR " if r.get("error") else ("    " if all(r.get(k, True) for k in ("hit@5", "expect", "expect_all", "min_docs", "negative")) else "FAIL")
+        flag = "ERR " if r.get("error") else ("    " if all(r.get(k, True) for k in ("hit@5", "expect", "expect_all", "min_docs", "negative") + CHECKS) else "FAIL")
         print(f"{flag} {r.get('tag') or '':10s} rank={r.get('rank', '-')!s:>3}({r.get('basis', '-')[:1]}) doc={r.get('doc_rank', '-')!s:>3} exp={r.get('expect', '-')!s:5} all={r.get('expect_all', '-')!s:5} "
               f"docs={r.get('docs', '-')!s:>2}/{r.get('min_docs', '-')!s:5} neg={r.get('negative', '-')!s:5} rr={r.get('rerank')} max={r.get('rerank_max')} "
               f"ms={r.get('total_ms')} {r['q'][:40]}" + (f"  !! {r['error']}" if r.get("error") else ""))

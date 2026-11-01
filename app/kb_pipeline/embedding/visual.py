@@ -165,6 +165,7 @@ class VisualEmbeddingClient:
     def embed_images(
         self,
         jobs: list[tuple[Path, Path | None]],
+        *, progress_cb=None,
     ) -> list[list[float] | None]:
         """Embed images in order; `jobs` are (image_path, cache_json) pairs.
 
@@ -187,12 +188,23 @@ class VisualEmbeddingClient:
         workers = min(self.concurrency, len(jobs))
         print(f"[visual-embed] start images={len(jobs)} concurrency={workers} model={self.model_id} dim={self.dim}", flush=True)
         started = time.time()
+        if progress_cb is not None:
+            progress_cb(0, len(jobs))
+
+        def collect(results):
+            vectors = []
+            for vector in results:
+                vectors.append(vector)
+                if progress_cb is not None:
+                    progress_cb(len(vectors), len(jobs))
+            return vectors
+
         if workers == 1:
-            vectors = [one(job) for job in jobs]
+            vectors = collect(map(one, jobs))
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 try:
-                    vectors = list(executor.map(one, jobs))
+                    vectors = collect(executor.map(one, jobs))
                 except Exception:
                     # One image failed in transport, so the whole file has to be redone: the queued images
                     # need not each be tried again

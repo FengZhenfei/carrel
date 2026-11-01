@@ -6,7 +6,7 @@
 上下文归类需要显式语义,不从样本频率推断。
 
 产出写回事实(series_key / series_len / series_index / conflict_group / superseded_by / superseded_on),
-并返回冲突清单与统计,时间线页与体检面板用;序列里最新那一档是现行值,更早的标被取代(检索默认只给现行值)。
+并返回潜在冲突清单与统计供时间线与主体页使用。所有原文声明保留,不自动判定取代。
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import unicodedata
+from itertools import combinations
 from typing import Any
 
 from .concepts import concept_norm
@@ -42,8 +43,7 @@ def _concept(fact: dict[str, Any]) -> str:
 
 
 def group_key(fact: dict[str, Any]) -> tuple[str, str, str]:
-    """分组键不含单位:没单位的事实(异常汇总里的「总胆固醇 增高」)要并进带单位的测量序列;
-    同一组里出现多个单位才按单位拆开(见 split_by_unit)。条件只算全部条件,真正参与分组的是 qualifier_keys 挑出来的那几个。"""
+    """主体、概念与完整条件的基础键;比较与时间线使用 comparison_groups。"""
     return (_subject_norm(fact), _concept(fact), _conditions_norm(fact.get("conditions")))
 
 
@@ -75,22 +75,70 @@ def unit_of(fact: dict[str, Any]) -> str:
 
 
 def split_by_unit(rows: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
-    """Split a group's facts by unit: a single unit (or none at all) is not split; several units form one group
-    each, and unit-less facts join the largest group."""
-    units = [u for u in (unit_of(r) for r in rows) if u]
-    if len(set(units)) <= 1:
-        return [(units[0] if units else "", rows)]
-    from collections import Counter
-
-    main = Counter(units).most_common(1)[0][0]
+    """Keep missing units separate from stated units; no majority-based unit imputation."""
     out: dict[str, list[dict[str, Any]]] = {}
-    for r in rows:
-        out.setdefault(unit_of(r) or main, []).append(r)
+    for row in rows:
+        out.setdefault(unit_of(row), []).append(row)
     return sorted(out.items(), key=lambda kv: (-len(kv[1]), kv[0]))
 
 
+def comparison_groups(facts: list[dict[str, Any]]) -> dict[tuple[str, ...], list[dict[str, Any]]]:
+    """One grouping contract for reconciliation, pages and trends. Missing is not inferred."""
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for f in facts:
+        key = (_subject_norm(f), _concept(f), _conditions_norm(_condition_items(f)), unit_of(f),
+               str(f.get("fact_kind") or "observation"), axis_value_kind(fact_axis(f)))
+        groups.setdefault(key, []).append(f)
+    return groups
+
+
 def fact_axis(fact: dict[str, Any]) -> str:
-    return str(fact.get("valid_from") or fact.get("axis") or "")
+    return str(fact.get("valid_from") or fact.get("observed_at") or fact.get("axis") or fact.get("observed") or "")
+
+
+def _overlapping_states(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """An explicit end prevents assuming a later assertion silently replaced it."""
+    if a.get("fact_kind") != "state" or b.get("fact_kind") != "state":
+        return False
+    from .currency import as_of_day
+
+    def start(row):
+        value = str(row.get("valid_from") or "")
+        as_of_day(value)
+        return value + {4: "-01-01", 7: "-01", 10: ""}[len(value)]
+
+    try:
+        sa, sb = start(a), start(b)
+        if sa > sb:
+            a, b, sa, sb = b, a, sb, sa
+        end = as_of_day(a.get("valid_until"))
+        other_end = as_of_day(b.get("valid_until"))
+        return bool(end and sa <= end and sb <= end and (not other_end or sb <= other_end))
+    except (ValueError, KeyError):
+        return False
+
+
+def _conflict_sets(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Connected conflicting assertions, preserving every source and interval."""
+    parents = list(range(len(rows)))
+    involved = set()
+
+    def root(i):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    for (i, a), (j, b) in combinations(enumerate(rows), 2):
+        if str(a.get("doc_id") or "") == str(b.get("doc_id") or "") or _values_equal(a, b):
+            continue
+        if fact_axis(a) == fact_axis(b) or _overlapping_states(a, b):
+            parents[root(j)] = root(i)
+            involved.update((i, j))
+    groups = {}
+    for i in sorted(involved):
+        groups.setdefault(root(i), []).append(rows[i])
+    return list(groups.values())
 
 
 def _values_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -102,7 +150,7 @@ def _values_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
     if a_num != b_num and not (unit_of(a) and unit_of(b)):
         return True
     for field in ("value", "min", "typ", "max"):
-        ai, bi = classify_value(a.get(field)), classify_value(b.get(field))
+        ai, bi = classify_value(a.get(field), unit=unit_of(a)), classify_value(b.get(field), unit=unit_of(b))
         if ai["kind"] == "scalar" and bi["kind"] == "scalar":
             # the comparator is part of the value: "<1.3" and "1.3" are not the same value (Codex review F04)
             if (ai.get("cmp") or "") != (bi.get("cmp") or ""):
@@ -124,27 +172,15 @@ def _values_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
     """Returns {"conflicts": [...], "stats": {...}}; series_* / conflict_group are written into the facts in place."""
-    raw_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    skipped_conflict = 0
+    from .quality import fact_quality
+
     for f in facts:
         for key in ("superseded_by", "superseded_on", "series_key", "series_len", "series_index", "conflict_group"):
             f.pop(key, None)
-    for f in facts:
-        if not (f.get("subject") and (f.get("property") or f.get("symbol"))):
-            continue
-        if f.get("evidence_conflict"):
-            skipped_conflict += 1          # image text vs estimated reading conflicted: no series, no conflict check (Codex review F01); the fact is kept
-            continue
-        raw_groups.setdefault((_subject_norm(f), _concept(f), ""), []).append(f)
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
-    for (subj, concept, _), rows in raw_groups.items():
-        keys = qualifier_keys(rows)
-        by_cond: dict[str, list[dict[str, Any]]] = {}
-        for r in rows:
-            by_cond.setdefault(_qualified(r, keys), []).append(r)
-        for cond, part in by_cond.items():
-            for unit, unit_rows in split_by_unit(part):
-                groups[(subj, concept, cond, unit)] = unit_rows
+    eligible = [f for f in facts if f.get("subject") and (f.get("property") or f.get("symbol"))
+                and fact_quality(f) != "needs_review"]
+    skipped_conflict = sum(fact_quality(f) == "needs_review" for f in facts)
+    groups = comparison_groups(eligible)
     stats = {"groups": len(groups), "multi_doc_groups": 0, "series": 0, "series_facts": 0, "conflicts": 0, "conflict_facts": 0,
              "same_document_variants": 0, "evidence_conflict_skipped": skipped_conflict}
     conflicts: list[dict[str, Any]] = []
@@ -157,6 +193,22 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
         by_axis: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             by_axis.setdefault(fact_axis(r), []).append(r)
+        for same in _conflict_sets(rows):
+            ckey = "x" + hashlib.sha256(("|".join(key) + "|" + "|".join(sorted(str(r.get("id")) for r in same))).encode("utf-8")).hexdigest()[:16]
+            for r in same:
+                r["conflict_group"] = ckey
+            stats["conflicts"] += 1
+            stats["conflict_facts"] += len(same)
+            axes = sorted({fact_axis(r) for r in same}, key=axis_sort_key)
+            conflicts.append({
+                "key": ckey, "subject": str(same[0].get("subject") or ""),
+                "concept": str(same[0].get("concept") or same[0].get("property") or ""),
+                "axis": axes[0] if len(axes) == 1 else "..".join((axes[0], axes[-1])),
+                "conditions": same[0].get("conditions") or {},
+                "values": [{"fact_id": r.get("id"), **{k: r.get(k) for k in (
+                    "value", "min", "typ", "max", "unit", "doc_id", "rel_path", "section", "quality",
+                    "valid_from", "valid_until", "observed_at", "time_basis")}} for r in same],
+            })
         # date axes and version axes form separate series: "2023-10-31" and "v6.0" have no order between them, so
         # in one series the start, the end and the trend would all be arbitrary
         axes_by_kind: dict[str, list[str]] = {}
@@ -175,13 +227,6 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
                     r["series_len"] = len(ordered)
                     r["series_index"] = idx
                     stats["series_facts"] += 1
-            # 新旧(方案第 7 条):序列里最新那一档是现行值,更早的每一档被它后面那一档取代(沿 superseded_by 能一路走到现行值)
-            for idx, axis in enumerate(ordered[:-1]):
-                newer = ordered[idx + 1]
-                for r in by_axis[axis]:
-                    r["superseded_by"] = by_axis[newer][0].get("id")
-                    r["superseded_on"] = newer
-                    stats["superseded_facts"] = stats.get("superseded_facts", 0) + 1
         for axis, same in by_axis.items():
             if len(same) < 2:
                 continue
@@ -198,18 +243,6 @@ def reconcile_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
                 # conflict, so they are only counted (2026-09-08: all 7 groups in one evaluation corpus were of this kind)
                 stats["same_document_variants"] += 1
                 continue
-            ckey = "x" + hashlib.sha256(f"{'|'.join(key)}|{axis}".encode("utf-8")).hexdigest()[:16]
-            for r in same:
-                r["conflict_group"] = ckey
-            stats["conflicts"] += 1
-            stats["conflict_facts"] += len(same)
-            conflicts.append({
-                "key": ckey, "subject": str(same[0].get("subject") or ""), "concept": str(same[0].get("concept") or same[0].get("property") or ""),
-                "axis": axis, "conditions": same[0].get("conditions") or {},
-                "values": [{"fact_id": r.get("id"), "value": r.get("value") or "", "min": r.get("min") or "", "typ": r.get("typ") or "",
-                            "max": r.get("max") or "", "unit": r.get("unit") or "", "doc_id": r.get("doc_id"), "rel_path": r.get("rel_path"),
-                            "section": r.get("section"), "quality": r.get("quality")} for r in distinct],
-            })
     conflicts.sort(key=lambda c: (c["subject"], c["concept"], c["axis"]))
     return {"conflicts": conflicts, "stats": stats}
 

@@ -1,6 +1,6 @@
 # Carrel infrastructure: the parser (MinerU), the three stores (Qdrant,
-# OpenSearch, Neo4j) and, behind the `local-models` profile, five vLLM model
-# servers for people who want embeddings / rerankers / the vision model on the
+# OpenSearch, Neo4j) and, behind the `local-models` profile, four vLLM model
+# servers for people who want text and visual embeddings / rerankers on the
 # same box instead of a hosted API.
 #
 # Every host path below is relative to this directory, so data lands under
@@ -27,8 +27,7 @@ x-vllm-environment: &vllm-environment
 # scores however requests are batched and whether the prefix cache hits, so the
 # same search ranks the same way every time. Without it identical requests got
 # slightly different scores and the chunks near the cut-off came and went.
-# Image embedding is somewhat slower in this mode; the generative servers (vlm,
-# the parser) keep the default.
+# Image embedding is somewhat slower in this mode; the parser keeps the default.
 x-vllm-deterministic: &vllm-deterministic
   <<: *vllm-environment
   VLLM_BATCH_INVARIANT: "${VLLM_BATCH_INVARIANT:-1}"
@@ -255,51 +254,6 @@ services:
       - --port
       - "8000"
     healthcheck: *vllm-healthcheck
-
-  vlm:
-    <<: *vllm-common
-    container_name: carrel-vlm
-    environment:
-      <<: *vllm-environment
-      WAIT_FOR_URL: http://vl-reranker:8000/health
-    depends_on:
-      vl-reranker:
-        condition: service_healthy
-    ports:
-      - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_INSTRUCT_PORT:-8105}:8000"
-    volumes:
-      - "${QWEN3_VL_INSTRUCT_MODEL_PATH:-../../models/Qwen3-VL-8B-Instruct-FP8}:/models/Qwen3-VL-8B-Instruct-FP8:ro"
-    command:
-      - vllm
-      - serve
-      - /models/Qwen3-VL-8B-Instruct-FP8
-      - --served-model-name
-      - qwen3-vl-8b-instruct-fp8
-      - --dtype
-      - "${QWEN3_VL_INSTRUCT_DTYPE:-bfloat16}"
-      - --quantization
-      - "${QWEN3_VL_INSTRUCT_QUANTIZATION:-fp8}"
-      - --gpu-memory-utilization
-      - "${QWEN3_VL_INSTRUCT_GPU_MEMORY_UTILIZATION:-0.18}"
-      - --max-model-len
-      - "${QWEN3_VL_INSTRUCT_MAX_MODEL_LEN:-8192}"
-      - --max-num-seqs
-      - "${QWEN3_VL_INSTRUCT_MAX_NUM_SEQS:-6}"
-      - --max-num-batched-tokens
-      - "${QWEN3_VL_INSTRUCT_MAX_NUM_BATCHED_TOKENS:-16384}"
-      - --limit-mm-per-prompt
-      - '{"image":1,"video":0}'
-      - --mm-processor-cache-gb
-      - "${QWEN3_VL_INSTRUCT_MM_PROCESSOR_CACHE_GB:-1}"
-      - --mm-processor-kwargs
-      - '{"max_pixels":${QWEN3_VL_INSTRUCT_MAX_PIXELS:-3686400}}'
-      - --enforce-eager
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    healthcheck: *vllm-healthcheck
-    stop_grace_period: 60s
 
   # ── parser ────────────────────────────────────────────────────────────────
   # Built from ./mineru. The entrypoint looks at the GPU it actually got,

@@ -75,9 +75,17 @@ in the service's own environment take precedence over the file.
 ## Time and schema queries
 
 `/search`, `/graph/neighbors`, `/graph/facts`, and `/graph/pages` default to
-current evidence. Use `history: true` to include superseded or expired records,
-or `as_of: "2025-06-30"` for a date. A year or month means its last day. Results
-carry time scope and status so historical statements remain distinguishable.
+source evidence, including historical, conflicting and future-dated claims. Carrel
+records dates and potential conflicts; it does not choose which claim is authoritative.
+Explicit document governance still applies. Use `history: true` to include documents
+hidden by governance, or `as_of: "2025-06-30"` to filter by stated time bounds and
+observation dates. A year or month means its last day. `time_basis` distinguishes
+explicit bounds, reported observations and document dates. Query status describes
+this scope, not business validity.
+
+`/graph/facts` applies that same time scope to fact rows and their series summaries.
+Document dates come from filenames or document metadata; native-table data rows,
+code examples and dates inside URLs do not date the entire document.
 
 `POST /graph/schema` takes `kb_id`, an optional `version`, and `format`
 (`json` or `yaml`). `POST /graph/stats` takes `kb_id` and returns graph coverage
@@ -423,6 +431,12 @@ For formats with structured locations, `source_locator` records notebook
 and `end`. These locations accompany search sources and `/grep` hits, alongside
 the document and chunk identifiers used by `/context`.
 
+Source excerpts can also carry zero-based `start_column` and `end_column`, or
+`line_ranges` for disjoint source spans. Structured facts include
+`evidence_precision` (`field` or `document`) and `source_locator` when available;
+`value_json` retains a configuration field's JSON value. Field evidence refers
+to the matching chunks, while document-level evidence identifies the file and field.
+
 ## Interpret the evidence
 
 | Result field | How to use it |
@@ -441,11 +455,11 @@ sufficient grounds for an answer. An unavailable reranker can produce
 `unranked` evidence. Service errors and unavailable channels are reported
 separately in the diagnostics.
 
-For facts, pages, entities, and relationships, inspect `verified` and
+For facts, pages, entities, and relationships, inspect `source_valid` and
 `sources_active`; entities and relationships are checked through one
 representative source point per document. After a document is deleted or
 re-parsed, the graph catches up only with its next version. Until then,
-`verified=false` marks items whose sources are all inactive: they are not
+`source_valid=false` marks items whose sources are all inactive: they are not
 current grounds, such facts carry no hint, and such pages carry no body text.
 Items whose sources could not be checked are left unmarked. Conflict indicators
 identify differing records. Compare measurements using their subject, unit,
@@ -535,3 +549,18 @@ Only `q` (or `question`) is required; every other field adds a check:
 `make-set` fills `q`, `expect`, `gold_point_ids`, `gold_docs`, `kbs` and `tag`.
 For hand-written questions, take `point_id` and `rel_path` from the `sources`
 of a search response.
+
+Graph assertions carry `quality_state` separately from `source_valid`. `source_valid` checks whether source chunks remain active. Relation fields `polarity`, `target_polarity`, `modality`, and `conditions` preserve what was asserted; qualified or unresolved relations remain retrievable but do not drive unconditional graph expansion. Facts distinguish observations, continuing states, and reference statements. Only comparable records share a trend; a later observation does not supersede an earlier one.
+
+### Structured evidence checks
+
+Question sets also accept `required_facts`, `forbidden_facts`, `required_relations`, `forbidden_relations`, `required_entities`, `forbidden_entities`, `required_documents` and `required_paths`. Fact selectors match fields on the same record, including exact values, conditions and observation dates. Directed paths specify connected `source` / `predicate` / `target` edges. `required_documents` requires every named source, rather than any one of them. `as_of` and `history` are forwarded to retrieval, allowing explicit historical and future-evidence exclusion cases.
+
+```json
+{"q": "What was Example's price by June?", "as_of": "2026-06-30",
+ "required_facts": [{"subject": "Example", "property": "price", "value": "10", "observed": "2026-05-01"}],
+ "forbidden_facts": [{"subject": "Example", "property": "price", "observed": "2026-07-01"}],
+ "required_documents": ["prices/may.csv"]}
+```
+
+Only declared checks enter each denominator. Retrieval errors count as failed checks. These checks complement hit rates and MRR with fact fidelity, source coverage, relation paths and explicit time scope. They use deterministic matching, not model grading.

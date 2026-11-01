@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from .quality import relation_qualifier, relation_semantics, relation_quality, traversable_relation, relation_label, fact_quality, flag_status
 from typing import Any, Callable
 
 from ..vector.qdrant import (
@@ -40,8 +41,8 @@ def entity_id(key: str) -> str:
     return "e" + hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:20]
 
 
-def relation_id(source_key: str, target_key: str, predicate: str) -> str:
-    raw = f"{source_key}|{target_key}|{predicate}"
+def relation_id(source_key: str, target_key: str, predicate: str, qualifier: str = "") -> str:
+    raw = f"{source_key}|{target_key}|{predicate}" + ("|" + qualifier if qualifier else "")
     return "r" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
@@ -117,7 +118,7 @@ def entity_embed_text(e: dict[str, Any]) -> str:
 
 
 def relation_embed_text(r: dict[str, Any]) -> str:
-    text = f"{r.get('source') or ''} -[{r.get('predicate') or 'related_to'}]-> {r.get('target') or ''}: {r.get('description') or ''}"
+    text = f"{r.get('source') or ''} -[{relation_label(r)}]-> {r.get('target') or ''}: {r.get('description') or ''}"
     return text.strip()[:EMBED_TEXT_MAX_CHARS]
 
 
@@ -142,9 +143,12 @@ def spec_payload(f: dict[str, Any], *, kb_id: str, source_collection: str, graph
         "when": when_text(f) or None, "period_text": f.get("period_text") or None,
         "series_key": f.get("series_key") or None, "series_len": f.get("series_len"), "series_index": f.get("series_index"),
         "conflict_group": f.get("conflict_group") or None,
-        # 新旧与观察时间(方案附录第 3 条):检索默认只给现行值
+        # 时间证据与显式文档治理;默认保留各时间点的原文声明
         "superseded_by": f.get("superseded_by") or None, "superseded_on": f.get("superseded_on") or None,
         "observed": f.get("observed") or None, "source_kind": f.get("source_kind") or None,
+        "fact_kind": f.get("fact_kind") or "observation", "subject_origin": f.get("subject_origin"),
+        "time_basis": f.get("time_basis") or None, "observed_at": f.get("observed_at") or None,
+        "quality_state": fact_quality(f), "flag_status": flag_status(f), "extraction_evidence": f.get("evidence"),
         "lapses": True if f.get("lapses") else None,             # 写明的一段状态:过了止期算已结束(currency.lapses)
         # 来源文档全都不现行(更正文件里标了被取代 / 归档 / 过了有效期):检索默认不给
         "doc_status": f.get("doc_status") or None,
@@ -163,6 +167,9 @@ def spec_payload(f: dict[str, Any], *, kb_id: str, source_collection: str, graph
                                     conditions_text(f.get("conditions")), f.get("note")),
         "unit_id": f.get("unit_id"), "doc_id": f.get("doc_id"), "rel_path": f.get("rel_path"), "section": f.get("section"),
         "point_ids": list(f.get("point_ids") or [])[:POINT_IDS_LIMIT],
+        "source_locator": f.get("source_locator"), "evidence_precision": f.get("evidence_precision"),
+        "evidence_unit_ids": f.get("evidence_unit_ids"),
+        "value_json": f.get("value_json"),
     }
     return {k: v for k, v in payload.items() if v is not None}
 
@@ -253,13 +260,14 @@ def entity_payload(e: dict[str, Any], *, kb_id: str, source_collection: str, gra
 def relation_payload(r: dict[str, Any], *, kb_id: str, source_collection: str, graph_version: str,
                      point_ids: list[str]) -> dict[str, Any]:
     payload = {
-        "gr_id": relation_id(r["source_key"], r["target_key"], r["predicate"]),
+        "gr_id": relation_id(r["source_key"], r["target_key"], r["predicate"], relation_qualifier(r)),
         "kb_id": kb_id, "graph_version": graph_version, "graph_type": "relation",
         "source_collection": source_collection,
         "title": f"{r.get('source')} -> {r.get('target')}",
         "source": r.get("source"), "target": r.get("target"),
         "source_id": entity_id(r["source_key"]), "target_id": entity_id(r["target_key"]),
         "type": r.get("predicate"), "directed": bool(r.get("directed")),
+        **relation_semantics(r), "quality_state": relation_quality(r), "traversable": traversable_relation(r),
         "description": r.get("description"),
         # 时间与状态(方案附录第 3 条):原文写明的起止、各来源文档的日期(观察时间)、是否被更新的说法取代
         "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
@@ -267,7 +275,7 @@ def relation_payload(r: dict[str, Any], *, kb_id: str, source_collection: str, g
         "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
         "doc_status": r.get("doc_status") or None, "lapses": True if r.get("lapses") else None,
         "doc_ids": list(r.get("doc_ids") or [])[:16] or None,
-        "search_text": _search_text(r.get("source"), r.get("target"), r.get("predicate"), r.get("description")),
+        "search_text": _search_text(r.get("source"), r.get("target"), relation_label(r), r.get("description")),
         "weight": float(r.get("weight") or 1.0), "strength_sum": float(r.get("strength_sum") or 0.0),
         "evidence": int(r.get("evidence") or 0), "cooccur": int(r.get("cooccur") or 0),
         "npmi": float(r.get("npmi") or 0.0), "combined_degree": int(r.get("combined_degree") or 0),

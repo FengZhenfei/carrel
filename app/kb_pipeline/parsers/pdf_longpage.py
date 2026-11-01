@@ -79,6 +79,17 @@ def prepare_long_pages(path: Path, cache_dir: Path) -> tuple[Path, list[dict]]:
 
 def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) -> list[ParsedBlock]:
     """Convert MinerU's normalized tile bbox to the original PDF's 0-1000 bbox."""
+    def original_box(box, seg):
+        if not seg["tiled"] or not box or len(box) < 4:
+            return box
+        tile_height = seg["y1"] - seg["y0"]
+        x0, y0, x1, y1 = map(float, box[:4])
+        if any(v > 1000 for v in (x0, y0, x1, y1)):
+            x0, x1 = x0 / seg["width"] * 1000, x1 / seg["width"] * 1000
+            y0, y1 = y0 / tile_height * 1000, y1 / tile_height * 1000
+        return [x0, (seg["y0"] + y0 * tile_height / 1000) / seg["height"] * 1000,
+                x1, (seg["y0"] + y1 * tile_height / 1000) / seg["height"] * 1000]
+
     for block in blocks:
         if block.page_idx is None or not 1 <= block.page_idx <= len(segments):
             raise ValueError("segmented PDF block has no valid source page")
@@ -91,15 +102,15 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
                 raise ValueError("segmented PDF table has no valid ending page")
             block.metadata["page_end"] = segments[end_tile - 1]["page"]
         if seg["tiled"]:
-            tile_height = seg["y1"] - seg["y0"]
-            if block.bbox and len(block.bbox) >= 4:
-                x0, y0, x1, y1 = map(float, block.bbox[:4])
-                if any(v > 1000 for v in (x0, y0, x1, y1)):
-                    x0, x1 = x0 / seg["width"] * 1000, x1 / seg["width"] * 1000
-                    y0, y1 = y0 / tile_height * 1000, y1 / tile_height * 1000
-                block.bbox = [x0, (seg["y0"] + y0 * tile_height / 1000) / seg["height"] * 1000,
-                              x1, (seg["y0"] + y1 * tile_height / 1000) / seg["height"] * 1000]
+            block.bbox = original_box(block.bbox, seg)
             block.parser_profile += "+" + VERSION
+        for region in block.metadata.get("code_context_sources", []):
+            tile = region.get("page")
+            if not isinstance(tile, int) or not 1 <= tile <= len(segments):
+                raise ValueError("segmented PDF code label has no valid source page")
+            label_seg = segments[tile - 1]
+            region["bbox"] = original_box(region.get("bbox"), label_seg)
+            region["page"] = label_seg["page"]
         block.metadata["source_tile"] = {"tile": tile_no, **seg}
         # source_item describes the parser input. Keep its tile coordinates nested,
         # while the public page_idx/bbox always locate the original document.

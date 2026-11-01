@@ -14,7 +14,7 @@
 #                           --data    also delete runtime/ and models/
 #
 # Options for `up`:
-#   --with-local-models     also run the five vLLM model servers (needs an
+#   --with-local-models     also run the four embedding/reranking servers (needs an
 #                           NVIDIA GPU and the weights under models/)
 #   --with-pdf-images       also install the optional PyMuPDF extra (AGPL-3.0)
 #                           so search can serve original-resolution PDF pictures
@@ -24,9 +24,9 @@
 #   --no-app                containers only: skip venv, config, init-db, units
 #   --yes                   never prompt (assumed when stdin is not a tty)
 #
-# Re-running `up` is safe: existing .env and config/knowledge-base.env are
-# kept, images are rebuilt only when their inputs changed, running containers
-# are recreated only when their definition changed.
+# Re-running `up` keeps existing settings; the model profile follows the flags.
+# Retired bundled VLM defaults are cleared on upgrade. Images are rebuilt
+# only when their inputs changed, and containers when their definition changed.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +34,7 @@ COMPOSE_DIR="$ROOT/deployment/compose"
 COMPOSE_ENV="$COMPOSE_DIR/.env"
 APP_ENV="$ROOT/config/knowledge-base.env"
 STORE_CONTAINERS=(carrel-qdrant carrel-opensearch carrel-neo4j)
-MODEL_CONTAINERS=(carrel-embedding carrel-reranker carrel-vl-embedding carrel-vl-reranker carrel-vlm)
+MODEL_CONTAINERS=(carrel-embedding carrel-reranker carrel-vl-embedding carrel-vl-reranker)
 DOCKER_HUB_MIRRORS=(docker.m.daocloud.io docker.1ms.run)
 PYPI_MIRRORS=(https://mirrors.aliyun.com/pypi/simple/ https://pypi.tuna.tsinghua.edu.cn/simple/)
 # PEP 503 indexes of PyTorch's CPU-only wheels (the official one serves files
@@ -63,7 +63,7 @@ for arg in "$@"; do
     --yes|-y) YES=1 ;;
     --images) PURGE_IMAGES=1 ;;
     --data) PURGE_DATA=1 ;;
-    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR == 1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -195,7 +195,7 @@ write_compose_env() {
     profiles="local-models"
     # The parser loads its model only once the last local model server is up
     # (the servers start in a queue; see deployment/compose/docker-compose.yml).
-    wait_url="http://vlm:8000/health"
+    wait_url="http://vl-reranker:8000/health"
   fi
 
   if [[ -f "$COMPOSE_ENV" ]]; then
@@ -243,6 +243,35 @@ write_compose_env() {
 }
 
 # ── app config ─────────────────────────────────────────────────────────────
+migrate_legacy_vlm() {
+  # One-way upgrade from the retired bundled VLM; custom endpoints stay intact.
+  local services vlm_url vlm_model vlm_port tmp
+  vlm_port="$(get_kv "$COMPOSE_ENV" QWEN3_VL_INSTRUCT_PORT)"
+  vlm_port="${vlm_port:-8105}"
+  if (( NO_APP == 0 )) && [[ -f "$APP_ENV" ]]; then
+    if grep -q '^KB_CONSOLE_SERVICES=' "$APP_ENV"; then
+      services="$(get_kv "$APP_ENV" KB_CONSOLE_SERVICES | awk -F, '{for (i=1; i<=NF; i++) {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i); if (tolower($i)!="vlm" && $i!="") {printf "%s%s", sep, $i; sep=","}}}')"
+      set_kv "$APP_ENV" KB_CONSOLE_SERVICES "$services"
+    fi
+    vlm_url="$(get_kv "$APP_ENV" VLM_BASE_URL)"
+    vlm_model="$(get_kv "$APP_ENV" VLM_MODEL_ID)"
+    if [[ "$vlm_model" == qwen3-vl-8b-instruct-fp8 ]]; then
+      case "${vlm_url%/}" in
+        "http://127.0.0.1:$vlm_port/v1"|"http://localhost:$vlm_port/v1")
+          set_kv "$APP_ENV" VLM_BASE_URL ""
+          set_kv "$APP_ENV" VLM_MODEL_ID ""
+          set_kv "$APP_ENV" VLM_API_KEY "" ;;
+      esac
+    fi
+  fi
+  if (( NO_APP == 0 )) && [[ -f "$COMPOSE_ENV" ]]; then
+    tmp="$(mktemp)"
+    awk '!/^QWEN3_VL_INSTRUCT_/' "$COMPOSE_ENV" > "$tmp"
+    cat "$tmp" > "$COMPOSE_ENV"
+    rm -f "$tmp"
+  fi
+}
+
 write_app_config() {
   local password
   password="$(get_kv "$COMPOSE_ENV" NEO4J_PASSWORD)"
@@ -259,7 +288,7 @@ write_app_config() {
   set_kv "$APP_ENV" MINERU_BACKEND auto
   set_kv "$APP_ENV" KB_PARSE_ENABLED 1
   if (( WITH_MODELS == 1 )); then
-    set_kv "$APP_ENV" KB_CONSOLE_SERVICES "database,mineru,embedding,visual_embedding,vlm,reranker"
+    set_kv "$APP_ENV" KB_CONSOLE_SERVICES "database,mineru,embedding,visual_embedding,reranker"
     set_kv "$APP_ENV" VISUAL_EMBEDDING_ENABLED 1
     set_kv "$APP_ENV" KB_SEARCH_VISUAL 1
     set_kv "$APP_ENV" RERANKER_BASE_URL "http://127.0.0.1:8102/v1"
@@ -268,7 +297,8 @@ write_app_config() {
     set_kv "$APP_ENV" KB_CONSOLE_SERVICES "database,mineru"
   fi
   log "wrote $APP_ENV"
-  (( WITH_MODELS == 1 )) || warn "point EMBEDDING_*, VLM_* (and optionally RERANKER_BASE_URL) in $APP_ENV at your model endpoints before ingesting"
+  (( WITH_MODELS == 1 )) || warn "point EMBEDDING_* (and optionally RERANKER_BASE_URL) in $APP_ENV at your model endpoints before ingesting"
+  log "select a multimodal model from the console model list for each knowledge base"
 }
 
 # ── containers ─────────────────────────────────────────────────────────────
@@ -410,6 +440,7 @@ cmd_up() {
   have curl || die "curl is required"
   detect
   print_detection
+  migrate_legacy_vlm
   write_compose_env
   containers_up
   if (( NO_APP == 1 )); then

@@ -290,7 +290,7 @@ class EmptyGraphSourceTests(unittest.TestCase):
 
     def _source(self):
         return KBSource(
-            kb_id="project_materials", collection="kb_project", source_root="Project Library",
+            kb_id="project_materials", collection="kb_project", source_root="Synthetic Delta",
             source_type="local_mirror", max_tokens=400, overlap_tokens=80, graph_enabled=True,
         )
 
@@ -301,7 +301,7 @@ class EmptyGraphSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._settings(Path(tmp))
             db.init_db(settings.state_db)
-            verdict = build_mod.evaluate_rebuild(settings, source_key="Project Library", source=self._source())
+            verdict = build_mod.evaluate_rebuild(settings, source_key="Synthetic Delta", source=self._source())
         self.assertFalse(verdict["due"])
         self.assertEqual(verdict["reason"], "no_active_content")
 
@@ -737,6 +737,11 @@ class GraphPhaseResumeTests(unittest.TestCase):
         js = _repo_file("app/kb_server/static/app.js")
         table = js.split("const GRAPH_STAGES = [", 1)[1].split("];", 1)[0]
         names = re.findall(r'\["([^"]+)",', table)
+        # Deployments may store either language in the progress table. The UI
+        # normalizes backend labels before matching; compare the same names here.
+        dictionary = _repo_file("app/kb_server/static/i18n.js")
+        translations = dict(re.findall(r'"([^"\n]+)": "([^"\n]+)"', dictionary))
+        names = [translations.get(name, name) for name in names]
         self.assertGreaterEqual(len(names), 8)
         for name in names:
             self.assertIn(f'"{name}', backend, f"控制台阶段「{name}」在后端找不到同名字面量")
@@ -908,7 +913,7 @@ class BundleTests(unittest.TestCase):
     def test_load_bundle_builds_nodes_edges_and_counts(self) -> None:
         from kb_pipeline.graph.neo4j_import import graph_uid, load_bundle
 
-        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="半导体", source_type="local_mirror",
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="样例模块", source_type="local_mirror",
                           max_tokens=400, overlap_tokens=80)
         with tempfile.TemporaryDirectory() as tmp:
             out, graph, units, entity_id = self._bundle_dir(tmp)
@@ -1087,7 +1092,7 @@ class BuildWiringTests(unittest.TestCase):
         self.assertEqual(validate_graph_schema_config([{"name": "a"}], {"t": "part"}), [])
         # 数量上限在截断之前数:过去先截到上限再比,永远不超,多出来的谓词保存时被无声丢掉
         self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(28)] + ["p0", "related_to"], {}), [])
-        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(29)], {}), ["At most 28 predicates"])
+        self.assertEqual(validate_graph_schema_config([f"p{i}" for i in range(29)], {}), [])
         self.assertTrue(validate_graph_schema_config("", {"t": "p"}))           # 父类必须是八个上层类之一
         with tempfile.TemporaryDirectory() as tmp:
             src = discovery.build_source(Path(tmp), "库", {
@@ -2637,7 +2642,8 @@ class BuildGateTests(unittest.TestCase):
                                                   "graph_entity_types": ["role"], **(config or {})})
         settings = SimpleNamespace(state_db=state, runtime_dir=root, graph_work_dir=root / "graph", mirror_root=mirror,
                                    qdrant_url="http://q", qdrant_api_key="", graph_neo4j_import_after_build=False,
-                                   graph_llm_timeout_seconds=60, graph_llm_concurrency=1, graph_circuit_fails=0)
+                                   graph_llm_timeout_seconds=60, graph_llm_concurrency=1, graph_circuit_fails=0,
+                                   embedding_model_id="example-embedding")
         source = discovery.enrolled_sources(state, mirror)[src.kb_id]
         return build_mod, settings, source
 
@@ -3040,7 +3046,8 @@ class GraphAutoResumeTests(unittest.TestCase):
         from kb_pipeline import cli
 
         loaded = SimpleNamespace(state_db=settings.state_db, mirror_root=settings.mirror_root,
-                                 runtime_dir=settings.runtime_dir, sources={source.kb_id: source})
+                                 runtime_dir=settings.runtime_dir, sources={source.kb_id: source},
+                                 embedding_model_id=settings.embedding_model_id)
         args = argparse.Namespace(graph_command="check-rebuild", execute=execute, dry_run=dry_run, force_full=False,
                                   env_file=None, source=None, collection=None, all=False)
         out = io.StringIO()
@@ -3779,7 +3786,7 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
         from kb_pipeline.graph import recall
         from kb_pipeline.graph.vectors import embed_sha, entity_embed_text, entity_payload
 
-        scoped = {"key": "kb_1:7::尿常规", "title": "尿常规", "type": "检查", "description": "d", "scope": "kb_1:7"}
+        scoped = {"key": "kb_1:7::密封检测", "title": "密封检测", "type": "检查", "description": "d", "scope": "kb_1:7"}
         plain = {"key": "白细胞", "title": "白细胞", "type": "指标", "description": "d", "scope": ""}
         payload = entity_payload(scoped, kb_id="kb_1", source_collection="kb_1", graph_version="v1", point_ids=[])
         self.assertEqual(payload["scope"], "kb_1:7")
@@ -3788,7 +3795,7 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
         self.assertEqual(embed_sha(entity_embed_text(scoped)), embed_sha(entity_embed_text({**scoped, "scope": ""})))
 
         seed = SimpleNamespace(id="p-e1", score=0.9, payload={**payload, "gr_id": "e1", "graph_version": "v1"})
-        relation = SimpleNamespace(id="p-r1", score=0.8, payload={"gr_id": "r1", "source": "尿常规", "target": "蛋白", "type": "has",
+        relation = SimpleNamespace(id="p-r1", score=0.8, payload={"gr_id": "r1", "source": "密封检测", "target": "溶质", "type": "has",
                                                                    "source_id": "e1", "target_id": "e3", "graph_version": "v1"})
 
         class FakeQ:
@@ -3806,9 +3813,9 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
                 rows: list = []
                 if "[r:RELATED_TO]" in query:
                     rows = [{"eid": "e1", "neighbours": [{"rid": "r2", "type": "has", "weight": 2.0, "description": "", "nid": "e2",
-                                                         "title": "尿常规", "ntype": "检查", "scope": "kb_1:9", "pagerank": 0.1, "degree": 1}]}]
+                                                         "title": "密封检测", "ntype": "检查", "scope": "kb_1:9", "pagerank": 0.1, "degree": 1}]}]
                 elif "RETURN eid, e.title" in query:
-                    rows = [{"eid": eid, "title": "蛋白", "type": "指标", "scope": "kb_1:7"} for eid in params["ids"]]
+                    rows = [{"eid": eid, "title": "溶质", "type": "指标", "scope": "kb_1:7"} for eid in params["ids"]]
                 return SimpleNamespace(data=lambda: rows, single=lambda: {"m": 1.0, "n": 0})
 
         driver = SimpleNamespace(session=lambda: FakeSession(), close=lambda: None)
@@ -3817,7 +3824,7 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
         with mock.patch.object(recall, "qdrant_client", return_value=FakeQ()), \
                 mock.patch.object(recall, "neo4j_driver", return_value=driver), \
                 mock.patch.object(recall, "active_neo4j_graph_version", return_value="v1"):
-            out = recall.graph_query(settings, source, "尿常规", vector=[0.1] * 4, hops=1)
+            out = recall.graph_query(settings, source, "密封检测", vector=[0.1] * 4, hops=1)
         scopes = {e["id"]: e.get("scope") for e in out["entities"]}
         # seeds, expanded neighbours and entities filled in from relation endpoints all carry their scope: the two
         # same-named urinalysis entities can be told apart
@@ -3825,8 +3832,7 @@ class BuildArtefactAndRecordTests(unittest.TestCase):
 
 
 class ExpansionRelevanceTests(unittest.TestCase):
-    """第一跳先按强度多取几倍邻边,再按与问题的相关度留 per_node 条:有关系向量按余弦,没有按词重合;相关度只决定留哪几条,
-    不乘进分数(10-24 新旧图对比:中心实体扩展出来的边只按强度挑,问「要哪些能力」,证据里是经验年限分布)。"""
+    """Synthetic regression: Expansion Relevance Tests."""
 
     def _run(self, vectors: dict | None, query_vector: list[float]):
         from unittest import mock
@@ -4231,8 +4237,8 @@ class GraphStatsTests(unittest.TestCase):
             u.doc_date = day
             units.append(u)
         entities = [
-            {"key": "张三", "title": "张三", "type": "person", "upper": "agent", "kind": "instance", "pagerank": 0.9,
-             "doc_ids": ["kb:0", "kb:1", "kb:2", "kb:3"], "unit_ids": ["u0", "u1", "u2", "u3"], "aliases": ["小张", "Zhang San"]},
+            {"key": "样例A", "title": "样例A", "type": "person", "upper": "agent", "kind": "instance", "pagerank": 0.9,
+             "doc_ids": ["kb:0", "kb:1", "kb:2", "kb:3"], "unit_ids": ["u0", "u1", "u2", "u3"], "aliases": ["小张", "Sample A"]},
             {"key": "项目甲", "title": "项目甲", "type": "project", "upper": "entity", "kind": "instance", "pagerank": 0.5,
              "doc_ids": ["kb:0", "kb:1"], "unit_ids": ["u0", "u1"], "aliases": [], "external_ids": [{"scheme": "编号", "value": "P-1"}]},
             {"key": "周报", "title": "周报", "type": "report", "upper": "document", "kind": "class", "pagerank": 0.2,
@@ -4243,14 +4249,14 @@ class GraphStatsTests(unittest.TestCase):
              "doc_ids": ["kb:2"], "unit_ids": ["u2"], "aliases": []},
         ]
         relations = [
-            {"source_key": "张三", "target_key": "项目甲", "predicate": "works_on", "doc_ids": ["kb:0", "kb:1"], "evidence": 2},
-            {"source_key": "张三", "target_key": "某漂移", "predicate": "related_to", "doc_ids": ["kb:2"], "evidence": 3},
-            {"source_key": "张三", "target_key": "周报", "predicate": "authored", "doc_ids": ["kb:4"], "evidence": 1,
+            {"source_key": "样例A", "target_key": "项目甲", "predicate": "works_on", "doc_ids": ["kb:0", "kb:1"], "evidence": 2},
+            {"source_key": "样例A", "target_key": "某漂移", "predicate": "related_to", "doc_ids": ["kb:2"], "evidence": 3},
+            {"source_key": "样例A", "target_key": "周报", "predicate": "authored", "doc_ids": ["kb:4"], "evidence": 1,
              "superseded_by": "x", "valid_from": "2025-12"},
         ]
         specs = [
-            {"id": "f1", "subject_key": "张三", "concept": "职位", "source_kind": "narrative"},
-            {"id": "f2", "subject_key": "张三", "concept": "职位", "superseded_by": "f1"},
+            {"id": "f1", "subject_key": "样例A", "concept": "职位", "source_kind": "narrative"},
+            {"id": "f2", "subject_key": "样例A", "concept": "职位", "superseded_by": "f1"},
             {"id": "f3", "subject_key": "项目甲", "concept": "预算", "source_kind": "table", "doc_status": "superseded"},
         ]
         graph = {"graph_version": "v9", "built_at": 1, "schema": {"version_id": "s3", "entity_types": ["person", "project", "report"]},
@@ -4274,21 +4280,21 @@ class GraphStatsTests(unittest.TestCase):
         self.assertFalse(next(t for t in st["types"] if t["type"] == "gadget")["in_schema"])
         self.assertTrue(next(t for t in st["types"] if t["type"] == "function")["in_schema"])   # 规则抽取的类型不算漂移
         self.assertEqual(st["unclassified"]["types_outside_schema"], [{"type": "gadget", "entities": 1}])
-        self.assertEqual(st["unclassified"]["frequent_related_to"], [{"source": "张三", "target": "某漂移", "evidence": 3}])
+        self.assertEqual(st["unclassified"]["frequent_related_to"], [{"source": "样例A", "target": "某漂移", "evidence": 3}])
         self.assertEqual((st["relations"]["related_to_share"], st["relations"]["superseded"], st["relations"]["with_period"]), (0.333, 1, 1))
         works = next(p for p in st["predicates"] if p["predicate"] == "works_on")
         self.assertEqual((works["edges"], works["docs"], works["pairs"]), (1, 2, [{"source_type": "person", "target_type": "project", "count": 1}]))
         self.assertEqual((st["facts"]["total"], st["facts"]["superseded"], st["facts"]["narrative"], st["facts"]["table"],
                           st["facts"]["non_current_documents"]), (3, 1, 1, 1, 1))
         self.assertEqual(st["facts"]["properties"][0], {"property": "职位", "facts": 2, "subjects": 1})
-        self.assertEqual([s["title"] for s in st["subjects"]], ["张三", "项目甲", "某漂移"])      # 类别名、文档类不当主体
-        self.assertEqual(st["alias_clusters"][0], {"title": "张三", "type": "person", "count": 2, "aliases": ["小张", "Zhang San"]})
+        self.assertEqual([s["title"] for s in st["subjects"]], ["样例A", "项目甲", "某漂移"])      # 类别名、文档类不当主体
+        self.assertEqual(st["alias_clusters"][0], {"title": "样例A", "type": "person", "count": 2, "aliases": ["小张", "Sample A"]})
         cov = entity_coverage(graph["entities"][0], {u.doc_id: u.doc_date for u in units})
         self.assertEqual(cov, {"doc_count": 4, "week_count": 2, "first_seen": "2026-01-05", "last_seen": "2026-02-20"})
         view = overview(st)
         self.assertEqual((view["documents"], view["entities"], view["facts"]), (5, 5, 3))
         self.assertEqual(view["predicates"][0]["pair"].count("->"), 1)
-        self.assertEqual(view["subjects"][:1], ["张三"])
+        self.assertEqual(view["subjects"][:1], ["样例A"])
         self.assertEqual(overview({}), {})
 
     def test_core_subjects_start_with_the_profile_subject_types(self) -> None:
@@ -4301,12 +4307,12 @@ class GraphStatsTests(unittest.TestCase):
                                   "pagerank": 0.4, "doc_ids": ["kb:0"], "unit_ids": ["u0"], "aliases": []})
         graph["profile"] = {"subject_types": ["project", "report"]}
         st = graph_stats(graph, units)
-        self.assertEqual([s["title"] for s in st["subjects"]], ["项目甲", "周报", "项目乙", "张三", "某漂移"])
+        self.assertEqual([s["title"] for s in st["subjects"]], ["项目甲", "周报", "项目乙", "样例A", "某漂移"])
 
     def test_bundle_carries_stats_status_and_coverage(self) -> None:
         from kb_pipeline.graph.neo4j_import import load_bundle
 
-        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="半导体", source_type="local_mirror",
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="样例模块", source_type="local_mirror",
                           max_tokens=400, overlap_tokens=80)
         with tempfile.TemporaryDirectory() as tmp:
             out, graph, units, entity_id = _bundle_dir(self, tmp)

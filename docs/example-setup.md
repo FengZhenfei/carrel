@@ -20,7 +20,7 @@ folder to the server. The author also asks questions here, in Codex.
 
 ## Server
 
-Nine containers, the ones in [deployment/compose](../deployment/compose/README.md)
+Eight containers, the ones in [deployment/compose](../deployment/compose/README.md)
 with the local model profile:
 
 | Container | Role |
@@ -31,12 +31,12 @@ with the local model profile:
 | `carrel-reranker` | text reranking, Qwen3-Reranker-0.6B |
 | `carrel-vl-embedding` | visual embeddings, Qwen3-VL-Embedding-2B |
 | `carrel-vl-reranker` | visual reranking, Qwen3-VL-Reranker-2B |
-| `carrel-vlm` | picture descriptions, Qwen3-VL-8B-Instruct-FP8 |
 
-Graph building is the one part that uses a hosted model: DeepSeek Flash
-through DeepSeek's OpenAI-compatible API, registered in the console's model
-registry. Parsing, embeddings and picture descriptions all run on the
-server; only graph building sends text out, to that provider.
+Graph building uses DeepSeek Flash through its OpenAI-compatible API, registered
+in the console. Image descriptions and table review use the multimodal model
+selected for each knowledge base from the same model list. This endpoint can
+run on another machine or at a provider; MinerU and the retrieval models remain
+on the knowledge-base server.
 
 The scheduled tasks run at the [default cadence](../deployment/systemd/README.md#units):
 the scan every minute, the parse queue every five minutes, the graph check

@@ -95,14 +95,15 @@ def test_malformed_corrections_are_validation_errors(doc):
     assert corrections.parse_corrections(doc)["errors"]
 
 
-def test_future_effective_current_matches_as_of():
+def test_default_retains_future_claims_but_as_of_scopes_them():
     old={"superseded_by":"new","superseded_on":"2027-01-01"}
     new={"valid_from":"2027-01-01"}
     assert currency.row_status(old,day="2026-10-25")=="current"
-    assert currency.row_status(new,day="2026-10-25")=="not_started"
-    assert currency.row_status(old,day="2027-01-01")=="superseded"
+    assert currency.row_status(new,day="2026-10-25")=="current"
+    assert currency.row_status(new,day="2026-10-25",as_of=True)=="not_started"
+    assert currency.row_status(old,day="2027-01-01")=="current"
     assert currency.row_status(new,day="2027-01-01")=="current"
-    assert currency.next_change_day([old,new,{"valid_until":"2026-11","lapses":True}],today="2026-10-25")=="2026-12-01"
+    assert currency.next_change_day([old,new,{"valid_until":"2026-11","lapses":True}],today="2026-10-25")==""
     assert currency.next_change_day([old,new],today="2027-01-01")==""
 
 
@@ -228,7 +229,7 @@ def test_document_date_boundary_and_removed_corrections_require_refresh(tmp_path
         assert docstatus.graph_refresh_pending(settings,source)
 
 
-def test_summaries_and_pages_drop_archived_and_future_sources():
+def test_pages_respect_governance_and_retain_future_source_claims():
     from kb_pipeline.graph.current_view import filter_descriptions,graph_for_pages
     from kb_search import docstatus
     corr=corrections.parse_corrections({"documents":[{"path":"old.pdf","status":"archived"}]})
@@ -240,10 +241,10 @@ def test_summaries_and_pages_drop_archived_and_future_sources():
            "entities":[{"key":"old","doc_ids":["old"]},{"key":"new","doc_ids":["new"]}],
            "relations":[{"doc_ids":["new"],"valid_from":"2027-01-01"}],"specs":[]}
     projected,_=graph_for_pages(graph,[],today="2026-10-25")
-    assert [e["key"] for e in projected["entities"]]==["new"] and not projected["relations"]
+    assert [e["key"] for e in projected["entities"]]==["new"] and projected["relations"] == graph["relations"]
     with patch.object(docstatus,"corrections_of",return_value=corr):
         assert not docstatus.page_allowed(None,None,{"source_paths":["current.pdf","old.pdf"]},{"mode":"current"})
-        assert not docstatus.page_allowed(None,None,{"source_paths":["current.pdf"],"time_mode":"history"},{"mode":"current"})
+        assert docstatus.page_allowed(None,None,{"source_paths":["current.pdf"],"time_mode":"history"},{"mode":"current"})
         assert not docstatus.page_allowed(None,None,{"compiled_day":"2026-10-24"},{"mode":"as_of","day":"2025-01-01"})
 
 

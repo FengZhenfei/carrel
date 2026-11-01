@@ -29,7 +29,9 @@ Skill 从一次检索开始。简单问题直接使用已有证据；比较和�
 
 ## 时间与模式查询
 
-`/search`、`/graph/neighbors`、`/graph/facts` 和 `/graph/pages` 默认返回现行证据。传入 `history: true` 可包含被取代或过期的记录；`as_of: "2025-06-30"` 按指定日期回看，仅给年份或月份时取其最后一天。结果附带时间口径和状态。
+`/search`、`/graph/neighbors`、`/graph/facts` 和 `/graph/pages` 默认保留历史、冲突和未来日期的原文声明，并遵循显式文档治理结果。Carrel 记录时间、变化和潜在冲突；采信、替代或废止由人工或后续 Agent Loop 治理（Agent Loop 尚未实现，正在开发中）。传入 `history: true` 可包含被治理规则隐藏的文档；`as_of: "2025-06-30"` 按原文时间区间和观察日期筛选，仅给年份或月份时取其最后一天。`time_basis` 区分原文区间、报告观察日期和文档日期；查询状态表示时间范围，不是业务有效性裁决。
+
+`/graph/facts` 的序列摘要与事实行使用相同的时间范围。文档日期从文件名或文档自身的日期信息取得；原生表格的数据行、示例代码和网址中的日期不作为整份文档的日期。
 
 `POST /graph/schema` 接受 `kb_id`、可选的 `version` 和 `format`（`json` 或 `yaml`）。`POST /graph/stats` 接受 `kb_id`，返回图谱覆盖与类型统计；`/catalog` 也提供类型、关系、主体及时间覆盖摘要。配套客户端提供 `schema`、`stats`、`--history` 和 `--as-of`。
 
@@ -185,6 +187,8 @@ Skill 客户端可用 `docs --kb 库ID --name "文件名"` 找文档，再用 D 
 
 支持结构化定位的格式还带 `source_locator`：Notebook 的 `cell` 和可选 `output`、JSONL 或 XML 的 `line`，或文本行范围的 `start` 与 `end`。检索来源和 `/grep` 命中保留这些位置，同时带有供 `/context` 使用的文档与切块标识。
 
+源码片段还可带从零计数的 `start_column`、`end_column`，或表示不连续来源的 `line_ranges`。结构化事实可带 `evidence_precision`（`field` 或 `document`）及 `source_locator`；`value_json` 保留配置字段的 JSON 值。字段级证据指向对应切块，文档级证据标明文件和字段。
+
 ## 理解返回证据
 
 | 字段 | 使用方式 |
@@ -199,7 +203,7 @@ Skill 客户端可用 `docs --kb 库ID --name "文件名"` 找文档，再用 D 
 
 首先检查 `retrieval_summary.evidence_state`：`accepted`、`diagnostic` 或 `unranked`。当 `no_relevant_content=true` 时，返回的候选不足以支持答案。重排不可用时可能返回 `unranked`；服务错误与不可用通道会在诊断字段中单独报告。
 
-事实、页面、实体和关系还需检查 `verified` 和 `sources_active`；实体和关系按代表性来源点核验，每份文档一个。文档删除或重新解析后，图谱要到下一个版本才会跟上；在此之前，来源全部失效的条目标为 `verified=false`，不能作为现行依据，这类事实不给线索，这类页面不附正文。来源点未能核验的条目不做标记。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。序列包含指定时间口径内已登记的时间档位，也可以补入未进入本次事实排序结果的档位。
+事实、页面、实体和关系还需检查 `source_valid` 和 `sources_active`；实体和关系按代表性来源点核验，每份文档一个。文档删除或重新解析后，图谱要到下一个版本才会跟上；在此之前，来源全部失效的条目标为 `source_valid=false`，不能作为现行依据，这类事实不给线索，这类页面不附正文。来源点未能核验的条目不做标记。冲突标记用于识别记录间的差异；比较测量结果时，可结合主体、单位、日期和条件字段。序列包含指定时间口径内已登记的时间档位，也可以补入未进入本次事实排序结果的档位。
 
 `text_truncated` 表示可能需要补取原文，`stitched.pieces` 给出拼接片段的位置。来源正文受 `KB_SEARCH_CONTEXT_TOKENS` 限制，编译页面另受 `KB_SEARCH_PAGE_TEXT_TOKENS` 限制，这两个预算独立于 `top_k`。被省略的条件、表头或上下文影响结论时，可调用 `/context` 补取。
 
@@ -260,3 +264,18 @@ cd app
 | `tag` | 输出时显示在题目旁边的标签 |
 
 `make-set` 生成的题目会带上 `q`、`expect`、`gold_point_ids`、`gold_docs`、`kbs` 和 `tag`。手写题目时，`point_id` 和 `rel_path` 可以从检索结果的 `sources` 中取得。
+
+图谱条目用 `source_valid` 表示来源切片是否仍有效，`quality_state` 表示抽取质量状态。关系保留 `polarity`、`target_polarity`、`modality` 和 `conditions`，分别表达否定范围、陈述性质和条件；带限定或待核实的关系可直接检索，但不用于无条件的图谱扩展。事实区分观察记录、持续状态和参考陈述，趋势只比较可比的记录，新观察不会自动取代旧观察。
+
+### 结构化证据评测
+
+题集还支持 `required_facts`、`forbidden_facts`、`required_relations`、`forbidden_relations`、`required_entities`、`forbidden_entities`、`required_documents` 和 `required_paths`。事实选择器要求主体、属性、精确值、条件和记录日期等字段在同一条记录上满足；有向路径按相连的 `source`／`predicate`／`target` 边检查；`required_documents` 要求所有指定来源都被召回。题目中的 `as_of`、`history` 传给检索服务，可测试历史查询及未来证据排除。
+
+```json
+{"q": "截至六月，Example 的价格是多少？", "as_of": "2026-06-30",
+ "required_facts": [{"subject": "Example", "property": "price", "value": "10", "observed": "2026-05-01"}],
+ "forbidden_facts": [{"subject": "Example", "property": "price", "observed": "2026-07-01"}],
+ "required_documents": ["prices/may.csv"]}
+```
+
+每项指标只统计声明了该检查的题目；检索报错计为未通过。它们在命中率和 MRR 之外补充事实准确性、来源覆盖、关联路径和时间范围检查，采用确定性匹配，不调用模型评分。

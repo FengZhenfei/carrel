@@ -11,6 +11,7 @@ from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, clean_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx, walk_dicts
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
 from .mineru_quality import recover_pdf_items
+from .pdf_code import repair_code_items
 
 # Block-level provenance tag, written into parser_profile in the chunk payload; whether a file is re-parsed is
 # decided by the route-level version (common.parser_profile_for_path). The tag does not name the MinerU
@@ -63,6 +64,7 @@ def mineru_pdf_blocks(
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     content = extract_content_list(payload)
     items = recover_pdf_items(content if content else list(walk_dicts(payload)), payload)
+    items = repair_code_items(items, path)
 
     blocks: list[ParsedBlock] = []
     seen: set[tuple] = set()
@@ -74,13 +76,15 @@ def mineru_pdf_blocks(
     toc_pages = detect_toc_pages((page_idx(i), item_text(i)) for i in items if label_of(i) in ("text", "title"))
     if toc_pages:       # page_idx() already returns 1-based page numbers
         print(f"[parser] pdf toc pages={sorted(toc_pages)} (headings there are not sections)", flush=True)
-    resolver = HeadingResolver(item_text(i) for i in items if heading_level(i) and label_of(i) in ("text", "title"))
+    resolver = HeadingResolver(item_text(i) for i in items if heading_level(i) and label_of(i) in ("text", "title")
+                               and not i.get("_pdf_code_label_owned"))
     count = 0
     for item in items:
         typ = label_of(item)
         text = item_text(item)
         level, inferred = (resolver.resolve(heading_level(item), text)
-                           if typ in ("text", "title") and page_idx(item) not in toc_pages else (None, False))
+                           if typ in ("text", "title") and page_idx(item) not in toc_pages
+                           and not item.get("_pdf_code_label_owned") else (None, False))
         sections.observe(level, text)
         footnote = footnote_of(item)
         if footnote:
@@ -129,6 +133,14 @@ def mineru_pdf_blocks(
             "source_type": typ,
             "source_item": {k: v for k, v in item.items() if k not in {"text", "content", "html", "latex"}},
         }
+        if footnote:
+            metadata["source_footnote"] = footnote
+        if item.get("_pdf_code_label_sources"):
+            metadata["code_context_sources"] = [dict(r) for r in item["_pdf_code_label_sources"]]
+        if item.get("_pdf_code_language"):
+            metadata["code_language"] = item["_pdf_code_language"]
+        if item.get("_pdf_code_recovery"):
+            metadata["pdf_code_recovery"] = item["_pdf_code_recovery"]
         if item.get("source_page_end") is not None:
             metadata["page_end"] = item["source_page_end"]
         if block_type in {"image", "chart"} and item.get("content") and not item.get("text"):

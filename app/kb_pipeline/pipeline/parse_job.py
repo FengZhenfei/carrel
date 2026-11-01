@@ -38,7 +38,7 @@ from ..vector.qdrant import collection_exists, ensure_collection
 from ..vector.qdrant import mark_old_versions_inactive, mark_stale_file_points_inactive, upsert_chunks
 from ..vector.qdrant import validate_collection_layout
 from ..vision.images import IMAGE_SUFFIXES
-from ..vision.vlm import prompt_with_language
+from ..vision.vlm import compose_prompt, prompt_with_language
 
 
 TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
@@ -189,6 +189,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     event(f"Parsing started, size={file_row['size']}, profile={parser_profile}")
 
     last_stage_write = [0.0]
+    last_stage_name = [""]
     last_cancel_check = [0.0]
 
     def check_cancelled(force: bool = False) -> None:
@@ -208,7 +209,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         if cancelled:
             raise JobCancelled(f"job {job['job_id']} cancelled by operator")
 
-    def stage(text: str, *, force: bool = False) -> None:
+    def stage(text: str, *, force: bool = False, models=None) -> None:
         # Progress checkpoint for the web console; failures must never take
         # a parse down with them.
         # Every checkpoint is an UPDATE+COMMIT. The VLM callback fires once per image (concurrency 8), which
@@ -216,11 +217,13 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         # to 1.5 seconds.
         check_cancelled(force)
         now = time.time()
-        if not force and now - last_stage_write[0] < 1.5:
+        head = text.split("(", 1)[0].strip()
+        if not force and head == last_stage_name[0] and now - last_stage_write[0] < 1.5:
             return
-        last_stage_write[0] = now
         try:
-            db.set_job_stage(con, str(job["job_id"]), text)
+            db.set_job_stage(con, str(job["job_id"]), text, models=models)
+            last_stage_write[0] = now
+            last_stage_name[0] = head
         except Exception:
             pass
 
@@ -294,7 +297,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     print(f"[parse] chunk-check {summarize_line(chunk_diag)} file={file_row['source_path']}", flush=True)
     event(f"{len(chunks)} chunks · " + ("check passed" if chunk_diag["ok"] else "chunking notes: " + "; ".join(r["message"] for r in chunk_diag["reasons"])))
 
-    stage(f"Text embedding ({len(chunks)} blocks)")
+    stage(f"Text embedding ({len(chunks)} blocks)", models={"embed_text": settings.embedding_model_id})
     embedder = EmbeddingClient(
         base_url=settings.embedding_base_url,
         api_key=settings.embedding_api_key,
@@ -310,7 +313,8 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     for chunk in chunks:
         chunk.embedding_context = embedding_context_for(chunk, doc_name=doc_name)
     try:
-        text_vectors = embedder.embed([embedding_input(chunk) for chunk in chunks])
+        text_vectors = embedder.embed([embedding_input(chunk) for chunk in chunks],
+            progress_cb=lambda d, n: stage(f"Text embedding ({d}/{n} batches)", force=d == 0 or d == n))
     except EmbeddingInputRejected as exc:
         # The service rejected one chunk for its content (most likely over the embedding model's length limit):
         # retrying the same file gives the same result however often, so skip the job-level retries and the
@@ -326,8 +330,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     # Second leg of the serial visual path: every picture the VLM described
     # now also gets a pixel-level vector. Runs after the description pass and
     # the text embeddings, one vector per picture (the first chunk of a block).
-    stage("Visual embedding", force=True)
-    visual_vectors = _embed_visual_chunks(settings, chunks, cache_dir)
+    visual_vectors = _embed_visual_chunks(settings, chunks, cache_dir, stage_cb=stage)
     rejected = len({chunk.block.block_id for chunk in chunks if chunk.block.metadata.get("visual_embed_status")})
     if rejected:
         event(f"The visual embedding service rejected {rejected} images; they have no visual vector")
@@ -499,7 +502,7 @@ def select_visual_chunks(chunks: list[UnifiedChunk]) -> list[UnifiedChunk]:
     return selected
 
 
-def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_dir: Path) -> dict[str, list[float]]:
+def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_dir: Path, *, stage_cb=None) -> dict[str, list[float]]:
     targets = select_visual_chunks(chunks)
     if not targets:
         return {}
@@ -530,7 +533,12 @@ def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_d
         else:
             cache_json = cache_dir / "visual" / f"{chunk.block.block_id}-nohash.embed.json"
         jobs.append((image_path, cache_json))
-    vectors = client.embed_images(jobs)
+    def progress(done, total):
+        if stage_cb is not None:
+            stage_cb(f"Visual embedding ({done}/{total} images)", force=done == total,
+                     models={"embed_visual": settings.visual_embedding_model_id})
+
+    vectors = client.embed_images(jobs, progress_cb=progress if stage_cb is not None else None)
     result: dict[str, list[float]] = {}
     for chunk, vector in zip(targets, vectors, strict=True):
         if vector is None:
@@ -662,7 +670,7 @@ def _finish_empty_document(
     return f"parse-empty:{job['job_id']}:inactive_points={stale_points}"
 
 
-def vlm_progress_callback(stage_cb):
+def vlm_progress_callback(stage_cb, model_id=None):
     """VLM progress → stage label "Describing images (VLM done/total)". The last image is written forcibly:
     the 1.5-second checkpoint rate limit would swallow it and the timeline would stop at "165/166"; when
     stage_cb does not accept the force parameter (other callers such as the preview), fall back to a plain
@@ -672,6 +680,12 @@ def vlm_progress_callback(stage_cb):
 
     def cb(done: int, total: int) -> None:
         text = f"Describing images (VLM {done}/{total})"
+        if model_id:
+            try:
+                stage_cb(text, force=done >= total, models={"vision": model_id})
+                return
+            except TypeError:
+                pass
         if done >= total:
             try:
                 stage_cb(text, force=True)
@@ -680,6 +694,22 @@ def vlm_progress_callback(stage_cb):
                 pass
         stage_cb(text)
     return cb
+
+
+def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str]:
+    """Resolve once per document so all visual stages share the same model and credentials."""
+    name = getattr(source, "vlm_model", None)
+    if not name:
+        if not settings.vlm_base_url or not settings.vlm_model_id:
+            raise NonRetryableParseError("No multimodal model configured; select a vision model in the console")
+        return settings.vlm_base_url, settings.vlm_api_key, settings.vlm_model_id
+    with db.connect(settings.state_db) as con:
+        row = db.get_llm(con, name)
+    if row is None:
+        raise NonRetryableParseError(f"Multimodal model {name!r} is not in the registry")
+    if str(row["protocol"] or "openai") != "openai":
+        raise NonRetryableParseError("Multimodal models require the OpenAI-compatible protocol")
+    return str(row["base_url"]), str(row["api_key"] or ""), str(row["model_id"])
 
 
 def _parse_blocks(
@@ -697,7 +727,10 @@ def _parse_blocks(
     default, so MinerU is never called inside the web process."""
     suffix = path.suffix.lower()
     require_source_content(path)
-    vlm_progress = vlm_progress_callback(stage_cb)
+    # Text-only routes do not depend on the vision model registry.
+    if suffix in IMAGE_SUFFIXES or suffix in {".pdf", ".docx", ".pptx", ".ipynb"}:
+        vlm_base_url, vlm_api_key, vlm_model_id = _vlm_endpoint(settings, source)
+    vlm_progress = vlm_progress_callback(stage_cb, locals().get("vlm_model_id"))
     vlm_options = {
         "temperature": settings.vlm_temperature,
         "top_p": settings.vlm_top_p,
@@ -714,8 +747,8 @@ def _parse_blocks(
         from ..parsers.visual_blocks import enrich_blocks_with_vlm
         blocks = parse_notebook(path, cache_dir)
         enrich_blocks_with_vlm(
-            blocks, base_url=settings.vlm_base_url, api_key=settings.vlm_api_key,
-            model_id=settings.vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
+            blocks, base_url=vlm_base_url, api_key=vlm_api_key,
+            model_id=vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
             filter_decorative=False, vlm_options=vlm_options, caption_cache_root=caption_cache_root,
             prompt=vlm_prompt, progress_cb=vlm_progress,
         )
@@ -724,9 +757,9 @@ def _parse_blocks(
         return parse_image_file(
             path=path,
             cache_dir=cache_dir,
-            vlm_base_url=settings.vlm_base_url,
-            vlm_api_key=settings.vlm_api_key,
-            vlm_model_id=settings.vlm_model_id,
+            vlm_base_url=vlm_base_url,
+            vlm_api_key=vlm_api_key,
+            vlm_model_id=vlm_model_id,
             vlm_concurrency=settings.vlm_concurrency,
             vlm_options=vlm_options,
             caption_cache_root=caption_cache_root,
@@ -736,9 +769,9 @@ def _parse_blocks(
     if suffix == ".pdf":
         return parse_pdf_enhanced(
             mineru_url=settings.mineru_url,
-            vlm_base_url=settings.vlm_base_url,
-            vlm_api_key=settings.vlm_api_key,
-            vlm_model_id=settings.vlm_model_id,
+            vlm_base_url=vlm_base_url,
+            vlm_api_key=vlm_api_key,
+            vlm_model_id=vlm_model_id,
             vlm_concurrency=settings.vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
@@ -753,9 +786,9 @@ def _parse_blocks(
     if suffix == ".pptx":
         return parse_pptx_enhanced(
             mineru_url=settings.mineru_url,
-            vlm_base_url=settings.vlm_base_url,
-            vlm_api_key=settings.vlm_api_key,
-            vlm_model_id=settings.vlm_model_id,
+            vlm_base_url=vlm_base_url,
+            vlm_api_key=vlm_api_key,
+            vlm_model_id=vlm_model_id,
             vlm_concurrency=settings.vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
@@ -768,9 +801,9 @@ def _parse_blocks(
     if suffix == ".docx":
         return parse_docx_enhanced(
             mineru_url=settings.mineru_url,
-            vlm_base_url=settings.vlm_base_url,
-            vlm_api_key=settings.vlm_api_key,
-            vlm_model_id=settings.vlm_model_id,
+            vlm_base_url=vlm_base_url,
+            vlm_api_key=vlm_api_key,
+            vlm_model_id=vlm_model_id,
             vlm_concurrency=settings.vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
@@ -789,7 +822,24 @@ def _parse_blocks(
         print(f"[parser] html dom done blocks={len(blocks)} file={path.name}", flush=True)
         return blocks
     if suffix in TABLE_SUFFIXES:
-        return parse_native_table(path, max_tokens=source.max_tokens, overlap_tokens=source.overlap_tokens)
+        blocks = parse_native_table(path, max_tokens=source.max_tokens, overlap_tokens=source.overlap_tokens)
+        if suffix == ".xlsx":
+            from ..parsers.xlsx_images import extract_xlsx_images
+            from ..parsers.visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text
+            images = extract_xlsx_images(path, cache_dir)
+            if any(b.visual_ref for b in images):
+                vlm_base_url, vlm_api_key, vlm_model_id = _vlm_endpoint(settings, source)
+                vlm_progress = vlm_progress_callback(stage_cb, vlm_model_id)
+                enrich_blocks_with_vlm(images, base_url=vlm_base_url, api_key=vlm_api_key,
+                    model_id=vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
+                    vlm_options=vlm_options, caption_cache_root=caption_cache_root,
+                    prompt=compose_prompt("figure", vlm_prompt), progress_cb=vlm_progress)
+                ensure_visual_blocks_have_text(images, doc_name=path.name)
+            blocks.extend(images)
+            if images:
+                order = {name: i for i, name in enumerate(dict.fromkeys(b.sheet_name for b in blocks))}
+                blocks.sort(key=lambda b: (order[b.sheet_name], b.row_start or 0, b.block_type == "image"))
+        return blocks
     return parse_native(path, "")
 
 
@@ -913,6 +963,7 @@ def _payload_for_chunk(
         "doc_type": block.doc_type or infer_doc_type(str(row["filename"]), str(row["mime_type"])),
         "block_type": block.block_type,
         "section_path": section_path,
+        "section_paths": block.metadata.get("section_paths") or None,
         "section_depth": len(section_path),
         "embedding_context": getattr(chunk, "embedding_context", None),
         "title": block.title,
@@ -923,11 +974,22 @@ def _payload_for_chunk(
         "symbol": block.metadata.get("symbol"),
         "frontmatter": block.metadata.get("frontmatter"),
         "source_locator": block.metadata.get("source_locator"),
+        "code_fragment": block.metadata.get("code_fragment"),
+        "code_language": block.metadata.get("code_language"),
+        "code_context": block.metadata.get("code_context"),
+        "code_context_sources": block.metadata.get("code_context_sources"),
+        "embedded_source": block.metadata.get("embedded_source"),
         # Table merged-cell flags and screenshot verification result (F02): fact extraction marks facts that took
         # an unverified merged value as untrusted, and the console shows a badge
         "table_flags": block.metadata.get("table_flags") or None,
         "degraded": block.metadata.get("degraded") or None,          # parse-time degradation reason, e.g. lost text layer (pdf_textlayer)
         "table_repair": block.metadata.get("table_repair") or None,
+        "table_review": block.metadata.get("table_review") or None,
+        "vlm_truncated": bool(block.metadata.get("vlm_truncated")),
+        "visual_decorative": bool(block.metadata.get("decorative")) if block.visual_ref else None,
+        "source_regions": block.metadata.get("source_regions") or block.metadata.get("table_source_regions") or None,
+        "source_field": block.metadata.get("source_field") or None,
+        "source_fields": block.metadata.get("source_fields") or None,
         # content
         "text": chunk.text,
         "token_count": chunk.token_count or count_tokens(chunk.text),
@@ -979,6 +1041,7 @@ def _payload_for_chunk(
         "visual_kind",
         "visual_confidence",
         "vlm_model",
+        "visual_fragment",
     ):
         if block.metadata.get(key):
             payload[key] = block.metadata[key]

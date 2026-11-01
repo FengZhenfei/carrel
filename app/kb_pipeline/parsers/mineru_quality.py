@@ -48,6 +48,29 @@ def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
             key = (page_idx(item), Path(str(item.get("img_path") or item.get("image_path") or "")).name)
             if key in ends:
                 item["source_page_end"] = ends[key]
+    # MinerU can append discarded headers after the page body. Restore only the
+    # recovered items to their geometric neighbours; keep the other reading order.
+    for item in list(items):
+        box = bbox(item)
+        if not item.get("original_source_type") or not box or len(box) != 4:
+            continue
+        neighbours = []
+        for i, other in enumerate(items):
+            ob = bbox(other)
+            if other is item or page_idx(other) != page_idx(item) or not ob or len(ob) != 4:
+                continue
+            if label_of(other) in {"header", "page_header", "footer", "page_footer", "page_number"}:
+                continue
+            overlap = min(box[2], ob[2]) - max(box[0], ob[0])
+            if overlap > 0 and overlap >= .5 * min(box[2] - box[0], ob[2] - ob[0]):
+                neighbours.append((i, other, ob))
+        below = [n for n in neighbours if n[2][1] >= box[3]]
+        above = [n for n in neighbours if n[2][3] <= box[1]]
+        target = min(below, key=lambda n: n[2][1]) if below else max(above, key=lambda n: n[2][3]) if above else None
+        if target:
+            items.remove(item)
+            index = next(i for i, v in enumerate(items) if v is target[1])
+            items.insert(index if below else index + 1, item)
     return items
 
 

@@ -74,8 +74,11 @@ class EmbeddingClient:
         self.retry = max(1, retry)
         self.sleep_seconds = max(0.0, sleep_seconds)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, progress_cb=None) -> list[list[float]]:
         vectors: list[list[float]] = []
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+        if progress_cb is not None:
+            progress_cb(0, total_batches)
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i:i + self.batch_size]
             end_idx = i + len(batch)
@@ -118,6 +121,8 @@ class EmbeddingClient:
                         time.sleep(min(60.0, 2.0 * attempt))
             if last_error is not None:
                 raise last_error
+            if progress_cb is not None:
+                progress_cb(i // self.batch_size + 1, total_batches)
             if self.sleep_seconds > 0:
                 time.sleep(self.sleep_seconds)
         return vectors

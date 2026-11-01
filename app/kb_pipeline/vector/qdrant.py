@@ -283,6 +283,7 @@ def delete_old_graph_collections(
     keep_latest: int | None = None,
     discard_versions: Iterable[str] = (),
     protect_versions: Iterable[str] = (),
+    version_timestamps: dict[tuple[str, str], int] | None = None,
 ) -> dict[str, object]:
     """Delete superseded graph-version collections. Two modes:
     with ``keep_latest`` (the end-of-build GC and the nightly graph-gc): the aliased (active) version plus the
@@ -296,7 +297,9 @@ def delete_old_graph_collections(
     Aliased collections are never deleted; the active version's unaliased optional collections (spec / page)
     stay with it.
     ``protect_versions``: the version kept for a resume (the newest paused / failed one) is neither deleted nor
-    counted against the keep window; a version listed in both sets is kept."""
+    counted against the keep window; a version listed in both sets is kept.
+    ``version_timestamps`` supplies known workspace timestamps for custom version names, keyed by
+    (source short name, version). Unknown names without this evidence remain untouched."""
     if retention_days < 1:
         raise ValueError("retention_days must be >= 1")
     if keep_latest is not None and int(keep_latest) < 1:
@@ -324,11 +327,15 @@ def delete_old_graph_collections(
             active_of.setdefault(str(parsed["source_short"]), set()).add(str(parsed["graph_version"]))
     rank_of: dict[tuple[str, str], int] = {}
     slots_of: dict[str, int] = {}
+    def timestamp(short: str, version: str) -> int | None:
+        parsed = graph_version_timestamp(version)
+        return parsed if parsed is not None else (version_timestamps or {}).get((short, version))
+
     if keep_latest is not None:
         by_source: dict[str, dict[str, int]] = {}
         for _, parsed in candidates:
             short, version = str(parsed["source_short"]), str(parsed["graph_version"])
-            ts = graph_version_timestamp(version)
+            ts = timestamp(short, version)
             if ts is not None and version not in discard and version not in protect \
                     and version not in active_of.get(short, ()):
                 by_source.setdefault(short, {})[version] = ts
@@ -355,7 +362,7 @@ def delete_old_graph_collections(
             deleted.append({**record, "reason": "unsuccessful", "status": delete_status})
             continue
 
-        version_ts = graph_version_timestamp(version)
+        version_ts = timestamp(short, version)
         if version_ts is None:
             if not delete_unparseable:
                 skipped_collections.append({**record, "reason": "unparseable_version_timestamp"})

@@ -205,6 +205,36 @@ def graph_merges(kb_id: str, limit: int = 2000) -> dict[str, Any]:
     return _wrap(service.graph_merges, kb_id, limit=limit)
 
 
+@router.get("/kbs/{kb_id}/graph_comparisons")
+def graph_comparisons(kb_id: str, version: str = "") -> dict[str, Any]:
+    from .governance import graph_comparisons as read
+    return _wrap(read, service.settings(), kb_id, version=version)
+
+
+@router.get("/kbs/{kb_id}/corrections")
+def get_corrections(kb_id: str) -> dict[str, Any]:
+    from .governance import corrections
+    return _wrap(corrections, service.settings(), kb_id)
+
+
+@router.post("/kbs/{kb_id}/corrections/preview")
+def preview_correction(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .governance import corrections
+    return _wrap(corrections, service.settings(), kb_id, payload=payload)
+
+
+@router.post("/kbs/{kb_id}/corrections")
+def commit_correction(kb_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .governance import corrections
+    return _wrap(corrections, service.settings(), kb_id, payload=payload, commit=True)
+
+
+@router.post("/kbs/{kb_id}/corrections/{record_id}/revoke")
+def revoke_correction(kb_id: str, record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .governance import corrections
+    return _wrap(corrections, service.settings(), kb_id, payload=payload, revoke=record_id)
+
+
 @router.get("/kbs/{kb_id}/config")
 def get_kb_config(kb_id: str) -> dict[str, Any]:
     return _wrap(service.get_kb_config, kb_id)
@@ -284,7 +314,7 @@ def _reject_bad_config(payload: dict[str, Any]) -> None:
     and what blew up then was the whole load_settings (500 across the site)."""
     int_keys = {"max_tokens", "overlap_tokens", "graph_unit_chunks", "graph_max_gleanings",
                 "graph_tune_sample_size"}
-    str_keys = {"vlm_prompt", "graph_rebuild_interval", "graph_rebuild_new_chunk_pct",
+    str_keys = {"vlm_prompt", "vlm_model", "graph_rebuild_interval", "graph_rebuild_new_chunk_pct",
                 "graph_rebuild_operator"}
     for key, value in (payload or {}).items():
         if value is None and key not in SCHEMA_EFFECTIVE_KEYS and key not in ("graph_schema_versions", "graph_paused", "graph_schema_active"):

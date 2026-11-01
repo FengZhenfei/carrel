@@ -13,12 +13,14 @@ skipped -- this table is at once the cache, the in-stage resume point and the ba
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import prompts
+from .quality import relation_qualifier, relation_semantics
 from .tabletext import expand_wide_tables
 from .llm import ChatClient, LLMSpec
 from .units import UNIT_KINDS, Unit
@@ -100,6 +102,7 @@ class ExtractionSchema:
 
     def endpoint_ok(self, type_name: str, ends: set[str]) -> bool:
         """端点约束:没有约束、"*"、或者类型链上任何一级(类型本身、父类、上层类)在允许的集合里。"""
+        ends = {str(e).casefold() for e in ends}
         if not ends or "*" in ends:
             return True
         return any(t in ends for t in self.type_path(type_name))
@@ -347,9 +350,11 @@ def record_caps(unit_kind: str | None, *, has_table: bool = False) -> tuple[int,
 
 
 def render_extract_prompt(unit_text: str, *, section: str, schema: ExtractionSchema, document: str = "",
-                          unit_kind: str | None = None, has_table: bool = False, document_date: str = "") -> str:
+                          unit_kind: str | None = None, has_table: bool = False, document_date: str = "",
+                          table_recovery: bool = False) -> str:
     total, entities = record_caps(unit_kind, has_table=has_table)
-    return prompts.GRAPH_EXTRACTION_PROMPT.format(
+    template = prompts.TABLE_GRAPH_EXTRACTION_PROMPT if table_recovery else prompts.GRAPH_EXTRACTION_PROMPT
+    return template.format(
         entity_types=type_menu(schema),
         predicates=predicate_menu(schema),
         language=schema.language or "English",
@@ -480,6 +485,16 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                 continue
             source = normalize_name(fields[1])
             target = normalize_name(fields[2])
+            metadata: dict[str, Any] = {}
+            if fields[-1].lstrip().startswith("{"):
+                try:
+                    metadata = json.loads(fields[-1])
+                    if not isinstance(metadata, dict):
+                        raise ValueError("relationship metadata must be an object")
+                except (ValueError, TypeError):
+                    metadata = {"polarity": "uncertain"}
+                    stats["malformed_metadata"] = stats.get("malformed_metadata", 0) + 1
+                fields = fields[:-1]
             period = None
             if len(fields) >= 7 and _STRENGTH_RE.fullmatch(fields[-2].strip() or "x"):
                 period = parse_period(fields[-1])
@@ -517,6 +532,7 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                 "source": source, "target": target, "predicate": predicate,
                 "predicate_raw": normalize_predicate(predicate_raw),
                 "description": description, "strength": _strength(strength),
+                **relation_semantics(metadata),
                 "valid_from": valid_from, "valid_until": valid_until,
             })
         else:
@@ -549,13 +565,14 @@ def consolidate(entities: list[dict[str, Any]], relations: list[dict[str, Any]])
         sk, tk = entity_key(r["source"]), entity_key(r["target"])
         if not sk or not tk or sk == tk:
             continue
-        rkey = (sk, tk, r["predicate"])
+        rkey = (sk, tk, r["predicate"], relation_qualifier(r))
         slot = rels.get(rkey)
         if slot is None:
             slot = rels[rkey] = {
                 "source": r["source"], "target": r["target"], "source_key": sk, "target_key": tk,
                 "predicate": r["predicate"], "predicate_raw": r.get("predicate_raw", ""),
                 "descriptions": [], "strength": float(r.get("strength") or 1.0),
+                **relation_semantics(r),
                 "valid_from": "", "valid_until": "",
             }
         slot["strength"] = max(slot["strength"], float(r.get("strength") or 1.0))
@@ -586,7 +603,8 @@ def _absorb_description(descriptions: list[str], desc: str) -> None:
 
 
 def prompt_hash() -> str:
-    parts = [prompts.GRAPH_EXTRACTION_PROMPT, prompts.DEFAULT_EXAMPLES, prompts.CONTINUE_PROMPT, prompts.LOOP_PROMPT]
+    parts = [prompts.GRAPH_EXTRACTION_PROMPT, prompts.TABLE_GRAPH_EXTRACTION_PROMPT,
+             prompts.DEFAULT_EXAMPLES, prompts.CONTINUE_PROMPT, prompts.LOOP_PROMPT]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -649,6 +667,24 @@ class GraphExtractor:
         response, n = self._ask(messages, stats)
         calls += n
         self._absorb(response, entities, relations, stats)
+        from .tabletext import contains_table
+        if (self.max_gleanings and unit.n_tokens < GLEANING_MIN_TOKENS and not entities and not relations
+                and stats.get("unit_kind") != "boilerplate" and (has_table or contains_table(unit.text))):
+            # A terse table may be mistaken for unexplained codes. Retry only an
+            # empty result, within the configured gleaning allowance. Existing
+            # nonempty extractions and ordinary prose keep their original path.
+            recovery = render_extract_prompt(expand_wide_tables(unit.text) or unit.text,
+                section=unit.section_label, schema=self.schema, document=unit.document_label,
+                unit_kind=unit.kind, has_table=has_table,
+                document_date=str(getattr(unit, "doc_date", "") or ""), table_recovery=True)
+            response, n = self._ask([{"role": "user", "content": recovery}], stats)
+            calls += n
+            stats["table_recovery"] = 1
+            stats["gleanings"] += 1
+            previous_kind = stats.pop("unit_kind", "body")
+            self._absorb(response, entities, relations, stats)
+            if not entities and not relations:
+                stats["unit_kind"] = previous_kind
         rounds = self.max_gleanings if unit.n_tokens >= GLEANING_MIN_TOKENS else 0
         for round_index in range(rounds):
             messages = messages + [{"role": "assistant", "content": response},

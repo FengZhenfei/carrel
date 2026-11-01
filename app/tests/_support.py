@@ -1,3 +1,4 @@
+# Test scenarios use synthetic names, records and values; no private corpus is required.
 """Shared test fixtures: repository file reading, fake blocks / chunks / units, a fake model client, and the
 class-level fixtures shared by the test modules after the split."""
 from __future__ import annotations
@@ -29,10 +30,10 @@ def _local_file(rel_path: str, *, checksum: str = "same-checksum") -> SourceFile
     return SourceFile(
         kb_id="project_materials",
         collection="kb_project",
-        source_root="Project Library",
+        source_root="Synthetic Delta",
         source_type="local_mirror",
         file_key=stable_int(f"file:project_materials:{rel_path}"),
-        source_path=f"Project Library/{rel_path}",
+        source_path=f"Synthetic Delta/{rel_path}",
         rel_path=rel_path,
         filename=Path(rel_path).name,
         dir=parent,
@@ -195,10 +196,10 @@ class _CodexAudit20260906TestsSupport:
         return blocks_to_chunks(kb_id="kb", file_key=1, content_version="v", parser_profile="p",
                                 blocks=blocks, max_tokens=max_tokens, overlap_tokens=overlap)
 
-    NVSRAM_ROW_HTML = ("<table><tr><td>参数</td><td>说明</td><td>测试条件</td><td>最小值</td><td>典型值</td><td>最大值</td><td>单位</td></tr>"
+    NVSTORE_ROW_HTML = ("<table><tr><td>参数</td><td>说明</td><td>测试条件</td><td>最小值</td><td>典型值</td><td>最大值</td><td>单位</td></tr>"
                        "<tr><td> $V_{CC}$ </td><td>电源</td><td></td><td>2.7</td><td>3.0</td><td>3.6</td><td>V</td></tr>"
                        "<tr><td> $I_{CC1}$ </td><td>平均电流  $V_{CC}$ </td><td> $t_{RC} = 20 ns$  $t_{RC} = 25 ns$  $t_{RC} = 45 ns$ 无输出负载下取得的值( $I_{OUT} = 0 mA$ )</td>"
-                       "<td>-</td><td>-</td><td>757557</td><td>mAmAmA</td></tr>"
+                       "<td>-</td><td>-</td><td>626248</td><td>mAmAmA</td></tr>"
                        "<tr><td> $I_{CC2}$ </td><td>存储电流</td><td>无需关注</td><td>-</td><td>-</td><td>20</td><td>mA</td></tr></table>")
 
 

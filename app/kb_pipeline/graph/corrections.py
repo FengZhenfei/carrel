@@ -6,7 +6,7 @@
 重建之后照样套用。每晚的过期库清理顺带对账:登记着的库缺文件就补模板,登记表里已经没有的库的文件挪进 orphaned/。
 文件头 kb.id 写着它属于哪个库,和文件名对不上就整份不套用;整库初始化以后库编号会从头再排,所以新编号第一次开库时,
 同名的旧文件先挪进 orphaned/ 再写模板,旧库的更正不会套到新库上。
-每次建图都在抽取结果之上重新套一遍,回退到旧版本时用的也是那一版建图时的更正。Carrel 只写模板、只删整份文件,内容从不改。
+每次建图都在抽取结果之上重新套一遍,回退到旧版本时用的也是那一版建图时的更正。更正可由人编辑,也可通过版本校验的 API 提交和撤销。
 
     kb:
       id: kb_004                                       # 这份更正属于哪个库
@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,6 +51,7 @@ TEMPLATE = """\
 # 名字按规范名比较(全半角、空白、大小写不敏感),标题和别名都认;格式错误会阻止建图并暂缓该库的现行召回。
 kb:
   id: {kb_id}            # 这份更正属于哪个库;和文件名对不上时整份不套用,不要改
+  identity: {identity}
   folder: {folder_yaml}  # 开库时的文件夹名,只给人看
 entities:
   merge: []              # 强制合并,第一个是规范名:[[某公司, 某公司有限公司]]
@@ -88,7 +90,7 @@ def _set_aside(path: Path) -> str:
 
 def ensure_corrections_file(settings: Any, kb_id: str, *, folder: str, fresh: bool = False) -> dict[str, Any]:
     """保证这个库有更正文件(开库时、每晚对账时)。fresh=True 是新编号第一次开库:同名的旧文件只可能属于整库初始化
-    之前的某个库,挪进 orphaned/ 再写模板;其余情况已有的文件原样保留,没有才写模板。返回 {"path", "created", "orphaned"}。"""
+    之前的某个库,挪进 orphaned/ 再写模板;已有规则保留,旧文件补库身份标识。返回 {"path", "created", "orphaned"}。"""
     path = corrections_path(settings, kb_id)
     if path is None:
         return {}
@@ -96,10 +98,28 @@ def ensure_corrections_file(settings: Any, kb_id: str, *, folder: str, fresh: bo
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if not fresh:
+            import yaml
+            raw = path.read_bytes()
+            if len(raw) <= MAX_BYTES:
+                try:
+                    doc = yaml.safe_load(raw)
+                except yaml.YAMLError:
+                    doc = None
+                if (isinstance(doc, dict) and isinstance(doc.get("kb"), dict)
+                        and doc["kb"].get("id") == kb_id and not doc["kb"].get("identity")
+                        and not parse_corrections(doc)["errors"]):
+                    doc["kb"]["identity"] = uuid.uuid4().hex
+                    temp = path.with_name(path.name + ".identity.tmp")
+                    temp.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                    if path.read_bytes() == raw:
+                        os.replace(temp, path)
+                        out["identity_added"] = True
+                    else:
+                        temp.unlink(missing_ok=True)
             return out
         out["orphaned"] = _set_aside(path)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(TEMPLATE.format(kb_id=kb_id, folder=folder, folder_yaml=json.dumps(str(folder), ensure_ascii=False)),
+    tmp.write_text(TEMPLATE.format(kb_id=kb_id, identity=uuid.uuid4().hex, folder=folder, folder_yaml=json.dumps(str(folder), ensure_ascii=False)),
                    encoding="utf-8")
     os.replace(tmp, path)
     out["created"] = True
@@ -138,7 +158,12 @@ def effective_sha(corr: dict[str, Any]) -> str:
     if is_empty(corr):
         return ""
     keys = ("merge", "separate", "aliases", "types", "reject_entities", "reject_relations", "reject_facts", "documents")
-    body = json.dumps({k: corr.get(k) for k in keys}, ensure_ascii=False, sort_keys=True)
+    effective = {k: corr.get(k) for k in keys}
+    active = [r for r in corr.get("records") or [] if r.get("state", "active") == "active"]
+    if active:
+        effective["records"] = active
+        effective["identity"] = corr.get("identity")
+    body = json.dumps(effective, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
@@ -167,6 +192,23 @@ def parse_corrections(doc: Any) -> dict[str, Any]:
     if not isinstance(doc, dict):
         out["errors"].append("更正文件的顶层必须是映射(entities / relations / facts / documents)")
         return out
+    out["identity"] = str((doc.get("kb") or {}).get("identity") or "") if isinstance(doc.get("kb"), dict) else ""
+    out["records"] = []
+    from .governance import validate_record
+    records = doc.get("records") or []
+    if not isinstance(records, list):
+        out["errors"].append("records must be a list")
+        records = []
+    seen = set()
+    for record in records:
+        try:
+            validate_record(record)
+            if record["id"] in seen:
+                raise ValueError("duplicate correction id")
+            seen.add(record["id"])
+            out["records"].append(dict(record))
+        except ValueError as exc:
+            out["errors"].append(str(exc))
     # Validate containers before iterating. A legal YAML scalar is not a rule list.
     doc = dict(doc)
     for section in ("entities", "relations", "facts"):
@@ -316,8 +358,9 @@ def load_corrections(path: Path | None) -> dict[str, Any]:
 
 
 def is_empty(corr: dict[str, Any] | None) -> bool:
-    return not corr or not any(corr.get(k) for k in ("merge", "separate", "aliases", "types", "reject_entities",
+    return not corr or (not any(corr.get(k) for k in ("merge", "separate", "aliases", "types", "reject_entities",
                                                      "reject_relations", "reject_facts", "documents"))
+                       and not any(r.get("state", "active") == "active" for r in corr.get("records") or []))
 
 
 # ── 文档状态 ─────────────────────────────────────────────────────────────
@@ -393,10 +436,12 @@ def apply_entity_corrections(entities: list[dict[str, Any]], relations: list[dic
     upper_of / path_of:类型 → 上层类 / 类型链(改了类型要跟着改)。"""
     from .resolution import merge_entities
 
-    stats = {"rejected_entities": 0, "retyped": 0, "aliases_added": 0, "forced_merges": 0, "unknown_names": [], "unknown_types": []}
+    stats = {"rejected_entities": 0, "retyped": 0, "aliases_added": 0, "forced_merges": 0, "unknown_names": [], "unknown_types": [], "ambiguous_names": []}
     if is_empty(corr):
         return entities, relations, stats, set()
-    rejected = {entity_key(n) for n in corr.get("reject_entities") or []}
+    idx = _index(entities)
+    rejected = {entity_key(n) for n in corr.get("reject_entities") or [] if len(idx.get(entity_key(n), [])) == 1}
+    stats["ambiguous_names"].extend(n for n in corr.get("reject_entities") or [] if len(idx.get(entity_key(n), [])) > 1)
     if rejected:
         drop = {e["key"] for e in entities if entity_key(str(e.get("title") or "")) in rejected}
         entities = [e for e in entities if e["key"] not in drop]
@@ -410,6 +455,9 @@ def apply_entity_corrections(entities: list[dict[str, Any]], relations: list[dic
             stats["unknown_types"].append(f"{name}: {etype}")
             continue
         hits = idx.get(entity_key(name)) or []
+        if len(hits) > 1:
+            stats["ambiguous_names"].append(name)
+            continue
         if not hits:
             stats["unknown_names"].append(name)
         for i in hits:
@@ -423,6 +471,9 @@ def apply_entity_corrections(entities: list[dict[str, Any]], relations: list[dic
             stats["retyped"] += 1
     for name, aliases in (corr.get("aliases") or {}).items():
         hits = idx.get(entity_key(name)) or []
+        if len(hits) > 1:
+            stats["ambiguous_names"].append(name)
+            continue
         if not hits:
             stats["unknown_names"].append(name)
         for i in hits[:1]:
@@ -434,6 +485,10 @@ def apply_entity_corrections(entities: list[dict[str, Any]], relations: list[dic
     pairs: list[tuple[int, int]] = []
     heads: dict[int, str] = {}
     for group in corr.get("merge") or []:
+        ambiguous = [n for n in group if len(idx.get(entity_key(n), [])) > 1]
+        if ambiguous:
+            stats["ambiguous_names"].extend(ambiguous)
+            continue
         found = [(n, (idx.get(entity_key(n)) or [None])[0]) for n in group]
         present = [(n, i) for n, i in found if i is not None]
         stats["unknown_names"].extend(n for n, i in found if i is None)
@@ -459,12 +514,21 @@ def apply_entity_corrections(entities: list[dict[str, Any]], relations: list[dic
     forbidden: set[frozenset[str]] = set()
     idx = _index(entities)
     for group in corr.get("separate") or []:
+        ambiguous = [n for n in group if len(idx.get(entity_key(n), [])) > 1]
+        if ambiguous:
+            stats["ambiguous_names"].extend(ambiguous)
+            continue
         keys = [entities[i]["key"] for n in group for i in (idx.get(entity_key(n)) or [])[:1]]
         for a in range(len(keys)):
             for b in range(a + 1, len(keys)):
                 if keys[a] != keys[b]:
                     forbidden.add(frozenset((keys[a], keys[b])))
     stats["unknown_names"] = sorted(set(stats["unknown_names"]))[:50]
+    from .governance import apply_records
+    entities, relations, _, scoped_forbidden = apply_records(
+        entities, relations, [], corr, phase="entity", known_types=known_types, upper_of=upper_of, path_of=path_of)
+    forbidden |= scoped_forbidden
+    stats["records"] = dict(corr.get("_outcomes") or {})
     return entities, relations, stats, forbidden
 
 
@@ -472,13 +536,19 @@ def apply_relation_corrections(relations: list[dict[str, Any]], entities: list[d
                                ) -> tuple[list[dict[str, Any]], int]:
     """驳回的关系(两端按名字、谓词不写就不限)删掉;返回 (关系, 删掉的条数)。"""
     rules = (corr or {}).get("reject_relations") or []
+    from .governance import apply_records
+    old_count = len(relations)
+    _, relations, _, _ = apply_records(entities, relations, [], corr, phase="relation")
     if not rules:
-        return relations, 0
+        return relations, old_count - len(relations)
+    idx = _index(entities)
+    rules = [r for r in rules if len(idx.get(entity_key(r["source"]), [])) == 1
+             and len(idx.get(entity_key(r["target"]), [])) == 1]
     names: dict[str, set[str]] = {}
     for e in entities:
         names[e["key"]] = {entity_key(str(e.get("title") or ""))} | {entity_key(str(a)) for a in (e.get("aliases") or [])}
     out = []
-    dropped = 0
+    dropped = old_count - len(relations)
     for r in relations:
         src, tgt = names.get(r["source_key"], set()), names.get(r["target_key"], set())
         hit = any(entity_key(x["source"]) in src and entity_key(x["target"]) in tgt
@@ -493,10 +563,20 @@ def apply_relation_corrections(relations: list[dict[str, Any]], entities: list[d
 def apply_fact_corrections(facts: list[dict[str, Any]], corr: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
     """驳回的事实:主体按名字,属性不写就是这个主体的全部事实,值写了只删这个值。"""
     rules = (corr or {}).get("reject_facts") or []
+    from .governance import apply_records
+    old_count = len(facts)
+    _, _, facts, _ = apply_records([], [], facts, corr, phase="fact")
+    # Scoped entity rejection removes only its own supported facts.
+    for entity in corr.get("_rejected_entities") or []:
+        facts = [f for f in facts if f.get("subject_key") != entity["key"]]
     if not rules:
-        return facts, 0
+        return facts, old_count - len(facts)
+    identities = {}
+    for f in facts:
+        identities.setdefault(entity_key(str(f.get("subject") or "")), set()).add(str(f.get("subject_key") or ""))
+    rules = [r for r in rules if len(identities.get(entity_key(r["subject"]), set())) <= 1]
     out = []
-    dropped = 0
+    dropped = old_count - len(facts)
     for f in facts:
         subj = entity_key(str(f.get("subject") or ""))
         prop = str(f.get("property") or "").casefold()

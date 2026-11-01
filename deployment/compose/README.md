@@ -13,7 +13,6 @@ Everything the pipeline needs that is not the pipeline itself:
 | text reranker | `carrel-reranker` | 8102 | vLLM, Qwen3-Reranker-0.6B |
 | visual embeddings | `carrel-vl-embedding` | 8103 | vLLM, Qwen3-VL-Embedding-2B |
 | visual reranker | `carrel-vl-reranker` | 8104 | vLLM, Qwen3-VL-Reranker-2B |
-| vision-language model | `carrel-vlm` | 8105 | vLLM, Qwen3-VL-8B-Instruct-FP8 |
 
 Run `./deploy.sh` at the repo root instead of `docker compose` directly: it
 detects the machine, writes `.env` next to this file and only then calls
@@ -24,7 +23,8 @@ compose. Everything below explains what it decided and how to change it.
 | Key | Chosen from |
 |---|---|
 | `COMPOSE_FILE` | `docker-compose.yml:compose.gpu.yml` when an NVIDIA driver *and* the container toolkit (CDI spec or nvidia runtime) are present, otherwise the base file alone. The overlay only adds `gpus: all` to the parser. |
-| `COMPOSE_PROFILES` | `local-models` with `--with-local-models`, otherwise empty. |
+| `COMPOSE_PROFILES` | `local-models` with `--with-local-models`; otherwise empty. |
+| `MINERU_WAIT_FOR_URL` | Wait for `vl-reranker` with `local-models`; empty for the default deployment. |
 | `MINERU_FLAVOR`, `MINERU_BASE_IMAGE` | `gpu` (vLLM base image, both backends installed) or `cpu` (`python:3.12-slim`, pipeline backend only). |
 | `QDRANT_IMAGE`, `NEO4J_IMAGE`, `OPENSEARCH_IMAGE`, `VLLM_IMAGE` | Pinned tags; prefixed with a mirror registry when Docker Hub does not answer from this host. On aarch64 `VLLM_IMAGE` is NVIDIA's DGX Spark build. |
 | `PIP_INDEX_URL` | A PyPI mirror when pypi.org does not answer; used for the image build and the host venv. |
@@ -77,23 +77,31 @@ Only for hosts with an NVIDIA GPU. Put the weights under `models/` first:
 # from HuggingFace (or the ModelScope equivalents)
 pip install -U huggingface_hub
 for m in Qwen/Qwen3-Embedding-0.6B Qwen/Qwen3-Reranker-0.6B Qwen/Qwen3-VL-Embedding-2B \
-         Qwen/Qwen3-VL-Reranker-2B Qwen/Qwen3-VL-8B-Instruct-FP8; do
+         Qwen/Qwen3-VL-Reranker-2B; do
   huggingface-cli download "$m" --local-dir "models/$(basename "$m")"
 done
 ./deploy.sh --with-local-models
 ```
 
+Add a vision endpoint to the console's model list and select it per knowledge
+base. Switching the selection applies to the next document that starts parsing;
+previously indexed content stays unchanged. The endpoint can run on another
+machine or be hosted by a provider.
+
+On upgrade, `deploy.sh` removes the retired bundled VLM container as a Compose
+orphan and clears its default endpoint. Custom endpoints and downloaded weights
+are preserved.
+
 `deploy.sh --with-local-models` also lists the model rows in
 `KB_CONSOLE_SERVICES` and enables the visual vectors in
 `config/knowledge-base.env`. The `*_GPU_MEMORY_UTILIZATION` fractions in
 `.env.example` were tuned for a 121 GB unified-memory machine; scale them up
-on a card with less memory. On that machine the five model servers take 0.65
-of the memory, about 0.71 together with the parser's share; with unified
-memory this is system RAM, and it cannot be swapped out.
+on a card with less memory. The four model servers reserve a combined fraction of 0.47 by default;
+MinerU adds its own allocation. With unified memory this is system RAM.
 
-The five model servers start in a queue: each one waits for the previous
+The four model servers start in a queue: each one waits for the previous
 server's `/health` before it loads its model (embedding, reranker,
-vl-embedding, vl-reranker, vlm), and with the profile on `deploy.sh` points the
+vl-embedding, vl-reranker), and with the profile on `deploy.sh` points the
 parser at the last of them through `MINERU_WAIT_FOR_URL`. Servers that profile
 the shared memory at the same time fail their memory check and restart until
 Docker's backoff happens to separate them; the queue avoids that both under
@@ -108,7 +116,7 @@ the same input however requests are batched and whether the prefix cache hits,
 so a search returns the same ranking every time. Without it, identical requests
 got slightly different scores and the chunks near the cut-off swapped places.
 Image embedding is somewhat slower in this mode; `VLLM_BATCH_INVARIANT=0` in
-`.env` turns it off. The vlm server and the parser keep the default.
+`.env` turns it off. The parser keeps the default.
 
 ## Data locations
 

@@ -6,12 +6,15 @@
 · 列实体:按类型(含子类型)/ 上层类 / 类与实例 / 名字列实体,带总数与翻页(「全部 / 所有」类问题);
 · 查事实:按主体 / 属性 / 文档 / 冲突列限定事实,带总数与翻页,行结构与 /search 的 specs 相同;
 · 编译页:按类别 / 标题 / 实体 / 文档列编译页,可带全文。
-关系与事实默认只给现行的(没被更新的说法取代、来源文档没被标成被取代或归档、有效期没过),带 as_of 回看某一天,
-带 history 全部给;每行带 status,另给被筛掉了多少条(hidden),口径见 kb_pipeline.graph.currency。
+关系与事实默认保留历史、冲突与未来日期的原文声明,并遵循显式文档治理结果。as_of 按原文时间筛选,
+history 包含被治理规则隐藏的文档;status 表示查询范围,不裁定业务有效性。口径见 kb_pipeline.graph.currency。
 另有 /search 附带的「主体的一跳邻域」(neighborhoods):题目里点名的实体各列几条权重最高的关系,agent 看了再决定往哪走。
 列出来的是图谱里登记的内容(模型抽取的结果),不是资料里的完整清单。"""
 from __future__ import annotations
 
+from kb_pipeline.chunking.context import payload_text
+
+import json
 import math
 import threading
 from typing import Any, Iterable
@@ -26,7 +29,7 @@ ENTITY_FIELDS = ("id", "title", "type", "upper", "type_path", "kind", "scope", "
 ENTITY_RETURN = ", ".join(f"e.{k} AS {k}" for k in ENTITY_FIELDS)
 # 关系的时间与状态字段(建图时写在 RELATED_TO 边上),每条邻居关系原样带回、再按口径算 status
 RELATION_TIME_FIELDS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
-                        "lapses")
+                        "lapses", "polarity", "target_polarity", "modality", "conditions_json", "quality_state", "traversable")
 EVIDENCE_PER_RELATION = 3
 EVIDENCE_PER_FACT = 3
 # Every relation carries an excerpt of the original text: only the few sentences of the evidence that name the far
@@ -52,7 +55,8 @@ CONCEPT_KEYS_MAX = 200
 # Payload keys fetched from the main collection for an evidence chunk: the locators of /context, the position
 # string, whether it is still active
 EVIDENCE_PAYLOAD_KEYS = ["is_active", "doc_id", "rel_path", "filename", "chunk_index", "content_version", "page_idx",
-                         "slide_idx", "sheet_name", "row_start", "row_end", "section_path", "source_locator"]
+                         "slide_idx", "sheet_name", "row_start", "row_end", "section_path", "section_paths", "source_locator",
+                         "code_context", "code_context_sources", "source_regions"]
 # Entities a listing leaves out: those found only on boilerplate pages and reference numbers (the same rule graph
 # recall uses for its seeds).
 # e.id IS NOT NULL does not change the result (every entity has an id); it is only there so that the plan uses
@@ -68,7 +72,9 @@ FACT_MATCH = {
 # payload projection does not carry it)
 _FACT_BASIC = ("id", "subject", "property", "symbol", "concept", "concept_key", "value", "min", "typ", "max", "unit", "unit_canonical",
                "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section", "doc_id",
-               "observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses")
+               "observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses",
+               "fact_kind", "time_basis", "observed_at", "subject_origin", "quality_state", "flag_status", "extraction_evidence",
+               "source_locator", "evidence_precision", "evidence_unit_ids", "subject_origin", "value_json")
 SERIES_MEMBERS_MAX = 40             # 一条序列最多带几档(体检指标一年一档,几十档已经很长)
 PAGE_KINDS = ("subject", "timeline", "source", "index")
 PAGE_SCROLL = 256
@@ -103,6 +109,9 @@ def with_status(row: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
     from kb_pipeline.graph.currency import mark_status
 
     mark_status(row, scope)
+    if "conditions_json" in row:
+        import json
+        row["conditions"] = json.loads(row.pop("conditions_json") or "{}")
     row.pop("lapses", None)             # 会不会过期只用来定状态,不返回
     return row
 
@@ -381,7 +390,7 @@ def locate_facts(q: Any, collections: dict[str, str], specs: list[dict[str, Any]
 
     def body(pid: str) -> str:
         if pid not in squashed:
-            squashed[pid] = _squash((by_point.get(pid) or fetched.get(pid) or {}).get("text"))
+            squashed[pid] = _squash(payload_text(by_point.get(pid) or fetched.get(pid) or {}))
         return squashed[pid]
 
     for sp, pids in zip(specs, cited):
@@ -434,7 +443,7 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
             evidence_entry(ev, payload)
             if anchors is None or payload is None or not ev.get("active") or not payload.get("text"):
                 continue
-            body, match = excerpt_of(payload["text"], r.get("_names") or [], anchors)
+            body, match = excerpt_of(payload_text(payload), r.get("_names") or [], anchors)
             named, visual = match in ("both", "other"), bool(payload.get("visual_ref"))
             rank = (not named, visual and named, _MATCH_RANK[match], visual, i)
             if best is None or rank < best[0]:
@@ -652,6 +661,7 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
                         UNWIND $ids AS eid
                         MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: eid}})-[r:RELATED_TO]-(n:Entity)
                         WHERE coalesce(r.boilerplate, false) = false AND coalesce(n.reference, false) = false
+                          AND coalesce(r.traversable, false) = true
                           AND {in_effect("r", observed="observed_first", scope=scope)}
                         WITH eid, r, n, (startNode(r).id = eid) AS outgoing
                         ORDER BY coalesce(r.weight, 0) DESC, coalesce(n.pagerank, 0) DESC, r.id, n.id
@@ -775,22 +785,25 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
     return out
 
 
-def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
-    """各条序列的全部档位(不按时间口径筛):现行的那一档旁边要能看到它之前的值(「30(2024)、31(2025)」)。"""
+def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any], *,
+                   scope: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Series evidence uses the same time scope as the fact rows it accompanies."""
     wanted = sorted({str(k) for k in keys if k})
     if not wanted:
         return {}
+    scope = scope or time_scope()
+    effect = in_effect("f", observed="observed", scope=scope)
     rows = session.run(
-        "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys "
+        f"MATCH (f:Spec {{kb_id: $kb, graph_version: $gv}}) WHERE f.series_key IN $keys AND {effect} "
         "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, f.unit AS unit, "
-        "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.axis AS axis, f.series_index AS series_index "
-        "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted).data()
+        "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.valid_until AS valid_until, f.time_basis AS time_basis, f.observed_at AS observed_at, f.observed AS observed, f.axis AS axis, f.series_index AS series_index "
+        "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted, day=scope["day"]).data()
     out: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         members = out.setdefault(str(r["series_key"]), [])
         if len(members) < SERIES_MEMBERS_MAX:
-            members.append({**{k: r.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical", "valid_from", "series_index")},
-                            "when": r.get("valid_from") or r.get("axis")})
+            members.append({**{k: r.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical", "valid_from", "valid_until", "time_basis", "observed_at", "observed", "series_index")},
+                            "when": r.get("valid_from") or r.get("observed_at") or r.get("axis") or r.get("observed")})
     return out
 
 
@@ -809,7 +822,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
     事实行取自事实集合的负载,与 /search 的 specs 同一个投影,所以线索串、序列、冲突、来源核验的口径都一样;
     每行另带证据切片的定位(可直接拿去 /context)、挂在哪个实体下(subject_id)、出自哪份文档(doc_id)。
     给了主体或文档时,第一页附这个范围里的属性清单。
-    时间口径(history / as_of,见 time_scope):默认只列现行值,序列里更早的档位不单列、写在现行那一条的 series_text 里;
+    时间口径(history / as_of,见 time_scope):默认保留各时间点的原文声明,series_text 补齐同一查询范围的时间档位;
     属性试探不受口径影响(只认写法),总数、清单、属性清单都按口径数,time.hidden 是被筛掉的条数。"""
     from kb_pipeline.graph.neo4j_import import active_neo4j_graph_version, neo4j_driver
     from kb_pipeline.graph.recall import TimedSession, spec_result_row
@@ -897,7 +910,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
             picked = [dict(r.get("row") or {}) for r in records]
             subject_ids = [r.get("subject_id") for r in records]
-            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked))
+            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked), scope=tscope)
             properties = None
             if (center is not None or doc_id) and offset == 0:
                 properties = session.run(
@@ -924,13 +937,20 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             degraded.append(f"spec_payload: {type(exc).__name__}")
     raw = [spec_result_row(payloads[fid]) if fid in payloads else {**{k: r.get(k) for k in _FACT_BASIC}, "point_ids": []}
            for fid, r in zip(fact_ids, picked)]
+    for row in raw:
+        if isinstance(row.get("source_locator"), str):
+            try:
+                row["source_locator"] = json.loads(row["source_locator"])
+            except (ValueError, TypeError):
+                row["source_locator"] = None
     for row, r, sid in zip(raw, picked, subject_ids):
         # the payload projection (shared with /search) carries neither: the source document comes from the graph
         # database, with the payload's as a fallback
         row["doc_id"] = r.get("doc_id") or (payloads.get(str(r["id"])) or {}).get("doc_id")
         row["subject_id"] = sid
         # 时间与状态以图库为准(负载与它同一次建图写入,图库这份不受别名切换影响)
-        for k in ("observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses"):
+        for k in ("observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses",
+                  "fact_kind", "time_basis", "observed_at", "subject_origin", "quality_state", "flag_status", "extraction_evidence"):
             if r.get(k) not in (None, ""):
                 row[k] = r[k]
         if row.get("series_key") and members.get(str(row["series_key"])):

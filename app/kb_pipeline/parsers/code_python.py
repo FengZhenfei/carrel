@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ParsedBlock
+from .code_source import module_source, source_text
 
 PROFILE = "py-symbols-v2"
 _SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.")
@@ -154,10 +155,10 @@ def python_symbol_blocks(source: str, *, parser_profile: str = PROFILE, doc_type
         blocks.append(ParsedBlock(
             parser="python-ast", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
             text=text, title=meta["qualname"], block_id=f"py-{idx:04d}-{_safe_id(meta['qualname'])}",
-            metadata={"section_path": list(section_path), "symbol": meta},
+            metadata={"section_path": list(section_path), "symbol": meta,
+                      "source_spans": source_text(lines, [(start, end)])[1]},
         ))
-    rest = [lines[i - 1] for i in range(1, len(lines) + 1) if not covered[i]]
-    rest_text = "\n".join(rest).strip("\n")
+    rest_text, rest_spans = module_source(lines, covered)
     constants = [t.id for stmt in tree.body if isinstance(stmt, (ast.Assign, ast.AnnAssign))
                  for t in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])
                  if isinstance(t, ast.Name) and t.id.isupper()]
@@ -167,7 +168,7 @@ def python_symbol_blocks(source: str, *, parser_profile: str = PROFILE, doc_type
         blocks.insert(0, ParsedBlock(
             parser="python-ast", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
             text=rest_text, title="(module)", block_id="py-0000-module",
-            metadata={"section_path": [], "symbol": module_meta},
+            metadata={"section_path": [], "symbol": module_meta, "source_spans": rest_spans},
         ))
     elif blocks:
         blocks[0].metadata["module"] = module_meta
@@ -183,5 +184,6 @@ def parse_python(path: Path, doc_type: str = "py", parser_profile: str = PROFILE
     try:
         return python_symbol_blocks(source, parser_profile=parser_profile, doc_type=doc_type)
     except SyntaxError:
-        return [ParsedBlock(parser="native", parser_profile=parser_profile, doc_type=doc_type, block_type="text",
-                            text=source, block_id="text-0001", metadata={"symbol": {"kind": "module", "syntax_error": True}})]
+        return [ParsedBlock(parser="native", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
+                            text=source, block_id="text-0001", metadata={"symbol": {"kind": "module", "syntax_error": True},
+                            "source_spans": [{"start": 1, "end": source.count("\n") + 1, "offset": 0, "length": len(source)}]})]

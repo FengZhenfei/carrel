@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import copy
 import hashlib
 import json
 import re
@@ -12,6 +13,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from ..llm_compat import CompatibleRequest, generation_parameters, sdk_arguments
 from ..parsers.errors import JobCancelled, service_unreachable
 from .images import DEFAULT_MAX_PIXELS
 from .images import image_data_url as _image_data_url
@@ -19,7 +21,7 @@ from .images import image_data_url as _image_data_url
 
 # Bump when the schema, the field semantics or the default prompts change, so
 # that cached captions from an earlier contract are not reused.
-CAPTION_CONTRACT_VERSION = 5  # v5: decorative field; extraction requirements per image kind (screenshot OCR goes into facts, logo walls list every name, no mermaid for architecture diagrams)
+CAPTION_CONTRACT_VERSION = 6  # Complete facts only; truncated responses are not reusable captions.
 
 # text_verbatim is deliberately the LAST property: guided decoding emits
 # fields in schema order, and it is the only field that can run long. If a
@@ -170,22 +172,20 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     return client
 
 
-# Endpoints (base URL, model) that turned down `repetition_penalty` by name. Later requests leave it out
-# instead of paying a rejected round trip for every image.
-_NO_REPETITION_PENALTY: set[tuple[str, str]] = set()
-
-
-def _rejected_by_endpoint(exc: Exception) -> bool:
-    """The request itself was turned down: a 4xx answer, or an error raised while building it. Connection
-    errors, timeouts and 5xx are not this; sending them again with fewer features only wastes an inference."""
-    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    try:
-        status = int(status) if status is not None else None
-    except (TypeError, ValueError):
-        status = None
-    if status is not None:
-        return 400 <= status < 500
-    return isinstance(exc, (TypeError, ValueError, KeyError))
+def _compatible_completion(client: OpenAI, request: CompatibleRequest):
+    while True:
+        body = copy.deepcopy(request.body)
+        if "response_format" not in body:
+            body["messages"][0]["content"][0]["text"] += "\n\nOutput exactly one JSON object and nothing else."
+        try:
+            return client.chat.completions.create(**sdk_arguments(body))
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            # SDK errors expose the server's JSON body separately from their display text.
+            detail = getattr(exc, "body", None)
+            error = json.dumps(detail) if isinstance(detail, (dict, list)) else str(exc)
+            if not request.adapt(status, error):
+                raise
 
 
 def image_data_url(path: Path, max_pixels: int | None = DEFAULT_MAX_PIXELS) -> str:
@@ -400,7 +400,8 @@ def complete_json_prefix(raw: str) -> str | None:
     prefix."""
     stack: list[str] = []
     in_str = esc = False
-    for ch in raw:
+    string_start = 0
+    for offset, ch in enumerate(raw):
         if in_str:
             if esc:
                 esc = False
@@ -411,6 +412,7 @@ def complete_json_prefix(raw: str) -> str | None:
             continue
         if ch == '"':
             in_str = True
+            string_start = offset
         elif ch in "{[":
             stack.append("}" if ch == "{" else "]")
         elif ch in "}]":
@@ -419,9 +421,9 @@ def complete_json_prefix(raw: str) -> str | None:
             stack.pop()
     if not stack and not in_str:
         return raw  # already complete
-    fixed = raw[:-1] if esc else raw
-    if in_str:
-        fixed += '"'
+    # A closed JSON string is a complete value. Never promote a half sentence
+    # (possibly missing its condition or negation) by adding its closing quote.
+    fixed = raw[:string_start] if in_str else raw
     tail = fixed.rstrip()
     if tail.endswith(":"):
         # the value after this key never started; drop the dangling key
@@ -514,17 +516,23 @@ def caption_image(
     max_pixels: int | None = DEFAULT_MAX_PIXELS,
 ) -> dict[str, Any]:
     effective_prompt = prompt or compose_prompt("figure")
+    body: dict[str, Any] = {
+        "model": model_id,
+        **generation_parameters(model_id, base_url=base_url, max_tokens=max_tokens,
+                                temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty),
+    }
+    if structured:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "visual_block", "schema": RESULT_SCHEMA, "strict": True},
+        }
+    request = CompatibleRequest(base_url, model_id, "openai", body)
     cache_identity = {
         "contract_version": CAPTION_CONTRACT_VERSION,
         "model_id": model_id,
+        "endpoint_sha256": hashlib.sha256(base_url.rstrip("/").encode("utf-8")).hexdigest(),
         "prompt_sha256": hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest(),
-        "temperature": temperature,
-        "top_p": top_p,
-        # Mild anti-repeat: degenerate loops die within a few lines while a
-        # pinout's legitimately repeated labels survive. Part of the cache
-        # identity -- changing it must re-caption.
-        "repetition_penalty": repetition_penalty,
-        "structured": bool(structured),
+        "request_parameters": request.parameters(),
         "max_pixels": max_pixels,
     }
     if cache_json and cache_json.exists():
@@ -543,61 +551,17 @@ def caption_image(
                 return result
 
     client = _client_for(base_url, api_key)
-    request: dict[str, Any] = {
-        "model": model_id,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": effective_prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_url(image_path, max_pixels)}},
-                ],
-            }
-        ],
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-    }
-    endpoint = (base_url, model_id)
-    if endpoint not in _NO_REPETITION_PENALTY:
-        request["extra_body"] = {"repetition_penalty": repetition_penalty}
-    constrained = bool(structured)
-    if structured:
-        request["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "visual_block", "schema": RESULT_SCHEMA, "strict": True},
+    request.body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": effective_prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url(image_path, max_pixels)}},
+            ],
         }
-
-    while True:
-        try:
-            resp = client.chat.completions.create(**request)
-            break
-        except Exception as exc:
-            # Give a feature up only when the endpoint rejects the request itself. Connection errors /
-            # timeouts / 5xx used to land here too and be re-sent with the unconstrained prompt -- one
-            # wasted inference, and the result was still written to the cache as structured.
-            if not _rejected_by_endpoint(exc):
-                raise
-            named = "repetition_penalty" in str(exc)
-            if "extra_body" in request and (named or "response_format" not in request):
-                # repetition_penalty is not part of the OpenAI API: vLLM and most hosts of open models
-                # take it, services that validate their parameters answer 400. Without it the runaway
-                # checks below still catch a description that loops.
-                print(f"[vlm] repetition_penalty rejected, retrying without it: {exc!r}", flush=True)
-                request.pop("extra_body")
-                if named:
-                    _NO_REPETITION_PENALTY.add(endpoint)
-            elif "response_format" in request:
-                # Endpoint does not support schema-constrained decoding; fall back to
-                # asking for JSON in the prompt and parsing leniently.
-                print(f"[vlm] structured output rejected, retrying unconstrained: {exc!r}", flush=True)
-                constrained = False
-                request.pop("response_format")
-                request["messages"][0]["content"][0]["text"] = (
-                    effective_prompt + "\n\nOutput exactly one JSON object and nothing else."
-                )
-            else:
-                raise
+    ]
+    resp = _compatible_completion(client, request)
+    constrained = "response_format" in request.body
 
     content = resp.choices[0].message.content or ""
     finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
@@ -607,7 +571,8 @@ def caption_image(
         data = normalize_result(obj) if obj is not None else None
     else:
         data = parse_jsonish(content)
-        if not (data["summary"] or data["title"] or data["facts"] or data["entities"]):
+        if not (data["summary"] or data["title"] or data["facts"] or data["entities"]
+                or (data.get("decorative") is True and data.get("confidence") == "high")):
             data = None
 
     if data is not None and data.get("runaway"):
@@ -619,20 +584,23 @@ def caption_image(
         # and verbatim disabled, trading the transcription for a clean
         # structured description instead of garbage.
         print(f"[vlm] caption unparseable or runaway (finish_reason={finish_reason}); degraded retry", flush=True)
-        retry = dict(request)
-        if "extra_body" in request:       # an endpoint that rejected the parameter does not get it back
-            retry["extra_body"] = {"repetition_penalty": max(1.15, repetition_penalty)}
+        retry = copy.deepcopy(request.body)
+        if "repetition_penalty" in retry:  # do not reintroduce a rejected parameter
+            retry["repetition_penalty"] = max(1.15, float(retry["repetition_penalty"]))
         retry["messages"] = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": effective_prompt + "\n\nNote: this time text_verbatim must be an empty string."},
-                    request["messages"][0]["content"][1],
+                    request.body["messages"][0]["content"][1],
                 ],
             }
         ]
-        resp = client.chat.completions.create(**retry)
+        degraded_request = CompatibleRequest(base_url, model_id, "openai", retry)
+        resp = _compatible_completion(client, degraded_request)
+        constrained = "response_format" in degraded_request.body
         content = resp.choices[0].message.content or ""
+        finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
         obj = parse_structured(content) if constrained else None
         data = normalize_result(obj) if obj is not None else parse_jsonish(content)
         data["vlm_degraded_retry"] = True
@@ -643,21 +611,25 @@ def caption_image(
             print(f"[vlm] still running away after retry; kept {len(data.get('facts') or [])} facts, confidence low", flush=True)
             data["confidence"] = "low"
             data["vlm_runaway"] = True
+    data["vlm_truncated"] = finish_reason == "length"
     data["vlm_cache_hit"] = False
-    # A degraded retry (verbatim forced empty) and an all-empty result are not written to the cache:
-    # otherwise the same image with the same prompt would never get another attempt at a full
-    # transcription -- one service hiccup would freeze this image's description as the crippled
-    # version forever.
+    # An explicit, confident decoration classification is a complete result, even without text.
+    # Empty unknown images and degraded transcriptions still need a future full attempt.
     degraded = bool(data.get("vlm_degraded_retry"))
     empty = not any(str(data.get(k) or "").strip() for k in ("summary", "title", "text_verbatim")) \
         and not (data.get("facts") or data.get("entities") or data.get("keywords"))
-    if cache_json and not degraded and not empty:
+    decoration = data.get("decorative") is True and data.get("confidence") == "high"
+    cacheable = not degraded and not data.get("runaway") and not data.get("vlm_truncated") and (not empty or decoration)
+    if cacheable:
+        request.accept()
+        cache_identity["request_parameters"] = request.parameters()
+    if cache_json and cacheable:
         cache_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {**data, "_cache": cache_identity}
         payload.pop("vlm_cache_hit", None)
         cache_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    elif cache_json and (degraded or empty):
-        print(f"[vlm] not caching the {'degraded' if degraded else 'empty'} result; retried next time", flush=True)
+    elif cache_json:
+        print(f"[vlm] not caching the {'truncated' if data.get('vlm_truncated') else 'degraded' if degraded else 'empty'} result; retried next time", flush=True)
     return data
 
 
@@ -680,6 +652,14 @@ def caption_images_parallel(
         return {}
     workers = max(1, min(int(concurrency or 1), len(jobs)))
     results: dict[str, dict[str, Any]] = {}
+    groups: dict[tuple[str, str], list[tuple[str, Path, str | None, Path | None]]] = {}
+    for job in jobs:
+        _, image_path, prompt, _ = job
+        try:
+            digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        except OSError:
+            digest = str(image_path)
+        groups.setdefault((digest, prompt or compose_prompt("figure")), []).append(job)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_id = {
             executor.submit(
@@ -696,13 +676,15 @@ def caption_images_parallel(
                 structured=structured,
                 repetition_penalty=repetition_penalty,
                 max_pixels=max_pixels,
-            ): job_id
-            for job_id, image_path, prompt, cache_json in jobs
+            ): group
+            for group in groups.values()
+            for job_id, image_path, prompt, cache_json in group[:1]
         }
         image_by_id = {job_id: image_path for job_id, image_path, _p, _c in jobs}
         completed = 0
         for future in as_completed(future_to_id):
-            job_id = future_to_id[future]
+            group = future_to_id[future]
+            job_id = group[0][0]
             try:
                 results[job_id] = future.result()
             except Exception as exc:
@@ -725,7 +707,9 @@ def caption_images_parallel(
                 failed["confidence"] = "low"
                 failed["error"] = repr(exc)
                 results[job_id] = failed
-            completed += 1
+            for alias, _, _, _ in group[1:]:
+                results[alias] = copy.deepcopy(results[job_id])
+            completed += len(group)
             if completed == 1 or completed == len(jobs) or completed % workers == 0:
                 print(f"[vlm] progress {completed}/{len(jobs)}", flush=True)
             if progress_cb is not None:

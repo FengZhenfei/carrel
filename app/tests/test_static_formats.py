@@ -283,7 +283,8 @@ def test_extended_text_routes_retain_evidence(tmp_path, name, body, needle):
     p = tmp_path / name; p.write_text(body)
     assert is_supported_path(p)
     assert needle in text(parse_native(p))
-    assert parser_profile_for_path(p) in set(EXTRA_PROFILES.values()) | {"workflow-text-v1"}
+    base_profile = EXTRA_PROFILES.get(p.suffix.lower(), "workflow-text-v1")
+    assert parser_profile_for_path(p) == base_profile + "+source-v1"
 
 
 def test_xsd_preserves_types_constraints_namespace_and_does_not_read_entities(tmp_path):
@@ -307,9 +308,9 @@ def test_scan_and_route_agree_without_admitting_unrelated_binary_files(tmp_path)
     assert {f.filename for f in files} == {"run", "Snakefile"}
 
 
-def test_existing_parser_profiles_do_not_trigger_bulk_reparse():
-    expected = {"a.md": "md-sections-v3", "a.pdf": "pdf-mineru-table-vlm-v15", "a.png": "image-vlm-v1",
-                "a.py": "py-symbols-v2", "a.csv": "table-native-v4", "a.js": "code-symbols-v2"}
+def test_source_revision_changes_text_profiles_and_preserves_image_table_profiles():
+    expected = {"a.md": "md-sections-v3+source-v1", "a.pdf": "pdf-mineru-table-vlm-v15+source-v1", "a.png": "image-vlm-v1",
+                "a.py": "py-symbols-v2+source-v1", "a.csv": "table-native-v4", "a.js": "code-symbols-v2+source-v1"}
     for name, profile in expected.items():
         assert parser_profile_for_path(Path(name)) == profile
 

@@ -176,8 +176,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         reranker_api_key=os.getenv("RERANKER_API_KEY", "").strip(),
         visual_reranker_base_url=os.getenv("VISUAL_RERANKER_BASE_URL", "http://127.0.0.1:8104/v1").strip(),
         image_max_pixels=int(os.getenv("KB_IMAGE_MAX_PIXELS", "3686400")),
-        vlm_base_url=os.getenv("VLM_BASE_URL", "http://127.0.0.1:8105/v1"),
-        vlm_model_id=os.getenv("VLM_MODEL_ID", "qwen3-vl-8b-instruct-fp8"),
+        vlm_base_url=os.getenv("VLM_BASE_URL", ""),
+        vlm_model_id=os.getenv("VLM_MODEL_ID", ""),
         vlm_api_key=os.getenv("VLM_API_KEY", ""),
         vlm_concurrency=int(os.getenv("VLM_CONCURRENCY") or "1"),
         # Qwen3-VL recommends top_p 0.8 for vision tasks; the temperature is
@@ -228,7 +228,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         # be switched back (the rollback on a failed switch only protects the moment of release). It was once
         # 1 version only (morning of 2026-09-06); the Codex review advised keeping at least one accepted
         # version.
-        graph_gc_keep_versions=max(1, int(os.getenv("GRAPH_GC_KEEP_VERSIONS", "2"))),
+        graph_gc_keep_versions=max(1, int(os.getenv("GRAPH_GC_KEEP_VERSIONS", "3"))),
         graph_gc_grace_seconds=max(0, int(os.getenv("GRAPH_GC_GRACE_SECONDS", "60"))),
         graph_neo4j_import_batch_size=int(os.getenv("GRAPH_NEO4J_IMPORT_BATCH_SIZE", "1000")),
         console_services=parse_console_services(os.getenv("KB_CONSOLE_SERVICES")),
@@ -239,7 +239,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
 # Console service rows, in display order. "database" bundles Qdrant, OpenSearch
 # and Neo4j; the rest map one row to one container group (see
 # kb_server.service.SERVICE_CONTAINERS).
-CONSOLE_SERVICE_KEYS: tuple[str, ...] = ("database", "mineru", "embedding", "visual_embedding", "vlm", "reranker")
+CONSOLE_SERVICE_KEYS: tuple[str, ...] = ("database", "mineru", "embedding", "visual_embedding", "reranker")
 CONSOLE_SERVICES_DEFAULT: tuple[str, ...] = ("database", "mineru")
 
 

@@ -23,7 +23,7 @@ function definition(name) {
 }
 const definitions = ['renderConfig', 'parseFormValues', 'requireInt', 'collectParseConfig',
   'collectGraphConfig', 'collectInterval', 'collectNewChunk', 'splitInterval', 'splitNewChunk',
-  'rebuildProgressParts'].map(definition).join('\n');
+  'rebuildProgressParts', 'vlmOptions'].map(definition).join('\n');
 const saveStart = source.indexOf('$("#cfg-save").addEventListener');
 const saveHandler = source.slice(saveStart, source.indexOf('\n});', saveStart) + 4);
 const harness = `

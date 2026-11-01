@@ -28,6 +28,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 from . import prompts
+from .quality import relation_qualifier, relation_semantics, traversable_relation
 from .resolution import is_identifier_like
 from .extract import entity_key, normalize_name
 from .units import UNIT_KINDS, Unit
@@ -116,7 +117,6 @@ def merge_extractions(
     type_scopes: dict[str, str] | None = None,
     allowed_ends: dict[str, tuple[set[str], set[str]]] | None = None,
     unit_kinds: dict[str, str] | None = None,
-    prior_pairs: Iterable[tuple[str, str, str]] = (),
     exact_types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """把各单元的抽取结果合成一张图。返回 {"entities": [...], "relations": [...], "stats": {...}}。
@@ -134,7 +134,6 @@ def merge_extractions(
       照旧按众数归到一个节点。
     · 规则抽取的实体(代码、配置)保持各自的作用域(跨文件引用由 scope_doc 指到被引用的文件)。
     upper_parents:{类型: 上层类};type_parents:{类型: 直接父类}(类型树,端点约束按整条链判);
-    prior_pairs:上一版模式版本账里已确认的端点组合 (谓词, 起点上层类, 终点上层类),这一版直接放行;
     unit_kinds:合成后的单元类型(见 combine_unit_kind);没给就用单元自己的结构类型;
     exact_types:规则抽取自己的类型 → 上层类(deterministic.UPPER),只用于规则抽取的实体 —— 模式里同名的类型
     (产品的 module、报价里的 package)不受它影响。"""
@@ -345,15 +344,16 @@ def merge_extractions(
                 continue
             descriptions = [str(d).strip() for d in (r.get("descriptions") or ([r["description"]] if r.get("description") else [])) if str(d).strip()]
             if descriptions and all(is_negated(d) for d in descriptions):
-                stats["negated_dropped"] += 1
-                continue
-            if predicate == prompts.DEFAULT_PREDICATE and tk < sk:
+                # Unsupported relationship commentary is retained as uncertain evidence.
+                r = {**r, "polarity": "uncertain"}
+            if predicate == prompts.DEFAULT_PREDICATE and not relation_qualifier(r) and tk < sk:
                 sk, tk = tk, sk
-            rkey = (sk, tk, predicate)
+            rkey = (sk, tk, predicate, relation_qualifier(r))
             slot = relations.get(rkey)
             if slot is None:
                 slot = relations[rkey] = {
                     "source_key": sk, "target_key": tk, "predicate": predicate,
+                    **relation_semantics(r),
                     "directed": predicate != prompts.DEFAULT_PREDICATE,
                     "descriptions": [], "description_sources": [], "strength_sum": 0.0, "evidence": 0, "unit_ids": [],
                     "predicate_raw": Counter(), "kinds": Counter(), "doc_ids": [], "periods": Counter(),
@@ -442,6 +442,7 @@ def merge_extractions(
             "source_key": rel["source_key"], "target_key": rel["target_key"],
             "source": src["title"], "target": tgt["title"],
             "predicate": rel["predicate"], "directed": rel["directed"],
+            **relation_semantics(rel),
             "descriptions": rel["descriptions"], "description_sources": rel["description_sources"], "description": "",
             "strength_sum": round(float(rel["strength_sum"]), 3), "evidence": int(rel["evidence"]),
             "unit_ids": sorted(rel["unit_ids"], key=lambda u: unit_order.get(u, 0)),
@@ -478,36 +479,9 @@ def merge_extractions(
     out_stats["type_health"] = health
     out_stats["demoted_type_names"] = []
     out_stats["noisy_type_names"] = demoted      # just a hint: these types have a high reference / boilerplate share, worth a look
-    # Endpoint constraint self-healing: when more than half of a predicate's edges are "violations", the
-    # constraint itself is wrong (evaluation: 527/527 violations under one predicate); flagging them is meaningless and drags
-    # scores down, so this version relaxes it and notes it in the report
-    # Check the account first: endpoint combinations confirmed by a previous build pass directly, without having to
-    # reach the threshold again every version (the same for appends, small KBs and corpus jitter); it runs before
-    # the threshold relaxation so the report shows which pairs the account released and which this version earned
-    prior_applied = relax_prior_pairs(relation_rows, entity_rows, prior_pairs)
-    if prior_applied:
-        out_stats["endpoint_pairs_prior"] = prior_applied
-        print("[graph] endpoint pairs relaxed from the schema account: "
-              + ", ".join(f"{p['predicate']} {p['source_parent']}->{p['target_parent']} x{p['count']}" for p in prior_applied), flush=True)
-    relaxed = relax_bad_endpoints(relation_rows)
-    if relaxed:
-        out_stats["endpoints_relaxed"] = relaxed
-        print(f"[graph] predicate endpoint constraints relaxed (violation ratio > {RELAX_ENDPOINTS_RATIO:.0%}): {relaxed}", flush=True)
-    # 再按「谓词 × 端点上层类对」放行:没过半、但某一对端点集中越界的(associated_with 的 entity → property)
-    relaxed_pairs = relax_bad_endpoint_pairs(relation_rows, entity_rows)
-    if relaxed_pairs:
-        out_stats["endpoint_pairs_relaxed"] = relaxed_pairs
-        print(f"[graph] endpoint pairs relaxed (>= {RELAX_PAIR_MIN_EDGES} edges and >= {RELAX_PAIR_RATIO:.0%} of the predicate): "
-              + ", ".join(f"{p['predicate']} {p['source_parent']}->{p['target_parent']} x{p['count']}" for p in relaxed_pairs), flush=True)
-    if relaxed or relaxed_pairs or prior_applied:
-        stats["type_violations"] = sum(1 for r in relation_rows if r.get("type_violation"))
-        out_stats["type_violations"] = stats["type_violations"]
-    all_pairs = list(relaxed_pairs) + list(prior_applied)
-    out_stats["predicate_health"] = predicate_health(relation_rows, entity_rows, relaxed=relaxed, relaxed_pairs=all_pairs)
-    # Endpoint account: written back to the schema version at the end of the build; the next merge and label
-    # re-extraction both start from it (schema_flow.record_schema_observation)
-    out_stats["endpoint_observed"] = endpoint_observation(relation_rows, entity_rows, relaxed=relaxed, relaxed_pairs=all_pairs,
-                                                          known_types=known_types)
+    # Frequent mismatches are schema review candidates, never proof of valid semantics.
+    out_stats["predicate_health"] = predicate_health(relation_rows, entity_rows)
+    out_stats["endpoint_observed"] = endpoint_observation(relation_rows, entity_rows, known_types=known_types)
     out_stats["scoped_entities"] = sum(1 for e in entity_rows if e.get("scope"))
     out_stats["class_entities"] = sum(1 for e in entity_rows if e.get("kind") == "class")
     return {"entities": entity_rows, "relations": relation_rows, "stats": out_stats}
@@ -645,105 +619,17 @@ def derive_variant_edges(entities: list[dict[str, Any]], relations: list[dict[st
     return out
 
 
-RELAX_ENDPOINTS_RATIO = 0.5
-RELAX_ENDPOINTS_MIN_EDGES = 20
-# Relax per "predicate × endpoint parent pair": when one pair of endpoint parents accumulates enough violating
-# edges under a predicate, and a non-trivial share of that predicate's edges, it is stable usage rather than a
-# sporadic error (evaluation: 119 entity → property edges under one predicate); the constraint was too narrow,
-# so that pair is released
-RELAX_PAIR_MIN_EDGES = 20
-RELAX_PAIR_RATIO = 0.05      # 20 edges is the main bar; the ratio only guards fragments under big predicates (evaluation: process → process 38/407 under one predicate is stable usage too)
-
-
-def relax_bad_endpoints(relations: list[dict[str, Any]], *, ratio: float = RELAX_ENDPOINTS_RATIO,
-                        min_edges: int = RELAX_ENDPOINTS_MIN_EDGES) -> list[str]:
-    """Predicates with more than half violations (and enough edges): drop their type_violation flags for this
-    version and return the predicate names."""
-    edges: Counter = Counter()
-    bad: Counter = Counter()
-    for r in relations:
-        pred = str(r.get("predicate") or prompts.DEFAULT_PREDICATE)
-        edges[pred] += 1
-        if r.get("type_violation"):
-            bad[pred] += 1
-    relaxed = sorted(p for p, n in edges.items() if n >= min_edges and bad[p] / n > ratio)
-    if relaxed:
-        gone = set(relaxed)
-        for r in relations:
-            if r.get("type_violation") and str(r.get("predicate") or prompts.DEFAULT_PREDICATE) in gone:
-                r["type_violation"] = False
-                r["endpoints_relaxed"] = True
-    return relaxed
+OBSERVED_PAIR_MIN_EDGES = 20
+OBSERVED_PAIR_RATIO = 0.05
 
 
 def _parent_of(entities: list[dict[str, Any]]) -> dict[str, str]:
-    """端点账与放行按上层类记(八个固定的类,跨版本可比);谓词约束里写的是上层类。"""
+    """端点观察按上层类记(八个固定的类,跨版本可比);谓词约束里写的是上层类。"""
     return {e["key"]: (str(e.get("upper") or "").casefold() or "-") for e in entities}
 
 
-def relax_bad_endpoint_pairs(relations: list[dict[str, Any]], entities: list[dict[str, Any]], *,
-                             min_edges: int = RELAX_PAIR_MIN_EDGES, ratio: float = RELAX_PAIR_RATIO) -> list[dict[str, Any]]:
-    """Relax per "predicate × (source parent, target parent)": when one violating endpoint parent pair under a
-    predicate accumulates ≥ min_edges edges and ≥ ratio of that predicate's edges, it is stable extraction usage
-    rather than a sporadic error and the constraint was too narrow: drop those edges' type_violation flags and
-    return the released pairs (with counts). Predicates over the half mark were already released by
-    relax_bad_endpoints; this handles the ones below it where one endpoint pair is concentrated."""
-    parent_of = _parent_of(entities)
-    edges: Counter = Counter()
-    bad_pairs: Counter = Counter()
-    for r in relations:
-        pred = str(r.get("predicate") or prompts.DEFAULT_PREDICATE)
-        edges[pred] += 1
-        if r.get("type_violation"):
-            bad_pairs[(pred, parent_of.get(r["source_key"], "-"), parent_of.get(r["target_key"], "-"))] += 1
-    relaxed = {k for k, n in bad_pairs.items() if n >= min_edges and n / max(1, edges[k[0]]) >= ratio}
-    if relaxed:
-        for r in relations:
-            if not r.get("type_violation"):
-                continue
-            k = (str(r.get("predicate") or prompts.DEFAULT_PREDICATE), parent_of.get(r["source_key"], "-"), parent_of.get(r["target_key"], "-"))
-            if k in relaxed:
-                r["type_violation"] = False
-                r["endpoints_relaxed"] = True
-    return [{"predicate": p, "source_parent": a, "target_parent": b, "count": bad_pairs[(p, a, b)]}
-            for (p, a, b) in sorted(relaxed, key=lambda k: (-bad_pairs[k], k))]
-
-
-def relax_prior_pairs(relations: list[dict[str, Any]], entities: list[dict[str, Any]],
-                      prior_pairs: Iterable[tuple[str, str, str]]) -> list[dict[str, Any]]:
-    """Endpoint combinations (predicate, source parent, target parent) confirmed in the previous schema version's
-    account: passed directly this version without reaching the threshold again. Returns the released pairs (with
-    this version's counts, prior=True)."""
-    wanted = {(str(p), str(a).casefold(), str(b).casefold()) for p, a, b in prior_pairs}
-    if not wanted:
-        return []
-    parent_of = _parent_of(entities)
-    hit: Counter = Counter()
-    for r in relations:
-        if not r.get("type_violation"):
-            continue
-        k = (str(r.get("predicate") or prompts.DEFAULT_PREDICATE), parent_of.get(r["source_key"], "-"), parent_of.get(r["target_key"], "-"))
-        if k in wanted:
-            r["type_violation"] = False
-            r["endpoints_relaxed"] = True
-            r["endpoints_prior"] = True
-            hit[k] += 1
-    return [{"predicate": p, "source_parent": a, "target_parent": b, "count": hit[(p, a, b)], "prior": True}
-            for (p, a, b) in sorted(hit, key=lambda k: (-hit[k], k))]
-
-
-def endpoint_observation(relations: list[dict[str, Any]], entities: list[dict[str, Any]], *, relaxed: Iterable[str] = (),
-                         relaxed_pairs: Iterable[dict[str, Any]] = (), known_types: Iterable[str] = ()) -> dict[str, Any]:
-    """Endpoint account: how many edges each predicate actually has per "source parent->target parent" combination
-    (derived edges excluded), the predicates relaxed this version, the released pairs, and the combinations
-    confirmed by the same threshold (≥ RELAX_PAIR_MIN_EDGES edges and ≥ RELAX_PAIR_RATIO). Written back to the
-    schema version at the end of the build; the next merge passes the confirmed pairs directly and label
-    re-extraction keeps them by rule (schema.apply_observed_guard).
-    Three health figures are recorded too (2026-09-13, handed to the model on label re-extraction so its
-    revisions have evidence, not targeting any particular KB): per predicate, the number of edges outside the
-    declared endpoints (violations, relaxed ones included, because they are exactly the evidence of a narrow
-    constraint); entities per type (type_counts); and how many entities used names outside the type table at
-    extraction (unknown_types, only counted when known_types is given, at most 20)."""
+def endpoint_observation(relations: list[dict[str, Any]], entities: list[dict[str, Any]], *, known_types: Iterable[str] = ()) -> dict[str, Any]:
+    """Record endpoint usage and violations without changing assertions or ontology constraints. Frequent pairs are suggestions for schema review."""
     parent_of = _parent_of(entities)
     pairs: dict[str, Counter] = {}
     edges: Counter = Counter()
@@ -753,61 +639,32 @@ def endpoint_observation(relations: list[dict[str, Any]], entities: list[dict[st
             continue
         pred = str(r.get("predicate") or prompts.DEFAULT_PREDICATE)
         edges[pred] += 1
-        if r.get("type_violation") or r.get("endpoints_relaxed"):
+        if r.get("type_violation"):
             violations[pred] += 1
         pairs.setdefault(pred, Counter())[f"{parent_of.get(r['source_key'], '-')}->{parent_of.get(r['target_key'], '-')}"] += 1
     known = {str(t).casefold() for t in known_types if str(t)}
     type_counts: Counter = Counter(str(e.get("type") or "") for e in entities)
     unknown: Counter = Counter({t: n for t, n in type_counts.items() if known and t and t.casefold() not in known})
-    confirmed: dict[tuple[str, str, str], int] = {}
-    for rp in relaxed_pairs:
-        key = (str(rp.get("predicate") or ""), str(rp.get("source_parent") or ""), str(rp.get("target_parent") or ""))
-        if all(key):
-            confirmed[key] = max(confirmed.get(key, 0), int(rp.get("count") or 0))
+    suggested: dict[tuple[str, str, str], int] = {}
     for pred, counter in pairs.items():
         for pair, n in counter.items():
             src, tgt = pair.split("->", 1)
-            if "-" in (src, tgt) or n < RELAX_PAIR_MIN_EDGES or n / max(1, edges[pred]) < RELAX_PAIR_RATIO:
+            if "-" in (src, tgt) or n < OBSERVED_PAIR_MIN_EDGES or n / max(1, edges[pred]) < OBSERVED_PAIR_RATIO:
                 continue
-            confirmed[(pred, src, tgt)] = max(confirmed.get((pred, src, tgt), 0), n)
+            suggested[(pred, src, tgt)] = n
     return {
         "edges": dict(edges),
         "pairs": {p: dict(c.most_common()) for p, c in pairs.items()},
         "violations": dict(violations),
         "type_counts": dict(type_counts.most_common()),
         "unknown_types": dict(unknown.most_common(20)),
-        "relaxed_predicates": sorted(str(p) for p in relaxed),
-        "relaxed_pairs": [{"predicate": rp.get("predicate"), "source_parent": rp.get("source_parent"),
-                           "target_parent": rp.get("target_parent"), "count": int(rp.get("count") or 0)} for rp in relaxed_pairs],
-        "confirmed": [{"predicate": p, "source_parent": a, "target_parent": b, "count": n}
-                      for (p, a, b), n in sorted(confirmed.items(), key=lambda kv: (kv[0][0], -kv[1], kv[0][1], kv[0][2]))],
+        "suggested": [{"predicate": p, "source_parent": a, "target_parent": b, "count": n}
+                      for (p, a, b), n in sorted(suggested.items(), key=lambda kv: (kv[0][0], -kv[1], kv[0][1], kv[0][2]))],
     }
 
 
-def confirmed_pairs(observed: dict[str, Any] | None) -> list[tuple[str, str, str]]:
-    """Endpoint combinations confirmed in the account [(predicate, source parent, target parent)]: passed directly
-    at merge time and kept by rule on label re-extraction."""
-    out: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for row in (observed or {}).get("confirmed") or []:
-        key = (str(row.get("predicate") or ""), str(row.get("source_parent") or ""), str(row.get("target_parent") or ""))
-        if all(key) and key not in seen:
-            seen.add(key)
-            out.append(key)
-    return out
-
-
-def predicate_health(relations: list[dict[str, Any]], entities: list[dict[str, Any]], *, relaxed: Iterable[str] = (),
-                     relaxed_pairs: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
-    """Per predicate: edge count, violation count and ratio, the (source parent, target parent) combinations with
-    the most violations, fan-out p95. Predicates over the half mark had their constraint relaxed this version
-    (relax_bad_endpoints) and are marked relaxed in the report; pairs relaxed per endpoint pair
-    (relax_bad_endpoint_pairs) are listed in relaxed_pairs, for a human to judge later whether the constraint was
-    too narrow or the extraction drifted."""
-    relaxed_set = {str(p) for p in relaxed}
-    pairs_by_pred: dict[str, list[dict[str, Any]]] = {}
-    for rp in relaxed_pairs:
-        pairs_by_pred.setdefault(str(rp.get("predicate") or ""), []).append({"source_parent": rp.get("source_parent"), "target_parent": rp.get("target_parent"), "count": rp.get("count")})
+def predicate_health(relations: list[dict[str, Any]], entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Report predicate counts, violations, endpoint pairs and fan-out without relaxing constraints."""
     parent_of = _parent_of(entities)
     rows: dict[str, dict[str, Any]] = {}
     fanout: dict[tuple[str, str], int] = {}
@@ -830,8 +687,7 @@ def predicate_health(relations: list[dict[str, Any]], entities: list[dict[str, A
             "violation_ratio": round(slot["violations"] / slot["edges"], 3) if slot["edges"] else 0.0,
             "top_violating_pairs": [{"source_parent": a, "target_parent": b, "count": n}
                                     for (a, b), n in slot["pairs"].most_common(3)],
-            "fanout_p95": int(p95), "derived": slot["derived"], "relaxed": pred in relaxed_set,
-            "relaxed_pairs": pairs_by_pred.get(pred, []),
+            "fanout_p95": int(p95), "derived": slot["derived"],
         })
     return sorted(out, key=lambda r: (-r["violations"], -r["edges"], r["predicate"]))
 
@@ -892,6 +748,11 @@ def admit_entities(entities: list[dict[str, Any]], relations: list[dict[str, Any
         elif is_reference_name(e.get("title") or ""):
             e["reference"] = True
     by_key = {e["key"]: e for e in entities}
+    # Qualified assertions cannot be folded into unconditional owner attributes.
+    for r in relations:
+        if not traversable_relation(r):
+            value_keys.pop(r["source_key"], None)
+            value_keys.pop(r["target_key"], None)
     kept_relations: list[dict[str, Any]] = []
     for r in relations:
         sv, tv = r["source_key"] in value_keys, r["target_key"] in value_keys
@@ -980,7 +841,7 @@ def dissolve_combined_names(entities: list[dict[str, Any]], relations: list[dict
                 sk, tk = (target, source) if not r.get("directed") and target < source else (source, target)
                 if sk == tk:
                     continue
-                key = (sk, tk, str(r.get("predicate")))
+                key = (sk, tk, str(r.get("predicate")), relation_qualifier(r))
                 if key in placed:
                     continue             # two end pairs split from one relation land on the same key: counted once
                 placed.add(key)
@@ -1125,7 +986,7 @@ def compute_weights(entities: list[dict[str, Any]], relations: list[dict[str, An
         neighbours.setdefault(r["target_key"], set()).add(r["source_key"])
     for e in entities:
         e["degree"] = len(neighbours.get(e["key"], ()))
-    ranks = pagerank(by_key.keys(), ((r["source_key"], r["target_key"], r["strength_sum"]) for r in relations))
+    ranks = pagerank(by_key.keys(), ((r["source_key"], r["target_key"], r["strength_sum"]) for r in relations if traversable_relation(r)))
     max_rank = max(ranks.values(), default=0.0) or 1.0
     for e in entities:
         e["pagerank"] = round(ranks.get(e["key"], 0.0), 8)

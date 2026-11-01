@@ -570,6 +570,8 @@ def cmd_health(args: argparse.Namespace) -> int:
 
 def _vllm_health(base_url: str) -> dict[str, object]:
     """vLLM serves /health at the server root, one level above /v1."""
+    if not base_url:
+        return {"configured": False}
     root = base_url.rstrip("/")
     if root.endswith("/v1"):
         root = root[: -len("/v1")]

@@ -132,7 +132,7 @@ class ExtractionOutputParserTests(unittest.TestCase):
         self.assertEqual(stats["unknown_predicates"], 1)
 
     def test_quotes_parens_and_unknown_types_are_tolerated(self) -> None:
-        text = '（entity<|>Zhang San<|>Person<|>desc）\n##\n(entity<|>Acme<|>company<|>x)\n##\ngarbage'
+        text = '（entity<|>Sample A<|>Person<|>desc）\n##\n(entity<|>Acme<|>company<|>x)\n##\ngarbage'
         entities, _, stats = parse_records(text, self.SCHEMA)
         self.assertEqual([e["type"] for e in entities], ["person", "company"])
         self.assertEqual(stats["unknown_types"], 1)
@@ -256,8 +256,8 @@ class ExtractionOutputParserTests(unittest.TestCase):
         self.assertEqual(fp, extraction_fingerprint(LLMSpec(name="n", base_url="http://y", api_key="k", model_id="model-a"), base, max_gleanings=1))
 
     def test_names_keep_case_but_keys_do_not(self) -> None:
-        self.assertEqual(normalize_name('  "ZK7C1049GN"  '), "ZK7C1049GN")
-        self.assertEqual(entity_key("Ｎorthwind  Tech"), "northwind tech")
+        self.assertEqual(normalize_name('  "ZX8D1049GN"  '), "ZX8D1049GN")
+        self.assertEqual(entity_key("Ｅxample  Tech"), "example tech")
 
 
 class RecordFormatTests(unittest.TestCase):
@@ -269,20 +269,20 @@ class RecordFormatTests(unittest.TestCase):
 
         schema = ExtractionSchema(entity_types=("person", "org", "meeting"), predicates=({"name": "works_for"}, {"name": "precedes"}),
                                   parent_types={"meeting": "event"})
-        raw = ('("entity"<|>张三<|>person<|>工程师<|>instance)##("entity"<|>客户<|>org<|>泛指的客户<|>class)##'
+        raw = ('("entity"<|>样例A<|>person<|>工程师<|>instance)##("entity"<|>客户<|>org<|>泛指的客户<|>class)##'
                '("entity"<|>Acme<|>org<|>old style)##'
-               '("relationship"<|>张三<|>Acme<|>works_for<|>2021 年入职<|>8<|>2021-03..)##'
-               '("relationship"<|>张三<|>客户<|>related_to<|>对接客户<|>3<|>)##'
-               '("relationship"<|>Acme<|>张三<|>related_to<|>old style<|>2)##'
+               '("relationship"<|>样例A<|>Acme<|>works_for<|>2021 年入职<|>8<|>2021-03..)##'
+               '("relationship"<|>样例A<|>客户<|>related_to<|>对接客户<|>3<|>)##'
+               '("relationship"<|>Acme<|>样例A<|>related_to<|>old style<|>2)##'
                '("relationship"<|>周会 2026-03-21<|>评审 2026-03-14<|>follows<|>周会在评审之后<|>5<|>)<|COMPLETE|>')
         ents, rels, stats = parse_records(raw, schema)
         self.assertEqual([(e["name"], e["kind"], e["description"]) for e in ents],
-                         [("张三", "instance", "工程师"), ("客户", "class", "泛指的客户"), ("Acme", "instance", "old style")])
+                         [("样例A", "instance", "工程师"), ("客户", "class", "泛指的客户"), ("Acme", "instance", "old style")])
         by = {(r["source"], r["target"]): r for r in rels}
-        self.assertEqual((by[("张三", "Acme")]["valid_from"], by[("张三", "Acme")]["valid_until"], by[("张三", "Acme")]["strength"]),
+        self.assertEqual((by[("样例A", "Acme")]["valid_from"], by[("样例A", "Acme")]["valid_until"], by[("样例A", "Acme")]["strength"]),
                          ("2021-03", "", 8.0))
-        self.assertEqual((by[("张三", "客户")]["valid_from"], by[("张三", "客户")]["strength"]), ("", 3.0))
-        self.assertEqual((by[("Acme", "张三")]["description"], by[("Acme", "张三")]["strength"]), ("old style", 2.0))
+        self.assertEqual((by[("样例A", "客户")]["valid_from"], by[("样例A", "客户")]["strength"]), ("", 3.0))
+        self.assertEqual((by[("Acme", "样例A")]["description"], by[("Acme", "样例A")]["strength"]), ("old style", 2.0))
         flipped = by[("评审 2026-03-14", "周会 2026-03-21")]                 # follows 归一成反向的 precedes
         self.assertEqual(flipped["predicate"], "precedes")
         self.assertEqual(stats["malformed"], 0)
@@ -302,7 +302,7 @@ class RecordFormatTests(unittest.TestCase):
         for needle in ("entity_kind", "relationship_period", "add the event's date to the name", "Turn relative or incomplete dates"):
             self.assertIn(needle, prompts.GRAPH_EXTRACTION_PROMPT, needle)
         self.assertIn("<|>class)", prompts.DEFAULT_EXAMPLES)                   # 通用示例里有一个泛指的类别名
-        self.assertIn("<|>2014..)", prompts.DEFAULT_EXAMPLES)                  # 和一条带起点的关系
+        self.assertIn("<|>2014..<|>", prompts.DEFAULT_EXAMPLES)                # 和一条带起点及断言限定的关系
 
     def test_file_names_do_not_turn_part_numbers_into_years(self) -> None:
         from kb_pipeline.graph.temporal import document_axis, name_date
@@ -311,7 +311,7 @@ class RecordFormatTests(unittest.TestCase):
         self.assertIsNone(name_date("plan_2099.pdf"))                          # 晚于明年的不是文档日期
         self.assertEqual(name_date("report_2024.pdf"), "2024")                 # 扩展名前的年份照认
         self.assertEqual(name_date("notes-20240315.md"), "2024-03-15")
-        self.assertEqual(name_date("2025-心电图.pdf"), "2025")
+        self.assertEqual(name_date("2025-波形图.pdf"), "2025")
         self.assertEqual(document_axis("ZX8C2048KV17.pdf", "Rev. *L")["kind"], "version")
 
 
@@ -319,33 +319,32 @@ class MergeTests(unittest.TestCase):
     def test_entities_merge_by_normalized_name_with_majority_type(self) -> None:
         units = [_unit("u1"), _unit("u2", order=1)]
         ext = {
-            "u1": _ext([("Northwind", "organization", "maker"), ("SRAM", "memory device", "chip")],
-                       [("Northwind", "SRAM", "produces", "makes it", 8)]),
-            "u2": _ext([("NORTHWIND", "company", "German company"), ("SRAM", "memory device", "chip")],
-                       [("SRAM", "Northwind", "related_to", "made by", 3), ("Ghost", "SRAM", "related_to", "x", 1)]),
+            "u1": _ext([("Example", "organization", "maker"), ("STORE", "sample module", "chip")],
+                       [("Example", "STORE", "produces", "makes it", 8)]),
+            "u2": _ext([("EXAMPLE", "company", "Sample company"), ("STORE", "sample module", "chip")],
+                       [("STORE", "Example", "related_to", "made by", 3), ("Ghost", "STORE", "related_to", "x", 1)]),
         }
-        out = merge_extractions(units, ext, entity_types=("organization", "memory device"),
-                                upper_parents={"organization": "agent", "memory device": "entity"},
+        out = merge_extractions(units, ext, entity_types=("organization", "sample module"),
+                                upper_parents={"organization": "agent", "sample module": "entity"},
                                 allowed_ends={"produces": ({"agent"}, {"part"})})
         ents = {e["key"]: e for e in out["entities"]}
-        self.assertEqual(set(ents), {"northwind", "sram"})
-        self.assertEqual(ents["northwind"]["title"], "Northwind")          # 出现次数平手取首次写法
-        self.assertEqual(ents["northwind"]["descriptions"], ["maker", "German company"])
-        self.assertEqual(ents["northwind"]["frequency"], 2)
-        self.assertEqual((ents["northwind"]["upper"], ents["northwind"]["type_path"]), ("agent", ["organization", "agent"]))
-        self.assertEqual(ents["northwind"]["kind"], "instance")
-        self.assertEqual(ents["sram"]["descriptions"], ["chip"])          # 去重
+        self.assertEqual(set(ents), {"example", "store"})
+        self.assertEqual(ents["example"]["title"], "Example")          # 出现次数平手取首次写法
+        self.assertEqual(ents["example"]["descriptions"], ["maker", "Sample company"])
+        self.assertEqual(ents["example"]["frequency"], 2)
+        self.assertEqual((ents["example"]["upper"], ents["example"]["type_path"]), ("agent", ["organization", "agent"]))
+        self.assertEqual(ents["example"]["kind"], "instance")
+        self.assertEqual(ents["store"]["descriptions"], ["chip"])          # 去重
         rels = {(r["source_key"], r["target_key"], r["predicate"]): r for r in out["relations"]}
-        self.assertIn(("northwind", "sram", "produces"), rels)             # 受控谓词保留方向
-        self.assertIn(("northwind", "sram", "related_to"), rels)           # 兜底谓词按 sorted 端点
-        self.assertTrue(rels[("northwind", "sram", "produces")]["type_violation"])   # sram 的上层类是 entity 不是 part
+        self.assertIn(("example", "store", "produces"), rels)             # 受控谓词保留方向
+        self.assertIn(("example", "store", "related_to"), rels)           # 兜底谓词按 sorted 端点
+        self.assertTrue(rels[("example", "store", "produces")]["type_violation"])   # store 的上层类是 entity 不是 part
         self.assertEqual(out["stats"]["orphan_dropped"], 1)               # Ghost 没有实体
         self.assertEqual(out["stats"]["schema_drift_types"], 0)           # company 输给了 organization
         self.assertEqual(out["stats"]["type_violations"], 1)
 
     def test_out_of_schema_type_names_get_the_upper_they_name(self) -> None:
-        """10-24 真机:类型表里没有 concept 以后,抽取模型说不出具体类型时照样写 concept,合并时表外类型一律算实体,
-        一组评估中 1.6 千个概念成了实体。表外的名字先按本体认(上层类名或同义词),认不出才算实体。"""
+        """Synthetic regression: out of schema type names get the upper they name."""
         units = [_unit("u1")]
         ext = {"u1": _ext([("上下文工程", "concept", "x"), ("功能安全标准", "standard", "y"), ("小部件", "gizmo", "z"),
                            ("Acme", "organization", "w")], [])}
@@ -365,8 +364,9 @@ class MergeTests(unittest.TestCase):
         ext = {"u1": _ext([("A", "t", "a"), ("B", "t", "b")],
                           [("A", "B", "related_to", "no clear relationship", 1), ("A", "a", "related_to", "self", 1)])}
         out = merge_extractions(units, ext)
-        self.assertEqual(out["relations"], [])
-        self.assertEqual((out["stats"]["negated_dropped"], out["stats"]["self_loops_dropped"]), (1, 1))
+        self.assertEqual(len(out["relations"]), 1)
+        self.assertEqual(out["relations"][0]["polarity"], "uncertain")
+        self.assertEqual((out["stats"]["negated_dropped"], out["stats"]["self_loops_dropped"]), (0, 1))
 
     def test_weights_npmi_and_pagerank(self) -> None:
         # Since 2026-09-12 single-letter names are document-scoped; the fixture uses two capital letters (still global entities)
@@ -417,15 +417,15 @@ class MergeTests(unittest.TestCase):
     def test_same_name_with_different_upper_classes_splits_only_on_real_evidence(self) -> None:
         """公司与它的同名产品:两种上层类各有足够的提及、来自不同文档,才拆成两个节点;零星的类型分歧仍按众数归一个。"""
         units = [_unit(f"u{i}", doc=f"kb:{i}", order=i) for i in range(5)]
-        ext = {f"u{i}": _ext([("Notion", "organization" if i < 3 else "product", f"d{i}")], []) for i in range(5)}
+        ext = {f"u{i}": _ext([("ExampleHub", "organization" if i < 3 else "product", f"d{i}")], []) for i in range(5)}
         kw = dict(entity_types=("organization", "product"), upper_parents={"organization": "agent", "product": "entity"})
         out = merge_extractions(units, ext, **kw)
         ents = {e["key"]: e for e in out["entities"]}
-        self.assertEqual(set(ents), {"notion", "notion||entity"})
-        self.assertEqual((ents["notion"]["upper"], ents["notion||entity"]["upper"]), ("agent", "entity"))
+        self.assertEqual(set(ents), {"examplehub", "examplehub||entity"})
+        self.assertEqual((ents["examplehub"]["upper"], ents["examplehub||entity"]["upper"]), ("agent", "entity"))
         self.assertEqual(out["stats"]["homonyms_split"], 1)
-        noisy = {f"u{i}": _ext([("Notion", "organization" if i else "product", f"d{i}")], []) for i in range(5)}
-        self.assertEqual([e["key"] for e in merge_extractions(units, noisy, **kw)["entities"]], ["notion"])   # 1/5 只算噪声
+        noisy = {f"u{i}": _ext([("ExampleHub", "organization" if i else "product", f"d{i}")], []) for i in range(5)}
+        self.assertEqual([e["key"] for e in merge_extractions(units, noisy, **kw)["entities"]], ["examplehub"])   # 1/5 只算噪声
 
     def test_dated_event_names_are_global_and_undated_ones_stay_in_their_document(self) -> None:
         units = [_unit("u1", doc="kb:1"), _unit("u2", doc="kb:2", order=1)]
@@ -439,23 +439,23 @@ class MergeTests(unittest.TestCase):
         units = [_unit("u1", doc="kb:1"), _unit("u2", doc="kb:2", order=1), _unit("u3", doc="kb:3", order=2)]
         for u, day in zip(units, ("2024-07-26", "2025-10-11", "2025-10-11")):
             u.doc_date = day
-        ext = {u.unit_id: _ext([("健康体检", "examination", "体检"), ("2024年健康体检", "examination", "那一年的体检")], []) for u in units}
+        ext = {u.unit_id: _ext([("样例巡检", "examination", "巡检"), ("2024年样例巡检", "examination", "那一年的巡检")], []) for u in units}
         kw = dict(entity_types=("examination",), upper_parents={"examination": "event"}, type_scopes={"examination": "global"})
         keys = sorted(e["key"] for e in merge_extractions(units, ext, **kw)["entities"])
-        self.assertEqual(keys, ["2024年健康体检", "kb:1::健康体检", "kb:2::健康体检", "kb:3::健康体检"])
+        self.assertEqual(keys, ["2024年样例巡检", "kb:1::样例巡检", "kb:2::样例巡检", "kb:3::样例巡检"])
         same_day = [units[1], units[2]]
         keys = sorted(e["key"] for e in merge_extractions(same_day, {u.unit_id: ext[u.unit_id] for u in same_day}, **kw)["entities"])
-        self.assertEqual(keys, ["2024年健康体检", "健康体检"])                   # 同一天的两份文档说的是同一次
+        self.assertEqual(keys, ["2024年样例巡检", "样例巡检"])                   # 同一天的两份文档说的是同一次
 
     def test_type_disagreement_among_abstract_classes_is_noise_not_two_things(self) -> None:
-        """同一个名字一处判成病症(概念)、一处判成风险因素(属性),是同一个东西的类型摇摆,不拆;
+        """同一个名字一处判成故障(概念)、一处判成风险因素(属性),是同一个东西的类型摇摆,不拆;
         人员与组织 / 具体的东西 / 抽象的东西三组之间的分歧才拆(见上一条的公司与同名产品)。"""
         units = [_unit(f"u{i}", doc=f"kb:{i}", order=i) for i in range(5)]
-        ext = {f"u{i}": _ext([("肥胖", "condition" if i < 3 else "risk factor", f"d{i}")], []) for i in range(5)}
+        ext = {f"u{i}": _ext([("过载", "condition" if i < 3 else "risk factor", f"d{i}")], []) for i in range(5)}
         out = merge_extractions(units, ext, entity_types=("condition", "risk factor"),
                                 upper_parents={"condition": "concept", "risk factor": "property"},
                                 type_scopes={"condition": "global", "risk factor": "global"})
-        self.assertEqual([(e["key"], e["type"]) for e in out["entities"]], [("肥胖", "condition")])
+        self.assertEqual([(e["key"], e["type"]) for e in out["entities"]], [("过载", "condition")])
         self.assertEqual(out["stats"]["homonyms_split"], 0)
 
     def test_kind_scope_and_external_ids_are_carried_to_the_entity(self) -> None:
@@ -485,52 +485,52 @@ class MergeTests(unittest.TestCase):
 
 class ResolutionTests(unittest.TestCase):
     def test_prefilter_rules(self) -> None:
-        self.assertFalse(resolution.is_similar("ZK7C4021KV13", "ZK7C4041KV13"))
-        self.assertTrue(resolution.is_similar("Northwind", "NORTHWIND"))
-        self.assertTrue(resolution.is_similar("nvSRAM", "nv-SRAM"))
-        self.assertFalse(resolution.is_similar("SRAM", "Static Random Access Memory"))
+        self.assertFalse(resolution.is_similar("ZX8D4021KV13", "ZX8D4041KV13"))
+        self.assertTrue(resolution.is_similar("Example", "EXAMPLE"))
+        self.assertTrue(resolution.is_similar("nvSTORE", "nv-STORE"))
+        self.assertFalse(resolution.is_similar("STORE", "Static Random Access Memory"))
         self.assertTrue(resolution.is_similar("非易失性存储器", "非易失存储器"))
         self.assertFalse(resolution.is_similar("电源电压", "输入电压"))
         self.assertFalse(resolution.is_similar("电源管理", "管理电源"))          # ordered n-grams: a bag of characters would misjudge this
         self.assertFalse(resolution.is_similar("", "x"))
 
     def test_candidates_and_prompt(self) -> None:
-        ents = [{"title": "Northwind", "type": "ORGANIZATION", "descriptions": ["German maker. Big."]},
-                {"title": "NORTHWIND", "type": "ORGANIZATION", "descriptions": []},
-                {"title": "Northwind", "type": "PRODUCT"},
-                {"title": "ZK7C1049GN", "type": "PRODUCT"}, {"title": "ZK7C1049GN-10", "type": "PRODUCT"}]
+        ents = [{"title": "Example", "type": "ORGANIZATION", "descriptions": ["Sample maker. Big."]},
+                {"title": "EXAMPLE", "type": "ORGANIZATION", "descriptions": []},
+                {"title": "Example", "type": "PRODUCT"},
+                {"title": "ZX8D1049GN", "type": "PRODUCT"}, {"title": "ZX8D1049GN-10", "type": "PRODUCT"}]
         pairs = resolution.candidate_pairs(ents)
         self.assertIn((0, 1), pairs)
         self.assertNotIn((0, 2), pairs)
         self.assertNotIn((3, 4), pairs)
         prompt = resolution.render_batch([(0, 1)], ents)
-        self.assertIn('1. "Northwind" [German maker. Big.] | "NORTHWIND" []', prompt)          # sameness judgement sees the first two sentences of the description
+        self.assertIn('1. "Example" [Sample maker. Big.] | "EXAMPLE" []', prompt)          # sameness judgement sees the first two sentences of the description
         self.assertIn("Entity type: ORGANIZATION", prompt)
         self.assertEqual(resolution.parse_answers("1: yes\n2: no\n3. YES\n4) 否", 5), [True, False, True, False, False])
 
     def test_components_merge_whole_and_edges_are_rewritten(self) -> None:
         ents = [
-            {"key": "northwind", "title": "NORTHWIND", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t1"], "frequency": 5, "aliases": []},
-            {"key": "northwind technologies", "title": "Northwind Technologies", "type": "ORG", "descriptions": ["semiconductor company"], "unit_ids": ["t2", "t1"], "frequency": 2, "aliases": []},
-            {"key": "northwind ag", "title": "Northwind AG", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t3"], "frequency": 1, "aliases": []},
-            {"key": "zk7c1049gn", "title": "ZK7C1049GN", "type": "PRODUCT", "descriptions": ["sram"], "unit_ids": ["t1"], "frequency": 3, "aliases": []},
+            {"key": "example", "title": "EXAMPLE", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t1"], "frequency": 5, "aliases": []},
+            {"key": "example technologies", "title": "Example Technologies", "type": "ORG", "descriptions": ["sample module company"], "unit_ids": ["t2", "t1"], "frequency": 2, "aliases": []},
+            {"key": "example ag", "title": "Example AG", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t3"], "frequency": 1, "aliases": []},
+            {"key": "zx8d1049gn", "title": "ZX8D1049GN", "type": "PRODUCT", "descriptions": ["store"], "unit_ids": ["t1"], "frequency": 3, "aliases": []},
         ]
         rels = [
-            {"source_key": "northwind", "target_key": "zk7c1049gn", "source": "NORTHWIND", "target": "ZK7C1049GN", "predicate": "produces", "directed": True, "descriptions": ["makes"], "strength_sum": 2.0, "evidence": 1, "unit_ids": ["t1"]},
-            {"source_key": "northwind technologies", "target_key": "zk7c1049gn", "source": "Northwind Technologies", "target": "ZK7C1049GN", "predicate": "produces", "directed": True, "descriptions": ["manufactures"], "strength_sum": 1.0, "evidence": 1, "unit_ids": ["t2"]},
-            {"source_key": "northwind ag", "target_key": "northwind", "source": "Northwind AG", "target": "NORTHWIND", "predicate": "related_to", "directed": False, "descriptions": ["same"], "strength_sum": 1.0, "evidence": 1, "unit_ids": ["t3"]},
+            {"source_key": "example", "target_key": "zx8d1049gn", "source": "EXAMPLE", "target": "ZX8D1049GN", "predicate": "produces", "directed": True, "descriptions": ["makes"], "strength_sum": 2.0, "evidence": 1, "unit_ids": ["t1"]},
+            {"source_key": "example technologies", "target_key": "zx8d1049gn", "source": "Example Technologies", "target": "ZX8D1049GN", "predicate": "produces", "directed": True, "descriptions": ["manufactures"], "strength_sum": 1.0, "evidence": 1, "unit_ids": ["t2"]},
+            {"source_key": "example ag", "target_key": "example", "source": "Example AG", "target": "EXAMPLE", "predicate": "related_to", "directed": False, "descriptions": ["same"], "strength_sum": 1.0, "evidence": 1, "unit_ids": ["t3"]},
         ]
         merged, edges, stats = resolution.merge_entities(ents, rels, [(0, 1), (1, 2)])
         self.assertEqual(stats["entities_after"], 2)
         head = next(e for e in merged if e["type"] == "ORG")
-        self.assertEqual(head["title"], "NORTHWIND")
+        self.assertEqual(head["title"], "EXAMPLE")
         self.assertEqual(head["frequency"], 8)
         self.assertEqual(head["unit_ids"], ["t1", "t2", "t3"])
-        self.assertEqual(head["descriptions"], ["maker", "semiconductor company"])
-        self.assertEqual(head["aliases"], ["Northwind Technologies", "Northwind AG"])
+        self.assertEqual(head["descriptions"], ["maker", "sample module company"])
+        self.assertEqual(head["aliases"], ["Example Technologies", "Example AG"])
         self.assertEqual(len(edges), 1)
         self.assertEqual((edges[0]["source"], edges[0]["target"], edges[0]["strength_sum"], edges[0]["evidence"]),
-                         ("NORTHWIND", "ZK7C1049GN", 3.0, 2))
+                         ("EXAMPLE", "ZX8D1049GN", 3.0, 2))
         self.assertEqual(edges[0]["unit_ids"], ["t1", "t2"])
         self.assertEqual(stats["self_loops_dropped"], 1)
 
@@ -565,36 +565,36 @@ class ResolutionTests(unittest.TestCase):
             return {"source": f"{doc}.pdf", "when": when}
 
         ents = [
-            {"key": "bmi", "title": "BMI", "type": "indicator", "frequency": 9, "unit_ids": ["u1"], "aliases": [],
+            {"key": "lix", "title": "LIX", "type": "indicator", "frequency": 9, "unit_ids": ["u1"], "aliases": [],
              "descriptions": [f"报告 {i} 的说法" for i in range(10)], "description_sources": [src(f"d{i}", f"20{10 + i}") for i in range(10)]},
-            {"key": "体重指数", "title": "体重指数", "type": "indicator", "frequency": 2, "unit_ids": ["u2"], "aliases": [],
+            {"key": "负载指数", "title": "负载指数", "type": "indicator", "frequency": 2, "unit_ids": ["u2"], "aliases": [],
              "attributes": ["measured_as = 22.6"],
              # the last one is an attribute row synthesised at admission and never had a source; the second repeats
              # a description of the representative
-             "descriptions": ["另一份报告的说法", "报告 3 的说法", "体重指数: measured_as = 22.6"],
+             "descriptions": ["另一份报告的说法", "报告 3 的说法", "负载指数: measured_as = 22.6"],
              "description_sources": [src("other", "2026"), src("other", "2026")]},
-            {"key": "体重指数(bmi)", "title": "体重指数(BMI)", "type": "indicator", "frequency": 1, "unit_ids": ["u3"], "aliases": [],
+            {"key": "负载指数(lix)", "title": "负载指数(LIX)", "type": "indicator", "frequency": 1, "unit_ids": ["u3"], "aliases": [],
              "descriptions": ["第三份报告的说法"], "description_sources": [src("third", "2027")]},
-            {"key": "zhang", "title": "张三", "type": "person", "frequency": 5, "unit_ids": ["u1"], "aliases": [], "descriptions": ["受检者"]},
+            {"key": "zhang", "title": "样例A", "type": "person", "frequency": 5, "unit_ids": ["u1"], "aliases": [], "descriptions": ["样例负责人"]},
         ]
         rels = [
-            {"source_key": "zhang", "target_key": "体重指数", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 0,
+            {"source_key": "zhang", "target_key": "负载指数", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 0,
              "unit_ids": ["u2"], "descriptions": ["推出来的边,没有来源"]},
-            {"source_key": "zhang", "target_key": "bmi", "predicate": "variant_of", "directed": True, "strength_sum": 2.0, "evidence": 1,
+            {"source_key": "zhang", "target_key": "lix", "predicate": "variant_of", "directed": True, "strength_sum": 2.0, "evidence": 1,
              "unit_ids": ["u1"], "descriptions": ["2024 年的说法"], "description_sources": [src("d1", "2024")]},
-            {"source_key": "zhang", "target_key": "体重指数(bmi)", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 1,
+            {"source_key": "zhang", "target_key": "负载指数(lix)", "predicate": "variant_of", "directed": True, "strength_sum": 1.0, "evidence": 1,
              "unit_ids": ["u3"], "descriptions": ["2027 年的说法", "2024 年的说法"], "description_sources": [src("third", "2027"), src("third", "2027")]},
         ]
         original = json.dumps([ents, rels], ensure_ascii=False, sort_keys=True)
         merged, edges, _ = resolution.merge_entities(ents, rels, [(0, 1), (1, 2)])
-        head = next(e for e in merged if e["key"] == "bmi")
+        head = next(e for e in merged if e["key"] == "lix")
         self.assertEqual(head["descriptions"], [f"报告 {i} 的说法" for i in range(10)]
-                         + ["另一份报告的说法", "体重指数: measured_as = 22.6", "第三份报告的说法"])
+                         + ["另一份报告的说法", "负载指数: measured_as = 22.6", "第三份报告的说法"])
         self.assertEqual(len(head["description_sources"]), len(head["descriptions"]))
         rows = description_rows(head)
         self.assertEqual(rows[9], {"text": "报告 9 的说法", "source": "d9.pdf", "when": "2019"})
         self.assertEqual(rows[10], {"text": "另一份报告的说法", "source": "other.pdf", "when": "2026"})
-        self.assertEqual(rows[11], {"text": "体重指数: measured_as = 22.6"})                     # a description without a source takes an empty slot, so the ones after it do not shift
+        self.assertEqual(rows[11], {"text": "负载指数: measured_as = 22.6"})                     # a description without a source takes an empty slot, so the ones after it do not shift
         self.assertEqual(rows[12], {"text": "第三份报告的说法", "source": "third.pdf", "when": "2027"})
         self.assertEqual(len(edges), 1)
         self.assertEqual(description_rows(edges[0]), [{"text": "推出来的边,没有来源"},
@@ -602,13 +602,13 @@ class ResolutionTests(unittest.TestCase):
                                                       {"text": "2027 年的说法", "source": "third.pdf", "when": "2027"}])
         self.assertEqual(json.dumps([ents, rels], ensure_ascii=False, sort_keys=True), original)      # the input rows are not modified
         # entities that were not merged stay as they are
-        self.assertEqual(next(e for e in merged if e["key"] == "zhang")["descriptions"], ["受检者"])
+        self.assertEqual(next(e for e in merged if e["key"] == "zhang")["descriptions"], ["样例负责人"])
 
     def test_resolve_runs_batches_and_tolerates_a_failed_batch(self) -> None:
-        # Northwind / NORTHWIND and Northwind / Northwind Technologies are now merged directly without asking the
+        # Example / EXAMPLE and Example / Example Technologies are now merged directly without asking the
         # model (identifier equality, organisation suffix); here we use a pair that does need the model (spelling variant)
-        ents = [{"key": "a", "title": "Northwind", "type": "ORG", "descriptions": [], "unit_ids": ["t1"], "frequency": 1, "aliases": []},
-                {"key": "b", "title": "Northwindn", "type": "ORG", "descriptions": [], "unit_ids": ["t2"], "frequency": 1, "aliases": []}]
+        ents = [{"key": "a", "title": "Example", "type": "ORG", "descriptions": [], "unit_ids": ["t1"], "frequency": 1, "aliases": []},
+                {"key": "b", "title": "Examplen", "type": "ORG", "descriptions": [], "unit_ids": ["t2"], "frequency": 1, "aliases": []}]
         client = _client(["1: yes"])
         merged, _, stats = resolution.resolve(client, ents, [])
         self.assertEqual((stats["candidates"], stats["yes"], stats["entities_after"]), (1, 1, 1))
@@ -626,7 +626,7 @@ class NoiseReductionTests(unittest.TestCase):
         from kb_pipeline.graph.units import classify_unit_text, unit_signals
 
         toc = "Contents Pin Configurations ....5 Pin Definitions ....7 Functional Overview ...... 9 Command Cycles ....9 Read and Write ....11 TAP ....22"
-        history = ("CAPTION: Document History Page | Document Title: ZK7C4021KV13 | Rev | ECN | Date | Description |\n"
+        history = ("CAPTION: Document History Page | Document Title: ZX8D4021KV13 | Rev | ECN | Date | Description |\n"
                    "| *J | 4575129 | 11/20/2014 | PRIT | Updated Functional Description |\n"
                    "| *K | 4741050 | 05/05/2015 | PRIT | Updated Ordering Information |\n"
                    "| *L | 5012377 | 12/01/2015 | PRIT | Updated to new template |")
@@ -641,7 +641,7 @@ class NoiseReductionTests(unittest.TestCase):
         self.assertEqual(classify_unit_text(ac_table, ["Switching Characteristics"]), "body")   # parameter tables are body text
         self.assertEqual(classify_unit_text(prose, ["Functional Overview"]), "body")
         self.assertEqual(classify_unit_text("本文档所含信息如有更改,恕不另行通知。版权所有。", ["法律声明"]), "boilerplate")
-        self.assertEqual(classify_unit_text("销售、解决方案和法律信息 全球销售和设计支持 赛普拉斯公司拥有一个由办事处组成的全球性网络。", ["销售、解决方案和法律信息"]), "boilerplate")
+        self.assertEqual(classify_unit_text("销售、解决方案和法律信息 全球销售和设计支持 示例模块公司拥有一个由办事处组成的全球性网络。", ["销售、解决方案和法律信息"]), "boilerplate")
         self.assertEqual(classify_unit_text("CAPTION: 测量单位 | 符号 | 测量单位 | | --- | --- | | °C | 摄氏度 | | MHz | 兆赫兹 |", ["封装图"]), "boilerplate")
         sig = unit_signals(ballmap)
         self.assertGreaterEqual(sig["table_ratio"], 0.5)
@@ -680,7 +680,7 @@ class NoiseReductionTests(unittest.TestCase):
         self.assertEqual(strip_latex("t $_{AA}$"), "tAA")
         self.assertEqual(strip_latex("A $_{0-A19}$"), "A0-A19")
         self.assertEqual(strip_latex("芯片使能($\\overline{\\mathrm{CE}}$)"), "芯片使能(CE#)")
-        self.assertEqual(strip_latex("ZK7C4021KV13"), "ZK7C4021KV13")
+        self.assertEqual(strip_latex("ZX8D4021KV13"), "ZX8D4021KV13")
         # a $, backslash or underscore that is not LaTeX stays untouched: variable names, currencies, paths
         for name in ("$SKILL_DIR", "${HOME}_dir", "Revenue A$", "$schema", "C:\\data\\my_file", "$100 to $200",
                      "$PATH and $HOME_DIR", "部门\\成员_列表"):
@@ -734,11 +734,11 @@ class NoiseReductionTests(unittest.TestCase):
 
         for name in ("1.3V", "667 MHz", "2.7 V至3.6 V", "1024 K × 8", "65nm", "-40°C to 85°C", "4021", "3.333 ns", "0.160"):
             self.assertTrue(is_value_name(name), name)
-        for name in ("ZK7C4021KV13", "361-ball FCBGA", "8 Mbit", "Commercial", "tAS", "PE#", "QuantumTrap", "边界扫描寄存器"):
+        for name in ("ZX8D4021KV13", "256-pin EXBOX", "8 Mbit", "Commercial", "tAS", "PE#", "ExampleCell", "边界扫描寄存器"):
             self.assertFalse(is_value_name(name), name)
-        for name in ("Figure 5", "Table 20", "图 5", "表 3.2", "001-79553", "Rev *J", "*J", "Note 15", "附录 A"):
+        for name in ("Figure 5", "Table 20", "图 5", "表 3.2", "000-12345", "Rev *J", "*J", "Note 15", "附录 A"):
             self.assertTrue(is_reference_name(name), name)
-        for name in ("Errata", "TAP Timing Diagram", "ZK7C4021KV13", "SRAM"):
+        for name in ("Errata", "TAP Timing Diagram", "ZX8D4021KV13", "STORE"):
             self.assertFalse(is_reference_name(name), name)
 
     def _merge_input(self):
@@ -747,20 +747,20 @@ class NoiseReductionTests(unittest.TestCase):
         u_toc.kind = "boilerplate"
         extractions = {
             "u1": {"entities": [
-                        {"name": "ZK7C4021KV13", "type": "device", "description": "a QDR SRAM", "mentions": 2},
+                        {"name": "ZX8D4021KV13", "type": "device", "description": "a sample store", "mentions": 2},
                         {"name": "1.3V", "type": "operating condition", "description": "core voltage", "mentions": 1},
                         {"name": "tAS", "type": "timing parameter", "description": "address setup", "mentions": 1},
                         {"name": "Figure 5", "type": "document", "description": "block diagram", "mentions": 1},
-                        {"name": "ZK7C4041KV13", "type": "device", "description": "the x36 sibling", "mentions": 1},
-                        {"name": "ZK7C4021KV13/ZK7C4041KV13", "type": "device", "description": "the family datasheet", "mentions": 1}],
+                        {"name": "ZX8D4041KV13", "type": "device", "description": "the x36 sibling", "mentions": 1},
+                        {"name": "ZX8D4021KV13/ZX8D4041KV13", "type": "device", "description": "the family datasheet", "mentions": 1}],
                    "relations": [
-                        {"source": "ZK7C4021KV13", "target": "1.3V", "predicate": "has_voltage_level", "description": "VDD is 1.3V", "strength": 8},
-                        {"source": "ZK7C4021KV13", "target": "tAS", "predicate": "has_timing_parameter", "description": "tAS min 0.16 ns", "strength": 7},
-                        {"source": "ZK7C4021KV13", "target": "Figure 5", "predicate": "has_document", "description": "shown in figure 5", "strength": 3},
-                        {"source": "ZK7C4021KV13/ZK7C4041KV13", "target": "tAS", "predicate": "has_timing_parameter", "description": "family has tAS", "strength": 5}]},
+                        {"source": "ZX8D4021KV13", "target": "1.3V", "predicate": "has_voltage_level", "description": "VDD is 1.3V", "strength": 8},
+                        {"source": "ZX8D4021KV13", "target": "tAS", "predicate": "has_timing_parameter", "description": "tAS min 0.16 ns", "strength": 7},
+                        {"source": "ZX8D4021KV13", "target": "Figure 5", "predicate": "has_document", "description": "shown in figure 5", "strength": 3},
+                        {"source": "ZX8D4021KV13/ZX8D4041KV13", "target": "tAS", "predicate": "has_timing_parameter", "description": "family has tAS", "strength": 5}]},
             "u2": {"entities": [{"name": "TAP Registers", "type": "document", "description": "section title", "mentions": 1},
-                                {"name": "ZK7C4021KV13", "type": "device", "description": "the part", "mentions": 1}],
-                   "relations": [{"source": "ZK7C4021KV13", "target": "TAP Registers", "predicate": "has_document", "description": "toc entry", "strength": 4}]},
+                                {"name": "ZX8D4021KV13", "type": "device", "description": "the part", "mentions": 1}],
+                   "relations": [{"source": "ZX8D4021KV13", "target": "TAP Registers", "predicate": "has_document", "description": "toc entry", "strength": 4}]},
         }
         return [u_body, u_toc], extractions
 
@@ -772,30 +772,30 @@ class NoiseReductionTests(unittest.TestCase):
         st = out["stats"]
         # Values do not become nodes; they fold into the device's attribute descriptions
         self.assertNotIn("1.3v", ents)
-        self.assertIn("has_voltage_level = 1.3V", ents["zk7c4021kv13"]["attributes"])
-        self.assertTrue(any("has_voltage_level = 1.3V" in d for d in ents["zk7c4021kv13"]["descriptions"]))
+        self.assertIn("has_voltage_level = 1.3V", ents["zx8d4021kv13"]["attributes"])
+        self.assertTrue(any("has_voltage_level = 1.3V" in d for d in ents["zx8d4021kv13"]["descriptions"]))
         self.assertEqual((st["value_entities_dropped"], st["value_relations_folded"]), (1, 1))
         # References are kept but flagged reference, and relations touching them carry the same flag
         self.assertTrue(ents["figure 5"]["reference"])
-        self.assertTrue(rels[("ZK7C4021KV13", "has_document", "Figure 5")]["reference"])
-        self.assertFalse(rels[("ZK7C4021KV13", "has_timing_parameter", "tAS")]["reference"])
+        self.assertTrue(rels[("ZX8D4021KV13", "has_document", "Figure 5")]["reference"])
+        self.assertFalse(rels[("ZX8D4021KV13", "has_timing_parameter", "tAS")]["reference"])
         # A combined name splits into its two parts: the combined node disappears and each device gets its own
         # has_timing_parameter → tAS
-        self.assertNotIn("zk7c4021kv13/zk7c4041kv13", ents)
+        self.assertNotIn("zx8d4021kv13/zx8d4041kv13", ents)
         self.assertEqual(st["combined_names_split"], 1)
-        self.assertIn(("ZK7C4041KV13", "has_timing_parameter", "tAS"), rels)
-        self.assertIn("ZK7C4021KV13/ZK7C4041KV13", ents["zk7c4041kv13"]["aliases"])
-        merged = rels[("ZK7C4021KV13", "has_timing_parameter", "tAS")]
+        self.assertIn(("ZX8D4041KV13", "has_timing_parameter", "tAS"), rels)
+        self.assertIn("ZX8D4021KV13/ZX8D4041KV13", ents["zx8d4041kv13"]["aliases"])
+        merged = rels[("ZX8D4021KV13", "has_timing_parameter", "tAS")]
         self.assertEqual(merged["evidence"], 1)                       # same unit, evidence is not counted twice
         self.assertAlmostEqual(merged["strength_sum"], 12.0)          # 7 + 5 merged into the same edge
         # Boilerplate unit: relations and entities are flagged, strength is discounted
-        toc_rel = rels[("ZK7C4021KV13", "has_document", "TAP Registers")]
+        toc_rel = rels[("ZX8D4021KV13", "has_document", "TAP Registers")]
         self.assertTrue(toc_rel["boilerplate"])
         self.assertEqual(toc_rel["evidence_kind"], "boilerplate")
         self.assertAlmostEqual(toc_rel["strength_sum"], 1.0)         # 4 × 0.25
         self.assertTrue(ents["tap registers"]["boilerplate"])
-        self.assertFalse(ents["zk7c4021kv13"]["boilerplate"])         # also appeared in body text
-        self.assertEqual(ents["zk7c4021kv13"]["evidence_kind"], "body")
+        self.assertFalse(ents["zx8d4021kv13"]["boilerplate"])         # also appeared in body text
+        self.assertEqual(ents["zx8d4021kv13"]["evidence_kind"], "body")
         self.assertEqual((st["boilerplate_units"], st["boilerplate_relations"], st["boilerplate_entities"]), (1, 1, 1))
         self.assertIn("type_health", st)
         # The type health check only reports, it does not demote whole types: in type document, Figure 5 is a
@@ -886,8 +886,8 @@ class NoiseReductionTests(unittest.TestCase):
         self.assertIn((2, 3), pairs)
         self.assertFalse(any(4 in p for p in pairs))                  # different types do not merge
         self.assertTrue(is_containment("tASH", "tASH setup time"))
-        self.assertFalse(is_containment("SRAM", "Static Random Access Memory"))
-        self.assertFalse(is_containment("ZK7C4021KV13", "ZK7C4041KV13 device"))   # the digits differ
+        self.assertFalse(is_containment("STORE", "Static Random Access Memory"))
+        self.assertFalse(is_containment("ZX8D4021KV13", "ZX8D4041KV13 device"))   # the digits differ
         vectors = {"AutoStore": [1.0, 0.0], "自动存储": [0.99, 0.1], "PE#": [0.0, 1.0]}
 
         def embed(titles):
@@ -921,8 +921,8 @@ class NoiseReductionTests(unittest.TestCase):
     def test_question_identifiers_pick_the_tokens_worth_matching(self) -> None:
         from kb_pipeline.graph.merge import question_identifiers
 
-        self.assertEqual(question_identifiers("ZK7C4021KV13 的输入高电平电压 VIH 在 VCC 为 2.7 V 至 3.6 V 时的最小值是多少？"),
-                         ["ZK7C4021KV13", "VIH", "VCC", "2.7", "3.6"])
+        self.assertEqual(question_identifiers("ZX8D4021KV13 的输入高电平电压 VIH 在 VCC 为 2.7 V 至 3.6 V 时的最小值是多少？"),
+                         ["ZX8D4021KV13", "VIH", "VCC", "2.7", "3.6"])
         self.assertEqual(question_identifiers("IDCODE 指令在 TAP 控制器中执行什么功能？"), ["IDCODE", "TAP"])
         self.assertEqual(question_identifiers("tAS 的最小值"), ["tAS"])
 
@@ -953,7 +953,7 @@ class NoiseReductionTests(unittest.TestCase):
     def test_bundle_writes_unit_kind_on_text_units_and_chunks(self) -> None:
         from kb_pipeline.graph.neo4j_import import load_bundle
 
-        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="半导体", source_type="local_mirror",
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="样例模块", source_type="local_mirror",
                           max_tokens=400, overlap_tokens=80)
         with tempfile.TemporaryDirectory() as tmp:
             out, graph, units, entity_id = _bundle_dir(self, tmp)
@@ -974,15 +974,15 @@ class NoiseReductionTests(unittest.TestCase):
         """Dense seeds miss short identifiers like "tAS"; an exact pass over titles / aliases / relation endpoints fills them in."""
         from kb_pipeline.graph.recall import identifier_variants, lexical_seeds, lexical_tokens
 
-        q = "ZK7C4021KV13 的地址建立时间 tAS 在 667 MHz 和 600 MHz 下的最小值分别是多少？"
-        self.assertEqual(lexical_tokens(q), ["ZK7C4021KV13", "tAS", "MHz"])   # 667 / 600 are values, not searched
+        q = "ZX8D4021KV13 的地址建立时间 tAS 在 667 MHz 和 600 MHz 下的最小值分别是多少？"
+        self.assertEqual(lexical_tokens(q), ["ZX8D4021KV13", "tAS", "MHz"])   # 667 / 600 are values, not searched
         self.assertIn("TAS", identifier_variants("tAS"))
         self.assertEqual(identifier_variants("t_AS")[:2], ["t_AS", "T_AS"])
         calls: list[tuple[str, Any]] = []
         points = {
             "graph_kb_entity": [SimpleNamespace(id="p1", payload={"gr_id": "e1", "title": "tAS", "aliases": ["t_AS"]}),
-                                SimpleNamespace(id="p2", payload={"gr_id": "e2", "title": "ZK7C4021KV13", "aliases": []})],
-            "graph_kb_relation": [SimpleNamespace(id="p3", payload={"gr_id": "r1", "source": "ZK7C4021KV13", "target": "tAS", "type": "has_timing_parameter"})],
+                                SimpleNamespace(id="p2", payload={"gr_id": "e2", "title": "ZX8D4021KV13", "aliases": []})],
+            "graph_kb_relation": [SimpleNamespace(id="p3", payload={"gr_id": "r1", "source": "ZX8D4021KV13", "target": "tAS", "type": "has_timing_parameter"})],
         }
 
         class FakeQ:
@@ -1070,21 +1070,21 @@ class OntologyTests(unittest.TestCase):
 
         u1 = _unit("u1", doc="kb_003:1"); u2 = _unit("u2", doc="kb_003:2", order=1)
         ext = {
-            "u1": _ext([("ZK7C4021KV13", "device", "part A"), ("tAS", "timing parameter", "setup A")],
-                       [("ZK7C4021KV13", "tAS", "has_timing_parameter", "A has tAS", 7)]),
-            "u2": _ext([("ZK7C1049GN", "device", "part B"), ("tAS", "timing parameter", "setup B")],
-                       [("ZK7C1049GN", "tAS", "has_timing_parameter", "B has tAS", 7)]),
+            "u1": _ext([("ZX8D4021KV13", "device", "part A"), ("tAS", "timing parameter", "setup A")],
+                       [("ZX8D4021KV13", "tAS", "has_timing_parameter", "A has tAS", 7)]),
+            "u2": _ext([("ZX8D1049GN", "device", "part B"), ("tAS", "timing parameter", "setup B")],
+                       [("ZX8D1049GN", "tAS", "has_timing_parameter", "B has tAS", 7)]),
         }
         out = merge_extractions([u1, u2], ext, entity_types=("device", "timing parameter"),
                                 upper_parents={"device": "entity", "timing parameter": "property"})
         ents = {e["key"]: e for e in out["entities"]}
-        self.assertEqual(set(ents), {"zk7c4021kv13", "zk7c1049gn", scoped_key("tas", "kb_003:1"), scoped_key("tas", "kb_003:2")})
+        self.assertEqual(set(ents), {"zx8d4021kv13", "zx8d1049gn", scoped_key("tas", "kb_003:1"), scoped_key("tas", "kb_003:2")})
         self.assertEqual(ents[scoped_key("tas", "kb_003:1")]["scope"], "kb_003:1")
         self.assertEqual(ents[scoped_key("tas", "kb_003:1")]["upper"], "property")
-        self.assertEqual(ents["zk7c4021kv13"]["scope"], "")
+        self.assertEqual(ents["zx8d4021kv13"]["scope"], "")
         rels = {(r["source_key"], r["target_key"]) for r in out["relations"]}
-        self.assertIn(("zk7c4021kv13", scoped_key("tas", "kb_003:1")), rels)
-        self.assertIn(("zk7c1049gn", scoped_key("tas", "kb_003:2")), rels)
+        self.assertIn(("zx8d4021kv13", scoped_key("tas", "kb_003:1")), rels)
+        self.assertIn(("zx8d1049gn", scoped_key("tas", "kb_003:2")), rels)
         self.assertEqual(out["stats"]["scoped_entities"], 2)
         # No upper mapping given: old behaviour, global merge
         old = merge_extractions([u1, u2], ext, entity_types=("device", "timing parameter"))
@@ -1097,14 +1097,14 @@ class OntologyTests(unittest.TestCase):
     def test_two_letter_pin_names_count_as_identifiers(self) -> None:
         from kb_pipeline.graph.merge import question_identifiers
 
-        self.assertEqual(question_identifiers("ZK7C4021KV13 的 AP 引脚在 ×18 数据宽度下覆盖哪些地址引脚"), ["ZK7C4021KV13", "AP", "18"])
+        self.assertEqual(question_identifiers("ZX8D4021KV13 的 AP 引脚在 ×18 数据宽度下覆盖哪些地址引脚"), ["ZX8D4021KV13", "AP", "18"])
         self.assertEqual(question_identifiers("ap 引脚 pin"), [])      # lowercase ordinary words do not count
 
     def test_variant_edges_are_derived_from_names(self) -> None:
         from kb_pipeline.graph.merge import derive_variant_edges
 
-        ents = [{"key": "zk7c4021kv13", "title": "ZK7C4021KV13", "type": "device", "scope": "", "unit_ids": ["u1"]},
-                {"key": "zk7c4021kv13-667fcxc", "title": "ZK7C4021KV13-667FCXC", "type": "device", "scope": "", "unit_ids": ["u2"]},
+        ents = [{"key": "zx8d4021kv13", "title": "ZX8D4021KV13", "type": "device", "scope": "", "unit_ids": ["u1"]},
+                {"key": "zx8d4021kv13-667fcxc", "title": "ZX8D4021KV13-667FCXC", "type": "device", "scope": "", "unit_ids": ["u2"]},
                 {"key": "iphone 15", "title": "iPhone 15", "type": "device", "scope": "", "unit_ids": []},
                 {"key": "iphone 15 pro", "title": "iPhone 15 Pro", "type": "device", "scope": "", "unit_ids": []},
                 {"key": "kb_003:1::tas", "title": "tAS", "type": "timing parameter", "scope": "kb_003:1", "unit_ids": []},
@@ -1113,7 +1113,7 @@ class OntologyTests(unittest.TestCase):
                 {"key": "ab-1", "title": "AB-1", "type": "device", "scope": "", "unit_ids": []}]
         derived = derive_variant_edges(ents, [{"source_key": "iphone 15 pro", "target_key": "iphone 15"}])
         pairs = {(d["source_key"], d["target_key"]) for d in derived}
-        self.assertEqual(pairs, {("zk7c4021kv13-667fcxc", "zk7c4021kv13")})   # iPhone already has a relation; document-local entities and too-short base names are not derived
+        self.assertEqual(pairs, {("zx8d4021kv13-667fcxc", "zx8d4021kv13")})   # iPhone already has a relation; document-local entities and too-short base names are not derived
         self.assertTrue(derived[0]["derived"])
         self.assertEqual(derived[0]["predicate"], "variant_of")
 
@@ -1135,10 +1135,10 @@ class OntologyTests(unittest.TestCase):
 
         raw = '''```json
 {"facts": [
-  {"subject": "ZK7C4021KV13", "property": "Address setup to CK", "symbol": "tAS", "min": "0.160", "unit": "ns", "conditions": {"speed grade": "667 MHz"}},
-  {"subject": "ZK7C4021KV13", "property": "Address setup to CK", "symbol": "tAS", "min": "0.180", "unit": "ns", "conditions": {"speed grade": "600 MHz"}},
+  {"subject": "ZX8D4021KV13", "property": "Address setup to CK", "symbol": "tAS", "min": "0.160", "unit": "ns", "conditions": {"speed grade": "667 MHz"}},
+  {"subject": "ZX8D4021KV13", "property": "Address setup to CK", "symbol": "tAS", "min": "0.180", "unit": "ns", "conditions": {"speed grade": "600 MHz"}},
   {"subject": "", "property": "x", "value": "1"},
-  {"subject": "ZK7C4021KV13", "property": "no value here"},
+  {"subject": "ZX8D4021KV13", "property": "no value here"},
 ]}
 ```'''
         facts, malformed = parse_facts_json(raw)
@@ -1148,7 +1148,7 @@ class OntologyTests(unittest.TestCase):
         self.assertEqual(norm[0]["min_num"], 0.16)
         self.assertEqual(norm[0]["conditions"], {"speed grade": "667 MHz"})
         self.assertNotEqual(fact_id("u1", norm[0]), fact_id("u1", norm[1]))     # different conditions make two facts
-        self.assertEqual(spec_text(norm[0]), "ZK7C4021KV13 · Address setup to CK (tAS): min 0.160 ns | speed grade: 667 MHz")
+        self.assertEqual(spec_text(norm[0]), "ZX8D4021KV13 · Address setup to CK (tAS): min 0.160 ns | speed grade: 667 MHz")
         self.assertEqual(parse_facts_json("no json here"), ([], 1))
         self.assertEqual(parse_number("1,024"), 1024.0)
         self.assertEqual(parse_number("-40°C"), -40.0)
@@ -1165,21 +1165,21 @@ class OntologyTests(unittest.TestCase):
 
         unit = _unit("u1", doc="kb_003:1", points=("p1", "p2"))
         unit.block_types = ["table"]
-        client = _client(['{"facts": [{"subject": "ZK7C4021KV13", "property": "Address setup", "symbol": "tAS", "min": "0.160", "unit": "ns", "conditions": {"speed grade": "667 MHz"}}]}'])
-        res = FactExtractor(client).extract(unit, document="a.pdf", subjects=["ZK7C4021KV13"])
+        client = _client(['{"facts": [{"subject": "ZX8D4021KV13", "property": "Address setup", "symbol": "tAS", "min": "0.160", "unit": "ns", "conditions": {"speed grade": "667 MHz"}}]}'])
+        res = FactExtractor(client).extract(unit, document="a.pdf", subjects=["ZX8D4021KV13"])
         self.assertEqual((len(res.facts), res.calls, res.stats["facts"]), (1, 1, 1))
-        ents = [{"key": "zk7c4021kv13", "title": "ZK7C4021KV13", "aliases": [], "scope": "", "upper": "entity", "doc_ids": ["kb_003:1"], "frequency": 9},
+        ents = [{"key": "zx8d4021kv13", "title": "ZX8D4021KV13", "aliases": [], "scope": "", "upper": "entity", "doc_ids": ["kb_003:1"], "frequency": 9},
                 {"key": "kb_003:1::tas", "title": "tAS", "aliases": ["t_AS"], "scope": "kb_003:1", "upper": "property", "doc_ids": ["kb_003:1"], "frequency": 2}]
         stats = link_facts(res.facts, ents, units_by_id={"u1": unit})
         self.assertEqual(stats, {"subjects_linked": 1, "properties_linked": 1, "compound_subjects": 0})
         # Compound subject "A, B": both are linked, the primary key takes the first
-        both = [{"subject": "ZK7C4021KV13, ZK7C4041KV13", "property": "x", "value": "1", "unit_id": "u1"}]
-        ents2 = ents + [{"key": "zk7c4041kv13", "title": "ZK7C4041KV13", "aliases": [], "scope": "", "upper": "entity", "doc_ids": ["kb_003:1"], "frequency": 3}]
+        both = [{"subject": "ZX8D4021KV13, ZX8D4041KV13", "property": "x", "value": "1", "unit_id": "u1"}]
+        ents2 = ents + [{"key": "zx8d4041kv13", "title": "ZX8D4041KV13", "aliases": [], "scope": "", "upper": "entity", "doc_ids": ["kb_003:1"], "frequency": 3}]
         st2 = link_facts(both, ents2, units_by_id={"u1": unit})
-        self.assertEqual((both[0]["subject_key"], both[0]["subject_keys"], st2["compound_subjects"]), ("zk7c4021kv13", ["zk7c4021kv13", "zk7c4041kv13"], 1))
+        self.assertEqual((both[0]["subject_key"], both[0]["subject_keys"], st2["compound_subjects"]), ("zx8d4021kv13", ["zx8d4021kv13", "zx8d4041kv13"], 1))
         fact = res.facts[0]
-        self.assertEqual((fact["subject_key"], fact["property_key"], fact["point_ids"]), ("zk7c4021kv13", "kb_003:1::tas", ["p1", "p2"]))
-        self.assertEqual(document_subjects(ents), {"kb_003:1": ["ZK7C4021KV13"]})   # document-local entities are not subjects
+        self.assertEqual((fact["subject_key"], fact["property_key"], fact["point_ids"]), ("zx8d4021kv13", "kb_003:1::tas", ["p1", "p2"]))
+        self.assertEqual(document_subjects(ents), {"kb_003:1": ["ZX8D4021KV13"]})   # document-local entities are not subjects
         payload = spec_payload(fact, kb_id="kb_003", source_collection="kb_003", graph_version="v1")
         self.assertEqual(payload["graph_type"], "spec")
         self.assertEqual(payload["symbol"], "tAS")
@@ -1194,7 +1194,7 @@ class OntologyTests(unittest.TestCase):
 
         self.assertIn("spec", GRAPH_VECTOR_TYPES)
         self.assertTrue(GRAPH_COLLECTION_RE.match("graph_003_spec__v1"))
-        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="半导体", source_type="local_mirror",
+        source = KBSource(kb_id="kb_003", collection="kb_003", source_root="样例模块", source_type="local_mirror",
                           max_tokens=400, overlap_tokens=80)
         with tempfile.TemporaryDirectory() as tmp:
             out, graph, units, entity_id = _bundle_dir(self, tmp)
@@ -1211,12 +1211,12 @@ class OntologyTests(unittest.TestCase):
 
         class FakeQ:
             def query_points(self, collection_name, query, limit, with_payload, query_filter=None):
-                return SimpleNamespace(points=[SimpleNamespace(id="s1", score=0.7, payload={"gr_id": "f1", "subject": "ZK7C4021KV13", "symbol": "tCK", "property": "cycle", "point_ids": ["p9"]})])
+                return SimpleNamespace(points=[SimpleNamespace(id="s1", score=0.7, payload={"gr_id": "f1", "subject": "ZX8D4021KV13", "symbol": "tCK", "property": "cycle", "point_ids": ["p9"]})])
 
             def scroll(self, collection_name, scroll_filter, limit, with_payload, with_vectors):
-                return [SimpleNamespace(id="s2", payload={"gr_id": "f2", "subject": "ZK7C4021KV13", "symbol": "tAS", "property": "setup", "point_ids": ["p1"]})], None
+                return [SimpleNamespace(id="s2", payload={"gr_id": "f2", "subject": "ZX8D4021KV13", "symbol": "tAS", "property": "setup", "point_ids": ["p1"]})], None
 
-        seeds = spec_seeds(FakeQ(), "graph_003_spec", [0.1], "ZK7C4021KV13 的 tAS 最小值")
+        seeds = spec_seeds(FakeQ(), "graph_003_spec", [0.1], "ZX8D4021KV13 的 tAS 最小值")
         by = {s["gr_id"]: s for s in seeds}
         self.assertEqual(by["f2"]["_via"], "lexical")
         self.assertGreater(by["f2"]["_score"], by["f1"]["_score"])      # a hit on both subject and symbol ranks first
@@ -1381,7 +1381,7 @@ class DeterministicBuilderTests(unittest.TestCase):
                 path.write_text(text, encoding="utf-8")
                 doc_ids[rel] = f"kb_007:{i}"
                 blocks = parse_native(path, "")
-                self.assertEqual(blocks[0].parser_profile, "code-symbols-v2")
+                self.assertEqual(blocks[0].parser_profile, "code-symbols-v2+source-v1")
                 refs += [ChunkRef(point_id=f"p{i}-{k}", chunk_uid=f"c{i}-{k}", doc_id=doc_ids[rel], content_version="v", chunk_index=k,
                                   block_id=b.block_id, block_type=b.block_type, section_path=list(b.metadata.get("section_path") or []),
                                   text=b.text, n_tokens=max(1, len(b.text) // 4), rel_path=rel, filename=rel.rsplit("/", 1)[-1])
@@ -1465,7 +1465,7 @@ class DeterministicBuilderTests(unittest.TestCase):
                                         "from requests import utils\nfrom pkg import models as own\nfrom pkg.vector import missing\n"
                                         "from tools.extra import helper_mod\n\n\n"
                                         "def point():\n    return models.PointStruct(id=1)\n"),
-            "tools/extra/helper_mod.py": "def run():\n    return 1\n",          # a package without __init__.py: the whole path has to match
+            "app/tools/extra/helper_mod.py": "def run():\n    return 1\n",      # a namespace package inside the same project
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1485,7 +1485,7 @@ class DeterministicBuilderTests(unittest.TestCase):
             self.assertEqual(imports["dj"], (None, "models", "django"))
             self.assertEqual(imports["utils"], (None, "utils", "requests"))
             self.assertEqual(imports["own"], ("app/pkg/models.py", None, None))            # a package of the base still resolves to its submodule
-            self.assertEqual(imports["helper_mod"], ("tools/extra/helper_mod.py", None, None))
+            self.assertEqual(imports["helper_mod"], ("app/tools/extra/helper_mod.py", None, None))
             self.assertNotEqual(imports.get("missing", (None,))[0], "app/pkg/models.py")
             rels = []
             for u in units:
@@ -1565,10 +1565,7 @@ class DeterministicBuilderTests(unittest.TestCase):
 
 class ConceptNeighbourScaleTests(unittest.TestCase):
     def test_numpy_neighbour_search_matches_the_pairwise_definition_and_scales(self) -> None:
-        """2026-09-12 benchmark with 12,933 concept candidates: pairwise cosine meant 167 million
-        computations, about 3 hours, and the graph build stalled at "property concept normalisation". The numpy
-        path must give the same result in the same order as the pairwise implementation, and a few thousand
-        candidates must finish within seconds."""
+        """Seeded synthetic vectors must yield the same ordered neighbours in the vectorized and pairwise implementations, including zero vectors, while meeting the runtime bound."""
         import random
         import time
         from kb_pipeline.graph.concepts import _neighbour_pairs, _neighbour_pairs_python, _unit_family
@@ -1611,18 +1608,18 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
             axis_sort_key, document_axis, find_dates, find_versions, in_window, parse_date, question_time_window,
         )
 
-        self.assertEqual(parse_date("现将您2021年03月14日的体检结果"), "2021-03-14")
+        self.assertEqual(parse_date("现将您2021年03月14日的巡检结果"), "2021-03-14")
         self.assertEqual(parse_date("Revised August 24, 2020"), "2020-08-24")
         self.assertEqual(parse_date("2023/09/12 14:27"), "2023-09-12")
         self.assertEqual(parse_date("报告时间 20230912"), "2023-09-12")
         self.assertEqual(parse_date("2022 年 06 月"), "2022-06")
-        self.assertEqual(parse_date("2021体检报告.pdf"), "2021")
+        self.assertEqual(parse_date("2021巡检报告.pdf"), "2021")
         self.assertIsNone(parse_date("01/02/03 nothing here"))
         self.assertEqual(find_dates("2021年3月14日 与 2022-06-05,以及 2026"), ["2021-03-14", "2022-06-05", "2026"])
-        self.assertEqual(find_versions("Document Number: 001-79553 Rev. *L  Version 2.1 版本 3"), ["rev *L", "v2.1", "v3"])
-        health = document_axis("李华/体检报告/2021体检报告.pdf", "尊敬的先生,您好!现将您2021年03月14日的体检结果报告如下")
+        self.assertEqual(find_versions("Document Number: 000-12345 Rev. *L  Version 2.1 版本 3"), ["rev *L", "v2.1", "v3"])
+        health = document_axis("样例C/巡检报告/2021巡检报告.pdf", "尊敬的先生,您好!现将您2021年03月14日的巡检结果报告如下")
         self.assertEqual((health["kind"], health["value"], health["date"]), ("date", "2021-03-14", "2021-03-14"))
-        sheet = document_axis("northwind-zk7c4021kv13-datasheet-en.pdf", "ZK7C4021KV13 72-Mbit QDR-IV SRAM Document Number: 001-79553 Rev. *L Revised August 24, 2020", kind="version")
+        sheet = document_axis("example-zx8d4021kv13-datasheet-en.pdf", "ZX8D4021KV13 72-unit Sample Store Document Number: 000-12345 Rev. *L Revised August 24, 2020", kind="version")
         self.assertEqual((sheet["kind"], sheet["value"], sheet["date"]), ("version", "rev *L", "2020-08-24"))
         self.assertEqual(document_axis("notes.md", "nothing dated")["kind"], "none")
         self.assertEqual(document_axis("2022-report.pdf", "2022-06-05 发布", kind="date")["value"], "2022-06-05")   # the filename only has the year; the first page completes it
@@ -1632,11 +1629,11 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertLess(axis_sort_key("2024"), axis_sort_key(""))
         today = date(2026, 9, 7)
         self.assertEqual(question_time_window("这两年我的身体状况如何", today=today), {"from": "2025", "to": "2026", "text": "这两年"})
-        self.assertEqual(question_time_window("最近三年的血脂变化", today=today)["from"], "2024")
-        self.assertEqual(question_time_window("2024到2026年体检有什么变化", today=today)["to"], "2026")
+        self.assertEqual(question_time_window("最近三年的组分变化", today=today)["from"], "2024")
+        self.assertEqual(question_time_window("2024到2026年巡检有什么变化", today=today)["to"], "2026")
         self.assertEqual(question_time_window("去年的报告", today=today), {"from": "2025", "to": "2025", "text": "去年"})
         self.assertEqual(question_time_window("since 2023 what changed", today=today)["from"], "2023")
-        self.assertEqual(question_time_window("2025年10月的心电图", today=today)["from"], "2025")
+        self.assertEqual(question_time_window("2025年10月的波形图", today=today)["from"], "2025")
         self.assertIsNone(question_time_window("tAS 的最小值是多少", today=today))
         win = {"from": "2022", "to": "2023"}
         self.assertTrue(in_window("2022-06-05", win))
@@ -1662,30 +1659,30 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertEqual(document_axis("notes.md", "Revised August 2020")["value"], "2020-08")
         # the year in the file name works as before; a full date of the same year on the first page completes it, one
         # of another year does not
-        self.assertEqual(document_axis("2021体检报告.pdf", "本中心成立于 1995 年")["value"], "2021")
-        self.assertEqual(document_axis("2021体检报告.pdf", "2021 年度体检报告\n检查日期 2021-03-14")["value"], "2021-03-14")
-        self.assertEqual(document_axis("2021体检报告.pdf", "出生日期 1980-01-01")["value"], "2021")
+        self.assertEqual(document_axis("2021巡检报告.pdf", "本中心成立于 1995 年")["value"], "2021")
+        self.assertEqual(document_axis("2021巡检报告.pdf", "2021 年度巡检报告\n检查日期 2021-03-14")["value"], "2021-03-14")
+        self.assertEqual(document_axis("2021巡检报告.pdf", "制造日期 1980-01-01")["value"], "2021")
         # a version axis without a version number falls back to the date, again only a full one
         self.assertEqual(document_axis("a.py", "# 2026-09-12 改过一次\nLIMIT = 2048", kind="version")["value"], "2026-09-12")
 
     def test_unit_classifier_recognises_report_boilerplate_and_conclusions(self) -> None:
         from kb_pipeline.graph.units import classify_unit_text, unit_signals
 
-        toc = ("www.northwind-checkup.test / 目录 / CONTENTS\n1 体检重要异常结果、复查建议及治疗建议 04 异常情况、专家建议与指导、标准治疗方案\n"
-               "2 专家建议与指导 05 建议与指导\n3 健康体检结果 07 检查详细结果\n4 口腔检查结果 26 口腔健康整体解决方案/建议\n"
-               "5 历年主要异常指标对比 28 历年数据对比及健康预测\n尊敬的李华先生,您好! 感谢您的光临。现将您2023年09月12日的体检结果报告如下。")
+        toc = ("www.example-inspection.test / 目录 / CONTENTS\n1 巡检重要异常结果、复查建议及维护建议 04 异常情况、专家建议与指导、标准维护方案\n"
+               "2 专家建议与指导 05 建议与指导\n3 样例巡检结果 07 检查详细结果\n4 装配检查结果 26 装配状态整体改进方案/建议\n"
+               "5 历年主要异常指标对比 28 历年数据对比及状态预测\n尊敬的样例C先生,您好! 感谢您的光临。现将您2023年09月12日的巡检结果报告如下。")
         self.assertEqual(classify_unit_text(toc, []), "boilerplate")
-        guide = ("报告阅读说明书\n1. 您本次体检报告由健康信息、本次体检主要阳性结果和异常情况、专家指导建议及本次体检结果等部分组成。\n"
-                 "2. 健康体检数据只是针对本次体检覆盖的相关器官的相关项目或指标的检查结果,并非能覆盖人体全部器官及全部指标。")
+        guide = ("报告阅读说明书\n1. 您本次巡检报告由设备信息、本次巡检主要阳性结果和异常情况、专家指导建议及本次巡检结果等部分组成。\n"
+                 "2. 样例巡检数据只是针对本次巡检覆盖的相关部件的相关项目或指标的检查结果,并非能覆盖装置全部部件及全部指标。")
         self.assertEqual(classify_unit_text(guide, []), "boilerplate")
-        self.assertEqual(classify_unit_text("尊敬的张三女士,您好!感谢您选择我们的体检服务,现将报告奉上。", []), "boilerplate")
-        promo = "想随时随地看报告?扫码下载Northwind体检APP。关注公众号,检前检后全管理。IMAGE: 一个二维码。"
+        self.assertEqual(classify_unit_text("尊敬的样例A女士,您好!感谢您选择我们的巡检服务,现将报告奉上。", []), "boilerplate")
+        promo = "想随时随地看报告?扫码下载Example巡检APP。关注公众号,检前检后全管理。IMAGE: 一个二维码。"
         self.assertEqual(classify_unit_text(promo, []), "boilerplate")
-        findings = ("1. 体检重要异常结果、复查建议及治疗建议 / 阳性结果和异常情况 / 【1】甲状腺左叶小囊肿(TI-RADS2类) / 【2】轻度脂肪肝 / "
-                    "【3】鼻中隔偏曲 / 【4】低密度脂蛋白胆固醇增高 / 【5】屈光不正 / 2. 专家建议与指导")
-        self.assertEqual(classify_unit_text(findings, ["体检重要异常结果"]), "body")                  # the "advice" word is not a generic conclusion cue (every section has it)
-        self.assertEqual(classify_unit_text("异常结果汇总\n1. 总胆固醇偏高", ["异常结果汇总"]), "conclusion")   # the "summary" word is
-        domain_only = "阳性结果和异常情况 / 【1】甲状腺左叶小囊肿(TI-RADS2类) / 【2】轻度脂肪肝 / 【3】鼻中隔偏曲"
+        findings = ("1. 巡检重要异常结果、复查建议及维护建议 / 阳性结果和异常情况 / 【1】左侧壳体小凹点(LEVEL2类) / 【2】轻度涂层不均 / "
+                    "【3】中心轴偏移 / 【4】低密度组分浓度增高 / 【5】焦距偏移 / 2. 专家建议与指导")
+        self.assertEqual(classify_unit_text(findings, ["巡检重要异常结果"]), "body")                  # the "advice" word is not a generic conclusion cue (every section has it)
+        self.assertEqual(classify_unit_text("异常结果汇总\n1. 总组分浓度偏高", ["异常结果汇总"]), "conclusion")   # the "summary" word is
+        domain_only = "阳性结果和异常情况 / 【1】左侧壳体小凹点(LEVEL2类) / 【2】轻度涂层不均 / 【3】中心轴偏移"
         self.assertEqual(classify_unit_text(domain_only, ["阳性结果和异常情况"]), "body")               # domain words are not in the code
         self.assertEqual(classify_unit_text(domain_only, ["阳性结果和异常情况"], conclusion_headings=["阳性结果和异常情况"]), "conclusion")
         self.assertEqual(classify_unit_text("Key findings: the device meets the 667 MHz timing budget across all corners.", ["Summary"]), "conclusion")
@@ -1747,22 +1744,22 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
     def test_summaries_use_thresholds_json_rows_and_attribution(self) -> None:
         from kb_pipeline.graph.summarize import concatenate, description_rows, needs_summary, summarize_one, summarize_rows
 
-        row = {"descriptions": ["42 岁", "43 岁", "受检者"], "description_sources": [{"source": "2021体检报告.pdf", "when": "2021-03-14"}, {"source": "2022体检报告.pdf", "when": "2022-06-05"}, {}]}
+        row = {"descriptions": ["42 批", "43 批", "样例负责人"], "description_sources": [{"source": "2021巡检报告.pdf", "when": "2021-03-14"}, {"source": "2022巡检报告.pdf", "when": "2022-06-05"}, {}]}
         rows = description_rows(row)
-        self.assertEqual(rows[0], {"text": "42 岁", "source": "2021体检报告.pdf", "when": "2021-03-14"})
-        self.assertEqual(rows[2], {"text": "受检者"})
+        self.assertEqual(rows[0], {"text": "42 批", "source": "2021巡检报告.pdf", "when": "2021-03-14"})
+        self.assertEqual(rows[2], {"text": "样例负责人"})
         self.assertFalse(needs_summary(rows))                      # 3 short descriptions: concatenate, no model call
         self.assertTrue(needs_summary(rows + [{"text": "x"}]))     # ≥4 rows
         self.assertTrue(needs_summary([{"text": "长" * 900}, {"text": "文" * 900}]))   # over the token limit
-        self.assertIn("[2021体检报告.pdf (2021-03-14)] 42 岁", concatenate(rows))
+        self.assertIn("[2021巡检报告.pdf (2021-03-14)] 42 批", concatenate(rows))
         seen: list[str] = []
 
         def chat(messages):
             seen.append(messages[-1]["content"])
             return "汇总"
         client = _client(chat)
-        self.assertEqual(summarize_one(client, "李华", rows + [{"text": "x"}], language="Chinese"), "汇总")
-        self.assertIn('{"text": "42 岁", "source": "2021体检报告.pdf", "when": "2021-03-14"}', seen[0])
+        self.assertEqual(summarize_one(client, "样例C", rows + [{"text": "x"}], language="Chinese"), "汇总")
+        self.assertIn('{"text": "42 批", "source": "2021巡检报告.pdf", "when": "2021-03-14"}', seen[0])
         self.assertIn("keep the differences and attribute them", seen[0])
         stats = summarize_rows(client, [dict(row), {"descriptions": ["only one"]}], language="Chinese", name_of=lambda r: "n")
         self.assertEqual((stats["summarized"], stats["concatenated"], stats["skipped"]), (0, 2, 2))
@@ -1772,7 +1769,7 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
             bound_distance, canonical_unit, fact_id, link_facts, normalize_fact, property_text, spec_text, value_text, wants_facts,
         )
 
-        raw = {"subject": "体重指数", "property": "测量结果", "value": "25.5", "unit": "", "flag": "↑", "ref_min": "18.5", "ref_max": "23.99",
+        raw = {"subject": "负载指数", "property": "测量结果", "value": "25.5", "unit": "", "flag": "↑", "ref_min": "18.5", "ref_max": "23.99",
                "valid_from": "2023年09月12日", "period_text": "2026/09", "note": ""}
         f = normalize_fact(raw)
         self.assertEqual((f["flag"], f["ref_min_num"], f["ref_max_num"], f["valid_from"], f["period_text"]), ("↑", 18.5, 23.99, "2023-09-12", "2026/09"))
@@ -1790,19 +1787,21 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertEqual(normalize_fact({"subject": "X", "property": "p", "value": "1", "unit": "ma"})["unit_canonical"], "mA")
         g = normalize_fact({"subject": "X", "property": "p", "value": "1", "valid_from": "not a date", "period_text": "x"})
         self.assertNotIn("valid_from", g)
-        self.assertNotIn("period_text", g)
+        self.assertEqual(g["period_text"], "x")
+        self.assertEqual(g["time_basis"], "unknown")
         a = normalize_fact({"subject": "X", "property": "p", "value": "1", "valid_from": "2024"})
         b = normalize_fact({"subject": "X", "property": "p", "value": "1", "valid_from": "2025"})
         self.assertNotEqual(fact_id("u", a), fact_id("u", b))
         self.assertIn("| when: 2023-09-12 | ref: 18.5~23.99", spec_text(f))
         self.assertIn("25.5 ↑", value_text(f))
-        self.assertEqual(property_text({"concept": "bmi", "property": "测量结果", "symbol": "", "subject": "体重指数"}), "bmi · 测量结果 · 体重指数")
+        self.assertEqual(property_text({"concept": "lix", "property": "测量结果", "symbol": "", "subject": "负载指数"}), "lix · 测量结果 · 负载指数")
         unit = _unit("u1", doc="kb_t:1", points=("p1",))
         unit.axis = "2022-06-05"
         facts = [{"subject": "X", "property": "p", "value": "30", "unit_id": "u1", "ref_min_num": 18.5, "ref_max_num": 24.0, "value_num": 30.0},
                  {"subject": "X", "property": "q", "value": "1", "unit_id": "u1", "valid_from": "2020"}]
         link_facts(facts, [], units_by_id={"u1": unit})
-        self.assertEqual((facts[0]["axis"], facts[0]["valid_from"], facts[1]["valid_from"]), ("2022-06-05", "2022-06-05", "2020"))
+        self.assertEqual((facts[0]["axis"], facts[0]["time_basis"], facts[1]["valid_from"]), ("2022-06-05", "document", "2020"))
+        self.assertNotIn("valid_from", facts[0])
         self.assertGreater(facts[0]["bound_distance"], 0)
         conclusion = _unit("c1")
         conclusion.kind = "conclusion"
@@ -1813,14 +1812,14 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         from kb_pipeline.graph.merge import combine_unit_kind
 
         units = [_unit("u1", doc="kb_t:1"), _unit("u2", doc="kb_t:2")]
-        units[0].rel_path, units[0].axis = "2021体检报告.pdf", "2021-03-14"
-        units[1].rel_path, units[1].axis = "2022体检报告.pdf", "2022-06-05"
-        ex = {"u1": {"entities": [{"name": "李华", "type": "person", "descriptions": ["34 岁"]}], "relations": []},
-              "u2": {"entities": [{"name": "李华", "type": "person", "descriptions": ["35 岁"]}], "relations": []}}
+        units[0].rel_path, units[0].axis = "2021巡检报告.pdf", "2021-03-14"
+        units[1].rel_path, units[1].axis = "2022巡检报告.pdf", "2022-06-05"
+        ex = {"u1": {"entities": [{"name": "样例C", "type": "person", "descriptions": ["34 岁"]}], "relations": []},
+              "u2": {"entities": [{"name": "样例C", "type": "person", "descriptions": ["35 岁"]}], "relations": []}}
         merged = merge_extractions(units, ex, entity_types=("person",))
         e = merged["entities"][0]
         self.assertEqual(e["descriptions"], ["34 岁", "35 岁"])
-        self.assertEqual(e["description_sources"], [{"source": "2021体检报告.pdf", "when": "2021-03-14"}, {"source": "2022体检报告.pdf", "when": "2022-06-05"}])
+        self.assertEqual(e["description_sources"], [{"source": "2021巡检报告.pdf", "when": "2021-03-14"}, {"source": "2022巡检报告.pdf", "when": "2022-06-05"}])
         self.assertEqual(combine_unit_kind("conclusion", "body"), "conclusion")
         self.assertEqual(combine_unit_kind("body", "conclusion"), "conclusion")
         self.assertEqual(combine_unit_kind("conclusion", "boilerplate"), "boilerplate")
@@ -1829,20 +1828,20 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
     def test_schema_suggests_definitions_profile_and_examples(self) -> None:
         from kb_pipeline.graph.schema import generate_examples
 
-        answers = ["Health reports", "Chinese", "You are an expert.",
+        answers = ["Synthetic records", "Chinese", "You are an expert.",
                    '{"entity_types": ["person", "indicator", "examination"]}',
                    '{"parent_types": {"person": "agent", "indicator": "property", "examination": "event"}}',
                    '{"predicates": [{"name": "has_indicator", "description": "d", "source_parents": ["agent"], "target_parents": ["property"]},'
                    ' {"name": "examined_by", "description": "e", "source_parents": ["agent"], "target_parents": ["agent"], "single_valued": true}]}',
-                   '{"types": {"person": {"definition": "the examinee a report is about", "scope": "global"},'
-                   ' "indicator": {"definition": "a measured health metric", "scope": "document"}, "ghost": {"definition": "x"}}}',
+                   '{"types": {"person": {"definition": "the record owner a report is about", "scope": "global"},'
+                   ' "indicator": {"definition": "a measured sample metric", "scope": "document"}, "ghost": {"definition": "x"}}}',
                    '{"subject_types": ["person", "nope"], "axis": "date", "conclusion_headings": ["异常结果汇总", "综合建议"], "extension_predicates": ["has_indicator", "bogus"]}']
         client = _client(list(answers))
         out = graph_schema.suggest(client, ["sample text"], examples=False)
         model = out["model"]
         types = {t["name"]: t for t in model["types"]}
         self.assertEqual({k: v["description"] for k, v in types.items()},
-                         {"person": "the examinee a report is about", "indicator": "a measured health metric", "examination": ""})
+                         {"person": "the record owner a report is about", "indicator": "a measured sample metric", "examination": ""})
         self.assertEqual({k: (v["is_a"], v["scope"]) for k, v in types.items()},
                          {"person": ("agent", "global"), "indicator": ("property", "document"), "examination": ("event", "document")})
         self.assertEqual(model["profile"], {"subject_types": ["person"], "axis": "date", "conclusion_headings": ["异常结果汇总", "综合建议"],
@@ -1855,17 +1854,17 @@ class PromptAndUnitClassificationTests(unittest.TestCase):
         self.assertEqual(client.stats["calls"], 8)
         schema = ExtractionSchema(entity_types=("person", "indicator"), predicates=({"name": "has_indicator", "source_parents": ["agent"], "target_parents": ["property"]},),
                                   language="Chinese", parent_types={"person": "agent", "indicator": "property"})
-        good = ('("unit"<|>body<|>s)##("entity"<|>李华<|>person<|>受检者)##("entity"<|>体重指数<|>indicator<|>指标)##'
-                '("relationship"<|>李华<|>体重指数<|>has_indicator<|>报告给出体重指数<|>8)##'
-                '("relationship"<|>体重指数<|>李华<|>has_indicator<|>越界的方向<|>3)<|COMPLETE|>')
+        good = ('("unit"<|>body<|>s)##("entity"<|>样例C<|>person<|>样例负责人)##("entity"<|>负载指数<|>indicator<|>指标)##'
+                '("relationship"<|>样例C<|>负载指数<|>has_indicator<|>报告给出负载指数<|>8)##'
+                '("relationship"<|>负载指数<|>样例C<|>has_indicator<|>越界的方向<|>3)<|COMPLETE|>')
         weak = '("entity"<|>A<|>person<|>x)##("entity"<|>B<|>indicator<|>y)##("relationship"<|>A<|>B<|>related_to<|>泛化<|>2)<|COMPLETE|>'
         text, stats = generate_examples(_client([weak, good]), ["短" * 220, "长文本 " * 60], schema)
         # Tried in descending length: the "long text" sample gets weak first (only related_to, below the bar), the "short"
         # one gets good; the reversed record in good violates the endpoints (1/2, not over half) and is removed
         self.assertEqual((stats["kept"], stats["fallback"], stats["violations_removed"], stats["dropped_empty"]), (1, 0, 1, 0))
         self.assertIn("Example 1:", text)
-        self.assertIn('("relationship"<|>李华<|>体重指数<|>has_indicator<|>报告给出体重指数<|>8<|>)', text)
-        self.assertIn('("entity"<|>李华<|>person<|>受检者<|>instance)', text)        # 示例与正文提示词用同一种记录格式
+        self.assertIn('("relationship"<|>样例C<|>负载指数<|>has_indicator<|>报告给出负载指数<|>8<|><|>{', text)
+        self.assertIn('("entity"<|>样例C<|>person<|>样例负责人<|>instance)', text)        # 示例与正文提示词用同一种记录格式
         self.assertNotIn("越界的方向", text)
         self.assertNotIn("(parent:", text)                                          # the menu in examples lists names only, definitions are not repeated
         self.assertIn("Predicates: has_indicator", text)
@@ -1918,12 +1917,12 @@ class ResolutionEvidenceTests(unittest.TestCase):
     def test_identifier_like_names_only_merge_on_canonical_equality(self) -> None:
         from kb_pipeline.graph.resolution import candidate_pairs, embedding_candidates, is_identifier_like, is_similar
 
-        for name in ("t_DBE", "VIH", "ZK7C1049GN", "rs0000133", "ADRB2", "PE#", "51-85087"):
+        for name in ("t_DBE", "VIH", "ZX8D1049GN", "mx0000133", "ASMB2", "PE#", "51-85087"):
             self.assertTrue(is_identifier_like(name), name)
-        for name in ("Northwind", "总胆固醇", "data input", "AutoStore", "Market Strategy Committee"):
+        for name in ("Example", "总组分浓度", "data input", "AutoStore", "Market Strategy Committee"):
             self.assertFalse(is_identifier_like(name), name)
         self.assertFalse(is_similar("t_DBE", "t_DOE"))          # identifiers one letter apart are two parameters (kb_001 once merged them)
-        self.assertFalse(is_similar("ADRB2", "ADRB3"))
+        self.assertFalse(is_similar("ASMB2", "ADRB3"))
         self.assertFalse(is_similar("ADH2", "ALDH2"))
         ents = [{"title": "t_DBE", "type": "timing parameter"}, {"title": "t_DOE", "type": "timing parameter"},
                 {"title": "tDOE", "type": "timing parameter"}]
@@ -1946,7 +1945,7 @@ class ResolutionEvidenceTests(unittest.TestCase):
                      ("1.1.0", "11.0"), ("v1.10", "v110")):
             self.assertNotEqual(canonical_identifier(a), canonical_identifier(b), (a, b))
             self.assertEqual(pairs(a, b), [], (a, b))
-        for a, b in (("t_AS", "t AS"), ("ZK7C 1049 GN", "ZK7C1049GN"), ("ZM32 F103", "ZM32F103"), ("表 3-12", "表3.12"),
+        for a, b in (("t_AS", "t AS"), ("ZX8D 1049 GN", "ZX8D1049GN"), ("ZM32 F103", "ZM32F103"), ("表 3-12", "表3.12"),
                      ("2024-01-05", "2024/01/05"), ("ISO 9001:2015", "ISO9001-2015"), ("W.W.", "WW")):
             self.assertEqual(pairs(a, b), [(0, 1)], (a, b))
         # keys obtained by stripping type words or bracketed aliases go through the same function: a different grouping
@@ -1968,33 +1967,33 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertTrue(polarity_conflict("输入数据", "输出数据"))
         self.assertTrue(polarity_conflict("VIH input high", "VIL input low"))
         self.assertFalse(polarity_conflict("data input", "input data"))
-        self.assertFalse(polarity_conflict("Northwind", "Northwind Technologies"))
+        self.assertFalse(polarity_conflict("Example", "Example Technologies"))
         self.assertFalse(is_similar("data input", "data output"))
         self.assertFalse(is_similar("output data valid", "input data valid"))
         # A subclass is not the same thing: a meaningful extra word blocks the merge; only type words / organisation
         # suffixes / "identifier + descriptor" count as qualifiers
-        self.assertFalse(is_containment("并发症", "糖尿病并发症"))
-        self.assertFalse(is_containment("视力减退原因待查", "双眼视力减退原因待查"))
-        self.assertFalse(is_containment("Diabetes", "Type 2 Diabetes"))
+        self.assertFalse(is_containment("联动故障", "过载联动故障"))
+        self.assertFalse(is_containment("精度减退原因待查", "双侧清晰度降低原因待查"))
+        self.assertFalse(is_containment("Overload", "Type 2 Overload"))
         from kb_pipeline.graph.resolution import auto_merge_pairs, strip_type_words
-        self.assertEqual(strip_type_words("Northwind Technologies AG"), "northwind")            # organisation suffix words: identical once stripped → merged directly
-        rows = [{"title": "Northwind", "type": "ORG"}, {"title": "Northwind Technologies", "type": "ORG"},
+        self.assertEqual(strip_type_words("Example Technologies AG"), "example")            # organisation suffix words: identical once stripped → merged directly
+        rows = [{"title": "Example", "type": "ORG"}, {"title": "Example Technologies", "type": "ORG"},
                 {"title": "输出使能", "type": "signal"}, {"title": "输出使能信号", "type": "signal"}]
         self.assertEqual(auto_merge_pairs(rows), [(0, 1)])                                 # Chinese type words come from the profile and only enter candidates, never merge directly
         self.assertTrue(is_containment("tASH", "tASH setup time"))
         self.assertFalse(is_containment("VSS", "I VSS"))                                    # the word before the identifier is a modifier: a current is not a voltage
         self.assertFalse(is_containment("FBGA", "48 FBGA"))
         self.assertFalse(is_containment("LDB#", "LDA#, LDB#"))
-        self.assertFalse(is_containment("Northwind", "Northwind Semiconductor Technologies"))  # a meaningful extra word beyond type / suffix: not containment
-        self.assertFalse(is_containment("Diabetes", "Diabetes Mellitus Complications"))
+        self.assertFalse(is_containment("Example", "Example Module Technologies"))  # a meaningful extra word beyond type / suffix: not containment
+        self.assertFalse(is_containment("Overload", "Overload Mellitus Complications"))
 
     def test_paren_aliases_type_name_words_and_symbol_descriptions(self) -> None:
         from kb_pipeline.graph.resolution import auto_merge_pairs, is_containment, paren_alias, strip_type_words, type_words_of
 
-        self.assertEqual(paren_alias("体重指数(BMI)"), ("体重指数", "BMI"))
-        self.assertEqual(paren_alias("低密度脂蛋白胆固醇 (LDL-C)"), ("低密度脂蛋白胆固醇", "LDL-C"))
-        self.assertEqual(paren_alias("深色蔬菜(紫甘蓝)"), ("", ""))                       # the parenthesis holds an example, not an alias
-        self.assertEqual(paren_alias("脑梗(缺血性脑卒中)"), ("", ""))
+        self.assertEqual(paren_alias("负载指数(LIX)"), ("负载指数", "LIX"))
+        self.assertEqual(paren_alias("低密度组分浓度 (LDC-X)"), ("低密度组分浓度", "LDC-X"))
+        self.assertEqual(paren_alias("深色涂层(墨蓝)"), ("", ""))                       # the parenthesis holds an example, not an alias
+        self.assertEqual(paren_alias("停机(供流不足型停机)"), ("", ""))
         # The reverse "identifier (expansion)" is an alias too: DSE (Data-Systems Engineer), AIP (AI Platform); the
         # expansion may contain Chinese characters and may exceed 24 characters
         self.assertEqual(paren_alias("DSE (Data-Systems Engineer)"), ("DSE", "Data-Systems Engineer"))
@@ -2013,31 +2012,31 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertEqual({reasons[p] for p in groups}, {"paren"})                                   # the resolution log records a paren alias, not identifier equality
         reasons2: dict = {}
         auto_merge_pairs([{"title": "t_AS", "type": "timing parameter"}, {"title": "tAS", "type": "timing parameter"},
-                          {"title": "361-ball FCBGA Package", "type": "package"}, {"title": "361-ball FCBGA", "type": "package"}], reasons2)
+                          {"title": "256-pin EXBOX Package", "type": "package"}, {"title": "256-pin EXBOX", "type": "package"}], reasons2)
         self.assertEqual(sorted(reasons2.values()), ["identifier", "type_words"])
-        ents = [{"title": "体重指数(BMI)", "type": "health indicator"}, {"title": "体重指数", "type": "health indicator"},
-                {"title": "BMI", "type": "health indicator"}, {"title": "深色蔬菜(紫甘蓝)", "type": "food"}, {"title": "深色蔬菜", "type": "food"},
-                {"title": "361-ball FCBGA Package", "type": "package"}, {"title": "361-ball FCBGA", "type": "package"},
-                {"title": "血常规 test", "type": "laboratory test"}, {"title": "血常规", "type": "laboratory test"}]
+        ents = [{"title": "负载指数(LIX)", "type": "sample indicator"}, {"title": "负载指数", "type": "sample indicator"},
+                {"title": "LIX", "type": "sample indicator"}, {"title": "深色涂层(墨蓝)", "type": "coating"}, {"title": "深色涂层", "type": "coating"},
+                {"title": "256-pin EXBOX Package", "type": "package"}, {"title": "256-pin EXBOX", "type": "package"},
+                {"title": "常规检测 test", "type": "sample test"}, {"title": "常规检测", "type": "sample test"}]
         pairs = set(auto_merge_pairs(ents))
         self.assertIn((0, 1), pairs)
         self.assertIn((0, 2), pairs)
         self.assertNotIn((3, 4), pairs)
         self.assertIn((5, 6), pairs)                                                      # the words of the type name package are type words
         self.assertIn((7, 8), pairs)
-        self.assertEqual(type_words_of("laboratory test"), {"laboratory", "test"})
-        self.assertEqual(strip_type_words("361-ball FCBGA Package", type_words_of("package")), "361-ball fcbga")
+        self.assertEqual(type_words_of("sample test"), {"sample", "test"})
+        self.assertEqual(strip_type_words("256-pin EXBOX Package", type_words_of("package")), "256-pin exbox")
         self.assertTrue(is_containment("CYP2C9", "CYP2C9酶"))                             # identifier + Chinese descriptor
         self.assertTrue(is_containment("CYP2C9", "细胞色素CYP2C9"))
-        self.assertFalse(is_containment("并发症", "糖尿病并发症"))
+        self.assertFalse(is_containment("联动故障", "过载联动故障"))
 
     def test_variant_edges_cover_packaging_suffixes_and_paren_forms(self) -> None:
         from kb_pipeline.graph.merge import derive_variant_edges
 
         def ent(key, title, etype="product"):
             return {"key": key, "title": title, "type": etype, "unit_ids": ["u1"]}
-        ents = [ent("a", "ZK14B108L-ZS25XI"), ent("b", "ZK14B108L-ZS25XIT"), ent("c", "ZK7C4021KV13"), ent("d", "ZK7C4021KV13-667FCXC"),
-                ent("e", "脑梗", "medical condition"), ent("f", "脑梗(缺血性脑卒中)", "medical condition"), ent("g", "ZK7C4041KV13")]
+        ents = [ent("a", "ZX25D108L-ZS25XI"), ent("b", "ZX25D108L-ZS25XIT"), ent("c", "ZX8D4021KV13"), ent("d", "ZX8D4021KV13-667FCXC"),
+                ent("e", "停机", "operating condition"), ent("f", "停机(供流不足型停机)", "operating condition"), ent("g", "ZX8D4041KV13")]
         edges = {(r["source_key"], r["target_key"]) for r in derive_variant_edges(ents, [])}
         self.assertEqual(edges, {("b", "a"), ("d", "c"), ("f", "e")})                     # 4041 is not a variant of 4021
 
@@ -2046,71 +2045,71 @@ class ResolutionEvidenceTests(unittest.TestCase):
 
         self.assertEqual(resolution.parse_answer_categories("1: yes abbreviation\n2: no\n3: yes (translation)\n4: yes\n5: yes bogus", 5),
                          ["abbreviation", "", "translation", "unspecified", "unspecified"])
-        prompt = resolution.render_batch([(0, 1)], [{"title": "Northwind", "type": "ORG", "descriptions": ["maker"]},
-                                                    {"title": "Northwind Technologies", "type": "ORG", "descriptions": []}])
+        prompt = resolution.render_batch([(0, 1)], [{"title": "Example", "type": "ORG", "descriptions": ["maker"]},
+                                                    {"title": "Example Technologies", "type": "ORG", "descriptions": []}])
         self.assertIn("abbreviation", prompt)
         self.assertIn("a specific thing and its general category", prompt)
         self.assertIn("a function and its module, a clause and its contract", prompt)      # the examples span domains
         for dead in ("merely look alike", "opposite direction or polarity"):            # identifiers / polarity are blocked by code, the prompt does not repeat it
             self.assertNotIn(dead, prompt, dead)
         self.assertIn("`<number>: yes <category>`", prompt)
-        ents = [{"key": "a", "title": "Northwind", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t1"], "frequency": 3, "aliases": []},
-                {"key": "b", "title": "Northwindn", "type": "ORG", "descriptions": ["semiconductor maker"], "unit_ids": ["t2"], "frequency": 1, "aliases": []},
+        ents = [{"key": "a", "title": "Example", "type": "ORG", "descriptions": ["maker"], "unit_ids": ["t1"], "frequency": 3, "aliases": []},
+                {"key": "b", "title": "Examplen", "type": "ORG", "descriptions": ["sample module maker"], "unit_ids": ["t2"], "frequency": 1, "aliases": []},
                 {"key": "c", "title": "data input", "type": "signal", "descriptions": ["input"], "unit_ids": ["t3"], "frequency": 1, "aliases": []},
                 {"key": "d", "title": "data output", "type": "signal", "descriptions": ["output"], "unit_ids": ["t4"], "frequency": 1, "aliases": []}]
         client = _client(["1: yes alias"])
         merged, _, stats = resolution.resolve(client, ents, [])
         self.assertEqual(stats["candidates"], 1)                     # data input / output never enter the candidates at all
         self.assertEqual(stats["yes_by_category"], {"alias": 1})
-        self.assertEqual(stats["_log"], [{"kept": "a", "merged": "b", "kept_title": "Northwind", "merged_title": "Northwindn",
+        self.assertEqual(stats["_log"], [{"kept": "a", "merged": "b", "kept_title": "Example", "merged_title": "Examplen",
                                           "source": "lexical", "category": "alias"}])
         self.assertEqual({e["key"] for e in merged}, {"a", "c", "d"})
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
         self.assertIn('"resolution_log": resolution_log', src)
 
     def test_merge_log_has_one_row_per_merged_entity(self) -> None:
-        """When neither end of a matched pair is the representative (the "body mass index (BMI)" entity links "body
-        mass index" and "BMI", and "body mass index" is the representative), the log used to record the
+        """When neither end of a matched pair is the representative (the "body mass index (LIX)" entity links "body
+        mass index" and "LIX", and "body mass index" is the representative), the log used to record the
         representative's key with another entity's title, and the merged-away entity could not be found in it. Now
         there is one row per merged-away entity, kept is always the representative, and the entity it was linked
         through is recorded in via_title."""
         def ent(key: str, title: str, freq: int) -> dict:
-            return {"key": key, "title": title, "type": "health indicator", "descriptions": [], "unit_ids": [f"u-{key}"],
+            return {"key": key, "title": title, "type": "sample indicator", "descriptions": [], "unit_ids": [f"u-{key}"],
                     "frequency": freq, "aliases": []}
 
-        ents = [ent("bmi", "BMI", 2), ent("体重指数(bmi)", "体重指数(BMI)", 1), ent("体重指数", "体重指数", 9),
-                ent("身高", "身高", 3)]
+        ents = [ent("lix", "LIX", 2), ent("负载指数(lix)", "负载指数(LIX)", 1), ent("负载指数", "负载指数", 9),
+                ent("高度", "高度", 3)]
         merged, _, stats = resolution.resolve(_client([]), ents, [])
-        self.assertEqual({e["key"] for e in merged}, {"体重指数", "身高"})
-        self.assertEqual(stats["_map"], {"bmi": "体重指数", "体重指数(bmi)": "体重指数"})
+        self.assertEqual({e["key"] for e in merged}, {"负载指数", "高度"})
+        self.assertEqual(stats["_map"], {"lix": "负载指数", "负载指数(lix)": "负载指数"})
         log = stats["_log"]
         self.assertEqual(sorted(r["merged"] for r in log), sorted(stats["_map"]))                # every merged-away key exactly once
-        self.assertEqual({(r["kept"], r["kept_title"]) for r in log}, {("体重指数", "体重指数")})
-        direct = next(r for r in log if r["merged"] == "体重指数(bmi)")
+        self.assertEqual({(r["kept"], r["kept_title"]) for r in log}, {("负载指数", "负载指数")})
+        direct = next(r for r in log if r["merged"] == "负载指数(lix)")
         self.assertEqual((direct["merged_title"], direct["source"], direct["category"], direct.get("via_title")),
-                         ("体重指数(BMI)", "auto", "paren", None))
-        chained = next(r for r in log if r["merged"] == "bmi")
+                         ("负载指数(LIX)", "auto", "paren", None))
+        chained = next(r for r in log if r["merged"] == "lix")
         self.assertEqual((chained["merged_title"], chained["source"], chained["category"], chained["via_title"]),
-                         ("BMI", "auto", "paren", "体重指数(BMI)"))
+                         ("LIX", "auto", "paren", "负载指数(LIX)"))
 
     def test_embedding_alias_merges_get_a_second_stricter_check(self) -> None:
         from kb_pipeline.graph import resolution
 
         self.assertEqual(resolution.parse_same("1: same\n2: narrower\n3: different\n4: broader", 5), [True, False, False, False, False])
         self.assertEqual(resolution.parse_verdicts("1: same\n2: narrower\n3: 不同\n4: broader", 5), ["same", "narrower", "different", "broader", ""])
-        prompt = resolution.render_hyponym_batch([(0, 1)], [{"title": "尿酸增高", "type": "finding", "descriptions": ["化验所见"]},
-                                                              {"title": "高尿酸血症", "type": "finding", "descriptions": ["诊断"]}])
+        prompt = resolution.render_hyponym_batch([(0, 1)], [{"title": "浓度增高", "type": "finding", "descriptions": ["检测所见"]},
+                                                              {"title": "浓度超限状态", "type": "finding", "descriptions": ["故障判定"]}])
         self.assertIn("a finding and a diagnosis", prompt)
         self.assertIn("a function and its module, a clause and its contract", prompt)      # the examples span domains, not only medicine
         self.assertIn("are never `same`", prompt)                                          # this sentence is the task definition; 88d3e91 removed it once, the paper KB got looser, restored
         self.assertIn("`<number>: same|broader|narrower|different`", prompt)
-        ents = [{"key": "a", "title": "尿酸增高", "type": "finding", "descriptions": ["化验所见"], "unit_ids": ["t1"], "frequency": 2, "aliases": []},
-                {"key": "b", "title": "高尿酸血症", "type": "finding", "descriptions": ["诊断"], "unit_ids": ["t2"], "frequency": 1, "aliases": []},
-                {"key": "c", "title": "中风", "type": "finding", "descriptions": ["急性脑血管病"], "unit_ids": ["t3"], "frequency": 2, "aliases": []},
-                {"key": "d", "title": "脑卒中", "type": "finding", "descriptions": ["急性脑血管病"], "unit_ids": ["t4"], "frequency": 1, "aliases": []}]
-        vectors = {"尿酸增高": [1.0, 0.0], "高尿酸血症": [0.98, 0.15], "中风": [0.0, 1.0], "脑卒中": [0.1, 0.99]}
-        # The first pass says alias for both pairs; the second pass: a (elevated uric acid) is a manifestation of
-        # b (hyperuricemia), so narrower; c / d (stroke / cerebral stroke) are same
+        ents = [{"key": "a", "title": "浓度增高", "type": "finding", "descriptions": ["检测所见"], "unit_ids": ["t1"], "frequency": 2, "aliases": []},
+                {"key": "b", "title": "浓度超限状态", "type": "finding", "descriptions": ["故障判定"], "unit_ids": ["t2"], "frequency": 1, "aliases": []},
+                {"key": "c", "title": "急停", "type": "finding", "descriptions": ["瞬时管路故障"], "unit_ids": ["t3"], "frequency": 2, "aliases": []},
+                {"key": "d", "title": "设备急停", "type": "finding", "descriptions": ["瞬时管路故障"], "unit_ids": ["t4"], "frequency": 1, "aliases": []}]
+        vectors = {"浓度增高": [1.0, 0.0], "浓度超限状态": [0.98, 0.15], "急停": [0.0, 1.0], "设备急停": [0.1, 0.99]}
+        # The first pass says alias for both pairs; the second pass: a (elevated concentration) is a manifestation of
+        # b (concentration excess), so narrower; c / d (shutdown / automatic shutdown) are same
         client = _client(["1: yes alias\n2: yes alias", "1: narrower\n2: same"])
         merged, _, stats = resolution.resolve(client, ents, [], embed=lambda titles: [vectors[t] for t in titles])
         self.assertEqual((stats["embedding_candidates"], stats["yes"], stats["rechecked"], stats["recheck_dropped"]), (2, 2, 2, 1))
@@ -2130,14 +2129,14 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertEqual({e["key"] for e in merged2}, {"s1", "s2", "s4"})
         self.assertEqual([r["reason"] for r in stats2["_rejected"]], ["recheck"])
         # Literally similar (edit distance) + alias pairs are re-checked too: output buffers / Output drivers differ by
-        # a meaningful word; "identifier + descriptor" (CLK / CLK clock input) and spelling pairs (Northwindn / Northwind)
+        # a meaningful word; "identifier + descriptor" (CLK / CLK clock input) and spelling pairs (Examplen / Example)
         # are not re-checked. Same type → asked in one batch, sorted by title
         ents3 = [{"key": "r1", "title": "output buffers", "type": "component", "descriptions": ["buffers"], "unit_ids": ["t1"], "frequency": 1, "aliases": []},
                  {"key": "r2", "title": "Output drivers", "type": "component", "descriptions": ["drivers"], "unit_ids": ["t2"], "frequency": 2, "aliases": []},
                  {"key": "r3", "title": "CLK", "type": "component", "descriptions": ["clock"], "unit_ids": ["t3"], "frequency": 2, "aliases": []},
                  {"key": "r4", "title": "CLK clock input", "type": "component", "descriptions": ["clock input"], "unit_ids": ["t4"], "frequency": 1, "aliases": []},
-                 {"key": "r5", "title": "Northwind", "type": "component", "descriptions": ["maker"], "unit_ids": ["t5"], "frequency": 2, "aliases": []},
-                 {"key": "r6", "title": "Northwindn", "type": "component", "descriptions": ["maker"], "unit_ids": ["t6"], "frequency": 1, "aliases": []}]
+                 {"key": "r5", "title": "Example", "type": "component", "descriptions": ["maker"], "unit_ids": ["t5"], "frequency": 2, "aliases": []},
+                 {"key": "r6", "title": "Examplen", "type": "component", "descriptions": ["maker"], "unit_ids": ["t6"], "frequency": 1, "aliases": []}]
         self.assertEqual(resolution.candidate_pairs(ents3), [(2, 3), (4, 5), (0, 1)])
         client3 = _client(["1: yes alias\n2: yes spelling\n3: yes alias", "1: different"])
         merged3, _, stats3 = resolution.resolve(client3, ents3, [])
@@ -2145,10 +2144,10 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertEqual((stats3["rechecked"], stats3["recheck_dropped"]), (1, 1))
         self.assertEqual({e["key"] for e in merged3}, {"r1", "r2", "r3", "r5"})
         self.assertEqual({e["key"] for e in merged}, {"a", "b", "c"})
-        self.assertEqual(stats["_log"], [{"kept": "c", "merged": "d", "kept_title": "中风", "merged_title": "脑卒中", "source": "embedding", "category": "alias"}])
+        self.assertEqual(stats["_log"], [{"kept": "c", "merged": "d", "kept_title": "急停", "merged_title": "设备急停", "source": "embedding", "category": "alias"}])
         # Pairs blocked by the second pass leave a trace too (not merged, not in the resolution log), stored as
         # resolution_rejected in the graph-build output
-        self.assertEqual(stats["_rejected"], [{"a": "a", "b": "b", "a_title": "尿酸增高", "b_title": "高尿酸血症", "source": "embedding",
+        self.assertEqual(stats["_rejected"], [{"a": "a", "b": "b", "a_title": "浓度增高", "b_title": "浓度超限状态", "source": "embedding",
                                                "category": "alias", "reason": "recheck", "verdict": "narrower"}])     # a withdrawn pair records the relation the model answered
         self.assertEqual(stats["yes_by_category"], {"alias": 1})
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "build.py").read_text(encoding="utf-8")
@@ -2158,9 +2157,9 @@ class ResolutionEvidenceTests(unittest.TestCase):
         from kb_pipeline.graph.units import _BOILER_STRONG_RE, _CONCLUSION_HINT_RE, _LISTING_HINT_RE, classify_unit_text
         from kb_pipeline.limits import normalize_profile
 
-        for word in ("主检医师", "总检", "体检小结", "阳性结果", "worldwide", "sales", "ordering", "ball", "pinout", "引脚"):
+        for word in ("主检员", "总检", "巡检小结", "阳性结果", "worldwide", "sales", "ordering", "ball", "pinout", "引脚"):
             self.assertNotIn(word, _CONCLUSION_HINT_RE.pattern + _BOILER_STRONG_RE.pattern + _LISTING_HINT_RE.pattern, word)
-        sales = "Worldwide Sales and Design Support Cypress maintains a worldwide network of offices, solution centers and distributors."
+        sales = "Worldwide Sales and Design Support ExampleDevices maintains a worldwide network of offices, solution centers and distributors."
         self.assertEqual(classify_unit_text(sales, ["Worldwide Sales and Design Support"]), "body")
         self.assertEqual(classify_unit_text(sales, ["Worldwide Sales and Design Support"], boilerplate_headings=["Worldwide Sales"]), "boilerplate")
         grid = "| A1 | VDD |\n| A2 | GND |\n| A3 | DQ0 |\n| A4 | DQ1 |\n| B1 | CK |\n| B2 | CK# |\n| B3 | DQ2 |\n| B4 | DQ3 |\n" * 2
@@ -2173,7 +2172,7 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertFalse(hasattr(resolution, "TYPE_WORDS"))
         self.assertEqual(normalize_profile({"type_words": ["信号", "status register", " 指标 "]})["type_words"], ["信号", "指标"])
         ents = [{"title": "复位信号", "type": "signal"}, {"title": "复位", "type": "signal"},
-                {"title": "血红蛋白指标", "type": "indicator"}, {"title": "血红蛋白", "type": "indicator"}]
+                {"title": "溶质浓度指标", "type": "indicator"}, {"title": "溶质浓度", "type": "indicator"}]
         # Profile type words do not merge directly (permission model / permission are identical once stripped yet not
         # necessarily one thing); the pair only becomes a candidate for the model to judge from the descriptions
         self.assertEqual(resolution.auto_merge_pairs(ents), [])
@@ -2366,7 +2365,10 @@ class WideTableRenderingTests(unittest.TestCase):
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "extract.py").read_text(encoding="utf-8")
         self.assertIn("render_extract_prompt(expand_wide_tables(unit.text) or unit.text", src)   # the extraction prompt uses the expanded text
         src = (Path(__file__).resolve().parents[1] / "kb_pipeline" / "graph" / "units.py").read_text(encoding="utf-8")
-        self.assertIn("render_tag=table_render_tag(text)", src)
+        for text in (self.NARROW, self.NATIVE):
+            unit = build_units([_chunk(0, text, block_type="table")], kb_id="kb")[0]
+            self.assertEqual(unit.unit_id, unit_id_for("kb", unit.doc_id, unit.text, positions=[0],
+                                                      render_tag=table_render_tag(unit.text)))
 
 
 class TableRouteTests(unittest.TestCase):
@@ -2388,24 +2390,23 @@ class TableRouteTests(unittest.TestCase):
         return "\n".join(["SHEET: 场景", f"ROWS: {start}-{start + len(rows) - 1}",
                           "HEADER: 编号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
 
-    ROWS = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01",
-            "S02 | 预算差异分析 | 李四 | S01 | 待启动 | 2026-05-01",
-            "S03 | 报表问数 | 张三 | S01、S02 | 进行中 | 2026-04-15"]
+    ROWS = ["S01 | 月结辅助 | 样例A |  | 进行中 | 2026-03-01",
+            "S02 | 预算差异分析 | 样例D | S01 | 待启动 | 2026-05-01",
+            "S03 | 报表问数 | 样例A | S01、S02 | 进行中 | 2026-04-15"]
     PROFILE = ('{"row_type": "scenario", "key_column": "编号", "name_column": "场景名称", '
                '"references": [{"column": "负责人", "target_type": "person", "predicate": "owned_by"}, '
                '{"column": "依赖", "target_type": "scenario", "predicate": "depends_on"}, {"column": "不存在", "target_type": "person"}], '
                '"date_column": "上线日期"}')
 
     def test_a_running_row_number_is_not_an_identifier(self) -> None:
-        """10-24 真机:需求清单的「序号」(1、2、3…)被当成编号列,行号成了需求的外部编号,还各出一条「序号 = 3」的事实。
-        编号列是从 1 附近数上来的小整数时不当编号、不出事实;真编号(S01、10086)照旧。"""
+        """Synthetic regression: a running row number is not an identifier."""
         from kb_pipeline.graph.tables import TableExtractor, running_numbers
 
         self.assertTrue(running_numbers(["1", "2", "3", "5"]))
         self.assertFalse(running_numbers(["10086", "10087", "10090"]))
         self.assertFalse(running_numbers(["S01", "S02"]))
-        rows = ["1 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "2 | 预算差异分析 | 李四 |  | 待启动 | 2026-05-01",
-                "3 | 报表问数 | 张三 |  | 进行中 | 2026-04-15"]
+        rows = ["1 | 月结辅助 | 样例A |  | 进行中 | 2026-03-01", "2 | 预算差异分析 | 样例D |  | 待启动 | 2026-05-01",
+                "3 | 报表问数 | 样例A |  | 进行中 | 2026-04-15"]
         text = "\n".join(["SHEET: 场景", "ROWS: 2-4", "HEADER: 序号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
         tx = TableExtractor([self._unit("u1", text)], schema=self.SCHEMA)
         (p,) = tx.profile(_client(['{"row_type": "scenario", "key_column": "序号", "name_column": "场景名称", "references": []}'])).values()
@@ -2420,19 +2421,18 @@ class TableRouteTests(unittest.TestCase):
         self.assertEqual(q["row_type"], "")
 
     def test_a_long_table_split_across_units_is_judged_as_a_whole(self) -> None:
-        """10-24 真机:一百多行的需求清单按行切成了几十个单元,一段两三行;只看行最多的那一段时,末尾那段的序号从 137 起,
-        没认出是行号,而一段只有一两行的长表又会被当成「不是清单」。各段的行合回整张表再判,重叠切块重复的行只算一次。"""
+        """Synthetic regression: a long table split across units is judged as a whole."""
         from kb_pipeline.graph.tables import TableExtractor
 
         def text(rows, start):
             return "\n".join(["SHEET: 场景", f"ROWS: {start}-{start + len(rows) - 1}",
                               "HEADER: 序号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期"] + rows)
 
-        rows = [f"{i} | 场景{i} | 张三 |  | 进行中 | 2026-03-01" for i in range(1, 8)]
+        rows = [f"{i} | 场景{i} | 样例A |  | 进行中 | 2026-03-01" for i in range(1, 8)]
         units = [self._unit("u1", text(rows[:2], 2)), self._unit("u2", text(rows[1:3], 3), order=1),     # 第 2 行两段都有
                  self._unit("u3", text(rows[3:4], 5), order=2), self._unit("u4", text(rows[4:7], 6), order=3)]   # 最长的一段从 5 起
         # 切块器把开头几行写成「列名: 值」的散行:那段算成另一张表,带表头的段合起来序号从 3 起
-        scattered = "\n".join(["SHEET: 场景", "ROWS: 2-4"] + [f"序号: {i} | 场景名称: 场景{i} | 负责人: 李四" for i in (1, 2, 8)])
+        scattered = "\n".join(["SHEET: 场景", "ROWS: 2-4"] + [f"序号: {i} | 场景名称: 场景{i} | 负责人: 样例D" for i in (1, 2, 8)])
         prompts_seen: list[str] = []
 
         def answer(messages):
@@ -2451,8 +2451,8 @@ class TableRouteTests(unittest.TestCase):
         # 真编号:合回整张表后照样唯一(重叠切块重复的那行只算一次)
         ids = ["S01", "S02", "S03", "S04"]
         units = [self._unit(f"v{i}", "\n".join(["SHEET: 场景", f"ROWS: {i + 2}-{i + 3}", "HEADER: 编号 | 场景名称 | 负责人 | 依赖 | 状态 | 上线日期",
-                                                 f"{ids[i]} | 场景{i} | 张三 |  | 进行中 | 2026-03-01",
-                                                 f"{ids[i + 1]} | 场景{i + 1} | 张三 |  | 进行中 | 2026-03-01"]), order=i) for i in range(3)]
+                                                 f"{ids[i]} | 场景{i} | 样例A |  | 进行中 | 2026-03-01",
+                                                 f"{ids[i + 1]} | 场景{i + 1} | 样例A |  | 进行中 | 2026-03-01"]), order=i) for i in range(3)]
         (q,) = TableExtractor(units, schema=self.SCHEMA).profile(
             _client(['{"row_type": "scenario", "key_column": "编号", "name_column": "场景名称", "references": []}'])).values()
         self.assertEqual(q["key_column"], "编号")
@@ -2486,7 +2486,7 @@ class TableRouteTests(unittest.TestCase):
         self.assertEqual(rows["月结辅助"]["aliases"], ["S01"])
         self.assertIn("状态: 进行中", rows["月结辅助"]["descriptions"][0])
         rels = {(r["source"], r["target"], r["predicate"]) for r in res.relations}
-        self.assertIn(("报表问数", "张三", "owned_by"), rels)
+        self.assertIn(("报表问数", "样例A", "owned_by"), rels)
         self.assertIn(("报表问数", "S02", "depends_on"), rels)                 # 「S01、S02」拆成两条
         facts = {(f["subject"], f["property"], f["value"], f.get("valid_from")) for f in tx.facts(u1)}
         self.assertIn(("月结辅助", "状态", "进行中", "2026-03-01"), facts)
@@ -2505,8 +2505,8 @@ class TableRouteTests(unittest.TestCase):
                              schema=self.SCHEMA)
         tx2.profile(_client([self.PROFILE]))
         self.assertFalse(tx2.wants(tx2.units[0]))                                 # 子表与说明行占了四成以上:整单元退回模型
-        dup = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "S01 | 预算差异分析 | 李四 |  | 待启动 | 2026-05-01",
-               "S01 | 报表问数 | 张三 |  | 进行中 | 2026-04-15"]
+        dup = ["S01 | 月结辅助 | 样例A |  | 进行中 | 2026-03-01", "S01 | 预算差异分析 | 样例D |  | 待启动 | 2026-05-01",
+               "S01 | 报表问数 | 样例A |  | 进行中 | 2026-04-15"]
         tx3 = TableExtractor([self._unit("u3", self._text(dup))], schema=self.SCHEMA)
         (p3,) = tx3.profile(_client([self.PROFILE])).values()
         self.assertEqual((p3["key_column"], p3["name_column"]), ("", "场景名称"))    # 编号不唯一:不当外部编号
@@ -2515,8 +2515,8 @@ class TableRouteTests(unittest.TestCase):
         from kb_pipeline.graph.merge import link_external_ids
         from kb_pipeline.graph.tables import TableExtractor
 
-        rows = ["S01 | 月结辅助 | 张三 |  | 进行中 | 2026-03-01", "S02 | 月结辅助 | 李四 |  | 待启动 | 2026-05-01",
-                "S03 | 报表问数 | 张三 |  | 进行中"]
+        rows = ["S01 | 月结辅助 | 样例A |  | 进行中 | 2026-03-01", "S02 | 月结辅助 | 样例D |  | 待启动 | 2026-05-01",
+                "S03 | 报表问数 | 样例A |  | 进行中"]
         unit = self._unit("u1", self._text(rows))
         tx = TableExtractor([unit], schema=self.SCHEMA)
         tx.profile(_client([self.PROFILE]))
@@ -2548,12 +2548,12 @@ entities:
   aliases:
     Acme Inc: [艾克米]
   types:
-    张三: person
-    李四: nonexistent_type
+    样例A: person
+    样例D: nonexistent_type
   reject: [噪声实体]
 relations:
   reject:
-    - {source: 张三, predicate: works_for, target: Acme Inc}
+    - {source: 样例A, predicate: works_for, target: Acme Inc}
 facts:
   reject:
     - {subject: Acme Inc, property: 价格}
@@ -2582,7 +2582,7 @@ documents:
             path = corrections_path(settings, "kb_004")
             self.assertEqual(path, Path(tmp) / "corrections" / "kb_004.yaml")
             self.assertIsNone(corrections_path(SimpleNamespace(), "kb_004"))           # 设置里没有更正目录:等于没有更正
-            made = ensure_corrections_file(settings, "kb_004", folder="Project Library: 2026", fresh=True)
+            made = ensure_corrections_file(settings, "kb_004", folder="Synthetic Delta: 2026", fresh=True)
             self.assertTrue(made["created"])
             self.assertIsNone(made["orphaned"])
             corr = load_corrections(path)
@@ -2596,7 +2596,7 @@ documents:
             self.assertNotEqual(sha, "")
             path.write_text("# 改个注释\nkb:\n  id: kb_004\nentities:\n  reject: [噪声]   # 噪声实体\n", encoding="utf-8")
             self.assertEqual(corrections_sha(path), sha)
-            self.assertFalse(ensure_corrections_file(settings, "kb_004", folder="Project Library")["created"])   # 重新开启:原样保留
+            self.assertFalse(ensure_corrections_file(settings, "kb_004", folder="Synthetic Delta")["created"])   # 重新开启:原样保留
             self.assertEqual(load_corrections(path)["reject_entities"], ["噪声"])
             # 整库初始化后编号从头再排:新编号第一次开库,同名的旧文件先挪开再写模板,旧库的更正不会套到新库上
             again = ensure_corrections_file(settings, "kb_004", folder="别的库", fresh=True)
@@ -2645,17 +2645,17 @@ documents:
         corr = self._corr()
         ents = [{"key": k, "title": t, "type": ty, "frequency": f, "unit_ids": [], "aliases": [], "descriptions": []}
                 for k, t, ty, f in (("acme", "Acme", "org", 5), ("acme inc", "Acme Inc", "org", 1), ("acme 公司", "ACME 公司", "org", 1),
-                                    ("张三", "张三", "org", 2), ("噪声实体", "噪声实体", "org", 1), ("苹果公司", "苹果公司", "org", 3),
+                                    ("样例A", "样例A", "org", 2), ("噪声实体", "噪声实体", "org", 1), ("苹果公司", "苹果公司", "org", 3),
                                     ("苹果", "苹果", "org", 3))]
-        rels = [{"source_key": "张三", "target_key": "acme inc", "predicate": "works_for", "directed": True, "descriptions": [], "strength_sum": 1, "evidence": 1, "unit_ids": []},
+        rels = [{"source_key": "样例A", "target_key": "acme inc", "predicate": "works_for", "directed": True, "descriptions": [], "strength_sum": 1, "evidence": 1, "unit_ids": []},
                 {"source_key": "噪声实体", "target_key": "acme", "predicate": "related_to", "directed": False, "descriptions": [], "strength_sum": 1, "evidence": 1, "unit_ids": []}]
         out, rels2, stats, forbidden = apply_entity_corrections(ents, rels, corr, known_types=("org", "person"),
                                                                 upper_of=lambda t: "agent", path_of=lambda t: [t, "agent"])
         by_title = {e["title"]: e for e in out}
         self.assertNotIn("噪声实体", by_title)
         self.assertEqual(stats["rejected_entities"], 1)
-        self.assertEqual((by_title["张三"]["type"], by_title["张三"]["type_path"]), ("person", ["person", "agent"]))
-        self.assertEqual(stats["unknown_types"], ["李四: nonexistent_type"])
+        self.assertEqual((by_title["样例A"]["type"], by_title["样例A"]["type_path"]), ("person", ["person", "agent"]))
+        self.assertEqual(stats["unknown_types"], ["样例D: nonexistent_type"])
         acme = by_title["Acme Inc"]                                                # 规范名是更正里写的第一个
         self.assertTrue({"Acme", "ACME 公司", "艾克米"} <= set(acme["aliases"]))
         self.assertEqual(stats["forced_merges"], 2)

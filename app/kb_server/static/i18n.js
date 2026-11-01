@@ -16,6 +16,58 @@ const I18N = (() => {
 })();
 
 const ZH_EN = {
+  "图片理解": "Image understanding",
+  "标签准备": "Preparing labels",
+  "来源归属": "Source attribution",
+  "发布图谱": "Publishing graph",
+  "标签抽取": "Label extraction",
+  "等待服务": "Waiting for service",
+  "等待向量服务": "Waiting for embeddings",
+  "等待多模态接口": "Waiting for vision endpoint",
+  "正在停止": "Stopping",
+  "旧切片可用": "Previous chunks available",
+  "下次重试": "Next retry",
+  "下次重试 {0}": "Next retry {0}",
+  "进度更新": "Progress updated",
+  "阶段用时": "Stage elapsed",
+  "文本向量模型": "Text embedding model",
+  "视觉向量模型": "Visual embedding model",
+  "解析 {0}/{1} · ≈{2}%": "Parse {0}/{1} · ≈{2}%",
+  "建图 · ≈{0}%": "Build · ≈{0}%",
+  "全量建图": "Full build",
+  "断点续跑": "Resuming",
+  "已发布 · 清理中": "Published · Cleaning up",
+  "已发布": "Published",
+  "收尾待确认": "Follow-up unconfirmed",
+  "收尾未完成": "Follow-up incomplete",
+  "任务版本": "Build version",
+  "当前版本": "Current version",
+  "增量并入": "Incremental append",
+  "已暂停": "Paused",
+  "任务详情": "Task details",
+  "当前可用 {0}": "Available: {0}",
+  "复用单元": "Reused units",
+  "采样片段": "Sampled chunks",
+  "已复用": "Reused",
+  "批": "batches", "张": "images",
+  "叙述": "Narration",
+  "版本对比": "Version comparison",
+  "历史记录未提供完整信息": "Historical records lack complete information",
+  "载入中...": "Loading...",
+  "无": "None",
+  "下次建图后生成版本对比": "Version comparison will be available after the next graph build",
+  "还没有可比较的旧版本": "No previous version to compare",
+  "旧版本产物已清理": "Previous version artifacts have been removed",
+  "版本对比未完成": "Version comparison is incomplete",
+  "输入变化": "Changed inputs",
+  "更正规则": "Corrections",
+  "标签模式": "Schema",
+  "建图流程": "Graph pipeline",
+  "之前": "Before",
+  "之后": "After",
+  "减少": "Removed",
+  "原文未变的减少项": "Removed with unchanged sources",
+  "原文未变的减少项可结合来源核对": "Review removed assertions against their unchanged sources",
   "缺少任务编号": "task_id is required",
   "知识库已删除,请刷新后重新启用": "knowledge base was deleted; refresh before enrolling",
   "已请求停止": "stop requested",
@@ -43,11 +95,18 @@ const ZH_EN = {
   "最大输入必须是正整数(tokens),且不超过 2147483647": "Max Input must be a positive integer (tokens), no greater than 2147483647",
   // ── 顶栏 / 侧栏 / 工作区骨架 ──
   "Carrel 控制台": "Carrel Console",
+  "知识库控制台": "Knowledge Base Console",
   "控制台设置了访问令牌,请输入 KB_WEB_TOKEN 的值": "This console requires an access token; enter the value of KB_WEB_TOKEN",
   "模型地址或协议变了,请重新填写 API Key;不需要 Key 的端点请勾选「清空 Key」": "The endpoint or protocol changed; enter the API key again, or tick \"clear key\" for endpoints that need none",
+  "模型地址或协议改了,已存的 API Key 不会沿用到新地址,请重新填写 API Key": "The model endpoint or protocol changed; the stored API key cannot be reused for a new endpoint. Enter the API key again",
   "界面语言 / Language": "Interface language",
   "中": "中",                                   // the Chinese-side label on the language switch is itself not translated
   "模型列表": "Models",
+  "多模态模型": "Multimodal model",
+  "尚未配置多模态模型,请在控制台选择支持图像的模型": "No multimodal model configured; select a vision model in the console",
+  "系统默认": "System default",
+  "不可用": "Unavailable",
+  "多模态模型需要使用 OpenAI 兼容协议": "Multimodal models require the OpenAI-compatible protocol",
   "服务状态": "Services",
   "知识库": "Knowledge base",
   "筛选知识库": "Filter knowledge bases",
@@ -103,6 +162,9 @@ const ZH_EN = {
   "开启知识库": "Enable knowledge base",
   "多模态结构化描述提示词(留空 = 内置默认)": "Multimodal structured description prompt (empty = built-in default)",
   "内置默认(自定义后替换此段):": "Built-in default (replaced by your own text):",
+  "这是知识库文档中的一张图片,请仔细识别并输出结构化结果。": "This is an image from a knowledge-base document; examine it carefully and output a structured result.",
+  "常见类型:界面截图、架构图、流程图、拓扑图、数据图表、表格、照片、公式、整页幻灯片;先判断图片类型,再逐项提取图中信息。": "Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, formulas, whole slides; decide the kind first, then extract the information item by item.",
+  "文字、数值、单位与编号一律按原样精确转录;忽略页眉页脚、页码、水印和纯装饰性元素,只提取承载信息的真实内容。": "Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, watermarks and purely decorative elements, and extract only content that carries information.",
   "(独立图片文件会额外附上文件名作为主题参考)": "(Standalone image files also get their file name as a topic hint)",
   "保存只更新策略,解析由自动扫描或「立即解析」触发;要应用到已入库内容用「整库重新解析」。": "Saving only updates the policy; parsing is triggered by the automatic scan or “Parse now”. Use “Re-parse all” to apply it to indexed content.",
   "保存配置": "Save",
@@ -389,7 +451,7 @@ const ZH_EN = {
   "上一层": "Previous level",
   "下一层": "Next level",
   "未分类": "unclassified",
-  "人员与组织": "Agent",
+  "人员与组织": "People & Organizations",
   "实体": "Entity",
   "部件": "Part",
   "属性": "Property",
@@ -414,7 +476,6 @@ const ZH_EN = {
   "解析服务": "Parser",
   "文本向量服务": "Text embedding",
   "跨模态向量服务": "Visual embedding",
-  "多模态服务": "Vision-language model",
   "重排序服务": "Rerankers",
   "上次 {0}": "last {0}",
   "上次失败({0})": "last run failed ({0})",
@@ -466,10 +527,18 @@ const ZH_EN = {
   "这一版没有谓词表:关系一律记为 related_to(重抽一次会补上)": "This version has no predicate table: every relation is recorded as related_to (re-extract to add one)",
   "任意": "any",
   "{0} 条": "{0} edges",
-  "建图 {0} 结束时写回的端点账:这个谓词实际用了多少条边;够 20 条且占 5% 以上的端点组合列在这里,下次归并直接放行、重抽标签时规则保住": "Endpoint account written back when build {0} finished: how many edges this predicate actually got; endpoint pairs with at least 20 edges and 5% share are listed here, passed directly at the next merge and preserved by rule when labels are re-extracted",
+  "建图 {0} 的端点使用统计;高频组合供模式归纳参考，约束仍按谓词定义校验": "Endpoint usage in build {0}; frequent pairs inform schema induction, while predicate definitions determine validity",
   "这一版还没建过图,没有端点账": "No graph has been built with this version yet, so there is no endpoint account",
   "谓词": "Predicate",
-  "数据放行": "Confirmed by data",
+  "端点观察": "Endpoint observations",
+  "建议": "Recommended", "计划": "Planned", "假设": "Hypothetical", "不确定": "Uncertain",
+  "否定关系": "Negated relation",
+  "否定目标行为": "Negated target action",
+  "待核实": "Needs review",
+  "recommended": "recommended",
+  "planned": "planned",
+  "hypothetical": "hypothetical",
+  "uncertain": "uncertain",
   "说明": "Description",
   "统计中…": "Counting…",
   "{0} 份文档共 {1} 个采样片段": "{0} documents, {1} chunks available for sampling",
@@ -483,9 +552,9 @@ const ZH_EN = {
   "＋ 添加模型": "＋ Add model",
   "Key 已配置": "Key set",
   "编辑": "Edit",
-  "\n\n以下知识图谱在引用它,删除后对应栏位会清空,需要重新选:\n": "\n\nThese knowledge graphs reference it; after deletion the fields are cleared and must be re-selected:\n",
+  "\n\n以下知识库在引用它,删除后对应栏位会清空;多模态模型恢复系统默认:\n": "\n\nThese knowledge bases reference it; deletion clears these fields. Multimodal models revert to the system default:\n",
   "删除模型「{0}」?": "Delete model “{0}”?",
-  "已删除;{0} 个知识图谱的对应栏位已清空": "Deleted; the fields of {0} knowledge graphs were cleared",
+  "已删除;{0} 个知识库的对应栏位已清空": "Deleted; the fields of {0} knowledge bases were cleared",
   "已删除": "Deleted",
   "名称": "Name",
   "(唯一,保存后不可改)": " (unique, cannot be changed after saving)",
@@ -624,11 +693,15 @@ const ZH_EN = {
 // errors. The first match wins. Both full-width and ASCII brackets and commas are accepted; $1... are
 // capture groups, and a function replacement can translate the Chinese fragments inside.
 const ZH_EN_PATTERNS = [
+  [/^文本向量化\s*[(（](\d+)\/(\d+) 批[)）]$/, "Text embedding ($1/$2 batches)"],
+  [/^视觉向量化\s*[(（](\d+)\/(\d+) 张[)）]$/, "Visual embedding ($1/$2 images)"],
+  [/^多模态模型 (.+) 不在模型列表中$/, "Multimodal model $1 is not in the registry"],
+  [/^文件内容在扫描之后变了[(（]扫描时 (\d+) 字节、修改时间 (\d+)[,，]现在 (\d+) 字节、修改时间 (\d+)[)）][,，](这一轮不解析|解析结果不写入)[,，]下一轮扫描按新内容重新排队$/, (m, a, ma, b, mb, what) => `The file content changed after the scan (${a} bytes, mtime ${ma} at scan time, now ${b} bytes, mtime ${mb}); ${what === "这一轮不解析" ? "not parsed this round" : "the parse result was not stored"}; the next scan queues it again with the new content`],
   [/^(\S+) 由模式版本展开,不能直接写入;请抽取、上传或选择模式版本$/, "$1 is expanded from the schema version and cannot be written directly; extract, upload or select a schema version"],
   [/^模式文件太大[(（]上限 (\d+) KB[)）]$/, "The schema file is too large (limit $1 KB)"],
   [/^模式校验没通过[:：] ?([\s\S]*)$/, "The schema failed validation: $1"],
   [/^标签版本 (\S+) 的模式无法读取$/, "The schema of label version $1 cannot be read"],
-  [/^图片描述[(（]VLM (\d+)\/(\d+)[)）]$/, "Describing images (VLM $1/$2)"],
+  [/^图片描述\s*[(（]VLM (\d+)\/(\d+)[)）]$/, "Describing images (VLM $1/$2)"],
   [/^文本向量化[(（](\d+) 块[)）]$/, "Text embedding ($1 blocks)"],
   [/^开始解析 size=(\S+) profile=(.+)$/, "Parsing started, size=$1, profile=$2"],
   [/^解析得到 (\d+) 个块$/, "Parsed into $1 blocks"],
@@ -752,10 +825,13 @@ for (const [en, zh] of Object.entries({ "Done": "完成", "Queued": "入队", "S
   "Visual embedding": "视觉向量化", "Files": "文件", "Delete": "删除", "Restart": "重启", "Save": "保存" })) EN_ZH.set(en, zh);
 const STAGE_PART_ZH = { subjects: "主体", timelines: "时间线", sources: "来源", narration: "叙述", entities: "实体", relations: "关系", facts: "事实", pages: "页面" };
 const EN_ZH_PATTERNS = [
+  [/^Text embedding \((\d+)\/(\d+) batches\)$/, "文本向量化($1/$2 批)"],
+  [/^Visual embedding \((\d+)\/(\d+) images\)$/, "视觉向量化($1/$2 张)"],
   [/^(\w+) is derived from the schema version; extract, upload or select a schema version to change it$/, "$1 由模式版本展开,可通过抽取、上传或选择模式版本修改"],
   [/^Schema file too large \(limit (\d+) KB\)$/, "模式文件太大(上限 $1 KB)"],
   [/^Cannot read the schema of label version (.+)$/, "标签版本 $1 的模式无法读取"],
   [/^Sample size must be between (\d+) and (\d+) \(0 is automatic; the model input budget determines the actual sample\)$/, "采样数量应在 $1–$2 之间(0 为自动;实际采样由模型输入预算确定)"],
+  [/^Multimodal model (.+) is not in the registry$/, "多模态模型 $1 不在模型列表中"],
   [/^Describing images \(VLM (\d+)\/(\d+)\)$/, "图片描述(VLM $1/$2)"],
   [/^Knowledge base directory (.+?) is a symbolic link; set KB_MIRROR_ALLOW_LINKED_DIRS=1 to read linked directories$/, "知识库目录 $1 是符号链接;要读取链接目录请设置 KB_MIRROR_ALLOW_LINKED_DIRS=1"],
   [/^Knowledge base directory (.+?) is missing$/, "知识库目录 $1 不存在"],
@@ -810,6 +886,7 @@ const EN_ZH_PATTERNS = [
   [/^Connectivity test failed: the service redirected \((\d+) → (.*?)\); enter the final address directly$/, "连通性测试失败: 服务返回重定向 $1 → $2,请直接填写最终地址"],
   [/^Connectivity test failed: HTTP ([\s\S]*)$/, "连通性测试失败: HTTP $1"],
   [/^Connectivity test did not pass: the model replied “([\s\S]*)”, which does not contain OK$/, "连通性测试未通过: 模型回复「$1」,未包含 OK"],
+  [/^Connectivity test did not pass: the response did not complete \((.*?)\)$/, "连通性测试未通过: 回复未完成($1)"],
   [/^(\w+) must be an integer$/, "$1 必须是整数"],
   [/^(\w+) must be a string$/, "$1 必须是字符串"],
   [/^(\w+) must be a boolean$/, "$1 必须是布尔值"],
@@ -871,7 +948,7 @@ function translateSegmentsZh(s) {
   return s;
 }
 function translateZh(s) {
-  if (!s || ZH_RE.test(s)) return s;
+  if (!s) return s;
   const exact = EN_ZH.get(s);
   if (exact != null) return exact;
   const trimmed = s.trim();
@@ -881,6 +958,9 @@ function translateZh(s) {
   }
   const pat = lookupPatternZh(s);
   if (pat != null) return pat;
+  // Known English templates can contain Chinese names. Match those first;
+  // otherwise preserve mixed-language user content rather than translating it.
+  if (ZH_RE.test(s)) return s;
   return translateSegmentsZh(s);
 }
 function t(s, ...args) {

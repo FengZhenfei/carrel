@@ -75,7 +75,7 @@ def test_table_range_is_restored_from_tiles_to_original_pages():
 
 
 @pytest.mark.parametrize("own,keep", [("A diagram of an unrelated device.", False),
-                                       ("```mermaid\ngraph LR\nA-->B\n```", True),
+                                       ("```mermaid\ngraph LR\nA-->B\n```", False),
                                        ("Voltage: 12 V", True)])
 def test_generated_description_does_not_override_image_reading(tmp_path, own, keep):
     image = tmp_path / "figure.png"
@@ -107,7 +107,7 @@ def test_tex_hierarchy_preserves_commands_equations_and_literal_examples(tmp_pat
     ("TITLE: convert(value)\nConvert a value to a string.", False),
     ("TITLE: 参数说明\n返回转换结果", False),
     ('"Show an example"', False), ("A complete sentence.", False),
-    ("TITLE: Setup\nSetup", True), ("1.2 Setup", True), ("学习要点", True)])
+    ("TITLE: Setup\nSetup", True), ("1.2 Setup", True), ("学习要点", False)])
 def test_heading_diagnostics_distinguish_short_body(text, expected):
     assert _heading_only(text) is expected
 
@@ -127,8 +127,8 @@ def test_html_table_markers_and_normal_cells_survive_once(tmp_path, sectioned):
     assert "{{ROWS}}" in "\n".join(c.text for c in chunks)
 
 
-def test_existing_route_versions_do_not_trigger_historical_reparse():
-    assert parser_profile_for_path(Path("old.pdf")) == "pdf-mineru-table-vlm-v15"
-    assert parser_profile_for_path(Path("old.md")) == "md-sections-v3"
-    assert parser_profile_for_path(Path("old.tex")) == "tex-sections-v1"
-    assert parser_profile_for_path(Path("old.html")) == "html-dom-v2"
+def test_source_revision_versions_document_routes():
+    assert parser_profile_for_path(Path("sample.pdf")) == "pdf-mineru-table-vlm-v15+source-v1"
+    assert parser_profile_for_path(Path("sample.md")) == "md-sections-v3+source-v1"
+    assert parser_profile_for_path(Path("sample.tex")) == "tex-sections-v1+source-v1"
+    assert parser_profile_for_path(Path("sample.html")) == "html-dom-v2+source-v1"

@@ -278,3 +278,26 @@ def test_phrase_limit_default_preserves_explicit_requests(client, tmp_path, requ
     if cli_limit is not None:
         args += ['--limit', str(cli_limit)]
     assert client.payload(client.parser().parse_args(args))['limit'] == expected
+
+
+def test_compact_relations_keep_negation_scope_and_conditions(client):
+    positive = {"source":"Controller","target":"Module","type":"uses","directed":True}
+    negative = {**positive,"target_polarity":"negated","modality":"recommended","conditions":{"mode":"recovery"}}
+    assert client.link(positive) != client.link(negative)
+    for text in (client.link(negative), client.arrow(negative)):
+        assert "target_polarity=negated" in text
+        assert "modality=recommended" in text
+        assert "mode=recovery" in text
+
+
+def test_unresolved_fact_does_not_use_confident_hint(client):
+    row = {"subject":"Sample","property":"Output","value":"8","quality_state":"needs_review","hint":"certain result"}
+    text = client.fact_line(row)
+    assert "certain result" not in text
+    assert "Awaiting verification" in text
+
+
+def test_source_availability_supports_current_and_previous_field(client):
+    row = {"subject":"Sample","property":"Output","value":"8"}
+    for field in ("source_valid", "verified"):
+        assert client.TXT["stale"] in client.fact_line({**row,field:False})

@@ -1,16 +1,6 @@
-"""模式版本的自动流转(2026-09-08 晚,用户要求管线全自动、不用人看):
-
-- 建图结束把端点账(merge.endpoint_observation)写回现行模式版本 —— 谁提的约束、数据实际怎么用的,记在一起;
-- 下一次归并先看账:账里确认过的端点组合直接放行,不必每一版重新凑够阈值;
-- 空白图:建图时没有任何模式版本,就用默认参数(本库采样量、tune 槽的模型,没选就是 DEFAULT_GRAPH_LLM)先抽一版
-  标签并直接生效,再建图;
-- 阈值触发的整库重建:先以现行版本和账为底重抽一版(schema.suggest 的 prior),账里确认过的端点由规则保住
-  (schema.apply_observed_guard),自动生效,再建图。
-
-版本条目:id / created_at / model / 采样口径 / domain / persona / linkml(模式本体,ontology.to_linkml 的产物)/
-examples(语料示例,不进 LinkML)/ origin(manual / auto_blank / auto_rebuild / upload)/ prior_id(以哪一版为底)/
-observed(端点账,建图后写入)。控制台「立即/重新抽取标签」走的也是这里的 suggest_schema_version,只是
-adopt=False(仍由人选中并保存);上传 LinkML 走 register_uploaded_schema。
+"""Versioned schema lifecycle: retain endpoint observations, induce labels for blank
+graphs and refresh labels before threshold rebuilds. Usage is diagnostic input,
+not automatic permission to widen predicate endpoints.
 """
 from __future__ import annotations
 
@@ -180,13 +170,14 @@ def wait_for_suggest(settings: Any, kb_id: str, *, timeout: float | None = None,
 
 
 def update_suggest_progress(settings: Any, kb_id: str, token: str, *, phase: str,
-                            sampled: int | None = None) -> bool:
+                            sampled: int | None = None, model_id: str | None = None) -> bool:
     now = int(time.time())
     with db.connect(settings.state_db) as con:
         cur = con.execute("UPDATE app_config SET value=json_set(value,'$.phase',?,'$.sampled',"
-                          "coalesce(?,json_extract(value,'$.sampled')),'$.started_at',?),updated_at=? "
+                          "coalesce(?,json_extract(value,'$.sampled')),'$.started_at',?,'$.progress_at',?,"
+                          "'$.model_id',coalesce(?,json_extract(value,'$.model_id'))),updated_at=? "
                           "WHERE key=? AND json_extract(value,'$.token')=?",
-                          (phase, sampled, now, now, SUGGEST_MARK_PREFIX + kb_id, token))
+                          (phase, sampled, now, now, model_id, now, SUGGEST_MARK_PREFIX + kb_id, token))
         return cur.rowcount == 1
 
 
@@ -238,7 +229,34 @@ def prior_from_entry(entry: dict[str, Any] | None) -> dict[str, Any] | None:
         "type_definitions": {t["name"]: t["description"] for t in types if t.get("description")},
         "profile": dict(model.get("profile") or {}),
         "observed": entry.get("observed"),
+        "schema_model": model,
     }
+
+
+def attach_source_support(settings: Any, source: KBSource, prior: dict[str, Any] | None) -> None:
+    """Read the last source-backed graph; removed/reparsed chunks cannot pin a schema."""
+    if not prior or not getattr(settings, "graph_work_dir", None):
+        return
+    from .build import graph_paths
+    from .schema_reuse import supported_definitions
+
+    version = str((prior.get("observed") or {}).get("graph_version") or "")
+    if not version:
+        return
+    paths = graph_paths(settings, source, version)
+    if not paths.graph_file.exists() or not paths.units_file.exists():
+        return
+    with db.connect(settings.state_db) as con:
+        build = db.graph_build_by_version(con, source.collection, version)
+        if not build or build["status"] != "done" or build["kb_id"] != source.kb_id:
+            return
+        active = {str(r["point_id"]) for r in db.active_chunk_refs(con, source.collection)}
+    units = [json.loads(line) for line in paths.units_file.read_text().splitlines() if line.strip()]
+    live = {str(u["unit_id"]) for u in units if u.get("point_ids") and set(map(str, u["point_ids"])) <= active}
+    graph = json.loads(paths.graph_file.read_text())
+    if graph.get("kb_id") != source.kb_id:
+        return
+    prior["source_support"] = supported_definitions(graph, prior["schema_model"], live)
 
 
 def reload_source(settings: Any, source: KBSource) -> KBSource:
@@ -354,13 +372,16 @@ def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adop
     def progress(phase: str, sampled: int | None = None) -> None:
         if stop.is_set():
             raise LLMInterrupted("stop requested")
-        if not update_suggest_progress(settings, source.kb_id, token, phase=phase, sampled=sampled):
+        if not update_suggest_progress(settings, source.kb_id, token, phase=phase, sampled=sampled,
+                                       model_id=getattr(spec, "model_id", None)):
             raise LLMInterrupted("label extraction was cancelled or superseded")
+        print(f"[progress] schema={token} kb={source.kb_id} phase={phase}", flush=True)
 
     renewer = threading.Thread(target=keep_claim, name=f"schema-claim-{source.kb_id}", daemon=True)
     renewer.start()  # Covers payload loading and sample selection too.
     try:
         progress("sampling")
+        attach_source_support(settings, source, prior)
         if client is None:
             from .build import tune_llm_spec
             spec = spec or tune_llm_spec(settings, source)
@@ -411,8 +432,7 @@ def suggest_schema_version(settings: Any, source: KBSource, *, origin: str, adop
             "guard": result.get("guard") or {},
         }
         if entry_prior and entry_prior.get("observed"):
-            # the ledger is inherited by the new version: the merge in its first build can already let through the
-            # pairs confirmed by the previous version (overwritten by this version's own ledger once the build ends)
+            # Keep the prior observations for comparison; the next build replaces this ledger.
             entry["observed"] = {**dict(entry_prior["observed"]), "inherited_from": str(entry_prior.get("id"))}
         if suggest_owner(settings, source.kb_id) != token:
             # the mark was not renewed (hung process, clock jump) and someone else has claimed it: the result is only

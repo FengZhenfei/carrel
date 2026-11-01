@@ -314,7 +314,7 @@ def parse_frontmatter(md: str) -> tuple[dict[str, Any], str]:
     ({}, original text)."""
     if not md.startswith("---"):
         return {}, md
-    lines = md.splitlines()
+    lines = md.split("\n")
     if not lines or lines[0].strip() != "---":
         return {}, md
     end = next((i for i in range(1, len(lines)) if lines[i].strip() in ("---", "...")), None)
@@ -502,6 +502,31 @@ def strip_markdown_comments(md: str) -> str:
         return md
 
 
+def clean_markdown(text: str) -> str:
+    """Clean prose whitespace without changing literal fenced source."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    fence = None
+    out = []
+    protected = []
+    for line in lines:
+        match = _FENCE_RE.match(line.lstrip())
+        inside = fence is not None
+        if match:
+            marker, suffix = match.groups()
+            if fence is None:
+                fence = (marker[0], len(marker))
+            elif marker[0] == fence[0] and len(marker) >= fence[1] and not suffix.strip():
+                fence = None
+        out.append(line if inside else line.rstrip())
+        protected.append(inside)
+    start, end = 0, len(out)
+    while start < end and not protected[start] and not out[start].strip():
+        start += 1
+    while end > start and not protected[end - 1] and not out[end - 1].strip():
+        end -= 1
+    return "\n".join(out[start:end])
+
+
 def markdown_to_blocks(
     md: str,
     *,
@@ -511,7 +536,7 @@ def markdown_to_blocks(
 ) -> list[ParsedBlock]:
     from ..headings import clean_heading_text
 
-    md = clean_text(strip_markdown_comments(md))
+    md = clean_markdown(strip_markdown_comments(md))
     if not md:
         return []
     frontmatter, md = parse_frontmatter(md)
@@ -533,10 +558,10 @@ def markdown_to_blocks(
     # at least as long, with nothing else after it (``` inside ```` is content); a "# comment" or "---"
     # inside a fence is code, not a heading / rule.
     fence: tuple[str, int] | None = None
-    lines = md.splitlines()
+    lines = md.split("\n")
     i = 0
     while i < len(lines):
-        line = lines[i].rstrip()
+        line = lines[i] if fence is not None else lines[i].rstrip()
         stripped = line.lstrip()
         i += 1
         fence_match = _FENCE_RE.match(stripped)
@@ -580,7 +605,7 @@ def markdown_to_blocks(
         sections.append((current_title, current_lines, tracker.path))
 
     for idx, (title, lines, section_path) in enumerate(sections, start=1):
-        text = clean_text("\n".join(lines))
+        text = clean_markdown("\n".join(lines))
         if not text and (not title or idx != len(sections)):
             continue
         blocks.append(
@@ -666,6 +691,16 @@ class SectionTracker:
 
 
 def parser_profile_for_path(path: Path) -> str:
+    profile = _route_profile_for_path(path)
+    # Source-preserving chunking changes code listings in documents as well as source files.
+    # Route versions must include it so a future requested rebuild cannot reuse old chunk IDs.
+    suffix = path.suffix.lower()
+    if suffix not in {".xlsx", ".xls", ".csv", ".tsv", ".doc"} and suffix not in IMAGE_SUFFIXES:
+        profile += "+source-v1"
+    return profile
+
+
+def _route_profile_for_path(path: Path) -> str:
     """Route-level profile: decides which parsing chain a file takes purely by extension. It is a
     separate thing from the block-level profile (the one inside chunk_uid, with the +text-merge-vN
     suffix).

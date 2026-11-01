@@ -62,11 +62,11 @@ def parse_native(path: Path, mime_type: str = "") -> list[ParsedBlock]:
         # text; parsing is no longer refused because the fallback whitelist lacks an entry (final
         # review S02)
         blocks = parse_text(path, doc_type, parser_profile_for_path(path))
-        if suffix in {".nf", ".cwl", ".wdl", ".dot"} or path.name in WORKFLOW_FILENAMES or extensionless_script(path):
+        if suffix in LANGUAGE_BY_SUFFIX or suffix in {".nf", ".cwl", ".wdl", ".dot", ".sql", ".json", ".json5", ".yaml", ".yml", ".toml"} or path.name in TEXT_FILENAMES or extensionless_script(path):
             for block in blocks:
                 block.block_type = "code"
                 block.title = path.name
-                block.metadata["source_locator"] = {"kind": "lines", "start": 1, "end": len(block.text.splitlines())}
+                block.metadata["source_locator"] = {"kind": "lines", "start": 1, "end": len(block.text.split("\n"))}
         return blocks
     # csv/xlsx/xls and html never reach here: parse_job routes them to
     # parse_native_table / parse_html_dom before falling back to this router.

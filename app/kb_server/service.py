@@ -3,6 +3,8 @@ re-loaded per call so enrollment changes take effect without restarts."""
 
 from __future__ import annotations
 
+from kb_pipeline.chunking.context import payload_text
+
 import json
 import os
 import re
@@ -17,6 +19,8 @@ from urllib.parse import urlsplit
 import requests
 
 from kb_pipeline import db, discovery, search_fts
+from kb_pipeline.llm_compat import CompatibleRequest, endpoint_url, generation_parameters
+from kb_pipeline.progress import job_view, read_progress
 from kb_pipeline.config import (
     Settings, load_settings, parse_interval_days, parse_new_chunk_count, parse_ratio,
 )
@@ -273,13 +277,36 @@ def _graph_build_info(con, kb_id: str, collection: str = "") -> dict[str, Any] |
     "Graph build status" panel."""
     row = con.execute(
         "SELECT graph_build_id, graph_version, status, stage, started_at, finished_at, error, "
-        "cache_fingerprint, source_content_hash, build_kind FROM graph_builds "
+        "cache_fingerprint, source_content_hash, build_kind, progress_json, manifest_json, worker_host, worker_pid FROM graph_builds "
         "WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
         (kb_id,),
     ).fetchone()
     if row is None:
         return None
     info = dict(row)
+    info["progress"] = read_progress(info.pop("progress_json", None))
+    worker_host, worker_pid = info.pop("worker_host", None), info.pop("worker_pid", None)
+    info["cleanup_running"] = None
+    if info["status"] == "done" and info["progress"].get("phase") == "cleanup":
+        # A published version remains usable if its cleanup process has stopped.
+        import socket
+        from kb_pipeline.graph.lock import build_lock_holder
+
+        if worker_host == socket.gethostname() and worker_pid:
+            try:
+                lock = build_lock_path(settings())
+                info["cleanup_running"] = bool(build_lock_held(lock) and build_lock_holder(lock).get("pid") == worker_pid)
+            except (OSError, ValueError, TypeError):
+                pass
+    manifest = read_progress(info.pop("manifest_json", None))
+    info["models"] = manifest.get("model_ids") or manifest.get("models") or {}
+    info["schema_version"] = manifest.get("schema_version_id") or (manifest.get("schema") or {}).get("version_id")
+    info["resumed"] = bool(manifest.get("resumed_phases"))
+    info["resumed_phases"] = manifest.get("resumed_phases") or []
+    info["post_publish_error"] = manifest.get("graph_gc_error") or manifest.get("post_publish_error") or manifest.get("comparison_write_error")
+    info["phase_history"] = [dict(r) for r in con.execute(
+        "SELECT phase, started_at, done_at AS finished_at FROM graph_build_phases "
+        "WHERE graph_build_id=? ORDER BY done_at, rowid", (row["graph_build_id"],))]
     # How many appends have landed since the last full-build version: the status card explains
     # "this graph = full build + N appends"
     full = con.execute(
@@ -368,7 +395,8 @@ def _schema_suggest_info(con, kb_id: str) -> dict[str, Any] | None:
         return None
     created = int(mark.get("created_at") or started)
     return {"origin": mark.get("origin"), "started_at": created, "seconds": max(0, int(time.time() - created)),
-            "sampled": mark.get("sampled"), "phase": mark.get("phase"), "task_id": mark.get("token")}
+            "sampled": mark.get("sampled"), "phase": mark.get("phase"), "task_id": mark.get("token"),
+            "model_id": mark.get("model_id"), "progress_at": mark.get("progress_at")}
 
 
 def _delete_state(row) -> str | None:
@@ -504,7 +532,8 @@ def overview() -> dict[str, Any]:
                 )
             kbs.append(entry)
         active_jobs = con.execute(
-            "SELECT j.job_id, j.kb_id, j.status, j.stage, j.updated_at, j.started_at, f.rel_path, f.filename "
+            "SELECT j.job_id, j.kb_id, j.status, j.stage, j.updated_at, j.started_at, j.progress_json, "
+            "j.error, j.next_attempt_at, j.cancel_requested, f.rel_path, f.filename "
             "FROM jobs j LEFT JOIN files f ON f.file_id = j.file_id "
             "WHERE j.job_type = 'parse' AND j.status IN ('running', 'queued', 'retry') "
             "ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, j.updated_at DESC LIMIT 30"
@@ -513,6 +542,9 @@ def overview() -> dict[str, Any]:
         now_ts = int(time.time())
         for r in active_jobs:
             item = dict(r)
+            item["progress"] = job_view(item, now_ts)
+            item.pop("progress_json", None)
+            item.pop("error", None)
             if item.get("status") == "running":
                 # Seconds elapsed in the current phase, computed server-side for the frontend: the progress bar
                 # interpolates within the phase from it, immune to clock skew between the two machines
@@ -655,7 +687,8 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
             "WHERE kb_id=? AND status NOT IN ('deleted','skipped') ORDER BY rel_path", (kb_id,)
         ).fetchall()
         jobs = con.execute(
-            "SELECT job_id, file_id, status, stage, error, updated_at FROM jobs "
+            "SELECT job_id, file_id, status, stage, error, updated_at, progress_json, "
+            "next_attempt_at, cancel_requested FROM jobs "
             "WHERE kb_id=? AND job_type='parse' ORDER BY created_at, rowid", (kb_id,)
         ).fetchall()
         chunk_counts = {str(r["file_id"]): int(r["n"]) for r in con.execute(
@@ -688,8 +721,9 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
             "dot": dot,
             "job_status": job_status,
             "job_id": (str(job["job_id"]) if job else None),
+            "progress": job_view(job, int(time.time())) if job else {},
             "stage": (str(job["stage"]) if job and job["stage"] else None),
-            "error": (str(job["error"])[:400] if job and job["error"] and job_status == "failed" else None),
+            "error": (str(job["error"])[:400] if job and job["error"] and job_status in {"failed", "retry"} else None),
             "chunk_diag": _chunk_diag_brief(r["chunk_diag_json"]) if dot == "green" else None,
             "chunks": chunk_counts.get(file_id) if dot == "green" else None,
             "indexed_profile": (str(r["indexed_parser_profile"]) if dot == "green" and r["indexed_parser_profile"] else None),
@@ -1064,6 +1098,13 @@ def _validate_config(con, effective: dict[str, Any], updates: dict[str, Any], li
     errors.extend(_validate_rebuild_policy(effective))
     errors.extend(validate_graph_tune_config(
         effective.get("graph_entity_types"), effective.get("graph_tune_sample_size")))
+    name = effective.get("vlm_model")
+    if name:
+        model = db.get_llm(con, str(name))
+        if model is None:
+            errors.append(f"Multimodal model {name!r} is not in the registry")
+        elif str(model["protocol"] or "openai") != "openai":
+            errors.append("Multimodal models require the OpenAI-compatible protocol")
     graph_llm = updates.get("graph_llm")
     if isinstance(graph_llm, dict):
         from kb_pipeline.graph.build import GRAPH_LLM_STEPS, GRAPH_TUNE_STEP
@@ -1734,7 +1775,9 @@ def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> d
                 "title": pl.get("title"), "caption": pl.get("caption"),
                 "embedding_context": pl.get("embedding_context"),
                 "table_flags": pl.get("table_flags") or None, "table_repair": pl.get("table_repair") or None,
-                "text": str(pl.get("text") or ""),
+                "text": payload_text(pl),
+                "code_context_sources": pl.get("code_context_sources"),
+                "source_regions": pl.get("source_regions"),
             })
     profile = str(row["parser_profile"]) if ("parser_profile" in keys and row["parser_profile"]) else None
     return {
@@ -1755,7 +1798,8 @@ def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> d
 # dropping what is not needed as it goes, and the result is cached per knowledge base.
 _GRAPH_ENTITY_FIELDS = ("key", "title", "type", "upper", "parent_type", "frequency", "doc_ids", "description",
                         "boilerplate", "scope", "aliases")
-_GRAPH_RELATION_FIELDS = ("source_key", "target_key", "predicate", "strength_sum", "description")
+_GRAPH_RELATION_FIELDS = ("source_key", "target_key", "predicate", "strength_sum", "description",
+                          "polarity", "target_polarity", "modality", "conditions", "type_violation")
 _GRAPH_DOCUMENT_FIELDS = ("rel_path", "date", "version")
 _GRAPH_READ_CHARS = 1 << 20
 # The graph.json sizes of all cached knowledge bases add up to no more than this (what is kept takes memory of
@@ -1961,7 +2005,8 @@ def graph_preview_pick(graph: dict[str, Any], *, limit: int = 60, q: str = "", u
     return {
         "nodes": nodes,
         "edges": [{"source": str(r["source_key"]), "target": str(r["target_key"]), "predicate": str(r.get("predicate") or ""),
-                   "strength": r.get("strength_sum"), "description": str(r.get("description") or "")[:160]} for r in edges],
+                   "strength": r.get("strength_sum"), "description": str(r.get("description") or "")[:160],
+                   **{k: r[k] for k in ("polarity", "target_polarity", "modality", "conditions", "type_violation") if k in r}} for r in edges],
         "totals": {"entities": len(entities), "relations": len(relations),
                    "boilerplate": sum(1 for e in entities if e.get("boilerplate"))},
         "upper_counts": dict(upper_counts.most_common()),
@@ -2060,8 +2105,16 @@ def job_detail(job_id: str) -> dict[str, Any]:
         if row is None:
             raise KeyError(job_id)
         job = {k: row[k] for k in _JOB_FIELDS if k in row.keys()}
+        job["progress"] = job_view(row, int(time.time()))
         file_row = db.get_file_by_id(con, str(row["file_id"])) if row["file_id"] else None
         events = db.job_events(con, job_id)
+        # Show the compensation task belonging to this parse, including its eventual completion.
+        followups = con.execute(
+            "SELECT job_id, job_type, status, stage, error, next_attempt_at FROM jobs "
+            "WHERE file_id=? AND job_type='fts_sync' AND created_at>=? AND created_at<=? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (row["file_id"], row["started_at"] or row["created_at"], row["finished_at"] or int(time.time())),
+        ).fetchall() if row["job_type"] == "parse" else []
     file_info = None
     if file_row is not None:
         file_info = {k: file_row[k] for k in ("file_id", "rel_path", "filename", "size", "mime_type",
@@ -2073,7 +2126,8 @@ def job_detail(job_id: str) -> dict[str, Any]:
         # as a real record.
         events = _synthesize_job_events(job)
         synthesized = bool(events)
-    return {"job": job, "file": file_info, "events": events, "synthesized": synthesized}
+    return {"job": job, "file": file_info, "events": events, "synthesized": synthesized,
+            "followups": [dict(r) for r in followups]}
 
 
 def _synthesize_job_events(job: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2148,10 +2202,13 @@ def _llm_usage(con) -> dict[str, list[dict[str, Any]]]:
     usage: dict[str, list[dict[str, Any]]] = {}
     for row in discovery.known_sources(con):
         try:
-            kb_llm = (json.loads(row["config_json"] or "{}").get("graph_llm") or {})
+            config = json.loads(row["config_json"] or "{}")
+            kb_llm = config.get("graph_llm") or {}
         except Exception:
             continue
         by_model: dict[str, list[str]] = {}
+        if config.get("vlm_model"):
+            by_model.setdefault(str(config["vlm_model"]), []).append("Multimodal model")
         for step, name in kb_llm.items():
             if name:
                 by_model.setdefault(str(name), []).append(
@@ -2196,23 +2253,24 @@ def _probe_llm(base_url: str, api_key: str, model_id: str, protocol: str = "open
     body: dict[str, Any] = {
         "model": model_id,
         "messages": [{"role": "user", "content": "Connectivity test: reply with OK only"}],
-        # reasoning models burn their thinking budget first; too small and the body comes back empty
-        "max_tokens": 512,
-        "temperature": 0,
+        # Reasoning tokens may share this budget; the probe still asks for only OK.
+        **generation_parameters(model_id, protocol=protocol, base_url=base, max_tokens=4096),
     }
+    url = endpoint_url(base, protocol)
     if protocol == "anthropic":
-        # Same joining rule as litellm on the graph build side: append /v1/messages when base lacks it
-        url = base if base.endswith("/v1/messages") else base + "/v1/messages"
         headers["anthropic-version"] = "2023-06-01"
         if api_key:
             headers["x-api-key"] = api_key
     else:
-        url = base + "/chat/completions"
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+    request = CompatibleRequest(base, model_id, protocol, body)
     try:
         # No redirects: following one to another host with the key attached hands the key to that host
-        resp = requests.post(url, headers=headers, json=body, timeout=30, allow_redirects=False)
+        while True:
+            resp = requests.post(url, headers=headers, json=request.body, timeout=30, allow_redirects=False)
+            if not request.adapt(resp.status_code, resp.text):
+                break
     except requests.RequestException as exc:
         raise ValueError(f"Connectivity test failed: cannot reach {url} ({exc.__class__.__name__})")
     if 300 <= resp.status_code < 400:
@@ -2221,14 +2279,21 @@ def _probe_llm(base_url: str, api_key: str, model_id: str, protocol: str = "open
         raise ValueError(f"Connectivity test failed: HTTP {resp.status_code} {resp.text[:120]}")
     try:
         if protocol == "anthropic":
-            blocks = resp.json()["content"]
+            data = resp.json()
+            blocks = data["content"]
             content = "".join(str(b.get("text") or "") for b in blocks if b.get("type") == "text")
+            finish = data.get("stop_reason")
         else:
-            content = str(resp.json()["choices"][0]["message"]["content"] or "")
+            choice = resp.json()["choices"][0]
+            content = str(choice["message"]["content"] or "")
+            finish = choice.get("finish_reason")
     except Exception:
         raise ValueError("Connectivity test failed: the response is not a valid chat format for the selected protocol")
     if not re.search(r"\bok\b", content, re.IGNORECASE):
         raise ValueError(f"Connectivity test did not pass: the model replied “{content.strip()[:60]}”, which does not contain OK")
+    if finish in ("length", "max_tokens", "content_filter", "insufficient_system_resource", "aborted"):
+        raise ValueError(f"Connectivity test did not pass: the response did not complete ({finish})")
+    request.accept()
 
 
 def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2273,6 +2338,10 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
     # so it does not hold the state database's write lock while parse and graph build writes wait
     _probe_llm(base_url, "" if clear_key else (api_key or stored_key), model_id, protocol)
     with db.connect(cfg.state_db) as con:
+        if protocol != "openai":
+            for row in discovery.known_sources(con):
+                if discovery.get_config(con, str(row["kb_id"])).get("vlm_model") == name:
+                    raise ValueError("Multimodal models require the OpenAI-compatible protocol")
         db.upsert_llm(
             con,
             name=name,
@@ -2307,9 +2376,12 @@ def remove_llm(name: str) -> dict[str, Any]:
         affected = _llm_usage(con).get(name, [])
         for row in discovery.known_sources(con):
             try:
-                kb_llm = dict(json.loads(row["config_json"] or "{}").get("graph_llm") or {})
+                config = json.loads(row["config_json"] or "{}")
+                kb_llm = dict(config.get("graph_llm") or {})
             except Exception:
                 continue
+            if config.get("vlm_model") == name:
+                discovery.set_config(con, str(row["kb_id"]), {"vlm_model": None})
             pruned = {k: v for k, v in kb_llm.items() if v != name}
             if pruned != kb_llm:
                 discovery.set_config(con, str(row["kb_id"]), {"graph_llm": pruned or None})
@@ -2337,16 +2409,14 @@ SERVICE_CONTAINERS: dict[str, list[str]] = {
     "mineru": ["carrel-mineru"],
     "embedding": ["carrel-embedding"],
     "visual_embedding": ["carrel-vl-embedding"],
-    "vlm": ["carrel-vlm"],
     # The "Reranker service" row covers two rerank models: text rerank + cross-modal rerank. The parse /
     # graph build pipelines do not use them (they only serve retrieval); they are managed here so that
     # "Stop all" really stops everything on the GPU.
     "reranker": ["carrel-reranker", "carrel-vl-reranker"],
 }
 
-# The database and parse rows are always shown (the pipeline cannot run without them); the four model rows
-# are shown only when listed in KB_CONSOLE_SERVICES -- their addresses may well be public endpoints, with no
-# container on this machine to probe or restart.
+# Database and parse rows are always shown. Model endpoints can be remote;
+# only containers listed in KB_CONSOLE_SERVICES have local restart controls.
 ALWAYS_SHOWN_SERVICES: tuple[str, ...] = ("database", "mineru")
 
 # Services the pipeline does not depend on: restarting one on its own interrupts no parse / graph build job,
@@ -2355,8 +2425,8 @@ _PIPELINE_INDEPENDENT: frozenset[str] = frozenset({"reranker"})
 
 
 def managed_services() -> tuple[str, ...]:
-    """Service rows managed by the console (KB_CONSOLE_SERVICES): only these get their model service probed,
-    a restart button and a place in restart all / stop all. When the settings object lacks the field (old
+    """Local containers managed by the console: only these get restart buttons and are included in
+    restart all / stop all. Endpoint health is checked separately. When the settings object lacks the field (old
     test stubs), the default two rows apply."""
     from kb_pipeline.config import CONSOLE_SERVICES_DEFAULT
 
@@ -2367,7 +2437,7 @@ def managed_services() -> tuple[str, ...]:
 
 
 def _refuse_if_busy(action: str, force: bool) -> None:
-    """Restarting / stopping Qdrant, OpenSearch or the VLM makes a running parse fail (it retries) or throws
+    """Restarting / stopping Qdrant, OpenSearch or MinerU makes a running parse fail (it retries) or throws
     away a graph build's progress (the whole round restarts). Without force, refuse while the system is
     busy; the frontend shows the reason and asks the user to confirm a second time."""
     if force:
@@ -2599,8 +2669,6 @@ def health() -> dict[str, Any]:
     # vLLM's /health there would just stay red.
     if "embedding" in managed:
         checks["embedding"] = lambda: vllm(cfg.embedding_base_url)
-    if "vlm" in managed:
-        checks["vlm"] = lambda: vllm(cfg.vlm_base_url)
     if "visual_embedding" in managed and cfg.visual_embedding_enabled:
         checks["visual_embedding"] = lambda: vllm(cfg.visual_embedding_base_url)
     # Rerank: text / cross-modal are probed separately and the frontend merges them into one "Reranker
@@ -2617,7 +2685,7 @@ def health() -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=len(checks)) as pool:
         futures = {name: pool.submit(fn) for name, fn in checks.items()}
         result: dict[str, Any] = {name: future.result() for name, future in futures.items()}
-    for name in ("embedding", "vlm", "visual_embedding", "reranker", "visual_reranker"):
+    for name in ("embedding", "visual_embedding", "reranker", "visual_reranker"):
         result.setdefault(name, None)
     if not neo4j_uri:
         result["neo4j"] = None          # no graph store: "Database services" checks only Qdrant / OpenSearch

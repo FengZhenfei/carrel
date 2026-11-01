@@ -16,6 +16,8 @@ path only; ngramming the body would balloon the index for little gain.
 
 from __future__ import annotations
 
+from .chunking.context import payload_text
+
 import json
 import time
 from typing import Any
@@ -36,6 +38,7 @@ PAYLOAD_FIELDS = [
     "chunk_uid",
     "chunk_index",
     "text",
+    "code_context",
     "doc_type",
     "block_type",
     "page_idx",
@@ -440,7 +443,7 @@ def _search_fields(payload: dict[str, Any]) -> dict[str, str]:
         )
         if item
     )
-    body = _text(payload.get("text"))
+    body = payload_text(payload)
     visual = "\n".join(
         item
         for item in (

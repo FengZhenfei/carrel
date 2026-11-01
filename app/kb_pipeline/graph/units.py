@@ -19,6 +19,8 @@ graph_extractions in the next graph build without a single LLM call -- that is t
 """
 from __future__ import annotations
 
+from ..chunking.context import payload_text
+
 import hashlib
 import json
 import re
@@ -191,6 +193,10 @@ class ChunkRef:
     # metrics where the model's estimated reading in an image description conflicts with the text in the image
     # (Codex review F01): {label, text_value, model_value}; the fact layer downgrades such facts
     value_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    source_locator: dict[str, Any] = field(default_factory=dict)
+    source_regions: list[dict[str, Any]] = field(default_factory=list)
+    code_context_sources: list[dict[str, Any]] = field(default_factory=list)
+    section_paths: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -222,6 +228,7 @@ class Unit:
     axis: str = ""
     # 文档日期(不管轴是日期还是版本,能认出日期就有):抽取提示词的 Document date 行、关系的观察时间
     doc_date: str = ""
+    source_locations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def document_label(self) -> str:
@@ -253,6 +260,7 @@ class Unit:
             value_conflicts=[dict(x) for x in (data.get("value_conflicts") or []) if isinstance(x, dict)],
             axis=str(data.get("axis") or ""),
             doc_date=str(data.get("doc_date") or ""),
+            source_locations=[dict(x) for x in data.get("source_locations") or [] if isinstance(x, dict)],
         )
 
 
@@ -284,7 +292,7 @@ def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any
         points = q.retrieve(collection_name=collection, ids=ids[i:i + batch], with_vectors=False, with_payload=True)
         for p in points:
             payload = p.payload or {}
-            text = str(payload.get("text") or "")
+            text = payload_text(payload)
             if not text.strip():
                 continue
             ref = by_point.get(str(p.id), {})
@@ -298,14 +306,19 @@ def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any
                 block_id=str(payload.get("block_id") or ""),
                 block_type=str(payload.get("block_type") or ""),
                 section_path=section,
+                section_paths=list(payload.get("section_paths") or []),
                 text=text,
-                n_tokens=int(payload.get("token_count") or 0) or count_tokens(text),
+                n_tokens=(count_tokens(text) if payload.get("block_type") == "code" and payload.get("code_context")
+                          else int(payload.get("token_count") or 0) or count_tokens(text)),
                 rel_path=str(payload.get("rel_path") or ""),
                 filename=str(payload.get("filename") or ""),
                 page_idx=payload.get("page_idx"),
                 page_end=payload.get("page_end", payload.get("page_idx")),
                 ambiguous_values=unrepaired_glued_values(payload.get("table_flags"), payload.get("table_repair")),
                 value_conflicts=[dict(x) for x in (payload.get("visual_value_conflicts") or []) if isinstance(x, dict)],
+                source_locator=dict(payload.get("source_locator") or {}),
+                source_regions=list(payload.get("source_regions") or []),
+                code_context_sources=list(payload.get("code_context_sources") or []),
             ))
     return out
 
@@ -338,16 +351,29 @@ def _flush(unit_chunks: list[ChunkRef], texts: list[str], *, kb_id: str, order: 
     chunk_uids = [c.chunk_uid for c in unit_chunks]
     extra: list[str] = []
     for c in unit_chunks:
-        if tuple(c.section_path) != tuple(first.section_path):
-            label = " > ".join(x for x in c.section_path if x) or "(no section)"
-            if label not in extra:
-                extra.append(label)
+        for path in c.section_paths or [c.section_path]:
+            if tuple(path) != tuple(first.section_path):
+                label = " > ".join(x for x in path if x) or "(no section)"
+                if label not in extra:
+                    extra.append(label)
     sections = [" > ".join(x for x in first.section_path if x), *extra]
+    render_tag = table_render_tag(text)
+    if any(c.section_paths for c in unit_chunks):
+        # Section context is part of the extraction input even if the body is unchanged.
+        context_tag = hashlib.sha256(json.dumps(sections, ensure_ascii=False).encode()).hexdigest()[:16]
+        render_tag += "|sections-v1:" + context_tag
+    kind = "body" if any(str(c.block_type) == "code" for c in unit_chunks) else classify_unit_text(
+        text, sections, conclusion_headings=conclusion_headings,
+        boilerplate_headings=boilerplate_headings, listing_headings=listing_headings)
+    if kind in {"boilerplate", "listing"} and any(c.section_paths for c in unit_chunks):
+        # One crossed heading must not suppress substantive neighbouring evidence.
+        if any(classify_unit_text(c.text, [" > ".join(c.section_path)],
+                    conclusion_headings=conclusion_headings, boilerplate_headings=boilerplate_headings,
+                    listing_headings=listing_headings) in {"body", "conclusion"} for c in unit_chunks):
+            kind = "body"
     return Unit(
-        kind="body" if any(str(c.block_type) == "code" for c in unit_chunks)
-        else classify_unit_text(text, sections, conclusion_headings=conclusion_headings,
-                                boilerplate_headings=boilerplate_headings, listing_headings=listing_headings),
-        unit_id=unit_id_for(kb_id, first.doc_id, text, positions=[c.chunk_index for c in unit_chunks], render_tag=table_render_tag(text)),
+        kind=kind,
+        unit_id=unit_id_for(kb_id, first.doc_id, text, positions=[c.chunk_index for c in unit_chunks], render_tag=render_tag),
         doc_id=first.doc_id,
         rel_path=first.rel_path,
         section_path=list(first.section_path),
@@ -361,6 +387,10 @@ def _flush(unit_chunks: list[ChunkRef], texts: list[str], *, kb_id: str, order: 
         extra_sections=extra,
         ambiguous_values=list(dict.fromkeys(v for c in unit_chunks for v in (c.ambiguous_values or []))),
         value_conflicts=[c for ch in unit_chunks for c in (ch.value_conflicts or [])],
+        source_locations=[{"point_id": ch.point_id, "chunk_uid": ch.chunk_uid, "locator": ch.source_locator,
+                           **({"regions": ch.source_regions} if ch.source_regions else {}),
+                           **({"context_sources": ch.code_context_sources} if ch.code_context_sources else {})}
+                          for ch in unit_chunks if ch.source_locator or ch.source_regions or ch.code_context_sources],
     )
 
 

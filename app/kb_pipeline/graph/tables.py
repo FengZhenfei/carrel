@@ -20,8 +20,8 @@ from . import prompts
 from .extract import ExtractionResult, ExtractionSchema, entity_name_ok, normalize_name, normalize_predicate, predicate_menu, type_menu
 from .units import Unit
 
-VERSION = "tables-v4"
-TABLE_SUFFIXES = (".xlsx", ".xls", ".csv")
+VERSION = "tables-v5"
+TABLE_SUFFIXES = (".xlsx", ".xls", ".csv", ".tsv")
 PROFILE_SAMPLE_ROWS = 8
 MIN_DATA_ROWS = 3
 KEY_UNIQUE_RATIO = 0.9
@@ -77,6 +77,9 @@ def parse_table_text(text: str) -> list[dict[str, Any]]:
                 if cur is None or cur["rows"]:
                     cur = {"sheet": (cur or {}).get("sheet", ""), "header": [], "rows": []}
                     sections.append(cur)
+                bounds = re.fullmatch(r"(\d+)-(\d+)", value.strip())
+                if bounds:
+                    cur["row_start"], cur["row_end"] = map(int, bounds.groups())
             elif tag == "HEADER":
                 if cur is None:
                     cur = {"sheet": "", "header": [], "rows": []}
@@ -97,6 +100,13 @@ def parse_table_text(text: str) -> list[dict[str, Any]]:
                 rows.append({"labelled": lab})
         else:
             cur["rows"].append({"cells": cells})
+    for section in sections:
+        start, end = section.get("row_start"), section.get("row_end")
+        # Sparse rows or ambiguous wrapped rows have no inferred cell address.
+        # Equal values alone never prove that two rows are the same source row.
+        if start is not None and end - start + 1 == len(section["rows"]):
+            for i, row in enumerate(section["rows"]):
+                row["row_number"] = start + i
     return [s for s in sections if s["rows"]]
 
 
@@ -312,7 +322,10 @@ class TableExtractor:
                 if not str(values.get(name_col) or values.get(key_col) or "").strip():
                     unmapped += 1
                     continue
-                out.append((prof, values))
+                located = dict(prof)
+                if r.get("row_number") is not None:
+                    located["source_row"] = [unit.doc_id, section.get("sheet") or "", r["row_number"]]
+                out.append((located, values))
         return out, total, unmapped
 
     def wants(self, unit: Unit) -> bool:
@@ -398,10 +411,66 @@ class TableExtractor:
                     continue
                 if key:
                     fact["subject_ref"] = f"{prof.get('key_column') or ''}:{key}"
-                fid = fact_id(unit.unit_id + (":" + fact["subject_ref"] if key else ""), fact)
+                cell = (json.dumps([*prof["source_row"], column], ensure_ascii=False)
+                        if prof.get("source_row") else "")
+                fid = fact_id(cell or unit.unit_id + (":" + fact["subject_ref"] if key else ""), fact)
                 if fid in seen:
                     continue
                 seen.add(fid)
                 fact.update({"id": fid, "unit_id": unit.unit_id, "source_kind": "table", "exact": True})
+                if cell:
+                    fact["source_cell"] = cell
                 out.append(fact)
         return out
+
+
+def deduplicate_cells(facts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Coalesce the same source cell across overlapping units; keep all evidence."""
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    out = []
+    removed = 0
+    for fact in facts:
+        key = (str(fact.get("source_cell") or ""), str(fact.get("id") or ""))
+        previous = seen.get(key) if key[0] else None
+        if previous is None:
+            out.append(fact)
+            if key[0]:
+                seen[key] = fact
+            continue
+        previous["point_ids"] = list(dict.fromkeys([*previous.get("point_ids", []), *fact.get("point_ids", [])]))
+        previous["evidence_unit_ids"] = list(dict.fromkeys([
+            *previous.get("evidence_unit_ids", [previous["unit_id"]]), fact["unit_id"]]))
+        removed += 1
+    return out, removed
+
+
+def fact_request_parts(unit: Unit, budget: int) -> list[str]:
+    """Bound native-table cells per model request, repeating column context.
+
+    This changes extraction inputs only. Ambiguous layouts stay intact for the
+    existing fallback; a single indivisible row may exceed the request budget.
+    """
+    if not is_table_file(unit.rel_path):
+        return []
+    sections = parse_table_text(unit.text)
+    rows = []
+    for section in sections:
+        for row in section["rows"]:
+            values = _row_values(section, row)
+            if values is None:
+                return []
+            # Labelled cells make every partition independently readable.
+            text = " | ".join(f"{k}: {v}" for k, v in values.items())
+            rows.append((section.get("sheet") or "", text, sum(bool(v) for v in values.values())))
+    if sum(n for _, _, n in rows) <= budget:
+        return []
+    parts, current, size, sheet = [], [], 0, None
+    for name, text, count in rows:
+        if current and (size + count > budget or name != sheet):
+            parts.append("\n".join([f"SHEET: {sheet}", *current]))
+            current, size = [], 0
+        sheet = name
+        current.append(text); size += count
+    if current:
+        parts.append("\n".join([f"SHEET: {sheet}", *current]))
+    return parts if len(parts) > 1 else []

@@ -30,7 +30,7 @@ class ChunkerRegressionTests(unittest.TestCase):
         # The overlap tail always keeps at least one sentence however large it
         # is. Before the guard, the main loop appended the next sentence to
         # that tail without rechecking, producing chunks near 2x the limit
-        # (observed 720 against 400 in the real corpus).
+        # The synthetic repeated sentence exercises this overflow boundary.
         sentence = "one two three four five six seven eight nine ten eleven twelve."
         t = count_tokens(sentence)
         max_tokens = int(t * 1.3)
@@ -299,7 +299,7 @@ class ChunkDiagnosticsTests(unittest.TestCase):
         self.assertIn('class="mini${busy ? "" : " graph"}"', nav)
         self.assertNotIn('"建图中"', nav)
         # the three kinds of in-progress work share one bar + short text; the stage name only goes into the tooltip
-        for needle in ('text = t("解析 {0}/{1} · {2}%", p.done, p.total, p.pct)', 'text = t("建图 · {0}%", bar)', "tip = shortStage("):
+        for needle in ('text = t("解析 {0}/{1} · ≈{2}%", p.done, p.total, p.pct)', 't("建图 · ≈{0}%", bar)', "tip = running.length ? progressLabel("):
             self.assertIn(needle, nav, needle)
         # single-file / whole-KB "re-parse": the file stays indexed throughout, so counted over the whole KB it
         # reads "113/114 · 99%"; now it is counted per round
@@ -314,11 +314,15 @@ class ChunkDiagnosticsTests(unittest.TestCase):
         self.assertNotIn('id="gb-list"', html)
         self.assertNotIn("建图记录", html)
         self.assertNotIn("renderGraphBuilds(", js)
-        # a built graph: entity / relation / unit cards + an "updated at" line; no version, mode or merge count
+        # The compact count cards keep entities / relations / units and updated
+        # time; versions and phase history belong in expandable task details.
         self.assertIn('class="pv-stats gstats"', panel)
         self.assertIn('${t("更新于")} ${esc(fmtTs(b.counts_at))}', panel)
-        self.assertNotIn("graph_version", panel)
-        self.assertNotIn("归并", panel)
+        cards = panel.split("const cards =", 1)[1].split("const failedUnits", 1)[0]
+        self.assertNotIn("graph_version", cards)
+        self.assertNotIn("归并", cards)
+        self.assertIn('<details class="pipeline-details"', panel)
+        self.assertIn('[t("任务版本"), b.graph_version', panel)
         svc = _repo_file("app/kb_server/service.py")
         self.assertIn('info["counts"] = summary.get("counts")', svc)
         self.assertIn('info["counts_at"] = done_row["finished_at"] or done_row["started_at"]', svc)
@@ -401,10 +405,10 @@ class HeadingInferenceTests(unittest.TestCase):
             self.assertIn("resolver.resolve(heading_level(item)", src, name)
             self.assertIn("HeadingResolver(", src, name)
             self.assertIn("heading_inferred", src, name)
-        self.assertEqual(parser_profile_for_path(Path("a.pdf")), "pdf-mineru-table-vlm-v15")     # 09-30 heading levels, headings at a block's end
-        self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v10")
-        self.assertEqual(parser_profile_for_path(Path("a.py")), "py-symbols-v2")                 # 09-30 line splitting
-        self.assertEqual(parser_profile_for_path(Path("a.ts")), "code-symbols-v2")
+        self.assertEqual(parser_profile_for_path(Path("a.pdf")), "pdf-mineru-table-vlm-v15+source-v1")     # 09-30 heading levels, headings at a block's end
+        self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v10+source-v1")
+        self.assertEqual(parser_profile_for_path(Path("a.py")), "py-symbols-v2+source-v1")                 # 09-30 line splitting
+        self.assertEqual(parser_profile_for_path(Path("a.ts")), "code-symbols-v2+source-v1")
 
     def test_merged_blocks_remember_their_heading_lines(self) -> None:
         from kb_pipeline.parsers.pdf_enhanced import merge_mineru_text_blocks
@@ -485,7 +489,12 @@ class HeadingAwareChunkingTests(unittest.TestCase):
             chunks = blocks_to_chunks(kb_id="k", file_key=1, content_version="v", parser_profile="p",
                                       blocks=[block], max_tokens=600, overlap_tokens=80)
             first = chunks[0].text
-            self.assertIn(f"{heading}\n{unit[:20]}", first)                      # after the fragment fallback the heading leads the content below it
+            if unit == fence:
+                self.assertTrue(any(heading in c.block.metadata.get("code_context", "") or heading in c.text for c in chunks))
+                self.assertEqual("".join(c.text for c in chunks if c.block.block_type == "code"),
+                                 fence.partition("\n")[2][:-3])
+            else:
+                self.assertIn(f"{heading}\n{unit[:20]}", first)
 
     def test_heading_at_the_end_of_the_text_is_not_dropped(self) -> None:
         """The block text ends with a heading (a merged block filled up right after the heading): the final flush
@@ -706,15 +715,16 @@ class ChunkStructureTests(unittest.TestCase):
                   _mb("b", "短句。", metadata={"section_path": ["第一章"]}),
                   _mb("c", "第三段正文,也足够长。" * 3, metadata={"section_path": ["第一章"]})]
         chunks = self._chunks(blocks, max_tokens=120)
-        self.assertEqual(len(chunks), 2)
-        self.assertTrue(chunks[1].text.startswith("短句。"))
-        self.assertEqual(chunks[1].chunk_uid, "kb:1:v:p:c:0")
-        self.assertEqual([c.chunk_index for c in chunks], [0, 1])
+        self.assertEqual(len(chunks), 1)
+        self.assertLess(chunks[0].text.index("第一段"), chunks[0].text.index("短句。"))
+        self.assertLess(chunks[0].text.index("短句。"), chunks[0].text.index("第三段"))
+        self.assertEqual({r["block_id"] for r in chunks[0].block.metadata["source_regions"]}, {"a", "b", "c"})
+        self.assertLessEqual(chunks[0].token_count, 120)
 
     def test_heading_only_piece_before_a_table_becomes_its_title(self) -> None:
         table = "| a | b |\n| --- | --- |\n| 1 | 2 |"
         blocks = [_mb("p", "前面的正文段落,内容足够长,不会被当碎片。" * 2),
-                  _mb("h", "直流电气特性"),
+                  _mb("h", "直流电气特性", block_type="title"),
                   _mb("t", table, block_type="table", table_markdown=table)]
         chunks = self._chunks(blocks, max_tokens=120)
         self.assertEqual(len(chunks), 2)
@@ -739,7 +749,7 @@ class ChunkStructureTests(unittest.TestCase):
         self.assertEqual(chunks[0].block.block_id, "c")
         self.assertGreaterEqual(len(chunks), 3)
 
-    def test_decorative_images_fold_into_the_previous_chunk(self) -> None:
+    def test_decorative_images_keep_their_own_chunks(self) -> None:
         blocks = [_mb("p", "正文段落,说明产品外观。" * 3),
                   _mb("img", "VISUAL SUMMARY: 产品外观照片", block_type="image", visual_summary="产品外观照片",
                       metadata={"decorative": True}),
@@ -747,26 +757,26 @@ class ChunkStructureTests(unittest.TestCase):
                       metadata={"decorative": True}),
                   _mb("chart", "VISUAL SUMMARY: 销量柱状图", block_type="chart", visual_summary="销量柱状图")]
         chunks = self._chunks(blocks, max_tokens=120)
-        self.assertEqual([c.block.block_id for c in chunks], ["p", "chart"])
-        self.assertTrue(chunks[0].text.endswith("IMAGE: 产品外观照片\nIMAGE: 装饰背景"))
+        self.assertEqual([c.block.block_id for c in chunks], ["p", "img", "img2", "chart"])
+        self.assertNotIn("产品外观照片", chunks[0].text)
+        self.assertIn("产品外观照片", chunks[1].text)
 
-    def test_decorative_fold_keeps_the_adopted_lead_in_text(self) -> None:
-        """Codex review F03: the short lines before an image (report date, testing lab) were absorbed by
-        pdf_enhanced into the title of the seal image; the seal was then judged decorative and folded away, and
-        the date was gone. The absorbed text must first flow back as body lines, followed by the description;
-        with no preceding body text to attach to, it becomes a chunk of its own."""
+    def test_decorative_image_keeps_its_adopted_source_text(self) -> None:
+        """An adopted source heading remains attached to the image that owns it."""
         stamp = dict(block_type="image", visual_summary="红色圆形公章", metadata={"decorative": True, "adopted_lead_in": True},
-                     title="报告日期:2023-11-06\n\n检测技术:基因芯片")
-        chunks = self._chunks([_mb("p", "营养代谢基因检测报告。" * 3), _mb("seal", "VISUAL SUMMARY: 红色圆形公章", **stamp)], max_tokens=120)
-        self.assertEqual([c.block.block_id for c in chunks], ["p"])
-        self.assertTrue(chunks[0].text.endswith("报告日期:2023-11-06\n\n检测技术:基因芯片\nIMAGE: 红色圆形公章"), chunks[0].text)
+                     title="报告日期:2023-11-06\n\n检测技术:接口采样")
+        chunks = self._chunks([_mb("p", "样例模块接口检测报告。" * 3), _mb("seal", "VISUAL SUMMARY: 红色圆形公章", **stamp)], max_tokens=120)
+        self.assertEqual([c.block.block_id for c in chunks], ["p", "seal"])
+        self.assertIn("报告日期:2023-11-06", chunks[1].text)
+        self.assertIn("检测技术:接口采样", chunks[1].text)
         # the seal comes first, with no previous chunk: the text is kept as a chunk of its own, not dropped
         alone = self._chunks([_mb("seal", "VISUAL SUMMARY: 红色圆形公章", **stamp), _mb("p", "正文段落,说明检测项目与方法。" * 9)], max_tokens=120)
         self.assertEqual([c.block.block_id for c in alone], ["seal", "p"])
         self.assertIn("报告日期:2023-11-06", alone[0].text)
-        # decorative images with no absorbed text are unchanged: one description line, dropped if nothing precedes
+        # A first image also keeps its identity when there is no preceding body text.
         plain = self._chunks([_mb("seal", "VISUAL SUMMARY: 装饰背景", block_type="image", visual_summary="装饰背景", metadata={"decorative": True}), _mb("p", "正文。")], max_tokens=120)
-        self.assertEqual([c.block.block_id for c in plain], ["p"])
+        self.assertIn("seal", [c.block.block_id for c in plain])
+        self.assertTrue(any("正文。" in c.text for c in plain))
 
     def test_embedding_context_prefixes_doc_and_section(self) -> None:
         from kb_pipeline.chunking.chunker import embedding_context_for, embedding_input
@@ -780,8 +790,14 @@ class ChunkStructureTests(unittest.TestCase):
         self.assertEqual(embedding_input(chunk), "产品手册 > 第1卷 > 第一章 > 1.1 概述\n正文。")
 
     def test_parse_job_embeds_with_context_and_stores_it(self) -> None:
+        import ast
+
         src = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
-        self.assertIn("embedder.embed([embedding_input(chunk) for chunk in chunks])", src)
+        calls = [node for node in ast.walk(ast.parse(src)) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "embed"
+                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "embedder"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ast.unparse(calls[0].args[0]), "[embedding_input(chunk) for chunk in chunks]")
         self.assertIn('"embedding_context": getattr(chunk, "embedding_context", None)', src)
 
 
@@ -861,8 +877,7 @@ class TableBudgetTests(unittest.TestCase):
         self.assertIn("\n存储 | 容量 | 100G | 1T", pieces[-1])                                # a row that fits stays as it is
 
     def test_a_cell_longer_than_the_budget_is_cut_at_sentences_and_keeps_row_and_column(self) -> None:
-        """A single cell over the budget: the whole cell used to become one chunk as it was, with no upper bound on the
-        chunk length (the longest in production was 5,921 tokens against a budget of 400)."""
+        """An oversized synthetic cell must split within the token budget while retaining its row and column context."""
         from kb_pipeline.chunking.chunker import split_table_text
         from kb_pipeline.utils import count_tokens
 
@@ -1087,7 +1102,7 @@ class EmbeddingRejectionTests(unittest.TestCase):
             def __init__(self, **kwargs) -> None:
                 pass
 
-            def embed(self, texts):
+            def embed(self, texts, *, progress_cb=None):
                 raise EmbeddingInputRejected(1, "maximum context length is 8192 tokens")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1156,7 +1171,7 @@ class DiagnosisRuleTests(unittest.TestCase):
 
         chunks = [mk(0, "x" * 400, "text", 380), mk(1, "图片识读", "image", 1100),
                   mk(2, "| a | b |\n| 1 | 2 |", "table", 30), mk(3, "| c | d |\n| 3 | 4 |", "table", 30),
-                  mk(4, "第一章 绪论", "text", 3), mk(5, "1.2 概述", "text", 5), mk(6, "学习要点", "text", 4)]
+                  mk(4, "第一章 绪论", "text", 3), mk(5, "1.2 概述", "text", 5), mk(6, "学习要点", "title", 4)]
         diag = chunk_diagnostics(chunks, max_tokens=400)
         keys = {r["key"] for r in diag["reasons"]}
         self.assertTrue({"long_visual", "headerless_tables", "orphan_headings"} <= keys, keys)
@@ -1170,26 +1185,27 @@ class DiagnosisRuleTests(unittest.TestCase):
 class ChunkGlueIntoFiguresTests(unittest.TestCase):
     _chunks = staticmethod(ChunkStructureTests._chunks)
     T0 = "| a | b |\n| --- | --- |\n| 1 | 2 |"
-    T1 = "| 任务类型 | Pro | flash |\n| --- | --- | --- |\n| 普通任务 | deepseek-v4-pro | deepseek-v4-flash |"
+    T1 = "| 任务类型 | Pro | flash |\n| --- | --- | --- |\n| 普通任务 | example-runner-pro | example-runner-fast |"
 
     def test_tiny_lead_in_paragraph_joins_the_table_chunk(self) -> None:
         blocks = [_mb("t0", self.T0, block_type="table", table_markdown=self.T0),
-                  _mb("p", "企业通过额度使用时无需理解每个模块配置什么模型,默认以下模型:"),
+                  _mb("p", "样例任务采用统一的资源配置,各类任务使用下表列出的执行器:"),
                   _mb("t1", self.T1, block_type="table", table_markdown=self.T1)]
         chunks = self._chunks(blocks, max_tokens=400)
         self.assertEqual([c.block.block_id for c in chunks], ["t0", "t1"])
-        self.assertTrue(chunks[1].text.startswith("企业通过额度使用时"))
+        self.assertTrue(chunks[1].text.startswith("样例任务采用统一"))
         self.assertIn("| 任务类型 |", chunks[1].text)
 
-    def test_tiny_text_between_a_table_and_an_image_goes_forward(self) -> None:
+    def test_unowned_text_between_table_and_image_stays_separate(self) -> None:
         blocks = [_mb("t0", self.T0, block_type="table", table_markdown=self.T0),
-                  _mb("p", "只要企业有额度,默认全企业员工可用。"),
+                  _mb("p", "启用共享配置后,样例组内所有任务均可使用。"),
                   _mb("img", "VISUAL SUMMARY: 配置界面截图", block_type="image", visual_summary="配置界面截图")]
         chunks = self._chunks(blocks, max_tokens=400)
-        self.assertEqual([c.block.block_id for c in chunks], ["t0", "img"])
-        self.assertTrue(chunks[1].text.startswith("只要企业有额度"))
+        self.assertEqual([c.block.block_id for c in chunks], ["t0", "p", "img"])
+        self.assertTrue(chunks[1].text.startswith("启用共享配置后"))
+        self.assertNotIn("启用共享配置后", chunks[2].text)
 
-    def test_short_text_joins_a_figure_within_the_slack_only(self) -> None:
+    def test_visual_text_splits_without_claiming_adjacent_prose(self) -> None:
         """The slack for merging short text into an adjacent image chunk is 25% of the budget, the same as for
         body fragments (2026-09-11, agreed with the user: a slide's title belongs with its own image); beyond
         the slack they stay separate chunks, and the image chunk is not pushed any further."""
@@ -1199,19 +1215,19 @@ class ChunkGlueIntoFiguresTests(unittest.TestCase):
         blocks = [_mb("img", big, block_type="image", visual_summary=big[16:]),
                   _mb("p", "一句短话。")]
         chunks = self._chunks(blocks, max_tokens=120)
-        self.assertEqual([c.block.block_id for c in chunks], ["img", "p"])
+        self.assertEqual(chunks[-1].block.block_id, "p")
+        self.assertTrue(all(c.block.block_id == "img" and c.token_count <= 120 for c in chunks[:-1]))
+        self.assertEqual(sum(c.text.count("很长的图片描述。") for c in chunks), 60)
         near = "VISUAL SUMMARY: " + "图片描述。" * 22                             # right at the budget (about 110)
         blocks = [_mb("title", "六个财务 Agent,六条业务链"), _mb("img2", near, block_type="image", visual_summary=near[16:])]
         chunks = self._chunks(blocks, max_tokens=120)
-        self.assertEqual([c.block.block_id for c in chunks], ["img2"])          # the title merged into the image chunk
-        self.assertTrue(chunks[0].text.startswith("六个财务 Agent,六条业务链\n"))
+        self.assertEqual([c.block.block_id for c in chunks], ["title", "img2"])
+        self.assertEqual(chunks[0].text, "六个财务 Agent,六条业务链")
         self.assertLessEqual(chunks[0].token_count, int(120 * 1.25))
 
 
 class VisualTextCompositionTests(unittest.TestCase):
-    """When the VLM has a result, MinerU's OCR text of screenshots / photos is dropped; for charts /
-    architecture diagrams the OCR text goes after the VLM sections; small icons removed by the size filter
-    are marked decorative and do not become chunks of their own."""
+    """Native source text survives visual interpretation, including small images."""
 
     @staticmethod
     def _enrich(blocks, kind, tmp, *, summary="摘要", facts=("f1",)):
@@ -1232,7 +1248,7 @@ class VisualTextCompositionTests(unittest.TestCase):
         return ParsedBlock(parser="p", parser_profile="p", doc_type="pdf", block_type="image", text=text,
                            block_id=bid, visual_ref=ref)
 
-    def test_screenshot_own_text_is_replaced_by_vlm_sections(self) -> None:
+    def test_native_screenshot_text_is_preserved_after_vlm_sections(self) -> None:
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1245,29 +1261,31 @@ class VisualTextCompositionTests(unittest.TestCase):
             self._enrich([empty], "screenshot", tmp, summary="", facts=())
         self.assertEqual(shot.text.splitlines()[0], "VISUAL SUMMARY: 摘要")
         self.assertIn("FACTS: f1", shot.text)
-        self.assertNotIn("密码", shot.text)
-        self.assertTrue(shot.metadata.get("own_text_dropped"))
+        self.assertIn("首页\n密码\n密码", shot.text)
+        self.assertFalse(shot.metadata.get("own_text_dropped"))
         self.assertTrue(diagram.text.startswith("VISUAL SUMMARY: 摘要"))
         self.assertTrue(diagram.text.endswith("\nA -> B"))
         self.assertFalse(diagram.metadata.get("own_text_dropped"))
         self.assertIn("首页", empty.text)                      # VLM returned nothing: the OCR text is kept as before
         self.assertFalse(empty.metadata.get("own_text_dropped"))
 
-    def test_size_filtered_icons_are_marked_decorative(self) -> None:
+    def test_small_icons_are_sent_to_the_model(self) -> None:
         from PIL import Image
         from kb_pipeline.parsers import visual_blocks
 
         with tempfile.TemporaryDirectory() as tmp:
             img = Path(tmp) / "icon.png"; Image.new("RGB", (20, 20)).save(img)
             icon = self._img("i", "", str(img))
-            with patch.object(visual_blocks, "caption_images_parallel", lambda jobs, **kw: {}):
+            with patch.object(visual_blocks, "caption_images_parallel", return_value={"i": {"summary": "A status symbol", "decorative": True, "confidence": "high"}}) as call:
                 visual_blocks.enrich_blocks_with_vlm([icon], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp))
+            self.assertEqual(len(call.call_args.args[0]), 1)
         self.assertTrue(icon.metadata.get("decorative"))
-        self.assertEqual(icon.metadata.get("vlm_skip_reason"), "tiny_icon")
-        # chunking: a decorative image with no body chunk before it simply produces no chunk
+        self.assertNotIn("vlm_skip_reason", icon.metadata)
+        # The image stays in the source chain even without preceding prose.
         icon.title = "AIHub 使用手册"
         chunks = ChunkStructureTests._chunks([icon, _mb("p", "正文段落,说明产品外观。" * 3)], max_tokens=120)
-        self.assertEqual([c.block.block_id for c in chunks], ["p"])
+        self.assertIn("i", [c.block.block_id for c in chunks])
+        self.assertTrue(any("正文段落" in c.text for c in chunks))
 
 
 class ChunkGlueAcrossSlidesTests(unittest.TestCase):
@@ -1275,7 +1293,7 @@ class ChunkGlueAcrossSlidesTests(unittest.TestCase):
 
     def test_heading_glue_stays_on_the_same_slide_and_drops_title_lines(self) -> None:
         slide = _mb("s5", "**客户墙**", block_type="slide", title="deck slide 5", page_idx=5, slide_idx=5)
-        img1 = _mb("img1", "VISUAL SUMMARY: 医院大楼", block_type="image", visual_summary="医院大楼", page_idx=1, slide_idx=1)
+        img1 = _mb("img1", "VISUAL SUMMARY: 示例站大楼", block_type="image", visual_summary="示例站大楼", page_idx=1, slide_idx=1)
         chunks = self._chunks([slide, img1], max_tokens=400)
         self.assertEqual([c.block.block_id for c in chunks], ["s5", "img1"])       # different pages: no merge
         img5 = _mb("img5", "VISUAL SUMMARY: 客户 logo 墙", block_type="image", visual_summary="客户 logo 墙", page_idx=5, slide_idx=5)
@@ -1283,12 +1301,12 @@ class ChunkGlueAcrossSlidesTests(unittest.TestCase):
         self.assertEqual([c.block.block_id for c in chunks], ["img5"])
         self.assertTrue(chunks[0].text.startswith("TITLE: 客户墙\nVISUAL SUMMARY"), chunks[0].text)
 
-    def test_pdf_pages_still_flow(self) -> None:
+    def test_unowned_heading_on_previous_pdf_page_stays_separate(self) -> None:
         h = _mb("h", "直流电气特性", page_idx=3)
         t = _mb("t", "| a | b |\n| --- | --- |\n| 1 | 2 |", block_type="table", table_markdown="| a | b |\n| --- | --- |\n| 1 | 2 |", page_idx=4)
         chunks = self._chunks([h, t], max_tokens=400)
-        self.assertEqual([c.block.block_id for c in chunks], ["t"])
-        self.assertTrue(chunks[0].text.startswith("TITLE: 直流电气特性"))
+        self.assertEqual([c.block.block_id for c in chunks], ["h", "t"])
+        self.assertEqual(chunks[0].text, "直流电气特性")
 
 
 class HeadingRuleFollowupTests(unittest.TestCase):

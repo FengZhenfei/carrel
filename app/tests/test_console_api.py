@@ -271,8 +271,8 @@ class SchemaVersionViewTests(unittest.TestCase):
         LinkML 本体不进视图(下载走单独的接口)。"""
         from kb_server.service import schema_versions_view
 
-        entry = _schema_entry("v1", [("person", "agent"), ("checkup", "event"), ("indicator", "property")],
-                              language="Chinese", scopes={"checkup": "document"},
+        entry = _schema_entry("v1", [("person", "agent"), ("inspection", "event"), ("indicator", "property")],
+                              language="Chinese", scopes={"inspection": "document"},
                               predicates=[{"name": "has_indicator", "source_parents": ["agent"], "target_parents": ["property"],
                                            "multivalued": False}],
                               examples="Example 1: x", origin="manual", model="m")
@@ -282,7 +282,7 @@ class SchemaVersionViewTests(unittest.TestCase):
         self.assertNotIn("linkml", v)
         self.assertEqual((v["origin"], v["model"], v["language"], v["has_examples"]), ("manual", "m", "Chinese", True))
         self.assertEqual({t["name"]: (t["upper"], t["scope"]) for t in v["types"]},
-                         {"person": ("agent", "global"), "checkup": ("event", "document"), "indicator": ("property", "document")})
+                         {"person": ("agent", "global"), "inspection": ("event", "document"), "indicator": ("property", "document")})
         preds = {p["name"]: p for p in v["predicates"]}
         self.assertFalse(preds["has_indicator"]["multivalued"])
         self.assertTrue(preds["precedes"]["core"])                     # 有事件类型就带上事件核心关系
@@ -563,7 +563,7 @@ class GraphPreviewTests(unittest.TestCase):
 
     GRAPH = {
         "entities": [
-            {"key": "a", "title": "ZK7C1049GN", "type": "semiconductor device", "upper": "产品", "frequency": 9, "doc_ids": ["d1", "d2"], "description": "SRAM"},
+            {"key": "a", "title": "ZX8D1049GN", "type": "sample device", "upper": "产品", "frequency": 9, "doc_ids": ["d1", "d2"], "description": "STORE"},
             {"key": "b", "title": "VCC", "type": "electrical parameter", "upper": "参数", "frequency": 5, "doc_ids": ["d1"]},
             {"key": "c", "title": "TSOP", "type": "package type", "upper": "产品", "frequency": 2, "doc_ids": ["d1"]},
             {"key": "d", "title": "孤立实体", "type": "other", "upper": "其它", "frequency": 1, "doc_ids": []},
@@ -610,31 +610,31 @@ class GraphPreviewTests(unittest.TestCase):
 
     def test_scoped_entities_carry_their_document_label(self) -> None:
         """Document-local entities (one per document for part / property / process) carry a short label of the
-        document they come from: the date, else the version, else the filename. Three check-up reports each have a
+        document they come from: the date, else the version, else the filename. Three synthetic inspection records each have a
         "urinalysis" entity, drawn on the canvas as "urinalysis · 2021-03-14", with a hover note saying which
         document it comes from. Global entities have scope / doc both None."""
         from kb_server.service import graph_preview_pick
 
         graph = {
-            "documents": {"kb:1": {"rel_path": "李/2021体检报告.pdf", "date": "2021-03-14", "version": ""},
+            "documents": {"kb:1": {"rel_path": "李/2021巡检报告.pdf", "date": "2021-03-14", "version": ""},
                           "kb:2": {"rel_path": "手册/rev-b.pdf", "date": "", "version": "B"},
                           "kb:3": {"rel_path": "杂/说明.pdf", "date": "", "version": ""}},
             "entities": [
-                {"key": "kb:1::尿常规", "title": "尿常规", "type": "laboratory test", "upper": "process", "scope": "kb:1", "frequency": 1, "doc_ids": ["kb:1"]},
-                {"key": "kb:2::尿常规", "title": "尿常规", "type": "laboratory test", "upper": "process", "scope": "kb:2", "frequency": 1, "doc_ids": ["kb:2"]},
-                {"key": "kb:3::尿常规", "title": "尿常规", "type": "laboratory test", "upper": "process", "scope": "kb:3", "frequency": 1, "doc_ids": ["kb:3"]},
+                {"key": "kb:1::密封检测", "title": "密封检测", "type": "sample test", "upper": "process", "scope": "kb:1", "frequency": 1, "doc_ids": ["kb:1"]},
+                {"key": "kb:2::密封检测", "title": "密封检测", "type": "sample test", "upper": "process", "scope": "kb:2", "frequency": 1, "doc_ids": ["kb:2"]},
+                {"key": "kb:3::密封检测", "title": "密封检测", "type": "sample test", "upper": "process", "scope": "kb:3", "frequency": 1, "doc_ids": ["kb:3"]},
                 {"key": "kb:9::x", "title": "x", "type": "t", "upper": "process", "scope": "kb:9", "frequency": 1, "doc_ids": ["kb:9"]},
-                {"key": "李华", "title": "李华", "type": "person", "upper": "entity", "frequency": 3, "doc_ids": ["kb:1", "kb:2", "kb:3"]},
+                {"key": "样例C", "title": "样例C", "type": "person", "upper": "entity", "frequency": 3, "doc_ids": ["kb:1", "kb:2", "kb:3"]},
             ],
-            "relations": [{"source_key": "李华", "target_key": k, "predicate": "has_test", "strength_sum": 1} for k in ("kb:1::尿常规", "kb:2::尿常规", "kb:3::尿常规", "kb:9::x")],
+            "relations": [{"source_key": "样例C", "target_key": k, "predicate": "has_test", "strength_sum": 1} for k in ("kb:1::密封检测", "kb:2::密封检测", "kb:3::密封检测", "kb:9::x")],
         }
         out = graph_preview_pick(graph, limit=0)
         by = {n["key"]: n for n in out["nodes"]}
-        self.assertEqual((by["kb:1::尿常规"]["scope"], by["kb:1::尿常规"]["doc"]), ("kb:1", "2021-03-14"))
-        self.assertEqual(by["kb:2::尿常规"]["doc"], "B")                    # no date, so the version
-        self.assertEqual(by["kb:3::尿常规"]["doc"], "说明")                  # neither, so the filename
+        self.assertEqual((by["kb:1::密封检测"]["scope"], by["kb:1::密封检测"]["doc"]), ("kb:1", "2021-03-14"))
+        self.assertEqual(by["kb:2::密封检测"]["doc"], "B")                    # no date, so the version
+        self.assertEqual(by["kb:3::密封检测"]["doc"], "说明")                  # neither, so the filename
         self.assertEqual(by["kb:9::x"]["doc"], "9")                          # document metadata missing: falls back to the tail of the document id
-        self.assertEqual((by["李华"]["scope"], by["李华"]["doc"]), (None, None))
+        self.assertEqual((by["样例C"]["scope"], by["样例C"]["doc"]), (None, None))
         js = _repo_file("app/kb_server/static/app.js")
         for needle in ("gpLabelOf", "dupTitles", "文档内实体 · 来自", "另有", "UPPER_ZH", "marqueeMergeCells", "seg-clone"):
             self.assertIn(needle, js, needle)
@@ -724,7 +724,7 @@ class GraphFileLoadTests(unittest.TestCase):
         "unit_kinds": {"u1": "body", "u2": "listing"},
         "entities": [
             {"key": "a", "title": "存储器 𠮷", "type": "device", "upper": "entity", "frequency": 9, "doc_ids": ["kb_1:1"],
-             "description": "长" * 500, "descriptions": ["长" * 500, "别的说法"], "unit_ids": ["u1", "u2"], "aliases": ["SRAM"],
+             "description": "长" * 500, "descriptions": ["长" * 500, "别的说法"], "unit_ids": ["u1", "u2"], "aliases": ["STORE"],
              "pagerank": 0.61, "degree": 2, "types": {"device": 3}},
             {"key": "kb_1:1::b", "title": "电压", "type": "parameter", "upper": "property", "frequency": 5, "doc_ids": ["kb_1:1"],
              "scope": "kb_1:1", "description": "供电 \"VCC\"\\n3.3 V", "unit_ids": ["u1"]},
@@ -737,7 +737,7 @@ class GraphFileLoadTests(unittest.TestCase):
         ],
         "mentions": [{"entity_key": "a", "point_id": "p1", "chunk_uid": "cu1", "count": 12345}] * 40,
         "resolution_map": {"a2": "a"}, "resolution_judged": [["a", "c", "no"], ["a", "kb_1:1::b", "no"]],
-        "resolution_log": [{"kept": "a", "kept_title": "存储器", "merged": "a2", "merged_title": "SRAM 存储器", "source": "lexical", "category": "alias"}],
+        "resolution_log": [{"kept": "a", "kept_title": "存储器", "merged": "a2", "merged_title": "STORE 存储器", "source": "lexical", "category": "alias"}],
         "resolution_rejected": [{"a_title": "甲", "b_title": "乙", "source": "embedding", "reason": "recheck", "verdict": "narrower"}],
         "stats": {"units": 2, "resolution": {"candidates": 3, "yes": 1, "entities_before": 4, "entities_after": 3}, "llm": {"calls": 9}},
         "pages": [{"page_id": "p", "markdown": "# 页\\n" + "文" * 300}], "specs": [], "conflicts": [],
@@ -774,7 +774,7 @@ class GraphFileLoadTests(unittest.TestCase):
                     self.assertEqual(slim["stats"], {"resolution": whole["stats"]["resolution"]})
                     self.assertEqual((slim["resolution_log"], slim["resolution_rejected"]),
                                      (whole["resolution_log"], whole["resolution_rejected"]))
-                    for view in ({"limit": 10}, {"limit": 0}, {"limit": 10, "q": "sram"}, {"limit": 10, "key": "kb_1:1::b"},
+                    for view in ({"limit": 10}, {"limit": 0}, {"limit": 10, "q": "store"}, {"limit": 10, "key": "kb_1:1::b"},
                                  {"limit": 10, "upper": "property"}):
                         self.assertEqual(service.graph_preview_pick(slim, **view), service.graph_preview_pick(whole, **view), view)
             for broken in ('{"entities": [{"key": "a"}', "[1, 2]", '{"entities": [1 2]}', ""):      # an incomplete read raises instead of returning half a graph
@@ -1016,7 +1016,7 @@ class ServiceDrawerBulkTests(unittest.TestCase):
             self.assertEqual(out["restarting"], service.SERVICE_CONTAINERS["reranker"])
             self.assertEqual([c[2] for c in calls], service.SERVICE_CONTAINERS["reranker"])
             with self.assertRaisesRegex(ValueError, "a restart would interrupt"):        # services the pipeline depends on are still blocked
-                service.restart_service("vlm", force=False)
+                service.restart_service("mineru", force=False)
 
         def cfg(**over):
             base = dict(qdrant_url="http://q", opensearch_url="http://o", neo4j_uri="", mineru_url="http://m",
@@ -1164,7 +1164,9 @@ class ParseProgressEstimateTests(unittest.TestCase):
         js = _repo_file("app/kb_server/static/app.js")
         self.assertIn("function parseStageSpans(weights)", js)
         self.assertIn("stageFraction(j.stage, j, kb.parse_stage_weights)", js)
-        self.assertIn("Math.min(0.95, elapsed / secs)", js)
+        self.assertIn("job.progress.completed / job.progress.total", js)
+        self.assertNotIn("Math.min(0.95, elapsed / secs)", js)
+        self.assertIn("建图 · ≈{0}%", js)
         self.assertIn("等待扫描登记", js)
         self.assertIn("kb.files_total || kb.dir_files || 0", js)
 
@@ -1269,21 +1271,24 @@ class ConsoleI18nTests(unittest.TestCase):
         return {unesc(m.group(1)) for m in re.finditer(r'^\s*"(?:[^"\\]|\\.)*": "((?:[^"\\]|\\.)*)"', i18n, re.M)}
 
     def test_server_stage_and_timer_labels_translate(self) -> None:
-        """The server now writes English directly: stage names, timer task names, reasons an append was blocked and
-        model step names must each be some English value in the dictionary so the Chinese UI can map them back."""
-        values = self._dict_values()
+        """Backend labels must have a dictionary counterpart in either language.
+        Runtime tests separately verify the translated text and progress values."""
+        entries = self._dict_keys() | self._dict_values()
         from kb_pipeline.graph.build import GRAPH_PHASE_LABELS, GRAPH_STEP_LABELS
         for label in list(GRAPH_PHASE_LABELS.values()) + list(GRAPH_STEP_LABELS.values()):
-            self.assertIn(label, values, label)
+            self.assertIn(label, entries, label)
         for label in ("Parsing document", "Describing images", "Chunking", "Text embedding", "Visual embedding",
                       "Writing vectors", "Keyword indexing", "Done",
                       "Entity resolution", "Description summaries", "Switching version aliases", "Cleaning up old versions",
                       "Mirror scan", "Parse queue", "Graph maintenance check", "Inactive point / parse asset GC",
                       "Weekly cache cleanup", "Monthly log rotation"):
-            self.assertIn(label, values, label)
-        from kb_server.service import APPEND_SKIP
-        for text in APPEND_SKIP.values():
-            self.assertIn(text, values, text)
+            self.assertIn(label, entries, label)
+        from kb_server import service
+        reasons = getattr(service, "APPEND_SKIP", None)
+        if reasons is None:
+            reasons = service.APPEND_SKIP_ZH
+        for text in reasons.values():
+            self.assertIn(text, entries, text)
 
     def test_server_messages_have_a_chinese_rendering(self) -> None:
         """Fixed strings the server throws at the console (ValueError / HTTP detail / validation errors / stage names)

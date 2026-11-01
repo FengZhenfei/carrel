@@ -18,6 +18,7 @@ import unicodedata
 from typing import Any, Callable, Iterable
 
 from .llm import ChatClient, LLMCallError
+from .quality import relation_qualifier
 
 WINDOW = 40
 BATCH_SIZE = 100
@@ -302,6 +303,37 @@ def declared_alias(title: str, descriptions: Iterable[str]) -> str:
     return ""
 
 
+def _abbreviation_claims(row: dict[str, Any]) -> dict[str, set[str]]:
+    """Explicit long-name/short-name assertions, independent of vocabulary or KB type."""
+    claims: dict[str, set[str]] = {}
+    title = str(row.get("title") or "")
+    names = [title, *[str(a) for a in row.get("aliases") or []]]
+    declared = declared_alias(title, row.get("descriptions") or ([row["description"]] if row.get("description") else []))
+    pairs = [paren_alias(name) for name in names]
+    if declared:
+        pairs.append((title, declared))
+    for a, b in pairs:
+        if not a or not b:
+            continue
+        for short, full in ((a, b), (b, a)):
+            if is_identifier_like(short) and not is_identifier_like(full):
+                # An explicit bilingual expansion may append a translation after a comma.
+                # Compare its matching Latin expansion, keeping different full names distinct.
+                words = " ".join(_LATIN_WORD_RE.findall(full))
+                expansion = words if _expands(short, words) else full
+                claims.setdefault(canonical_identifier(short), set()).add(canonical_identifier(expansion))
+    return claims
+
+
+def _ambiguous_abbreviations(entities: list[dict[str, Any]]) -> set[tuple[str, str, str]]:
+    expansions: dict[tuple[str, str, str], set[str]] = {}
+    for row in entities:
+        for short, full in _abbreviation_claims(row).items():
+            key = (str(row.get("type") or ""), str(row.get("scope") or ""), short)
+            expansions.setdefault(key, set()).update(full)
+    return {key for key, full in expansions.items() if len(full) > 1}
+
+
 def auto_merge_pairs(entities: list[dict[str, Any]], reasons: dict[tuple[int, int], str] | None = None) -> list[tuple[int, int]]:
     """Pairs mergeable without asking the model: same type and equal canonical_identifier, or equal after removing
     the words of the ontology type name, or the two spellings of a paren alias. Profile-induced type words
@@ -310,6 +342,7 @@ def auto_merge_pairs(entities: list[dict[str, Any]], reasons: dict[tuple[int, in
     (candidate_pairs). Pass a dict as reasons to record which rule merged each pair (the basis category of the
     resolution log)."""
     groups: dict[tuple[str, str, str], list[int]] = {}
+    ambiguous = _ambiguous_abbreviations(entities)
     key_rule: dict[tuple[str, str, str], str] = {}
     # A declared alias only becomes a key when that name really is another entity of the same type: two entities
     # each claiming to be short for the same non-existent name must not merge with each other (2026-09-12 product
@@ -339,6 +372,8 @@ def auto_merge_pairs(entities: list[dict[str, Any]], reasons: dict[tuple[int, in
         for key, rule in keys.items():
             if len(key) >= 2:
                 gk = (etype, scope, key)
+                if gk in ambiguous:
+                    continue
                 groups.setdefault(gk, []).append(idx)
                 # The two sides of one key may each arrive by a different rule (one the original name, the other
                 # with brackets removed): record the weaker one
@@ -739,6 +774,10 @@ def merge_entities(
     keys_of: dict[int, set[str]] = {i: {str(e.get("key"))} for i, e in enumerate(entities)} if forbid_partners else {}
     identity_of = {i: {(str(e.get("type") or "").casefold(), str(e.get("scope") or ""), str(e.get("upper") or ""))}
                    for i, e in enumerate(entities)}
+    claims_of = {i: _abbreviation_claims(e) for i, e in enumerate(entities)}
+    ambiguous = _ambiguous_abbreviations(entities)
+    bare_of = {i: {canonical_identifier(str(e.get("title") or ""))} if is_identifier_like(str(e.get("title") or "")) else set()
+               for i, e in enumerate(entities)}
     for i, j in yes_pairs:
         ri, rj = uf.find(i), uf.find(j)
         if ri == rj:
@@ -746,6 +785,15 @@ def merge_entities(
         if require_compatible_identity and identity_of[ri] != identity_of[rj]:
             blocked += 1
             continue
+        if require_compatible_identity:
+            left, right = claims_of[ri], claims_of[rj]
+            conflicting = any(len(left[k] | right[k]) > 1 for k in left.keys() & right.keys())
+            etype, scope = str(entities[i].get("type") or ""), str(entities[i].get("scope") or "")
+            unsupported = any((etype, scope, short) in ambiguous
+                              for short in (bare_of[ri] & right.keys()) | (bare_of[rj] & left.keys()))
+            if conflicting or unsupported:
+                blocked += 1
+                continue
         a, b = ext_of.get(ri) or {}, ext_of.get(rj) or {}
         if any(scheme in b and b[scheme] != value for scheme, value in a.items()):
             blocked += 1
@@ -756,6 +804,9 @@ def merge_entities(
         uf.union(i, j)
         root = uf.find(i)
         ext_of[root] = {**b, **a}
+        claims_of[root] = {k: claims_of[ri].get(k, set()) | claims_of[rj].get(k, set())
+                           for k in claims_of[ri].keys() | claims_of[rj].keys()}
+        bare_of[root] = bare_of[ri] | bare_of[rj]
         if forbid_partners:
             keys_of[root] = keys_of[ri] | keys_of[rj]
     groups: dict[int, list[int]] = {}
@@ -815,9 +866,9 @@ def merge_entities(
             self_loops += 1
             continue
         predicate = str(rel.get("predicate") or "related_to")
-        if not rel.get("directed") and dst < src:
+        if not rel.get("directed") and not relation_qualifier(rel) and dst < src:
             src, dst = dst, src
-        key = (src, dst, predicate)
+        key = (src, dst, predicate, relation_qualifier(rel))
         if key in edges:
             slot = edges[key]
             slot["strength_sum"] = round(float(slot.get("strength_sum") or 0) + float(rel.get("strength_sum") or 0), 3)

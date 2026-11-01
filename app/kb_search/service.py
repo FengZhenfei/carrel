@@ -10,6 +10,8 @@ unfinished stages are reported as degraded evidence.
 """
 from __future__ import annotations
 
+from kb_pipeline.chunking.context import payload_text
+
 import os
 import re
 import sqlite3
@@ -35,16 +37,18 @@ _state: dict[str, Any] = {"settings": None, "search": None, "q": None, "q_key": 
 _state_lock = threading.Lock()
 SETTINGS_TTL = 60.0
 
-ENTITY_FIELDS = ("id", "title", "type", "upper", "kind", "scope", "score", "hop", "via", "docs", "description", "verified", "sources_active")
+ENTITY_FIELDS = ("id", "title", "type", "upper", "kind", "scope", "score", "hop", "via", "docs", "description", "source_valid", "sources_active")
 # 关系与事实带时间与状态(status:current / superseded / ended / not_started / doc_superseded / doc_archived,见 currency)
 RELATION_FIELDS = ("id", "source", "type", "target", "status", "valid_from", "valid_until", "observed_first", "observed_last",
-                   "superseded_by", "score", "hop", "via", "description", "verified", "sources_active")
-SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "verified", "series_text", "conflict", "conflict_note",
+                   "superseded_by", "score", "hop", "via", "description", "source_valid", "sources_active",
+                   "polarity", "target_polarity", "modality", "conditions", "quality_state", "traversable", "type_violation")
+SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "source_valid", "series_text", "conflict", "conflict_note",
                "subject", "property", "symbol", "concept", "value", "min", "typ", "max", "unit", "unit_canonical", "flag", "ref_min", "ref_max",
                "when", "valid_from", "valid_until", "status", "observed", "superseded_by", "superseded_on", "doc_status", "source_kind",
                "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
-               "confidence", "comparable", "text", "note", "score", "rel_path", "section", "point_ids", "evidence")
-PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "compiled_day", "time_mode", "source_paths", "verified", "sources_active", "docs", "series", "point_ids")
+               "confidence", "comparable", "fact_kind", "time_basis", "observed_at", "subject_origin", "quality_state", "flag_status", "extraction_evidence", "text", "note", "score", "rel_path", "section", "point_ids", "evidence",
+               "source_locator", "evidence_precision", "evidence_unit_ids", "subject_origin", "value_json")
+PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "compiled_day", "time_mode", "source_paths", "source_valid", "sources_active", "docs", "series", "point_ids")
 NEIGHBORHOOD_FIELDS = ("id", "title", "type", "named", "relations", "facts", "predicates", "neighbors")
 NEIGHBORHOOD_TIMEOUT = 5.0          # subject neighbourhoods are leads that come along: wait at most this long for a slow graph database, never hold the request up
 # Generic words pointing across documents (Q08): when the question asks "both / each / respectively /
@@ -705,7 +709,7 @@ def _final_scores(ordered: list[dict[str, Any]], ss: SearchSettings, *, reranked
         base = float(c.get("score_rerank") or 0.0) if reranked else float(c.get("rrf") or 0.0) / top_rrf
         pl = c.get("payload") or {}
         if w_lex:
-            cov = question_coverage(question, str(pl.get("text") or ""))
+            cov = question_coverage(question, payload_text(pl))
             c.setdefault("scores", {})["score_lex"] = cov
             base = (1.0 - w_lex) * base + w_lex * cov
         factor = 1.0
@@ -1007,7 +1011,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         if pids:
             active = sum(1 for p in pids if point_active[p])
             row["sources_active"] = f"{active}/{len(pids)}"
-            row["verified"] = active > 0
+            row["source_valid"] = active > 0
     specs = spec_rows(specs, source_ns=source_ns, limit_hints=ss.spec_hint_limit, point_active=point_active)
     from . import graphwalk
 

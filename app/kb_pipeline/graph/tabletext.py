@@ -42,6 +42,12 @@ _MD_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _AUTO_NAME_RE = re.compile(r"^(?:[A-Z]{1,3}|column \d+)$")
 
 
+def contains_table(text: str) -> bool:
+    """Native table headers or Markdown column separators, irrespective of block type."""
+    return any(line.strip().startswith("HEADER:") or ("|" in line and _MD_SEP_RE.fullmatch(line.strip()))
+               for line in str(text or "").splitlines())
+
+
 def _native_cells(line: str) -> tuple[list[str], bool]:
     """Split one native-table line into cells by position; returns (cells, whether the leading empty cell was put back)."""
     s = line

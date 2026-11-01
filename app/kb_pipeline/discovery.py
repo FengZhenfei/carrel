@@ -89,7 +89,7 @@ DIR_DEFAULTS: dict[str, dict[str, Any]] = {}
 
 # Keys the web console may write into config_json.
 CONFIG_KEYS = {
-    "max_tokens", "overlap_tokens", "vlm_prompt", "graph_enabled",
+    "max_tokens", "overlap_tokens", "vlm_prompt", "vlm_model", "graph_enabled",
     "graph_unit_chunks", "graph_max_gleanings",
     "graph_rebuild_interval", "graph_rebuild_new_chunk_pct",
     "graph_rebuild_new_chunk_count",   # mutually exclusive with _pct; the console dropdown picks one
@@ -204,6 +204,7 @@ def build_source(
         max_tokens=int(cfg["max_tokens"]),
         overlap_tokens=int(cfg["overlap_tokens"]),
         vlm_prompt=prompt,
+        vlm_model=str(cfg.get("vlm_model") or "").strip() or None,
         graph_enabled=bool_value(cfg.get("graph_enabled"), False),
         graph_paused=bool_value(cfg.get("graph_paused"), False),
         graph_auto_append=bool_value(cfg.get("graph_auto_append"), True),

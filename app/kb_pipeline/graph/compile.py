@@ -27,7 +27,8 @@ from typing import Any, Callable
 from . import prompts
 from .facts import comparable_number, conditions_text, symbol_only_value, values_text, when_text
 from .llm import ChatClient, LLMCallError
-from .reconcile import fact_axis, series_of, unit_of
+from .reconcile import comparison_groups, fact_axis, series_of, unit_of
+from .quality import fact_quality, flag_status, relation_label, relation_quality, traversable_relation
 from .temporal import axis_sort_key, axis_value_kind
 
 SUBJECT_MAX_PAGES = 80
@@ -57,7 +58,7 @@ STAGE_PARTS = {"subjects": "subjects", "timelines": "timelines", "sources": "sou
 
 _LABELS = {
     "zh": {
-        "overview": "概述", "facts": "事实", "relations": "关系", "extensions": "延伸", "sources": "来源",
+        "reported_time": "报告记录日期", "document_time": "文档记录日期", "overview": "概述", "facts": "事实", "relations": "关系", "extensions": "延伸", "sources": "来源",
         "when": "时间 / 版本", "value": "值", "flag": "标记", "ref": "参考范围", "conditions": "条件", "source": "来源",
         "type": "类型", "aliases": "别名", "docs": "文档", "facts_n": "事实", "relations_n": "关系", "more": "另有 {n} 条未列出",
         "timeline": "时间线", "first": "起点", "last": "终点", "trend_up": "上升", "trend_down": "下降", "trend_flat": "持平",
@@ -75,7 +76,7 @@ _LABELS = {
         "quality_no_trend": "{n} 条事实待核实；其余有效时间点不足，不生成趋势",
     },
     "en": {
-        "overview": "Overview", "facts": "Facts", "relations": "Relationships", "extensions": "Extensions", "sources": "Sources",
+        "reported_time": "Reported observation date", "document_time": "Document observation date", "overview": "Overview", "facts": "Facts", "relations": "Relationships", "extensions": "Extensions", "sources": "Sources",
         "when": "When", "value": "Value", "flag": "Flag", "ref": "Reference", "conditions": "Conditions", "source": "Source",
         "type": "Type", "aliases": "Aliases", "docs": "documents", "facts_n": "facts", "relations_n": "relationships", "more": "{n} more not listed",
         "timeline": "Timeline", "first": "First", "last": "Last", "trend_up": "rising", "trend_down": "falling", "trend_flat": "flat",
@@ -135,7 +136,7 @@ def _md_cell(text: Any) -> str:
 
 
 def _unresolved(f: dict[str, Any]) -> bool:
-    return bool(f.get("evidence_conflict")) or f.get("quality") == "ambiguous_source"
+    return fact_quality(f) == "needs_review"
 
 
 def _quality_note(f: dict[str, Any], L: dict[str, str], *, readings: bool = True) -> str:
@@ -168,7 +169,7 @@ def _fact_row(f: dict[str, Any], *, rel_paths: dict[str, str], L: dict[str, str]
     value = L["unresolved"] if narrative and _unresolved(f) else values_text(f) or str(f.get("value") or "")
     flag = "; ".join(x for x in (str(f.get("flag") or ""), _quality_note(f, L, readings=not narrative)) if x)
     return "| " + " | ".join(_md_cell(x) for x in (
-        when_text(f) or "-", value, flag, _ref_text(f),
+        ((when_text(f) or "-") + (" (" + L["document_time" if f["time_basis"] == "document" else "reported_time"] + ")" if f.get("time_basis") in {"document", "reported"} else "")), value, flag, _ref_text(f),
         conditions_text(f.get("conditions")), Path(src).name if src else "")) + " |"
 
 
@@ -195,7 +196,7 @@ def parts_index(relations: list[dict[str, Any]], entities: list[dict[str, Any]])
     by_key = {str(e["key"]): e for e in entities}
     out: dict[str, list[str]] = defaultdict(list)
     for r in relations:
-        if r.get("boilerplate") or r.get("reference"):
+        if r.get("boilerplate") or r.get("reference") or not traversable_relation(r):
             continue
         ends = composition_ends(r.get("predicate"), str(r.get("source_key") or ""), str(r.get("target_key") or ""))
         if ends is None:
@@ -357,9 +358,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
     lines += part_lines
     narrate_lines += part_narrate
 
-    by_concept: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for f in facts:
-        by_concept[str(f.get("concept") or f.get("property") or f.get("symbol") or "")].append(f)
+    by_concept = comparison_groups(facts)
     concept_keys: list[str] = []
     series_lines: list[str] = []
     if by_concept:
@@ -367,8 +366,9 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
         narrate_lines += [f"## {L['facts']}", ""]
         # flagged (out-of-range) concepts first, then those with the most facts: the subject page leads with what
         # deserves attention
-        ordered = sorted(by_concept.items(), key=lambda kv: (-sum(1 for r in kv[1] if str(r.get("flag") or "").strip()), -len(kv[1]), kv[0]))
-        for label, rows in ordered[:CONCEPTS_PER_PAGE]:
+        ordered = sorted(by_concept.items(), key=lambda kv: (-sum(flag_status(r) == "abnormal" for r in kv[1]), -len(kv[1]), kv[0]))
+        for _, rows in ordered[:CONCEPTS_PER_PAGE]:
+            label = str(rows[0].get("concept") or rows[0].get("property") or rows[0].get("symbol") or "")
             rows = sorted(rows, key=lambda r: (axis_sort_key(fact_axis(r)), str(r.get("rel_path") or ""), str(r.get("section") or "")))
             ck = next((str(r.get("concept_key")) for r in rows if r.get("concept_key")), "")
             if ck and ck not in concept_keys:
@@ -386,7 +386,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
                 if not kind or len({fact_axis(r) for r in part}) < 2:
                     continue
                 line = _series_line(part, L)
-                flagged = sum(1 for r in part if not _unresolved(r) and str(r.get("flag") or "").strip())
+                flagged = sum(flag_status(r) == "abnormal" for r in part)
                 series_lines.append(line + ("," + L["out_of_range"].format(n=flagged) if flagged else ""))
             shown = rows[:ROWS_PER_CONCEPT]
             more = [L["more"].format(n=len(rows) - ROWS_PER_CONCEPT)] if len(rows) > ROWS_PER_CONCEPT else []
@@ -411,7 +411,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
         else:
             arrow, other = "←", entity_titles.get(str(r.get("source_key")), str(r.get("source") or ""))
         desc = str(r.get("description") or "").strip().replace("\n", " ")
-        return f"- {r.get('predicate')} {arrow} {other}" + (f": {desc[:240]}" if desc else "")
+        return f"- {relation_label(r)} {arrow} {other}" + (f": {desc[:240]}" if desc else "")
 
     if ext_rows:
         lines += [f"## {L['extensions']}", ""] + [rel_line(r) for r in ext_rows[:RELATIONS_PER_PAGE]] + [""]
@@ -434,7 +434,7 @@ def build_subject_page(entity: dict[str, Any], facts: list[dict[str, Any]], rela
     return {
         "id": page_id("subject", key), "kind": "subject", "title": title, "summary": summary, "text": "\n".join(lines).strip() + "\n",
         "quality_note": quality_note,
-        "narrate_text": "\n".join(narrate_lines + lines[tail_start:]).strip() + "\n",     # 只给 narrate_pages 用,不落盘
+        "narrate_text": "\n".join(narrate_lines + [line for line in lines[tail_start:] if "needs_review" not in line]).strip() + "\n",     # 只给 narrate_pages 用,不落盘
         "path": f"subjects/{_slug(title)}--{_path_tag(key)}.md", "entity_keys": [key], "concept_keys": concept_keys, "doc_ids": docs,
         "point_ids": point_ids, "spec_ids": [str(f.get("id")) for f in facts + part_facts if f.get("id")][:200],
         "facts": len(facts), "relations": len(relations), "series": series_lines, "parts": n_parts, "part_facts": len(part_facts),
@@ -449,7 +449,7 @@ def build_timeline_page(series_key: str, rows: list[dict[str, Any]], *, L: dict[
     unit = next((str(r.get("unit") or "") for r in rows if r.get("unit")), "")
     rel_paths = {d: str(v.get("rel_path") or "") for d, v in documents.items()}
     title = f"{subject} · {concept}"
-    flags = sum(1 for r in rows if not _unresolved(r) and str(r.get("flag") or "").strip())
+    flags = sum(flag_status(r) == "abnormal" for r in rows)
     line = _series_line(rows, L)
     if flags:
         line += "," + L["out_of_range"].format(n=flags)

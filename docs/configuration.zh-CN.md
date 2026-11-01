@@ -11,24 +11,40 @@
 | `config/knowledge-base.env` | 应用路径、模型接口、凭据和处理参数 |
 | `deployment/compose/.env` | 容器镜像、解析后端策略、资源限制和本地模型服务 |
 
+从内置 VLM 部署升级时，会移除已退役容器的配置和对应的默认接口；自定义视觉接口继续保留。
+
 可参考 [应用配置模板](../config/knowledge-base.env.example) 和 [Compose 配置说明](../deployment/compose/README.md)。生成的文件包含凭据，已由 Git 忽略规则排除。应用优先读取 `config/knowledge-base.env`，不存在时兼容读取 `app/.env`；也可通过 `KB_ENV_FILE` 指定其他文件。
 
 修改环境配置后，应重启使用该配置的常驻应用服务。Linux 上，控制台和检索服务分别是 `carrel-web.service`、`carrel-search.service`；新启动的扫描和 worker 进程会读取更新后的文件。正在处理的任务应先完成，再安排重启，详见 [运维说明](operations.zh-CN.md)。检索服务自己的 `KB_SEARCH_*` 参数是例外：服务每分钟重读一次配置文件，改参数、换令牌都不用重启；监听地址和端口，以及文件里其他部分的参数（如各模型接口地址）仍需重启，服务进程环境里显式设置的参数优先于文件。
 
+如需运行本地向量和重排模型，运行 `./deploy.sh --with-local-models`。在控制台模型列表添加视觉接口，再按知识库选择；也可通过 `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 配置全局默认。
+
 ## 模型接口
 
-默认部署启动存储服务和 MinerU。通过 `--with-local-models` 可额外启动五个向量、重排与视觉模型服务。
+默认部署启动存储服务和 MinerU。通过 `--with-local-models` 可额外启动四个文本／视觉向量与重排模型服务。
 
 | 能力 | 配置 | 使用条件 |
 |---|---|---|
 | 文本向量 | `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL_ID`、`EMBEDDING_API_KEY`、`EMBEDDING_DIM` | 入库和向量检索需要 |
-| 图片描述 | `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY`、`KB_IMAGE_MAX_PIXELS` | 处理图片和文档插图时需要；图片送出前先缩到像素预算以内 |
+| 图片描述与表格复核 | 在控制台按知识库选择多模态模型；`VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 提供全局默认；`KB_IMAGE_MAX_PIXELS` 设置图片像素预算 | 处理图片和文档插图时需要；接口需支持图片输入 |
 | 图谱抽取与摘要 | 在控制台注册对话模型，再为知识库选择 | 启用建图时需要 |
 | 文本重排 | `RERANKER_BASE_URL`、`RERANKER_MODEL_ID`、`RERANKER_API_KEY` | 可选，未配置时使用检索融合顺序 |
 | 视觉向量 | `VISUAL_EMBEDDING_ENABLED`、`VISUAL_EMBEDDING_BASE_URL`、`VISUAL_EMBEDDING_MODEL_ID`、`VISUAL_EMBEDDING_DIM` 及其他 `VISUAL_EMBEDDING_*` | 可选，用于像素层面的检索；配套实现连接本地 vLLM |
 | 视觉重排服务 | `VISUAL_RERANKER_BASE_URL` | 可选的多模态重排；配置后自动参与检索融合 |
 
 文本向量使用 OpenAI 兼容的 embeddings API，图片描述和建图模型使用兼容的 chat API。重排使用 `/v1/rerank`，视觉向量使用 vLLM 的多模态 pooling 请求格式；各接口需使用对应的请求格式。
+
+模型注册继续自由填写地址和模型 ID。连通性检查、图谱调用和图片描述共用输出 token 上限与采样参数的兼容规则。接口明确报告参数不支持时，允许有限次数的调整重试；成功的调整在进程内按端点、模型、协议和请求参数隔离记录。
+
+自定义部署别名可在环境文件中使用 `KB_LLM_COMPAT_OVERRIDES`。条目按完整的 `model_id` 匹配，可进一步指定 `base_url` 和 `protocol`（默认 `openai`）。例如：
+
+```sh
+KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://models.example/v1","max_tokens_field":"max_completion_tokens","omit":["temperature","top_p"]}]'
+```
+
+`max_tokens_field` 选择输出上限字段，`omit` 移除可选生成参数，`set` 指定参数值，例如 `{"reasoning_effort":"low"}` 或 `{"thinking":{"type":"disabled"}}`。匹配条目按顺序应用。修改后重启应用进程。连通性检查需要收到完整且包含 `OK` 的回复；HTTP 400 会显示为错误。
+
+部署端使用不同的思考控制格式时，可配置 `"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`。它只在图谱抽取等明确要求关闭思考的调用中替换思考参数，图片描述和连通性检查保留原有思考行为。需要对所有调用生效的参数使用 `set`。
 
 使用公网文本重排时，`RERANKER_BASE_URL` 填 API 基础地址或完整的 `/rerank` 地址，`RERANKER_MODEL_ID` 填供应商的模型名，`RERANKER_API_KEY` 填 Bearer 密钥。请求包含 `model`、`query` 和 `documents`，响应包含带 `index`、`relevance_score` 的 `results`。模型名留空时通过 `/models` 自动发现，密钥留空时沿用本地无认证访问。
 
@@ -73,6 +89,7 @@
 | 类别 | 主要参数 | 用途 |
 |---|---|---|
 | 切块 | `max_tokens`、`overlap_tokens` | 在向量模型上下文限制内控制块大小与重叠 |
+| 多模态解析 | `vlm_model`、`vlm_prompt` | 图片、图表理解和表格复核共用的已注册模型及可选描述提示词 |
 | 图谱控制 | `graph_enabled`、`graph_auto_append`、`graph_profile` | 启用图谱、允许增量更新、保存自动归纳的场景画像 |
 | 类型与关系 | `graph_schema_active`、`graph_language` | 选择 LinkML 模式版本和输出语言，类型与关系从选定模式展开 |
 | 抽取 | `graph_unit_chunks`、`graph_max_gleanings` | 抽取单元大小与补充抽取轮数；标签采样自动计算 |
@@ -93,3 +110,11 @@
 - **模型数据：** 文档、切片和图片会发送给配置的接口。远程供应商会收到这些内容；本地接口在自有基础设施内处理。
 - **凭据：** 模型注册表密钥保存在本机状态库，API 不回显。更换模型端点后，复用密钥需要重新输入。环境文件与数据库包含部署凭据。
 - **可选依赖：** PDF 原图检索需安装 `pdf-images`，其许可证见 [第三方声明](../NOTICE.md)。
+
+### 图谱和标签版本历史
+
+`GRAPH_GC_KEEP_VERSIONS=3` 保留现行图谱和两个已完成的旧版，包括对应图索引和建图产物。最新可续跑任务另行保护。标签模式保留最近 10 版，以及仍被保留建图引用的更早版本。控制台的「版本对比」展示最近 20 份轻量对比报告，完整图谱清理后报告仍保留。
+
+对比会区分原文、模式、模型、纠正和管线变化。原文未变而声明消失时标记供复核，不自动恢复旧声明。增加保留数量只影响后续清理，不能恢复已经删除的版本。
+
+定点纠正的预览、提交和撤销 API 见[架构说明](architecture.zh-CN.md#定点纠正)。

@@ -59,7 +59,7 @@ class ConsoleServicesConfigTests(unittest.TestCase):
         self.assertEqual(parse_console_services(None), CONSOLE_SERVICES_DEFAULT)
         self.assertEqual(CONSOLE_SERVICES_DEFAULT, ("database", "mineru"))
         self.assertEqual(parse_console_services(""), ())
-        self.assertEqual(parse_console_services("vlm, database ,bogus,Reranker"), ("database", "vlm", "reranker"))
+        self.assertEqual(parse_console_services("vlm, database ,bogus,Reranker"), ("database", "reranker"))
         example = _read("config/knowledge-base.env.example")
         self.assertIn("KB_CONSOLE_SERVICES=database,mineru", example)
 
@@ -78,9 +78,9 @@ class ConsoleServicesConfigTests(unittest.TestCase):
 
         seen: list[str] = []
 
-        def fake_get(url, timeout=0):
+        def fake_get(url, timeout=0, **kwargs):
             seen.append(url)
-            return SimpleNamespace(status_code=200)
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [{"id": "vision-synthetic"}]})
 
         with mock.patch.object(service.requests, "get", side_effect=fake_get), \
                 mock.patch.object(service, "_probe_neo4j", return_value=False), \
@@ -92,8 +92,9 @@ class ConsoleServicesConfigTests(unittest.TestCase):
             h = service.health()
             self.assertEqual(h["managed"], ["database", "mineru"])
             self.assertTrue(h["qdrant"] and h["opensearch"] and h["mineru"])
-            for key in ("embedding", "vlm", "visual_embedding", "reranker", "visual_reranker"):
+            for key in ("embedding", "visual_embedding", "reranker", "visual_reranker"):
                 self.assertIsNone(h[key], key)
+            self.assertNotIn("vlm", h)
             self.assertFalse([u for u in seen if "://e/" in u or "://v/" in u or "://ve/" in u or "://r/" in u])
             self.assertEqual(h["mineru_backend"], "pipeline")          # nothing published, MINERU_BACKEND unset
             self.assertEqual(h["mineru_backend_source"], "default")
@@ -102,19 +103,23 @@ class ConsoleServicesConfigTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 service.restart_service("vlm", force=True)
             service._health_cache["value"] = None
-        # with a model row managed as well: the health probe and restart both cover it
+        # A stale local VLM setting must not restore the removed service monitor.
         with mock.patch.object(service.requests, "get", side_effect=fake_get), \
                 mock.patch.object(service, "_probe_neo4j", return_value=False), \
                 mock.patch.object(service, "_systemctl_show", return_value={}), \
                 mock.patch.object(service, "_maintenance_defers", return_value={}), \
                 mock.patch.object(service, "timer_health", return_value=[]), \
-                mock.patch.object(service, "settings", return_value=cfg(console_services=("database", "mineru", "vlm"))):
+                mock.patch.object(service, "settings", return_value=cfg(console_services=("database", "mineru", "vlm"), vlm_model_id="vision-synthetic")):
             service._health_cache["value"] = None
             h = service.health()
-            self.assertTrue(h["vlm"])
+            self.assertNotIn("vlm", h)
             self.assertIsNone(h["embedding"])
-            self.assertIn("http://v/health", seen)
-            self.assertEqual(service._all_service_containers()[-1], "carrel-vlm")
+            self.assertNotIn("http://v/v1/models", seen)
+            self.assertEqual(h["managed"], ["database", "mineru"])
+            self.assertEqual(service._all_service_containers(),
+                             ["carrel-qdrant", "carrel-opensearch", "carrel-neo4j", "carrel-mineru"])
+            with self.assertRaises(KeyError):
+                service.restart_service("vlm", force=True)
         service._health_cache["value"] = None
 
     def test_console_draws_buttons_only_for_managed_rows(self) -> None:

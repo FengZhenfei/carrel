@@ -60,7 +60,7 @@ python3 /usr/local/bin/carrel-mineru-detect.py --json \
   > "$SHARED_DIR/carrel-mineru.json.tmp"
 mv -f "$SHARED_DIR/carrel-mineru.json.tmp" "$SHARED_DIR/carrel-mineru.json"
 
-# With the local-models profile the parser shares the GPU with the five model
+# With the local-models profile the parser shares the GPU with the four model
 # servers, and deploy.sh points MINERU_WAIT_FOR_URL at the last of them: this
 # model is loaded only after theirs (servers that profile the memory at the
 # same time fail and restart; see docker-compose.yml). The download and the

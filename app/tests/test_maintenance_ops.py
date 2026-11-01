@@ -1208,10 +1208,13 @@ class WorkerScriptAndTimerTests(unittest.TestCase):
         self.assertNotIn("OnCalendar", timer)                 # 2026-09-09 switched to relative time: no wall clock, no time zone
         self.assertNotIn("07/30", timer)
         self.assertIn('KB_MAINT_DEFER_LIMIT:-12}', _repo_file("scripts/kb-graph-rebuild-check.sh"))
-        for rel in ("app/kb_server/static/app.js", "app/kb_server/static/index.html"):
+        # The schedule is explained in the configuration form, not repeated in
+        # the compact task card. Keep its Chinese and English descriptions aligned.
+        for rel in ("app/kb_server/static/i18n.js", "app/kb_server/static/index.html"):
             text = _repo_file(rel)
             self.assertIn("每 2 小时", text, rel)
             self.assertNotIn("每 30 分钟", text, rel)
+        self.assertIn("every 2 hours", _repo_file("app/kb_server/static/i18n.js"))
 
 
 class DeploymentFileTests(unittest.TestCase):
@@ -1303,7 +1306,7 @@ class DeploymentFileTests(unittest.TestCase):
         self.assertIn("logging: *default-logging", common)
         blocks = re.split(r"(?m)^  ([\w.-]+):\n", body.split("\nnetworks:\n", 1)[0])
         services = dict(zip(blocks[1::2], blocks[2::2]))
-        self.assertEqual(len(services), 9)
+        self.assertEqual(set(services), {"embedding", "reranker", "vl-embedding", "vl-reranker", "mineru", "qdrant", "neo4j", "opensearch"})
         for name, block in services.items():
             self.assertTrue("logging: *default-logging" in block or "<<: *vllm-common" in block, name)
 

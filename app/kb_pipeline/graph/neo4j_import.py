@@ -17,6 +17,7 @@ Community-related nodes and edges are no longer produced.
 from __future__ import annotations
 
 import json
+from .quality import relation_qualifier, relation_semantics, relation_quality, traversable_relation, fact_quality, flag_status
 import math
 import time
 from collections.abc import Iterable
@@ -485,7 +486,7 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
         src_uid, tgt_uid = entity_uid_by_key.get(r["source_key"]), entity_uid_by_key.get(r["target_key"])
         if not src_uid or not tgt_uid:
             raise RuntimeError(f"relationship endpoint not found: {r.get('source')!r}->{r.get('target')!r}")
-        rid = relation_id(r["source_key"], r["target_key"], r["predicate"])
+        rid = relation_id(r["source_key"], r["target_key"], r["predicate"], relation_qualifier(r))
         uid = graph_uid(kb, gv, "Relation", rid)
         props = common_props(source, gv, "Relation", rid)
         props.update(clean_props({
@@ -496,6 +497,9 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "strength_sum": r.get("strength_sum"), "evidence": r.get("evidence"), "cooccur": r.get("cooccur"),
             "npmi": r.get("npmi"), "combined_degree": r.get("combined_degree"),
             "type_violation": bool(r.get("type_violation")),
+            **{k: v for k, v in relation_semantics(r).items() if k != "conditions"},
+            "conditions_json": json.dumps(relation_semantics(r)["conditions"], ensure_ascii=False),
+            "quality_state": relation_quality(r), "traversable": traversable_relation(r),
             "boilerplate": bool(r.get("boilerplate")), "reference": bool(r.get("reference")),
             "evidence_kind": r.get("evidence_kind") or "body",
             "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
@@ -511,6 +515,9 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
                 "combined_degree": r.get("combined_degree"), "description": r.get("description"),
                 "npmi": r.get("npmi"), "cooccur": r.get("cooccur"), "strength_sum": r.get("strength_sum"),
                 "directed": bool(r.get("directed")), "type_violation": bool(r.get("type_violation")),
+                **{k: v for k, v in relation_semantics(r).items() if k != "conditions"},
+                "conditions_json": json.dumps(relation_semantics(r)["conditions"], ensure_ascii=False),
+                "quality_state": relation_quality(r), "traversable": traversable_relation(r),
                 "boilerplate": bool(r.get("boilerplate")), "reference": bool(r.get("reference")),
                 "evidence_kind": r.get("evidence_kind") or "body",
                 # 关系的时间与新旧:检索默认只走现行的边,回看某一天按起止、观察时间与被取代的时间判(currency.cypher_in_effect)
@@ -572,12 +579,18 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "conflict_group": f.get("conflict_group") or None,
             "superseded_by": f.get("superseded_by") or None, "superseded_on": f.get("superseded_on") or None,
             "observed": f.get("observed") or None, "source_kind": f.get("source_kind") or None,
+            "fact_kind": f.get("fact_kind") or "observation", "subject_origin": f.get("subject_origin"),
+            "time_basis": f.get("time_basis") or None, "observed_at": f.get("observed_at") or None,
+            "quality_state": fact_quality(f), "flag_status": flag_status(f), "extraction_evidence": f.get("evidence"),
             "doc_status": f.get("doc_status") or None, "lapses": bool(f.get("lapses")),
             # 质量状态(Codex 复审 N02):低置信、图文冲突、比较符、能不能当数比,和 Qdrant 投影一致
             "confidence": f.get("confidence") or None,
             "evidence_conflict": json.dumps(f["evidence_conflict"], ensure_ascii=False, sort_keys=True) if f.get("evidence_conflict") else None,
             "cmps": json.dumps(f["cmps"], ensure_ascii=False, sort_keys=True) if f.get("cmps") else None,
             "comparable": comparable_number(f) is not None,
+            "source_locator": json.dumps(f["source_locator"], ensure_ascii=False) if f.get("source_locator") else None,
+            "evidence_precision": f.get("evidence_precision"), "evidence_unit_ids": f.get("evidence_unit_ids"),
+            "subject_origin": f.get("subject_origin"), "value_json": f.get("value_json"),
         }))
         specs.append(props)
         for skey in dict.fromkeys([str(f.get("subject_key") or ""), *(str(k) for k in (f.get("subject_keys") or []))]):
@@ -587,9 +600,11 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
         pu = entity_uid_by_key.get(str(f.get("property_key") or ""))
         if pu:
             of_property_edges.append({"spec_uid": uid, "entity_uid": pu})
-        tu = unit_uid.get(str(f.get("unit_id") or ""))
-        if tu:
-            states_edges.append({"text_unit_uid": tu, "spec_uid": uid})
+        evidence_units = f.get("evidence_unit_ids") if "evidence_unit_ids" in f else [f.get("unit_id")]
+        for unit_id in dict.fromkeys(evidence_units or []):
+            tu = unit_uid.get(str(unit_id or ""))
+            if tu:
+                states_edges.append({"text_unit_uid": tu, "spec_uid": uid})
 
     expected_counts = {
         "documents": len(documents), "text_units": len(text_units), "qdrant_chunks": len(qdrant_chunks),

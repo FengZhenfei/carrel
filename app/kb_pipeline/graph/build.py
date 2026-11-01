@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -318,7 +319,7 @@ def extraction_fingerprint(base_fingerprint: str, *, deterministic_units: int,
 
 
 TABLE_PROFILES_FILE = "tables.json"
-PIPELINE_REVISION = "audit-20261025-v2"  # Resume guard only; does not invalidate LLM input caches.
+PIPELINE_REVISION = "knowledge-foundation-v1"  # Resume guard only; does not invalidate LLM input caches.
 
 
 def table_extractor(units: list[Any], schema: ExtractionSchema, paths: "GraphPaths"):
@@ -425,7 +426,7 @@ def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
         # because nothing about the extraction inputs changed.
         # 2026-10-24 破坏性改版(八个上层类、LinkML 模式、逐类型作用域、新的实体身份规则):local-graph-4,
         # 旧版本的建图记录一律判为配置已变。
-        "v": "local-graph-4",
+        "v": "local-graph-5",
         "mode": "entity_graph",
         "models": {step: spec.model_id for step, spec in sorted(specs.items())},
         "entity_types": list(schema.entity_types),
@@ -683,6 +684,7 @@ def _run_phase(settings: Settings, *, build_id: str, phase: str, label: str, fn,
         stage(f"{label} (done, skipped)")
         print(f"[graph] phase={phase} skipped: done in a previous run", flush=True)
         return None
+    started_at = int(time.time())
     stage(label)
     attempt = 0
     while True:
@@ -711,7 +713,7 @@ def _run_phase(settings: Settings, *, build_id: str, phase: str, label: str, fn,
             time.sleep(delay)
             stage(label)
     with db.connect(settings.state_db) as con:
-        db.mark_graph_phase_done(con, build_id, phase)
+        db.mark_graph_phase_done(con, build_id, phase, started_at=started_at)
     done.add(phase)
     return out
 
@@ -755,11 +757,14 @@ class _Progress:
         self.stage = stage
         self.interval = interval
         self.last = 0.0
+        self.last_head = ""
 
     def __call__(self, label: str, *, force: bool = False) -> None:
         now = time.time()
-        if force or now - self.last >= self.interval:
+        head = re.split(r"\d|\(", label, maxsplit=1)[0].strip()
+        if force or head != self.last_head or now - self.last >= self.interval:
             self.last = now
+            self.last_head = head
             self.stage(label)
 
 
@@ -822,6 +827,12 @@ def build_graph(
         # layer swallow the interruption the signal raises: check again at each checkpoint
         if interrupted.is_set():
             raise GraphBuildInterrupted("Graph build interrupted by a stop signal")
+
+    def stage(label: str) -> None:
+        if dry_run or build_id == "dry-run":
+            return
+        with db.connect(settings.state_db) as stage_con:
+            db.set_graph_build_stage(stage_con, build_id, label)
 
     try:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
@@ -908,6 +919,7 @@ def build_graph(
         if not incremental and not dry_run and doc_ids is None:
             from .schema_flow import ensure_schema_before_build
 
+            stage("Preparing labels")
             source, schema_auto = ensure_schema_before_build(settings, source, stop=stop_event)
             check_stop()
             if schema_auto is not None:
@@ -927,13 +939,10 @@ def build_graph(
         LLMCache.build_tag = build_id if not dry_run else None
 
         schema = extraction_schema_for(source)
-        # Endpoint account of the active schema version: endpoint pairs confirmed by the previous version pass the
-        # merge directly this time; at the end of the build the new account is written back to the same version
-        from .merge import confirmed_pairs
+        # The active schema receives a fresh endpoint observation ledger after the build.
         from .schema_flow import active_schema_entry_for
 
         schema_entry = active_schema_entry_for(settings, source.kb_id) if not dry_run else None
-        prior_pairs = confirmed_pairs((schema_entry or {}).get("observed") or {})
         result = {
             "dry_run": dry_run, "mode": "entity_graph", "source": source_key, "kb_id": source.kb_id,
             "pipeline_revision": PIPELINE_REVISION,
@@ -949,6 +958,8 @@ def build_graph(
             "base_version": str(base_row["graph_version"]) if base_row is not None else None,
             "paths": {"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir), "cache_file": str(paths.cache_file)},
             "models": {step: spec.name for step, spec in specs.items()},
+            "model_ids": {**{step: spec.model_id for step, spec in specs.items()},
+                          "embed_text": settings.embedding_model_id},
             "schema": {
                 # 建这一版图用的模式版本:检索服务的 /graph/schema 按它取 LinkML(之后切换了模式版本、还没重建时两者不同)
                 "version_id": str(schema_entry.get("id")) if schema_entry else None,
@@ -959,12 +970,9 @@ def build_graph(
             "steps": ["preflight"],
         }
 
-        def stage(label: str) -> None:
-            if dry_run or build_id == "dry-run":
-                return
-            with db.connect(settings.state_db) as stage_con:
-                db.set_graph_build_stage(stage_con, build_id, label)
-
+        if not dry_run:
+            with db.connect(settings.state_db) as con:
+                db.update_graph_build_manifest(con, build_id, result)
         progress = _Progress(stage)
         retry_cfg = _phase_retry_config()
 
@@ -1004,6 +1012,8 @@ def build_graph(
         else:
             input_manifest, build_chunks = prepared
         result["input"] = input_manifest
+        from .governance import context as correction_context
+        corrections_snapshot["_context"] = correction_context(schema, read_units(paths.units_file)) if not dry_run else {}
         result["document_status_sha"] = status_fingerprint(corrections_snapshot, [c.get("rel_path", "") for c in build_chunks], today=corrections_day)
         if not dry_run:
             with db.connect(settings.state_db) as con:
@@ -1169,8 +1179,9 @@ def build_graph(
             units_by_id = {u.unit_id: u for u in units}
             det = deterministic_extractor(settings, source, units)
             det_count = sum(1 for u in units if det.wants(u))
-            fingerprint = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema,
-                                         max_gleanings=source.graph_max_gleanings).fingerprint
+            extractor = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema,
+                                       max_gleanings=source.graph_max_gleanings)
+            fingerprint = extractor.fingerprint
             fingerprints = unit_cache.fingerprints(fingerprint, units, {u.unit_id for u in units if det.wants(u)},
                                                    table_extractor(units, schema, paths))
             with db.connect(settings.state_db) as con:
@@ -1208,7 +1219,7 @@ def build_graph(
                                        upper_parents=dict(schema.parent_types or upper_parents),
                                        type_parents=dict(schema.type_parents or {}),
                                        type_scopes=dict(schema.type_scopes or {}),
-                                       allowed_ends=merge_ends, unit_kinds=unit_kinds, prior_pairs=prior_pairs,
+                                       allowed_ends=merge_ends, unit_kinds=unit_kinds,
                                        exact_types=dict(DET_UPPER) if det_count else None)
             entities, relations = merged["entities"], merged["relations"]
             # 正文或别的表里直接写编号的提及并到带这个编号的实体上(全库只有一个实体带这个编号才并)
@@ -1311,6 +1322,8 @@ def build_graph(
                 "stats": {**stats, "units": len(units), "entities": len(entities), "relations": len(relations),
                           "mentions": len(mentions)},
             }
+            from .governance import save_state
+            save_state(graph, corrections_snapshot)
             write_graph_file(paths.graph_file, graph)
             return dict(graph["stats"])
 
@@ -1318,6 +1331,9 @@ def build_graph(
         if merge_stats is None:
             merge_stats = json.loads(paths.graph_file.read_text(encoding="utf-8")).get("stats") or {}
         result["graph"] = merge_stats
+        from .governance import restore_state
+        if not dry_run:
+            restore_state(json.loads(paths.graph_file.read_text(encoding="utf-8")), corrections_snapshot)
         result["steps"].append("merge")
 
         # ── 3b. Structured facts (table / list units) ──
@@ -1409,18 +1425,31 @@ def build_graph(
                 with db.connect(settings.state_db) as con:
                     rows = unit_cache.load(con, source.kb_id, fingerprints, facts=True)
                 all_facts: list[dict[str, Any]] = []
-                from .facts import apply_unit_quality
+                from .facts import apply_unit_quality, fact_id, retain_source_time, recover_observation_date
+                llm_fact_ids = {u.unit_id for u in todo_units}
                 requalified = {"ambiguous": 0, "evidence_conflicts": 0}
                 for u in fact_units:
                     unit_facts = list((rows.get(u.unit_id) or {}).get("facts") or [])
                     for f in unit_facts:
                         f["unit_id"] = u.unit_id
+                        retain_source_time(f, u)
+                        recover_observation_date(f, u.text)
+                        if u.unit_id in llm_fact_ids:
+                            f["id"] = fact_id(u.unit_id, f)
                     # Cached facts get their quality flags recomputed from the unit's current evidence metadata (Codex
                     # re-review N04): the unit id does not cover that metadata
                     for k, v in apply_unit_quality(unit_facts, u).items():
                         requalified[k] += v
                     all_facts.extend(unit_facts)
-                link_stats = link_facts(all_facts, graph.get("entities") or [], units_by_id=units_by_id)
+                # Resolve identity before removing rejected subjects, so another
+                # same-named entity cannot inherit their facts.
+                fact_subjects = list(graph.get("entities") or []) + list(corrections_snapshot.get("_rejected_entities") or [])
+                link_stats = link_facts(all_facts, fact_subjects, units_by_id=units_by_id)
+                rejected_keys = {e["key"] for e in corrections_snapshot.get("_rejected_entities") or []}
+                rejected_subject_facts = sum(f.get("subject_key") in rejected_keys for f in all_facts)
+                all_facts = [f for f in all_facts if f.get("subject_key") not in rejected_keys]
+                from .tables import deduplicate_cells
+                all_facts, link_stats["overlapping_cells_merged"] = deduplicate_cells(all_facts)
                 # Measurement facts re-homed (report corpora: measurements under lab sheets / indicators / diagnoses
                 # go to the examinee, marker words are split off into flag, period conditions go into the axis)
                 measure_stats = normalize_measurements(all_facts, graph.get("entities") or [], units_by_id=units_by_id,
@@ -1428,6 +1457,7 @@ def build_graph(
                 # 更正文件里驳回的事实不进序列、不进对账
                 corr = corrections_snapshot
                 all_facts, rejected_facts = apply_fact_corrections(all_facts, corr)
+                rejected_facts += rejected_subject_facts
                 # 事实骨架(方案 5.A):属性概念键(规范化 + 向量近邻 + 判同)与跨文档对账(序列 / 冲突,只标注)
                 from .concepts import build_concepts
                 from .reconcile import reconcile_facts
@@ -1472,6 +1502,8 @@ def build_graph(
                     "requalified": requalified,
                 }
                 graph.setdefault("stats", {})["facts"] = stats
+                from .governance import save_state
+                save_state(graph, corrections_snapshot)
                 write_graph_file(paths.graph_file, graph)
                 facts_phase_gate(failed, partial_ok=_env_flag("KB_GRAPH_FACTS_PARTIAL_OK"))
                 return stats
@@ -1484,6 +1516,9 @@ def build_graph(
         if facts_stats is None:
             facts_stats = (json.loads(paths.graph_file.read_text(encoding="utf-8")).get("stats") or {}).get("facts") or {"skipped": True}
         result["facts"] = facts_stats
+        if not dry_run:
+            restore_state(json.loads(paths.graph_file.read_text(encoding="utf-8")), corrections_snapshot)
+        result["correction_records"] = dict(corrections_snapshot.get("_outcomes") or {})
         result["steps"].append("facts")
 
         # ── 3c. View pages: subject / timeline / source / index (plan 5.C); deterministic projection + subject narration ──
@@ -1516,6 +1551,29 @@ def build_graph(
         compiled_graph = json.loads(paths.graph_file.read_text(encoding="utf-8"))
         result["temporal_refresh_on"] = next_change_day(
             list(compiled_graph.get("specs") or []) + list(compiled_graph.get("relations") or []), today=corrections_day)
+
+        # Compare before publication/GC, including full rebuilds. Never replay an old
+        # assertion just because its evidence still exists; report it for inspection.
+        from .comparison import compare_graphs, source_snapshot
+        result["model_identity"] = {k: {"name": v.name, "model_id": v.model_id, "protocol": v.protocol}
+                                    for k, v in specs.items()}
+        try:
+            with db.connect(settings.state_db) as con:
+                prior_build = db.latest_successful_graph_build(con, source_key)
+            if prior_build is not None and str(prior_build["graph_version"]) != graph_version:
+                prior_paths = graph_paths(settings, source, str(prior_build["graph_version"]))
+                if prior_paths.graph_file.exists() and prior_paths.units_file.exists():
+                    result["comparison"] = compare_graphs(
+                        json.loads(prior_paths.graph_file.read_text()), compiled_graph,
+                        before_sources=source_snapshot(read_units(prior_paths.units_file)),
+                        after_sources=source_snapshot(read_units(paths.units_file)),
+                        before_manifest=json.loads(prior_build["manifest_json"] or "{}"), after_manifest=result)
+                else:
+                    result["comparison"] = {"after": graph_version, "status": "baseline_unavailable"}
+            else:
+                result["comparison"] = {"after": graph_version, "status": "no_previous_version"}
+        except (OSError, ValueError, TypeError) as exc:
+            result["comparison"] = {"after": graph_version, "status": "error", "error": str(exc)}
 
         # ── 4. Write vectors ──
         def enrich() -> dict[str, Any]:
@@ -1629,8 +1687,8 @@ def build_graph(
                 output_dir=str(paths.output_dir), manifest=result,
             )
         with db.connect(settings.state_db) as con:
-            # Write the endpoint account back to the active schema version: the next merge passes them directly
-            # and re-extracting labels keeps the rules (schema_flow)
+            # Record endpoint usage as diagnostics for the next schema extraction;
+            # observed frequency never overrides predicate endpoint constraints.
             if not dry_run and doc_ids is None and schema_entry is not None:
                 from .schema_flow import record_schema_observation
 
@@ -1644,13 +1702,17 @@ def build_graph(
                         print(f"[graph] schema account write failed: {obs_exc!r}", flush=True)
                     result["schema_observed"] = {
                         "version_id": str(schema_entry.get("id")), "written": bool(written),
-                        "predicates": len(observed.get("edges") or {}), "confirmed": len(observed.get("confirmed") or []),
-                        "prior_applied": len(((merge_stats or {}).get("merge") or {}).get("endpoint_pairs_prior") or []),
+                        "predicates": len(observed.get("edges") or {}), "suggested": len(observed.get("suggested") or []),
                     }
                     print(f"[graph] schema account: version={schema_entry.get('id')} written={written} "
-                          f"confirmed_pairs={len(observed.get('confirmed') or [])}", flush=True)
+                          f"suggested_pairs={len(observed.get('suggested') or [])}", flush=True)
         if should_activate:
             print(f"[graph] build published kb={source.kb_id}({source.source_root}) version={graph_version}", flush=True)
+            try:
+                from .comparison import save_report
+                save_report(settings.graph_work_dir / "reports" / paths.source_short, result["comparison"])
+            except OSError as exc:
+                result["comparison_write_error"] = str(exc)
 
         # -- 8. Clean up -- the version is recorded as done: a failing clean-up step only goes into the manifest,
         # a stop signal ends the remaining clean-up, and neither changes the terminal state
@@ -1772,7 +1834,9 @@ def _cached_extract_summary(settings: Settings, source: KBSource, schema: Extrac
     units = read_units(paths.units_file)
     det = deterministic_extractor(settings, source, units)
     det_units = [u for u in units if det.wants(u)]
-    fingerprint = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema, max_gleanings=source.graph_max_gleanings).fingerprint
+    extractor = GraphExtractor(ChatClient(specs["extract"], cache=LLMCache(None)), schema,
+                               max_gleanings=source.graph_max_gleanings)
+    fingerprint = extractor.fingerprint
     fingerprints = unit_cache.fingerprints(fingerprint, units, {u.unit_id for u in det_units}, table_extractor(units, schema, paths))
     with db.connect(settings.state_db) as con:
         rows = unit_cache.load(con, source.kb_id, fingerprints)
@@ -1860,7 +1924,7 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     A stop signal (GraphBuildInterrupted / LLMInterrupted) is not swallowed as a failed step; it is passed on
     to the caller.
     Returns {"result": per-step results, "steps": step names to record, "errors": failed steps}."""
-    keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 2) or 2))
+    keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 3) or 3))
     result: dict[str, Any] = {}
     steps: list[str] = []
     errors: dict[str, str] = {}
@@ -1894,9 +1958,21 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     if grace_seconds > 0 and not dry_run:
         print(f"[graph] gc: waiting {grace_seconds}s for searches in flight before deleting superseded versions", flush=True)
         time.sleep(grace_seconds)
+    # Use the same timestamp fallback as workspace GC for custom build names. Otherwise their vector
+    # collections would outlive the workspace and their retained build records could be pruned early.
+    version_timestamps: dict[tuple[str, str], int] = {}
+    short = graph_collection_short_name(source.collection)
+    parent = settings.graph_work_dir / "work" / short
+    if parent.is_dir():
+        for version_dir in parent.iterdir():
+            try:
+                if version_dir.is_dir():
+                    version_timestamps[(short, version_dir.name)] = int(version_dir.stat().st_mtime)
+            except OSError:
+                continue
     gc_step("graph_gc", lambda: delete_old_graph_collections(
         q, source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=dry_run,
-        keep_latest=keep, discard_versions=discard, protect_versions=protect))
+        keep_latest=keep, discard_versions=discard, protect_versions=protect, version_timestamps=version_timestamps))
     gc_step("workspace_gc", lambda: _prune_graph_workspaces(
         settings, source, keep_version=graph_version, retention_days=settings.graph_gc_retention_days,
         keep_latest=keep, discard_versions=discard, protect_versions=protect, dry_run=dry_run), step=False)
@@ -1910,7 +1986,8 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     # card still has their sizes and figures after a rollback to them
     kept = {graph_version} | protect | {
         str(r.get("graph_version") or "") for r in (result.get("graph_gc") or {}).get("skipped_collections", [])
-        if r.get("reason") in ("aliased", "active_version", "within_keep_latest", "within_retention", "resumable")}
+        if r.get("reason") in ("aliased", "active_version", "within_keep_latest", "within_retention", "resumable",
+                               "unparseable_version_timestamp")}
 
     def prune_records() -> int:
         if dry_run:
