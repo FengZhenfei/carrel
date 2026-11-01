@@ -659,11 +659,12 @@ This is an image from a knowledge-base document; examine it carefully and output
 Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, formulas, whole slides; decide the kind first, then extract the information item by item.
 Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, watermarks and purely decorative elements, and extract only content that carries information.
 (独立图片文件会额外附上文件名作为主题参考)"></textarea>
-              <div class="hint">保存只更新策略,解析由自动扫描或「立即解析」触发;要应用到已入库内容用「整库重新解析」。</div></div>
+              <div class="hint">保存只更新策略,解析由自动扫描或「立即/继续解析」触发;要应用到已入库内容用「整库重新解析」。</div></div>
           </fieldset>
           <div class="cfg-actions">
             <button class="primary" id="cfg-save" disabled>保存配置</button>
-            <button id="cfg-parse-now" disabled>立即解析</button>
+            <button id="cfg-parse-now" disabled>立即/继续解析</button>
+            <button id="cfg-parse-pause" disabled>暂停解析</button>
             <button id="cfg-reparse" disabled>整库重新解析</button>
             <span class="note" id="cfg-note"></span>
             <button class="danger" id="cfg-delete" disabled>删除知识库</button>
@@ -822,7 +823,7 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 </dialog>
 <script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
 <script src="vendor/katex.min.js?v=20261001-1"></script>
-<script src="i18n.js?v=20261102-2"></script>
-<script src="app.js?v=20261102-7"></script>
+<script src="i18n.js?v=20261102-3"></script>
+<script src="app.js?v=20261102-8"></script>
 </body>
 </html>

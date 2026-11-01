@@ -82,6 +82,11 @@ def graph_build(kb_id: str) -> dict[str, Any]:
     return _wrap(service.trigger_graph_build, kb_id)
 
 
+@router.post("/kbs/{kb_id}/parse_pause")
+def parse_pause(kb_id: str) -> dict[str, Any]:
+    return _wrap(service.pause_parsing, kb_id)
+
+
 @router.post("/kbs/{kb_id}/graph_pause")
 def graph_pause(kb_id: str) -> dict[str, Any]:
     return _wrap(service.pause_graph_build, kb_id)
@@ -317,6 +322,8 @@ def _reject_bad_config(payload: dict[str, Any]) -> None:
     str_keys = {"vlm_prompt", "vlm_model", "graph_rebuild_interval", "graph_rebuild_new_chunk_pct",
                 "graph_rebuild_operator"}
     for key, value in (payload or {}).items():
+        if key == "parse_paused":
+            raise HTTPException(status_code=422, detail="Use the parsing pause or resume operation")
         if value is None and key not in SCHEMA_EFFECTIVE_KEYS and key not in ("graph_schema_versions", "graph_paused", "graph_schema_active"):
             continue
         if key in int_keys and not isinstance(value, int):

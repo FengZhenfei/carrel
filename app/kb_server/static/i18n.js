@@ -16,6 +16,12 @@ const I18N = (() => {
 })();
 
 const ZH_EN = {
+  "立即/继续解析": "Parse now / Resume",
+  "暂停解析": "Pause parsing",
+  "暂停中…": "Pausing…",
+  "解析已暂停": "Parsing paused",
+  "已继续解析": "Parsing resumed",
+  "请使用暂停或继续解析操作": "Use the parsing pause or resume operation",
   "图片理解": "Image understanding",
   "标签准备": "Preparing labels",
   "来源归属": "Source attribution",
@@ -166,7 +172,7 @@ const ZH_EN = {
   "常见类型:界面截图、架构图、流程图、拓扑图、数据图表、表格、照片、公式、整页幻灯片;先判断图片类型,再逐项提取图中信息。": "Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, formulas, whole slides; decide the kind first, then extract the information item by item.",
   "文字、数值、单位与编号一律按原样精确转录;忽略页眉页脚、页码、水印和纯装饰性元素,只提取承载信息的真实内容。": "Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, watermarks and purely decorative elements, and extract only content that carries information.",
   "(独立图片文件会额外附上文件名作为主题参考)": "(Standalone image files also get their file name as a topic hint)",
-  "保存只更新策略,解析由自动扫描或「立即解析」触发;要应用到已入库内容用「整库重新解析」。": "Saving only updates the policy; parsing is triggered by the automatic scan or “Parse now”. Use “Re-parse all” to apply it to indexed content.",
+  "保存只更新策略,解析由自动扫描或「立即/继续解析」触发;要应用到已入库内容用「整库重新解析」。": "Saving only updates the policy; parsing is triggered by the automatic scan or “Parse now / Resume”. Use “Re-parse all” to apply it to indexed content.",
   "保存配置": "Save",
   "立即解析": "Parse now",
   "整库重新解析": "Re-parse all",

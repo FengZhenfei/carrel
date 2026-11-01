@@ -23,6 +23,10 @@ class JobCancelled(RuntimeError):
     recognize it for a cancellation raised in its callback to pass through."""
 
 
+class JobPaused(JobCancelled):
+    """Yield at a safe parse checkpoint, retaining this job and its completed caches."""
+
+
 def service_unreachable(exc: BaseException | None) -> bool:
     """Whether this failure means "the service cannot be reached": it is not up yet, or it is restarting. Walks
     the exception chain looking for connection-level errors (connection refused, connection reset by the peer,

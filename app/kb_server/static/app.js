@@ -311,7 +311,9 @@ function renderKbNav() {
       const gs = kb.graph_status, gb = kb.graph_build || {};
       const running = jobs.filter(j => j.status === "running");
       let text = "", bar = null, tip = "";
-      if (busy && !fresh && reparsing > 0) {
+      if (kb.parse_paused) {
+        text = t(kb.parse_pausing ? "暂停中…" : "解析已暂停");
+      } else if (busy && !fresh && reparsing > 0) {
         // Re-parsed files stay indexed throughout; counting the whole KB would give "113/114 · 99%". Count
         // this round instead: how many files in the round (max seen), how many done, which phase the
         // current one is in
@@ -567,6 +569,7 @@ async function renderConfig() {
     $("#cfg-save").disabled = true;
     $("#cfg-parse-now").disabled = true;
     $("#cfg-reparse").disabled = true;
+    $("#cfg-parse-pause").disabled = true;
     $("#cfg-gsave").disabled = true;
     $("#cfg-gbuild").disabled = true;
     $("#cfg-gappend").disabled = true;
@@ -611,8 +614,10 @@ async function renderConfig() {
   // The action row is permanent and never adds or removes controls per state: unavailable ones are greyed
   // out, so the template stays the same in every state
   $("#cfg-save").disabled = !(active || draft);
-  $("#cfg-parse-now").disabled = !active;
-  $("#cfg-reparse").disabled = !active;
+  $("#cfg-parse-now").disabled = !active || kb.parse_pausing;
+  $("#cfg-reparse").disabled = !active || kb.parse_paused;
+  $("#cfg-parse-pause").disabled = !active || kb.parse_paused;
+  $("#cfg-parse-pause").textContent = t(kb.parse_pausing ? "暂停中…" : "暂停解析");
   // Graph save button: enabled when the switch is on, or the saved state is on (to persist turning it off);
   // the build button only when the switch is on
   const savedGraphOn = !!(kb.graph_status && kb.graph_status !== "disabled");
@@ -1092,12 +1097,23 @@ $("#cfg-save").addEventListener("click", async () => {
   await refreshOverview();
 });
 
+$("#cfg-parse-pause").addEventListener("click", async ev => {
+  const kb = selectedEntry();
+  if (!kb || kb.state !== "active" || kb.parse_paused) return;
+  ev.currentTarget.disabled = true;
+  try {
+    const result = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/parse_pause`, { method: "POST" });
+    toast(t(result.pausing ? "暂停中…" : "解析已暂停"));
+  } catch (e) { toast(t("暂停失败: ") + t(e.message)); }
+  await refreshOverview();
+});
+
 $("#cfg-parse-now").addEventListener("click", async () => {
   const kb = selectedEntry();
   if (!kb || kb.state !== "active") return;
   try {
-    await api(`/kbs/${encodeURIComponent(kb.kb_id)}/parse_now`, { method: "POST", body: {} });
-    toast(t("已触发扫描:空库全量解析,已有内容则处理增量文件"));
+    const result = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/parse_now`, { method: "POST", body: {} });
+    toast(t(result.resumed ? "已继续解析" : "已触发扫描:空库全量解析,已有内容则处理增量文件"));
     setTab("files");
   } catch (e) { toast(t("触发失败: ") + t(e.message)); }
   await refreshOverview();   // saves nothing, so it must not roll back unsaved edits either
@@ -1499,6 +1515,7 @@ function fileDot(f) {
 }
 
 function fileStatusCell(f) {
+  if (f.parse_paused && ["queued", "retry", "running"].includes(f.job_status)) return `<span class="badge">${t(f.job_status === "running" ? "暂停中…" : "已暂停")}</span>`;
   if (f.progress?.wait_reason === "stopping") return `<span class="badge">${t("正在停止")}</span>`;
   if (f.job_status === "paused") return `<span class="badge">${t("已暂停")}</span>`;
   if (f.job_status === "running") return `<span class="stage">${esc(progressLabel(f.progress, f.stage))}</span>${f.dot === "green" ? `<div class="hint" style="margin:2px 0 0">${t("旧切片可用")}</div>` : ""}`;
@@ -1920,7 +1937,8 @@ async function refreshJobDetail() {
   if (state.jobs.selected !== jobId) return;
   const j = d.job, f = d.file || {};
   const p = j.progress || {};
-  const statusLabel = p.wait_reason ? waitingLabel(p) : t(JOB_STATUS_ZH[j.status] || j.status);
+  const statusLabel = j.parse_paused ? t(j.status === "running" ? "暂停中…" : "已暂停")
+    : p.wait_reason ? waitingLabel(p) : t(JOB_STATUS_ZH[j.status] || j.status);
   const end = j.finished_at || (j.status === "running" ? Math.floor(Date.now() / 1000) : null);
   const meta = [
     [t("状态"), statusLabel],
@@ -1938,7 +1956,7 @@ async function refreshJobDetail() {
   meta.push(...modelRows(p.models));
   const ev = d.events || [];
   const timeline = ev.length ? ev.map((e, i) => {
-    const next = ev.slice(i + 1).find(n => n.kind === "stage" || ["done", "error", "retry", "cancelled"].includes(n.kind));
+    const next = ev.slice(i + 1).find(n => n.kind === "stage" || ["done", "error", "retry", "cancelled", "paused"].includes(n.kind));
     const dur = e.kind === "stage" ? fmtDur((next ? next.ts : (end || e.ts)) - e.ts) : "";
     const ts = new Date(e.ts * 1000).toLocaleTimeString(I18N.locale, { hour12: false });
     const tag = e.kind === "error" ? "[ERROR] " : e.kind === "retry" ? "[RETRY] " : "";

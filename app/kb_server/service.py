@@ -450,6 +450,8 @@ def overview() -> dict[str, Any]:
                 entry["state"] = "active"
                 stats = _kb_stats(con, entry["kb_id"])
                 entry.update(stats)
+                entry["parse_paused"] = db.parse_is_paused(con, entry["kb_id"])
+                entry["parse_pausing"] = entry["parse_paused"] and stats["jobs_active"] > 0
                 if stats["files_total"] == 0:
                     # Just enabled and the scan has not enrolled the files yet: the sidebar shows the count
                     # from disk for now (marked "waiting for the scan to enroll"), otherwise the moment of
@@ -669,6 +671,9 @@ def _kb_stats(con, kb_id: str) -> dict[str, int]:
         "AND j.status IN ('queued','retry','running'))",
         kb_id,
     )
+    if db.parse_is_paused(con, kb_id):
+        jobs_active = one("SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND status='running'", kb_id)
+        jobs_waiting = 0
     pending = max(0, total - indexed - failed)
     return {"files_total": total, "files_indexed": indexed, "files_failed": failed,
             "files_pending": pending, "jobs_active": jobs_active,
@@ -681,6 +686,7 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
     file produced or which parser version indexed it."""
     cfg = settings()
     with db.connect(cfg.state_db) as con:
+        parse_paused = db.parse_is_paused(con, kb_id)
         rows = con.execute(
             "SELECT file_id, rel_path, filename, size, mtime, status, content_version, indexed_version, "
             "indexed_parser_profile, last_seen_at, chunk_diag_json FROM files "
@@ -720,6 +726,7 @@ def kb_files(kb_id: str) -> list[dict[str, Any]]:
             "mtime": int(r["mtime"] or 0),
             "dot": dot,
             "job_status": job_status,
+            "parse_paused": parse_paused,
             "job_id": (str(job["job_id"]) if job else None),
             "progress": job_view(job, int(time.time())) if job else {},
             "stage": (str(job["stage"]) if job and job["stage"] else None),
@@ -1371,23 +1378,40 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return {"config": saved, "warnings": []}
 
 
+def pause_parsing(kb_id: str) -> dict[str, Any]:
+    cfg = settings()
+    with db.connect(cfg.state_db) as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT status FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+        if row is None:
+            raise KeyError(kb_id)
+        if str(row["status"]) != "active":
+            raise ValueError("The knowledge base is not enabled")
+        discovery.set_config(con, kb_id, {"parse_paused": True})
+        running = con.execute("SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND status='running'", (kb_id,)).fetchone()[0]
+    return {"paused": True, "pausing": bool(running)}
+
+
 def parse_now(kb_id: str) -> dict[str, Any]:
     """The "Parse now" action: an empty knowledge base = initial full load, existing content = process the
     incremental files; in essence it kicks one scan + worker round right away, exactly the same path as the
     automatic scan every minute."""
     cfg = settings()
     with db.connect(cfg.state_db) as con:
+        con.execute("BEGIN IMMEDIATE")
         row = con.execute("SELECT status FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
         if row is None:
             raise KeyError(kb_id)
         if str(row["status"]) != "active":
             raise ValueError("The knowledge base is not enabled")
+        resumed = db.parse_is_paused(con, kb_id)
+        discovery.set_config(con, kb_id, {"parse_paused": None})
     scan_kick, worker_kick = kick_scan(), kick_worker()
     if "unavailable" in (scan_kick, worker_kick):
         # When both systemd and the script fallback failed, this used to return kicked=true anyway and the
         # user believed parsing had started
         raise RuntimeError(f"Could not trigger the scan / worker (scan={scan_kick}, worker={worker_kick}); check the background services")
-    return {"kicked": True, "scan": scan_kick, "worker": worker_kick}
+    return {"kicked": True, "scan": scan_kick, "worker": worker_kick, **({"resumed": True} if resumed else {})}
 
 
 def delete_graph(kb_id: str) -> dict[str, Any]:
@@ -2107,6 +2131,8 @@ def job_detail(job_id: str) -> dict[str, Any]:
             raise KeyError(job_id)
         job = {k: row[k] for k in _JOB_FIELDS if k in row.keys()}
         job["progress"] = job_view(row, int(time.time()))
+        job["parse_paused"] = (row["job_type"] == "parse" and row["status"] in ("queued", "retry", "running")
+                               and db.parse_is_paused(con, str(row["kb_id"])))
         file_row = db.get_file_by_id(con, str(row["file_id"])) if row["file_id"] else None
         events = db.job_events(con, job_id)
         # Show the compensation task belonging to this parse, including its eventual completion.

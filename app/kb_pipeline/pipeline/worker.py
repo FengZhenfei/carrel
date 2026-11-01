@@ -12,7 +12,7 @@ import traceback
 from .. import db
 from .. import search_fts
 from ..config import Settings
-from ..parsers.errors import service_unreachable
+from ..parsers.errors import JobPaused, service_unreachable
 from ..parsers.source_guard import MissingSourceContent
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
@@ -176,6 +176,13 @@ def run_once(
             _rerun_if_asked(con, job)
             return result
         raise RuntimeError(f"unknown job_type={job_type}")
+    except JobPaused:
+        owned = db.yield_paused_parse(con, str(job["job_id"]), current_worker_id)
+        cancelled = (not owned and db.cancel_job_if_owned(
+            con, str(job["job_id"]), current_worker_id, "Cancelled from the console"))
+        con.commit()
+        outcome = "parse-paused" if owned else "cancelled" if cancelled else "superseded"
+        return f"{outcome}:{job['job_id']}"
     except JobCancelled as exc:
         # The user closed / deleted this KB: not a failure, no failure record, no backoff retry, straight to
         # the terminal state. But the job may no longer belong to this worker -- reclaimed as an orphan into

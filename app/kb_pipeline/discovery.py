@@ -77,6 +77,7 @@ DEFAULTS = {
     # 「以后还建不建」,这个是「现在先停一下」。不合并的理由见
     # graph/build.py::evaluate_rebuild 里的那段注释。
     "graph_paused": False,
+    "parse_paused": False,
     # New / changed documents are automatically appended to the current graph (checked every 30 minutes); a
     # full rebuild still follows the policy conditions below.
     "graph_auto_append": True,
@@ -106,7 +107,7 @@ CONFIG_KEYS = {
     # Server-side only: written by "pause graph build", cleared by "build / rebuild graph now" and "enable
     # knowledge graph". The console cannot write it directly (api._reject_bad_config blocks it) -- it is the
     # trace of an action, not an option to tick casually.
-    "graph_paused",
+    "graph_paused", "parse_paused",
 }
 
 SCHEMA = """

@@ -1644,6 +1644,10 @@ def claim_job_for_types(
         WHERE
           (status = 'queued' OR status = 'retry' OR (status = 'running' AND locked_until < ?))
           AND next_attempt_at <= ?
+          AND (job_type != 'parse' OR NOT EXISTS (
+            SELECT 1 FROM kb_sources ks WHERE ks.kb_id=jobs.kb_id
+            AND json_extract(CASE WHEN json_valid(ks.config_json) THEN ks.config_json ELSE '{{}}' END,
+                             '$.parse_paused')=1))
           {type_clause}
           {kb_clause}
         ORDER BY priority ASC, created_at ASC
@@ -1834,6 +1838,26 @@ def release_crashed_job(
     )
     con.commit()
     return "failed" if give_up else "retry"
+
+
+def parse_is_paused(con: sqlite3.Connection, kb_id: str) -> bool:
+    row = con.execute("SELECT config_json FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
+    try:
+        config = json.loads(row[0] or "{}") if row else {}
+    except (ValueError, TypeError):
+        return False
+    return isinstance(config, dict) and config.get("parse_paused") is True
+
+
+def yield_paused_parse(con: sqlite3.Connection, job_id: str, owner: str) -> bool:
+    # Retain the active dedupe key and cache run ID. The per-KB pause blocks claims.
+    cur = con.execute(
+        "UPDATE jobs SET status='queued', error=NULL, locked_by=NULL, locked_until=NULL, updated_at=? "
+        "WHERE job_id=? AND status='running' AND locked_by=? AND COALESCE(cancel_requested,0)=0",
+        (now_ts(), job_id, owner))
+    if cur.rowcount:
+        add_job_event(con, job_id, "paused", "Parsing paused")
+    return bool(cur.rowcount)
 
 
 def mark_job_paused(con: sqlite3.Connection, job_id: str, reason: str) -> None:

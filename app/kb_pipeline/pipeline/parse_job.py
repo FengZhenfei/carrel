@@ -48,7 +48,7 @@ TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 
 # The definition moved to parsers.errors (the router raises it too); the name is kept here so the worker and
 # the tests keep importing it from this module
-from ..parsers.errors import JobCancelled, NonRetryableParseError  # noqa: E402,F401
+from ..parsers.errors import JobCancelled, JobPaused, NonRetryableParseError  # noqa: E402,F401
 
 
 def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.Row) -> str:
@@ -66,6 +66,13 @@ def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.
     except Exception:
         if committed[0]:
             _withdraw_cancel(con, job)
+        else:
+            try:
+                paused = db.parse_is_paused(con, str(job["kb_id"]))
+            except Exception:
+                paused = False  # A failed pause lookup must not hide the original error.
+            if paused:
+                raise JobPaused("Parsing paused")
         raise
 
 
@@ -212,10 +219,13 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         try:
             owner = job["locked_by"] if "locked_by" in job.keys() else None
             cancelled = db.job_cancel_requested(con, str(job["job_id"]), str(owner) if owner else None)
+            paused = db.parse_is_paused(con, str(job["kb_id"]))
         except Exception:
             return
         if cancelled:
             raise JobCancelled(f"job {job['job_id']} cancelled by operator")
+        if paused:
+            raise JobPaused("Parsing paused")
 
     def stage(text: str, *, force: bool = False, models=None) -> None:
         # Progress checkpoint for the web console; failures must never take
