@@ -1436,6 +1436,13 @@ $("#cfg-delete").addEventListener("click", async () => {
 
 /* ── files tab: table + filter / sort / pagination ─────────────── */
 const FILES_PAGE = 50;
+function filePageNumbers(current, total) {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  if (current <= 4) return [1, 2, 3, 4, 5, null, total];
+  if (current >= total - 3) return [1, null, total - 4, total - 3, total - 2, total - 1, total];
+  return [1, null, current - 1, current, current + 1, null, total];
+}
+
 const FILE_SORTS = {
   path: (a, b) => a.rel_path.localeCompare(b.rel_path, "zh-CN"),
   size: (a, b) => (a.size || 0) - (b.size || 0),
@@ -1593,13 +1600,23 @@ function renderFilesTable() {
     }));
   }
   const pagerHtml = pages > 1
-    ? `<button class="sm ghost" id="fl-prev" ${state.files.page <= 1 ? "disabled" : ""}>${t("上一页")}</button>
-       <span>${state.files.page} / ${pages}</span>
-       <button class="sm ghost" id="fl-next" ${state.files.page >= pages ? "disabled" : ""}>${t("下一页")}</button>`
+    ? `<nav class="pager-pages" aria-label="${t("文件分页")}">${filePageNumbers(state.files.page, pages).map(n => n === null
+        ? `<span class="pager-gap" aria-hidden="true">…</span>`
+        : `<button type="button" class="sm ghost" data-page="${n}" aria-label="${t("第 {0} 页", n)}"${n === state.files.page ? ' aria-current="page"' : ""}>${n}</button>`).join("")}</nav>
+       ${pages > 7 ? `<form class="pager-jump" id="fl-jump"><input type="number" name="page" min="1" max="${pages}" step="1" required inputmode="numeric" aria-label="${t("页码")}" placeholder="${t("页码")}"><button type="submit" class="sm ghost">${t("跳转")}</button></form>` : ""}`
     : "";
   if (setHtml($("#fl-pager"), pagerHtml)) {
-    $("#fl-prev")?.addEventListener("click", () => { state.files.page--; renderFilesTable(); });
-    $("#fl-next")?.addEventListener("click", () => { state.files.page++; renderFilesTable(); });
+    $$("[data-page]", $("#fl-pager")).forEach(b => b.addEventListener("click", () => {
+      state.files.page = Number(b.dataset.page);
+      renderFilesTable();
+    }));
+    $("#fl-jump")?.addEventListener("submit", ev => {
+      ev.preventDefault();
+      const n = Number(ev.currentTarget.elements.page.value);
+      if (!Number.isInteger(n) || n < 1 || n > pages) return;
+      state.files.page = n;
+      renderFilesTable();
+    });
   }
 }
 $("#fl-q").addEventListener("input", () => { state.files.page = 1; renderFilesTable(); });

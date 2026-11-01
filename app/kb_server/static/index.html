@@ -275,7 +275,12 @@ td .err{color:var(--red-text);font-size:12px;white-space:pre-wrap;word-break:bre
 .fn-link{cursor:pointer;color:var(--text);text-decoration:underline dotted var(--line-strong);text-underline-offset:3px}
 .fn-link:hover{color:var(--accent)}
 td.path{word-break:break-all;min-width:220px}
-.pager{display:flex;gap:6px;align-items:center;justify-content:flex-end;margin-top:10px;font-size:12px;color:var(--faint)}
+.pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:flex-end;margin-top:10px;font-size:12px;color:var(--faint)}
+.pager-pages,.pager-jump{display:flex;gap:6px;align-items:center;margin:0}
+.pager-pages button{min-width:30px;font-variant-numeric:tabular-nums}
+.pager-pages button[aria-current="page"]{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+.pager-gap{padding:0 2px}
+.pager-jump input[type=number]{width:64px;min-width:0;padding:3px 6px;font-size:12px;height:26px}
 .empty-state{padding:26px 16px;text-align:center;color:var(--muted);font-size:13px}
 .act{display:inline-flex;gap:6px;white-space:nowrap}
 /* File rows reserve two note lines; long paths and statuses stay inside the same height. */
