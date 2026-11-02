@@ -990,7 +990,7 @@ const DIAGNOSTIC_LABELS = {
   long_visual: ["{0} 张图片的识别文本超过预算 {1} 倍", "{0} images have recognized text over {1}× the budget"],
   headerless_tables: ["{0}/{1} 个表格切片缺少表头", "{0}/{1} table chunks have no header"],
   table_source_alignment: ["{0} 处表格的部分行列归属未确认，原文已保留", "Source text retained; table regions with unverified cell alignment: {0}"],
-  visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留完整事实", "{0} visual responses reached the output limit; only complete facts were retained"]
+  visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留可用结果", "{0} visual responses reached the output limit; available results were retained"]
 };
 // Length statistics alone do not establish missing or broken meaning.
 function diagnosticTone(reason) {

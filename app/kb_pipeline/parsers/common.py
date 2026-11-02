@@ -288,7 +288,10 @@ def grid_to_markdown(rows: list[list[str]] | None) -> str | None:
     width = max(len(row) for row in rows)
     if width <= 0:
         return None
-    padded = [row + [""] * (width - len(row)) for row in rows]
+    # HTML grids already escape bars; VLM grids contain literal bars and newlines.
+    # Keep repeated serialization stable and keep one physical line per row.
+    padded = [[re.sub(r"(?<!\\)\|", r"\\|", str(c)).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+               for c in row] + [""] * (width - len(row)) for row in rows]
     lines = ["| " + " | ".join(padded[0]) + " |",
              "| " + " | ".join(["---"] * width) + " |"]
     lines.extend("| " + " | ".join(row) + " |" for row in padded[1:])

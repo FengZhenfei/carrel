@@ -14,7 +14,15 @@ from ..models import ParsedBlock
 
 def _norm(text: str) -> str:
     text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or ""))
+    # Typographic hyphens are spelling variants; mathematical minus is not.
+    text = text.replace("‐", "-").replace("‑", "-")
     return normalize_ranges(text)
+
+
+def table_evidence_text(text: str) -> str:
+    """Remove table markup, preserving literal bars inside cells."""
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    return _norm(re.sub(r"(?<!\\)\|", " ", text).replace(r"\|", "|"))
 
 
 def normalize_ranges(text: str) -> str:
@@ -131,8 +139,8 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                 if context:
                     block.metadata["visual_source_context"] = context
                 continue
-            got = _norm("\n".join([block.table_markdown or block.text, block.caption or "",
-                                    str(block.metadata.get("source_footnote") or "")])).replace("|", "")
+            got = table_evidence_text("\n".join([block.table_markdown or block.text, block.caption or "",
+                                    str(block.metadata.get("source_footnote") or "")]))
             # get_text(sort=True) inserts spaces between cells. Compare individual
             # spans, not whole rows joined across Markdown column separators.
             native_spans = [s for b in page.get_text("dict", clip=rect).get("blocks", [])

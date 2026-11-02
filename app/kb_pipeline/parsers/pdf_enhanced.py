@@ -18,6 +18,7 @@ from .table_repair import review_pdf_tables
 from .pdf_evidence import add_pdf_region_evidence, supplement_visible_forms
 from .pdf_code import recover_native_code
 from .pdf_table_layout import restore_ruled_continuation_columns
+from .pdf_images import restore_pdf_images
 from .visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text, tidy_visual_blocks
 
 
@@ -103,6 +104,7 @@ def parse_pdf_enhanced(
 
     recover_native_code(blocks, path)
     blocks = supplement_visible_forms(blocks, path)
+    restore_pdf_images(blocks, path, cache_dir, (vlm_options or {}).get("max_pixels"))
     table_blocks = [b for b in blocks if b.block_type == "table" and b.metadata.get("table_flags")]
     if table_blocks:
         repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
@@ -165,7 +167,7 @@ def _table_lines(md: str) -> tuple[list[str], list[str], list[str]]:
 
 
 def _cells(row: str) -> list[str]:
-    return [c.strip() for c in row.strip().strip("|").split("|")]
+    return [c.strip() for c in re.split(r"(?<!\\)\|", row.strip().strip("|"))]
 
 
 def _is_separator(row: str) -> bool:

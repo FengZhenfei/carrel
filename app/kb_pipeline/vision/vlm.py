@@ -578,10 +578,36 @@ def caption_image(
                 or (data.get("decorative") is True and data.get("confidence") == "high")):
             data = None
 
-    if data is not None and data.get("runaway"):
+    length_retried = False
+    _log_caption_usage(resp, max_tokens)
+    if (finish_reason == "length" and data and not data.get("runaway") and max_tokens < 8192
+            and any(data.get(k) for k in ("summary", "facts", "text_verbatim", "entities"))):
+        # One larger-budget attempt, including recoverable JSON prefixes. Do
+        # not spend more tokens on detected repetition; that uses the existing
+        # degraded retry below. A failed retry cannot erase a usable prefix.
+        length_retried = True
+        retry_body = copy.deepcopy(request.body)
+        token_key = "max_completion_tokens" if "max_completion_tokens" in retry_body else "max_tokens"
+        retry_body[token_key] = min(8192, max_tokens * 2)
+        try:
+            retry_response = _compatible_completion(client, CompatibleRequest(base_url, model_id, "openai", retry_body))
+            _log_caption_usage(retry_response, retry_body[token_key])
+            candidate = parse_jsonish(retry_response.choices[0].message.content or "")
+            candidate_finish = str(getattr(retry_response.choices[0], "finish_reason", "") or "")
+            if (not candidate.get("runaway") and any(candidate.get(k) for k in ("summary", "facts", "text_verbatim", "entities"))
+                    and (candidate_finish == "stop" or len(json.dumps(candidate)) >= len(json.dumps(data or {})))):
+                data, finish_reason = candidate, candidate_finish
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            print(f"[vlm] output-limit retry failed ({type(exc).__name__}); retaining first result", flush=True)
+        data = data or parse_jsonish(content)
+        data["vlm_length_retry"] = True
+
+    if data is not None and data.get("runaway") and not length_retried:
         print(f"[vlm] caption ran away ({data.get('runaway_dropped')} repeated items); degraded retry", flush=True)
         data = None
-    if data is None:
+    if data is None and not length_retried:
         # Unrecoverable output -- usually a repetition loop that truncated
         # mid-string beyond repair. One degraded retry: stronger anti-repeat
         # and verbatim disabled, trading the transcription for a clean
@@ -634,6 +660,14 @@ def caption_image(
     elif cache_json:
         print(f"[vlm] not caching the {'truncated' if data.get('vlm_truncated') else 'degraded' if degraded else 'empty'} result; retried next time", flush=True)
     return data
+
+
+def _log_caption_usage(response, budget: int) -> None:
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    print("[vlm] " + json.dumps({"finish_reason": getattr(response.choices[0], "finish_reason", None),
+        "output_budget": budget, "completion_tokens": getattr(usage, "completion_tokens", None),
+        "reasoning_tokens": getattr(details, "reasoning_tokens", None)}), flush=True)
 
 
 def caption_images_parallel(

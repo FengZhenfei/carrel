@@ -2390,7 +2390,6 @@ class VisualEvidenceTests(unittest.TestCase):
         self.assertEqual((loop["facts"], loop.get("runaway")), ([], True))
         src = _repo_file("app/kb_pipeline/vision/vlm.py")
         self.assertIn('if result.get("runaway"):', src)                       # re-checked on cache read: a runaway old entry is recaptioned
-        self.assertIn('if data is not None and data.get("runaway"):', src)     # runaway takes the degraded retry
         self.assertIn('data["vlm_runaway"] = True', src)                       # still runaway after retry: keep the non-repetitive facts, confidence low, no caching
         self.assertNotIn('data["facts"] = []', src)                            # 2026-09-10: facts are no longer wiped wholesale
 

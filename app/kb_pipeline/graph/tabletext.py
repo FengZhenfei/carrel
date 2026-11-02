@@ -63,9 +63,9 @@ def _md_cells(line: str) -> list[str]:
     s = line.strip()
     if s.startswith("|"):
         s = s[1:]
-    if s.endswith("|"):
+    if s.endswith("|") and not s.endswith(r"\|"):
         s = s[:-1]
-    return [c.strip() for c in s.split("|")]
+    return [c.strip().replace(r"\|", "|") for c in re.split(r"(?<!\\)\|", s)]
 
 
 def _col_name(idx: int) -> str:
@@ -202,4 +202,5 @@ def table_render_tag(text: str) -> str:
     rendered, realigned = _render(text, WIDE_TABLE_MIN_COLUMNS)
     if rendered is None:
         return ""
-    return RENDER_TAG_REALIGNED if realigned else RENDER_TAG
+    tag = RENDER_TAG_REALIGNED if realigned else RENDER_TAG
+    return tag + "+literal-pipe-v1" if r"\|" in text else tag

@@ -25,7 +25,7 @@ from ..vision.images import file_hash
 from .common import grid_to_markdown, html_table_to_grid, html_table_spans
 from .table_check import GLUED_KINDS, expand_glued_rows, high_confidence
 from .errors import JobCancelled
-from .pdf_evidence import normalize_ranges, _span_present, _norm as _evidence_norm
+from .pdf_evidence import normalize_ranges, _span_present, table_evidence_text
 
 TABLE_ROWS_PROMPT = """This image is a table cropped from a document. Some cells contain several lines stacked vertically (one line per test condition), and an OCR pass merged those lines into one string.
 The table has {width} columns; its header row reads: {header}.
@@ -328,7 +328,7 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 # Passing unchanged rows does not prove that missing source text
                 # was recovered. Preserve the review flag and source supplement
                 # until every originally missing span is represented.
-                accepted = all(verified) and all(_span_present(s, _evidence_norm(block.text).replace("|", ""))
+                accepted = all(verified) and all(_span_present(s, table_evidence_text(block.text))
                     for s in block.metadata.get("table_missing_spans") or [])
                 block.metadata["table_review"] = {"status": "accepted" if accepted else "partial", "model": model_id,
                                                    "rows_verified": sum(verified), "rows_total": len(verified)}
@@ -338,7 +338,9 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                     original = block.text
         if not accepted:
             stats["unverified"] += 1
-            block.metadata.setdefault("table_review", {"status": "unverified", "model": model_id})
+            reason = ("missing_model_credentials" if not api_key else "missing_image" if not image.is_file()
+                      else "ambiguous_row_keys" if not alignable else "verification_incomplete")
+            block.metadata.setdefault("table_review", {"status": "unverified", "model": model_id, "reason": reason})
             # Retain independently read text as evidence, without inventing a cell
             # assignment. This also works when no VLM is configured.
             missing = block.metadata.get("table_missing_spans") or []
