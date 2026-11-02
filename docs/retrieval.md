@@ -493,6 +493,11 @@ channels and source positions for citation. Entries include:
 
 ## Evaluate retrieval
 
+The [0.4.0 capability evaluation](evaluations/capability-evaluations-0.4.0.md) covers
+retrieval and answer quality, temporal evidence, conflicts, ontology evolution,
+graph rebuild stability, latency, and token usage. It includes the test setup
+and anonymized question-and-answer examples.
+
 The [0.3.0 retrieval evaluation](evaluations/retrieval-evaluations-0.3.0.md) reports
 hit@5, MRR, cross-document evidence coverage, and latency across graph and
 reranking configurations, with the models and test conditions used.

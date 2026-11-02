@@ -224,6 +224,8 @@ Skill 客户端可用 `docs --kb 库ID --name "文件名"` 找文档，再用 D 
 
 ## 检索评测
 
+[0.4.0 知识库能力测评](evaluations/capability-evaluations-0.4.0.zh-CN.md) 包含检索与回答质量、时序证据、冲突、本体演进、图谱重建稳定性、耗时与 token 用量，并列出测试条件和脱敏问答示例。
+
 [0.3.0 检索评测报告](evaluations/retrieval-evaluations-0.3.0.zh-CN.md) 列出了模型与测试条件，以及不同图谱、重排配置下的 hit@5、MRR、跨文档证据覆盖和耗时。
 
 题集与结果放在 `runtime/eval/`，不提交到 Git。准备好题集后执行：

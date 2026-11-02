@@ -17,7 +17,9 @@ manages knowledge bases, models, and processing tasks. A bundled
 [search skill](skills/carrel-search/SKILL.md) connects agents such as Claude
 Code and Codex to the retrieval service.
 
-[Features](#features) · [Evaluation](#retrieval-evaluation) · [Design](#design) · [Quick start](#quick-start) · [Agent integration](#agent-integration) · [Documentation](#documentation)
+**[0.4.0 capability evaluation — full technical report](docs/evaluations/capability-evaluations-0.4.0.md)**
+
+[Features](#features) · [Evaluation](#capability-evaluation) · [Design](#design) · [Quick start](#quick-start) · [Agent integration](#agent-integration) · [Documentation](#documentation)
 
 ## Features
 
@@ -39,16 +41,23 @@ Code and Codex to the retrieval service.
 - **Web console:** configure processing, inspect chunks and graphs, track
   tasks, and manage services. Available in English and Chinese.
 
-## Retrieval evaluation
+## Capability evaluation
 
-The 0.3.0 evaluation compared retrieval strategies on 176 documents and 99
-questions. With the graph enabled, dual reranking increased image hit@5 from
-4/8 to 7/8. With text reranking, enabling the graph increased complete source
-coverage for cross-document questions from 5/10 to 8/10.
+The 0.4.0 evaluation covers **5 knowledge bases and 3,587 files**, with 275
+source-grounded retrieval questions, 75 questions in an answer comparison, and 100 synthetic
+questions for temporal, conflict, ontology, and other evidence-handling scenarios.
 
-The full pipeline achieved 88.46% hit@5 and 0.7327 MRR@12 on 78 ranking
-questions. See the [evaluation report](docs/evaluations/retrieval-evaluations-0.3.0.md)
-for model configurations, comparison results, and latency.
+- **Source retrieval:** evidence Hit@5 of **92.36%** and MRR@10 of **0.7979**.
+- **Cross-document answers:** Skill follow-up queries increased the share of
+  answers covering all required points from **60% to 76%** on 25 real-document
+  questions.
+- **Graph and ontology behavior:** source traceability, temporal cutoffs,
+  conflicting claims, topic evolution, and graph rebuilds are evaluated
+  separately, including differences between cache reuse and fresh extraction.
+
+The [full technical report](docs/evaluations/capability-evaluations-0.4.0.md) includes
+models and test conditions, retrieval ablations, anonymized question-and-answer
+examples, graph stability results, latency, and token usage.
 
 ## How it works
 
@@ -170,7 +179,7 @@ for authentication, response status, and citations.
 | [Configuration](docs/configuration.md) | Model endpoints, folders, per-base settings, and access control |
 | [Architecture](docs/architecture.md) | Parsing, graph construction, retrieval, and code layout |
 | [Retrieval and API](docs/retrieval.md) | Agent setup, endpoints, evidence status, and evaluation |
-| [Retrieval evaluation (0.3.0)](docs/evaluations/retrieval-evaluations-0.3.0.md) | Models, test conditions, graph and reranking comparisons, and latency |
+| [Capability evaluation (0.4.0)](docs/evaluations/capability-evaluations-0.4.0.md) | Full technical report: retrieval, answers, temporal evidence, conflicts, ontology, rebuild stability, latency, and token usage |
 | [Operations and development](docs/operations.md) | Console, CLI, scheduling, troubleshooting, and tests |
 | [Test scope](docs/testing.md) | Shared regression contracts, deployment-specific checks, and live evaluations |
 | [Example setup](docs/example-setup.md) | The author's installation on a DGX Spark, a Mac that syncs the documents, and lighter alternatives |
