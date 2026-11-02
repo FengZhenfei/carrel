@@ -29,6 +29,7 @@ const saveHandler = source.slice(saveStart, source.indexOf('\n});', saveStart) +
 const harness = `
 let formBase = null, schemaResultApplied = '';
 const draftCache = new Map(), elements = new Map(), calls = [], notices = [];
+const models = [{name: 'vision-a', protocol: 'openai'}];
 let selected = {dir: 'Library A', state: 'unenrolled'};
 const state = {draft: selected.dir, cfgKey: null, llms: [], graphSchema: {}, tabByKb: {}};
 function $(id) {
@@ -40,13 +41,14 @@ function $(id) {
   return elements.get(id);
 }
 const selectedEntry = () => selected, t = s => s, kbDot = () => '', kbStateText = () => '';
+const esc = s => s;
 const renderAdoptRow = () => {}, updateTabs = () => {}, syncTuneButton = () => {};
 const setSampleCount = () => {}, setChunkHint = () => {}, setOverlapHint = () => {};
 const refreshSchemaTaskResult = () => {}, refreshTab = () => {}, remember = () => {};
 const refreshOverview = async () => {}, llmOptions = () => '', restoreDraft = () => false;
 const setSchemaView = () => { state.graphSchema = {dirty: false, active: ''}; };
 const toast = msg => notices.push(msg);
-let read = async path => path === '/llms' ? [] : {};
+let read = async path => path === '/llms' ? models : {};
 async function api(path, options) {
   if (options) { calls.push({path, ...options}); return {}; }
   return read(path);
@@ -57,30 +59,41 @@ const checks = `
   // Saving before defaults arrive must not submit values from another library.
   let release;
   const gate = new Promise(resolve => release = resolve);
-  read = async path => { await gate; return path === '/llms' ? [] : {}; };
+  read = async path => { await gate; return path === '/llms' ? models : {}; };
   const pending = renderConfig();
+  $('#cfg-max').value = 512;
+  $('#cfg-ov').value = 64;
+  $('#cfg-vlm').value = 'vision-a';
   await $('#cfg-save').click();
   assert.equal(calls.length, 0);
+  assert.match(notices.at(-1), /载入中/);
   release(); await pending;
   $('#cfg-max').value = 512;
   $('#cfg-ov').value = 64;
+  // A ready form still needs an explicit vision model before enrollment.
+  $('#cfg-vlm').value = '';
+  await $('#cfg-save').click();
+  assert.equal(calls.length, 0);
+  assert.match(notices.at(-1), /请选择多模态模型/);
+  $('#cfg-vlm').value = 'vision-a';
   await $('#cfg-save').click();
   assert.equal(calls.length, 1, 'a ready new-library form must reach enrollment');
   assert.equal(calls[0].path, '/enroll');
   assert.equal(calls[0].body.dir, 'Library A');
   assert.equal(calls[0].body.config.max_tokens, 512);
   assert.equal(calls[0].body.config.overlap_tokens, 64);
+  assert.equal(calls[0].body.config.vlm_model, 'vision-a');
   assert.equal(calls[0].body.config.graph_enabled, false);
   assert.equal(state.draft, null);
 
   // A late response for A must not overwrite B's defaults or readiness.
   state.draft = selected.dir; state.cfgKey = null;
   const late = new Promise(resolve => release = resolve);
-  read = async path => { await late; return path === '/llms' ? [] : {}; };
+  read = async path => { await late; return path === '/llms' ? models : {}; };
   const oldRender = renderConfig();
   selected = {dir: 'Library B', state: 'unenrolled', dir_defaults: {max_tokens: 600}};
   state.draft = selected.dir; state.cfgKey = null;
-  read = async path => path === '/llms' ? [] : {};
+  read = async path => path === '/llms' ? models : {};
   await renderConfig();
   release(); await oldRender;
   assert.equal(formBase.dir, 'Library B');
@@ -95,9 +108,11 @@ const checks = `
   read = async () => { throw new Error('temporary hint failure'); };
   await renderConfig();
   assert.equal(formBase.dir, 'Library B');
+  $('#cfg-vlm').value = 'vision-a';
   await $('#cfg-save').click();
   assert.equal(calls.length, 2);
   assert.equal(calls[1].body.dir, 'Library B');
+  assert.equal(calls[1].body.config.vlm_model, 'vision-a');
 })()
 `;
 vm.runInNewContext(harness + definitions + '\n' + saveHandler + '\n' + checks, {assert})

@@ -3375,6 +3375,7 @@ class PdfTextLayerTests(unittest.TestCase):
     def test_parse_job_picks_the_mode_from_the_attempts_left(self) -> None:
         """With retries left a transient failure makes the job retry, and the last attempt degrades in place;
         callers outside a job (the chunk preview) read only the cache by default."""
+        from kb_pipeline import db
         from kb_pipeline.pipeline import parse_job
 
         seen = []
@@ -3387,17 +3388,25 @@ class PdfTextLayerTests(unittest.TestCase):
             raise Stop()
 
         def fake_pdf(**kw):
+            self.assertEqual((kw['vlm_base_url'], kw['vlm_api_key'], kw['vlm_model_id']),
+                             ('http://vision.invalid/v1', '', 'synthetic-vision'))
             seen.append(kw["text_layer_repair"])
             return []
 
         with tempfile.TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "a.pdf"
             pdf.write_bytes(b"%PDF-1.4 demo")
+            state_db = Path(tmp) / "state.db"
+            db.init_db(state_db)
+            with db.connect(state_db) as con:
+                db.upsert_llm(con, name="vision-a", base_url="http://vision.invalid/v1",
+                              api_key="", model_id="synthetic-vision")
             settings = SimpleNamespace(max_file_bytes=0, job_max_retries=5, cache_dir=Path(tmp) / "cache", mineru_url="http://x",
-                                       vlm_base_url="u", vlm_api_key="", vlm_model_id="m", vlm_concurrency=1, vlm_temperature=0.1,
+                                       state_db=state_db, vlm_concurrency=1, vlm_temperature=0.1,
                                        vlm_top_p=0.8, vlm_max_tokens=64, vlm_structured_output=True, image_max_pixels=1,
                                        mineru_timeout_seconds=5)
-            source = SimpleNamespace(vlm_prompt=None, graph_language=None, block_merge_tokens=800, max_tokens=400, overlap_tokens=0)
+            source = SimpleNamespace(vlm_model="vision-a", vlm_prompt=None, graph_language=None,
+                                     block_merge_tokens=800, max_tokens=400, overlap_tokens=0)
             row = {"physical_path": str(pdf), "size": 13, "mtime": int(pdf.stat().st_mtime), "kb_id": "kb_x", "file_key": 1,
                    "content_version": "v", "source_path": "r/a.pdf"}
             with patch.object(parse_job.db, "get_file_by_id", return_value=row), \
