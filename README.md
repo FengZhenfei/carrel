@@ -23,7 +23,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-**0.4.0 (release pending):** [Changes and upgrade steps](docs/releases/0.4.0.md).
+**0.4.0:** [Changes and upgrade steps](docs/releases/0.4.0.md).
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
