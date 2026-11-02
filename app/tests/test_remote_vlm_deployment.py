@@ -73,9 +73,11 @@ write_app_config
     assert not any(key.startswith('QWEN3_VL_INSTRUCT_') for key in c)
     assert a['KB_CONSOLE_SERVICES'] == ('database,mineru,embedding,visual_embedding,reranker' if with_models else 'database,mineru')
     assert a['KB_PARSE_ENABLED'] == '1'
-    assert a['VLM_BASE_URL'] == expected_url
+    assert a.get('VLM_BASE_URL', '') == expected_url
     if not expected_url:
-        assert a['VLM_MODEL_ID'] == a['VLM_API_KEY'] == ''
+        assert a.get('VLM_MODEL_ID', '') == a.get('VLM_API_KEY', '') == ''
+        if existing_url is None:
+            assert {'VLM_BASE_URL', 'VLM_MODEL_ID', 'VLM_API_KEY'}.isdisjoint(a)
     elif existing_url:
         assert a['VLM_MODEL_ID'] == existing_model
         assert a['VLM_API_KEY'] == 'synthetic-key'

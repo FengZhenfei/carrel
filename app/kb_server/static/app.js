@@ -146,6 +146,71 @@ function recall(key, fallback) {
   catch { return fallback; }
 }
 
+function initSidebarResize() {
+  const handle = $("#sidebar-resizer"), sidebar = $("#kb-sidebar");
+  const min = 220, max = 420, defaultWidth = 252;
+  const saved = recall("sidebarWidth", defaultWidth);
+  let preferred = typeof saved === "number" && Number.isFinite(saved) ? Math.max(min, Math.min(max, saved)) : defaultWidth;
+  let drag = null;
+  const limit = () => Math.max(min, Math.min(max, Math.floor(window.innerWidth * .4)));
+  const apply = () => {
+    const width = Math.round(Math.max(min, Math.min(limit(), preferred)));
+    document.documentElement.style.setProperty("--side", `${width}px`);
+    handle.setAttribute("aria-valuemin", min);
+    handle.setAttribute("aria-valuemax", limit());
+    handle.setAttribute("aria-valuenow", width);
+  };
+  const commit = () => {
+    remember("sidebarWidth", preferred);
+    // Existing graph sizing and drawer text measurement follow layout changes too.
+    window.dispatchEvent(new Event("resize"));
+  };
+  const finish = save => {
+    if (!drag) return;
+    const previous = drag;
+    drag = null;
+    if (!save) preferred = previous.preferred;
+    document.body.classList.remove("sidebar-dragging");
+    if (handle.hasPointerCapture(previous.id)) handle.releasePointerCapture(previous.id);
+    apply();
+    if (save) commit();
+  };
+  handle.setAttribute("aria-label", t("调整知识库栏宽度"));
+  handle.title = t("拖动调整宽度，双击恢复默认");
+  handle.addEventListener("pointerdown", e => {
+    if (e.button !== 0 || !e.isPrimary || window.innerWidth <= 900 || drag) return;
+    e.preventDefault();
+    drag = { id: e.pointerId, x: e.clientX, width: sidebar.getBoundingClientRect().width, preferred };
+    handle.setPointerCapture(e.pointerId);
+    handle.focus({ preventScroll: true });
+    document.body.classList.add("sidebar-dragging");
+  });
+  handle.addEventListener("pointermove", e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    preferred = Math.max(min, Math.min(limit(), drag.width + e.clientX - drag.x));
+    apply();
+  });
+  handle.addEventListener("pointerup", e => { if (e.pointerId === drag?.id) finish(true); });
+  handle.addEventListener("pointercancel", e => { if (e.pointerId === drag?.id) finish(false); });
+  handle.addEventListener("lostpointercapture", () => finish(true));
+  handle.addEventListener("dblclick", () => { preferred = defaultWidth; apply(); commit(); });
+  handle.addEventListener("keydown", e => {
+    if (e.key === "Escape" && drag) { e.preventDefault(); finish(false); return; }
+    const width = Number(handle.getAttribute("aria-valuenow"));
+    const next = { ArrowLeft: width - 16, ArrowRight: width + 16, Home: min, End: limit() }[e.key];
+    if (next == null || window.innerWidth <= 900) return;
+    e.preventDefault();
+    preferred = Math.max(min, Math.min(limit(), next));
+    apply(); commit();
+  });
+  window.addEventListener("resize", () => {
+    if (window.innerWidth <= 900) finish(false);
+    apply();
+  }, { passive: true });
+  apply();
+}
+initSidebarResize();
+
 function confirmDialog(text, yesLabel = t("确认")) {
   return new Promise(resolve => {
     const dlg = $("#confirm-dlg");
@@ -530,14 +595,14 @@ function rebuildProgressParts(rc) {
 function llmOptions(selectedName, { fallback = false } = {}) {
   let picked = selectedName;
   if (!picked && fallback) picked = defaultGraphLlm();
-  return `<option value="">${t("(未选择)")}</option>` +
+  return `<option value="">${t("未选择")}</option>` +
     state.llms.map(m => `<option value="${esc(m.name)}" ${picked === m.name ? "selected" : ""}>${esc(m.name)}</option>`).join("");
 }
 
 function vlmOptions(selectedName) {
   const models = state.llms.filter(m => (m.protocol || "openai") === "openai");
   const missing = selectedName && !models.some(m => m.name === selectedName);
-  return `<option value="">${t("系统默认")}</option>` +
+  return `<option value="">${t("未选择")}</option>` +
     (missing ? `<option value="${esc(selectedName)}" selected>${esc(selectedName)} (${t("不可用")})</option>` : "") +
     models.map(m => `<option value="${esc(m.name)}" ${selectedName === m.name ? "selected" : ""}>${esc(m.name)}</option>`).join("");
 }
@@ -968,6 +1033,8 @@ function restoreDraft(dir) {
 }
 
 function collectParseConfig() {
+  const vlmModel = $("#cfg-vlm").value;
+  if (!vlmModel) throw new Error(t("请选择多模态模型"));
   // parseInt used to be used here: empty values / decimals / "1e3" became NaN or were truncated, serialized
   // as null and treated by the backend as "clear the key, back to default", while the form did not refill
   // -- the user never learned the value had been replaced.
@@ -975,7 +1042,7 @@ function collectParseConfig() {
     max_tokens: requireInt("#cfg-max", "chunk max_tokens"),
     overlap_tokens: requireInt("#cfg-ov", "chunk overlap_tokens"),
     vlm_prompt: $("#cfg-prompt").value.trim() || null,
-    vlm_model: $("#cfg-vlm").value || null,
+    vlm_model: vlmModel,
   };
 }
 
@@ -1552,8 +1619,11 @@ function renderFilesTable() {
     const on = state.files.sort === key;
     return `<th class="sortable ${cls}" data-sort="${key}">${label}${on ? `<span class="arrow">${state.files.dir > 0 ? "▲" : "▼"}</span>` : ""}</th>`;
   };
-  const html = `<table class="files-table"><thead><tr>
-      <th style="width:22px"></th>
+  const html = `<table class="files-table"><colgroup>
+      <col class="fl-col-dot"><col><col class="fl-col-size"><col class="fl-col-chunks">
+      <col class="fl-col-note"><col class="fl-col-time"><col class="fl-col-status"><col class="fl-col-actions">
+    </colgroup><thead><tr>
+      <th></th>
       ${th("path", t("文件"))}
       ${th("size", t("大小"), "num")}
       ${th("chunks", t("切片"), "num")}
@@ -3380,7 +3450,7 @@ function renderLlmView(div, m) {
     // first -- decoupled does not mean silent.
     const used = m.used_by || [];
     const detail = used.length
-      ? t("\n\n以下知识库在引用它,删除后对应栏位会清空;多模态模型恢复系统默认:\n")
+      ? t("\n\n以下知识库在引用它,删除后对应栏位会清空:\n")
         + used.map(u => `· ${u.source_root} — ${(u.steps || []).map(s => t(s)).join(t("、"))}`).join("\n")
       : "";
     if (!(await confirmDialog(t("删除模型「{0}」?", m.name) + detail, t("确认删除")))) return;

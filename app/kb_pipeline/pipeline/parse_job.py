@@ -718,9 +718,7 @@ def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str]:
     """Resolve once per document so all visual stages share the same model and credentials."""
     name = getattr(source, "vlm_model", None)
     if not name:
-        if not settings.vlm_base_url or not settings.vlm_model_id:
-            raise NonRetryableParseError("No multimodal model configured; select a vision model in the console")
-        return settings.vlm_base_url, settings.vlm_api_key, settings.vlm_model_id
+        raise NonRetryableParseError("No multimodal model configured; select a vision model in the console")
     with db.connect(settings.state_db) as con:
         row = db.get_llm(con, name)
     if row is None:

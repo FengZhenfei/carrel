@@ -538,29 +538,29 @@ class ConfigLoadingTests(unittest.TestCase):
                  if "=" in line and not line.lstrip().startswith("#"))
         return {key.strip(): value.strip().strip("'\"") for key, value in pairs}
 
-    def test_vlm_endpoint_requires_explicit_configuration(self) -> None:
-        """An unset or misspelled VLM URL stays empty; a configured endpoint and model are respected."""
+    def test_global_vlm_endpoint_is_not_loaded(self) -> None:
+        """Visual parsing uses the per-KB registry selection, never environment defaults."""
         from urllib.parse import urlsplit
 
         for endpoint_line in ("", "VLM_BASEURL=https://vision.example.test/v1\n"):
             with self.subTest(endpoint_line=endpoint_line):
                 cfg = self._load("KB_PARSE_ENABLED=1\nVLM_API_KEY=fixture-key\n" + endpoint_line)
                 self.assertTrue(cfg.parse_enabled)
-                self.assertEqual(cfg.vlm_api_key, "fixture-key")
-                self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id), ("", ""))
+                self.assertFalse(hasattr(cfg, "vlm_api_key"))
+                self.assertFalse(hasattr(cfg, "vlm_base_url"))
+                self.assertFalse(hasattr(cfg, "vlm_model_id"))
                 for name in ("embedding_base_url", "visual_embedding_base_url", "reranker_base_url",
                              "visual_reranker_base_url", "mineru_url", "qdrant_url", "opensearch_url", "neo4j_uri"):
                     self.assertEqual(urlsplit(getattr(cfg, name)).hostname, "127.0.0.1", name)
 
         cfg = self._load("VLM_BASE_URL=https://vision.example.test/v1\n"
                          "VLM_MODEL_ID=fixture-vision\nVLM_API_KEY=fixture-key\n")
-        self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id, cfg.vlm_api_key),
-                         ("https://vision.example.test/v1", "fixture-vision", "fixture-key"))
+        for name in ("vlm_base_url", "vlm_model_id", "vlm_api_key"):
+            self.assertFalse(hasattr(cfg, name))
 
     def test_defaults_match_the_example_file_and_bundled_models(self) -> None:
         cfg, example = self._load(), self._example()
         for key, name in (("EMBEDDING_BASE_URL", "embedding_base_url"), ("EMBEDDING_MODEL_ID", "embedding_model_id"),
-                          ("VLM_BASE_URL", "vlm_base_url"), ("VLM_MODEL_ID", "vlm_model_id"),
                           ("VISUAL_EMBEDDING_BASE_URL", "visual_embedding_base_url"),
                           ("VISUAL_EMBEDDING_MODEL_ID", "visual_embedding_model_id"),
                           ("MINERU_SERVICE_URL", "mineru_url"), ("QDRANT_URL", "qdrant_url"),
@@ -570,14 +570,15 @@ class ConfigLoadingTests(unittest.TestCase):
         # step and the console hides the row); a value that is filled in must be the code default
         for key, name in (("RERANKER_BASE_URL", "reranker_base_url"), ("VISUAL_RERANKER_BASE_URL", "visual_reranker_base_url")):
             self.assertIn(example[key], ("", getattr(cfg, name)), key)
-        self.assertEqual((cfg.vlm_base_url, cfg.vlm_model_id), ("", ""))
+        self.assertTrue({"VLM_BASE_URL", "VLM_MODEL_ID", "VLM_API_KEY"}.isdisjoint(example))
         served = set(re.findall(r"--served-model-name\n\s+- (\S+)", _repo_file("deployment/compose/docker-compose.yml")))
         self.assertLessEqual({cfg.embedding_model_id, cfg.visual_embedding_model_id}, served)
 
     def test_legacy_vlm_variable_names_are_not_read(self) -> None:
         # The names stand in for the old fallback variables, which this tree no longer carries
         cfg = self._load(LEGACY_VLM_API_KEY="old", OLD_VLM_API_KEY="older", LEGACY_VLM_CONCURRENCY="9")
-        self.assertEqual((cfg.vlm_api_key, cfg.vlm_concurrency), ("", 1))
+        self.assertFalse(hasattr(cfg, "vlm_api_key"))
+        self.assertEqual(cfg.vlm_concurrency, 1)
         self.assertEqual(self._load("VLM_CONCURRENCY=\n").vlm_concurrency, 1)      # empty means the default
         self.assertEqual(self._load("VLM_CONCURRENCY=6\nVLM_API_KEY=k\n").vlm_concurrency, 6)
 

@@ -16,6 +16,8 @@ const I18N = (() => {
 })();
 
 const ZH_EN = {
+  "调整知识库栏宽度": "Resize knowledge base sidebar",
+  "拖动调整宽度，双击恢复默认": "Drag to resize; double-click to reset",
   "立即/继续解析": "Parse now / Resume",
   "暂停解析": "Pause parsing",
   "暂停中…": "Pausing…",
@@ -110,7 +112,9 @@ const ZH_EN = {
   "模型列表": "Models",
   "多模态模型": "Multimodal model",
   "尚未配置多模态模型,请在控制台选择支持图像的模型": "No multimodal model configured; select a vision model in the console",
-  "系统默认": "System default",
+  "未选择": "Not selected",
+  "请选择多模态模型": "Select a multimodal model",
+  "\n\n以下知识库在引用它,删除后对应栏位会清空:\n": "\n\nThese knowledge bases reference it; deletion clears these fields:\n",
   "不可用": "Unavailable",
   "多模态模型需要使用 OpenAI 兼容协议": "Multimodal models require the OpenAI-compatible protocol",
   "服务状态": "Services",
@@ -245,7 +249,6 @@ const ZH_EN = {
   "并入新增内容": "Append new content",
   "暂停建图": "Pause build",
   "删除知识图谱": "Delete knowledge graph",
-  "(未选择)": "(not selected)",
   "已完成 {0},续跑跳过": "Done: {0}; skipped when resuming",
   "缓存 {0} 条可续用": "{0} cache entries reusable",
   "{0},缓存不可续用,这次是从头建": "{0}; the cache cannot be reused, this build starts from scratch",
@@ -562,7 +565,6 @@ const ZH_EN = {
   "＋ 添加模型": "＋ Add model",
   "Key 已配置": "Key set",
   "编辑": "Edit",
-  "\n\n以下知识库在引用它,删除后对应栏位会清空;多模态模型恢复系统默认:\n": "\n\nThese knowledge bases reference it; deletion clears these fields. Multimodal models revert to the system default:\n",
   "删除模型「{0}」?": "Delete model “{0}”?",
   "已删除;{0} 个知识库的对应栏位已清空": "Deleted; the fields of {0} knowledge bases were cleared",
   "已删除": "Deleted",

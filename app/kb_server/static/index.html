@@ -152,9 +152,16 @@ h2{font-size:13px;font-weight:600;margin:0 0 10px;color:var(--text)}
 .dot.pulse{animation:ping 1.6s ease-in-out infinite}
 
 /* ── skeleton: left navigation + workspace ── */
-.shell{display:grid;grid-template-columns:var(--side) minmax(0,1fr);min-height:calc(100vh - var(--top))}
+.shell{display:grid;grid-template-columns:var(--side) 0 minmax(0,1fr);min-height:calc(100vh - var(--top))}
 .sidebar{border-right:1px solid var(--line);background:var(--card);position:sticky;top:var(--top);
   height:calc(100vh - var(--top));overflow-y:auto;padding:10px 8px calc(16px + env(safe-area-inset-bottom))}
+.sidebar-resizer{position:sticky;top:var(--top);height:calc(100vh - var(--top));width:9px;margin-left:-4px;
+  z-index:21;cursor:col-resize;touch-action:none;user-select:none;outline:none}
+.sidebar-resizer::after{content:"";position:absolute;top:calc(50% - 18px);left:3px;width:3px;height:36px;
+  border-radius:3px;background:var(--line-strong)}
+.sidebar-resizer:hover,.sidebar-resizer:focus-visible{background:var(--accent-soft)}
+.sidebar-resizer:hover::after,.sidebar-resizer:focus-visible::after{background:var(--accent)}
+body.sidebar-dragging,body.sidebar-dragging *{cursor:col-resize!important;user-select:none!important}
 .side-head{display:flex;align-items:center;gap:8px;padding:8px 10px 6px;font-size:12px;color:var(--faint);font-weight:500}
 .side-head .n{margin-left:auto;font-variant-numeric:tabular-nums}
 .kb-row{display:block;padding:9px 10px;border-radius:9px;cursor:pointer;transition:background .12s}
@@ -283,6 +290,16 @@ td.path{word-break:break-all;min-width:220px}
 .pager-jump input[type=number]{width:64px;min-width:0;padding:3px 6px;font-size:12px;height:26px}
 .empty-state{padding:26px 16px;text-align:center;color:var(--muted);font-size:13px}
 .act{display:inline-flex;gap:6px;white-space:nowrap}
+/* Column allocation follows the viewport, never the current filenames or page contents. */
+.files-table{table-layout:fixed;min-width:1100px}
+.files-table .fl-col-dot{width:28px}
+.files-table .fl-col-size{width:88px}
+.files-table .fl-col-chunks{width:72px}
+.files-table .fl-col-note{width:20%}
+.files-table .fl-col-time{width:120px}
+.files-table .fl-col-status{width:112px}
+.files-table .fl-col-actions{width:224px}
+.files-table .parse-note{width:100%;min-width:0;max-width:none}
 /* File rows reserve two note lines; long paths and statuses stay inside the same height. */
 .files-table tbody tr{height:70px}
 .files-table tbody td{height:70px;vertical-align:middle}
@@ -490,6 +507,7 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
 /* ── narrow screens ── */
 @media (max-width:900px){
   .shell{grid-template-columns:minmax(0,1fr);grid-template-rows:auto 1fr}
+  .sidebar-resizer{display:none}
   .sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line);
     overflow-x:auto;padding:8px 10px}
   .side-head{display:none}
@@ -551,11 +569,13 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
 </header>
 
 <div class="shell">
-  <aside class="sidebar">
+  <aside class="sidebar" id="kb-sidebar">
     <div class="side-head"><span data-en="Knowledge bases">知识库</span><span class="n" id="side-count"></span></div>
     <input type="search" id="kb-q" class="side-search" placeholder="筛选知识库" autocomplete="off">
     <div id="kb-nav"><div class="side-empty">载入中…</div></div>
   </aside>
+  <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="vertical"
+       aria-controls="kb-sidebar" tabindex="0"></div>
 
   <main class="workspace">
     <div class="ws-empty" id="ws-empty">
@@ -656,7 +676,7 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
                 <input type="number" id="cfg-ov" value="80">
                 <div class="hint" id="cfg-ov-hint"></div></div>
               <div><label class="f" for="cfg-vlm">多模态模型</label>
-                <select id="cfg-vlm"><option value="">系统默认</option></select></div>
+                <select id="cfg-vlm" required><option value="">未选择</option></select></div>
             </div>
             <div style="margin-top:14px"><label class="f">多模态结构化描述提示词(留空 = 内置默认)</label>
               <textarea id="cfg-prompt" placeholder="内置默认(自定义后替换此段):
@@ -828,7 +848,7 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 </dialog>
 <script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
 <script src="vendor/katex.min.js?v=20261001-1"></script>
-<script src="i18n.js?v=20261102-4"></script>
-<script src="app.js?v=20261102-8"></script>
+<script src="i18n.js?v=20261102-7"></script>
+<script src="app.js?v=20261102-12"></script>
 </body>
 </html>

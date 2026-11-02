@@ -71,9 +71,6 @@ def cmd_config(args: argparse.Namespace) -> int:
         "visual_embedding_concurrency": settings.visual_embedding_concurrency,
         "image_max_pixels": settings.image_max_pixels,
         "vector_layout": settings.vector_layout.sizes(),
-        "vlm_base_url": settings.vlm_base_url,
-        "vlm_model_id": settings.vlm_model_id,
-        "vlm_api_key": "***" if settings.vlm_api_key else "",
         "vlm_concurrency": settings.vlm_concurrency,
         "vlm_temperature": settings.vlm_temperature,
         "vlm_top_p": settings.vlm_top_p,
@@ -549,7 +546,6 @@ def cmd_health(args: argparse.Namespace) -> int:
         checks["mineru"] = {"error": repr(exc)}
     endpoints: dict[str, object] = {
         "embedding": _vllm_health(settings.embedding_base_url),
-        "vlm": _vllm_health(settings.vlm_base_url),
     }
     if settings.visual_embedding_enabled:
         endpoints["visual_embedding"] = _vllm_health(settings.visual_embedding_base_url)

@@ -17,7 +17,7 @@
 
 修改环境配置后，应重启使用该配置的常驻应用服务。Linux 上，控制台和检索服务分别是 `carrel-web.service`、`carrel-search.service`；新启动的扫描和 worker 进程会读取更新后的文件。正在处理的任务应先完成，再安排重启，详见 [运维说明](operations.zh-CN.md)。检索服务自己的 `KB_SEARCH_*` 参数是例外：服务每分钟重读一次配置文件，改参数、换令牌都不用重启；监听地址和端口，以及文件里其他部分的参数（如各模型接口地址）仍需重启，服务进程环境里显式设置的参数优先于文件。
 
-如需运行本地向量和重排模型，运行 `./deploy.sh --with-local-models`。在控制台模型列表添加视觉接口，再按知识库选择；也可通过 `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 配置全局默认。
+如需运行本地向量和重排模型，运行 `./deploy.sh --with-local-models`。在控制台模型列表添加视觉接口，按知识库选择后保存解析配置。
 
 ## 模型接口
 
@@ -26,7 +26,7 @@
 | 能力 | 配置 | 使用条件 |
 |---|---|---|
 | 文本向量 | `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL_ID`、`EMBEDDING_API_KEY`、`EMBEDDING_DIM` | 入库和向量检索需要 |
-| 图片描述与表格复核 | 在控制台按知识库选择多模态模型；`VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 提供全局默认；`KB_IMAGE_MAX_PIXELS` 设置图片像素预算 | 处理图片和文档插图时需要；接口需支持图片输入 |
+| 图片描述与表格复核 | 在控制台按知识库选择多模态模型；`KB_IMAGE_MAX_PIXELS` 设置图片像素预算 | 处理图片和文档插图时需要；接口需支持图片输入 |
 | 图谱抽取与摘要 | 在控制台注册对话模型，再为知识库选择 | 启用建图时需要 |
 | 文本重排 | `RERANKER_BASE_URL`、`RERANKER_MODEL_ID`、`RERANKER_API_KEY` | 可选，未配置时使用检索融合顺序 |
 | 视觉向量 | `VISUAL_EMBEDDING_ENABLED`、`VISUAL_EMBEDDING_BASE_URL`、`VISUAL_EMBEDDING_MODEL_ID`、`VISUAL_EMBEDDING_DIM` 及其他 `VISUAL_EMBEDDING_*` | 可选，用于像素层面的检索；配套实现连接本地 vLLM |

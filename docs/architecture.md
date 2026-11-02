@@ -51,7 +51,7 @@ routes differ; the application can read that decision with
 `MINERU_BACKEND=auto`. Backend selection is documented in
 [Docker Compose](../deployment/compose/README.md#the-parser-container).
 
-Each knowledge base can select a **Multimodal model** from the model registry. The shared selection handles image and chart understanding and screenshot-based table review through an OpenAI-compatible vision endpoint, including models hosted on another machine. **System default** uses `VLM_*`. Saving a selection applies to subsequent parsing; existing documents keep their current results until explicitly reparsed.
+Each knowledge base can select a **Multimodal model** from the model registry. The shared selection handles image and chart understanding and screenshot-based table review through an OpenAI-compatible vision endpoint, including models hosted on another machine. A model must be selected before saving the parsing configuration. Saving a selection applies to subsequent parsing; existing documents keep their current results until explicitly reparsed.
 
 PDF extraction also reads visible form fields and associates local text, captions and legends with their source regions. Tables with missing native text receive a targeted visual review; row identity, existing values, units and conditions are checked before a replacement is adopted. Unresolved alignment keeps the original table and separately labelled source text.
 

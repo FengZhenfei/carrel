@@ -58,9 +58,6 @@ class Settings:
     visual_reranker_base_url: str
     # pixel budget applied before an image goes to either vision model
     image_max_pixels: int
-    vlm_base_url: str
-    vlm_model_id: str
-    vlm_api_key: str
     vlm_concurrency: int
     vlm_temperature: float
     vlm_top_p: float
@@ -176,9 +173,6 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         reranker_api_key=os.getenv("RERANKER_API_KEY", "").strip(),
         visual_reranker_base_url=os.getenv("VISUAL_RERANKER_BASE_URL", "http://127.0.0.1:8104/v1").strip(),
         image_max_pixels=int(os.getenv("KB_IMAGE_MAX_PIXELS", "3686400")),
-        vlm_base_url=os.getenv("VLM_BASE_URL", ""),
-        vlm_model_id=os.getenv("VLM_MODEL_ID", ""),
-        vlm_api_key=os.getenv("VLM_API_KEY", ""),
         vlm_concurrency=int(os.getenv("VLM_CONCURRENCY") or "1"),
         # Qwen3-VL recommends top_p 0.8 for vision tasks; the temperature is
         # pulled well below its default 0.7 because this is an extraction task,

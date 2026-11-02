@@ -34,6 +34,8 @@ def env(tmp_path, monkeypatch):
     for name in ("New Library", "Other Library"):
         (cfg.mirror_root / name).mkdir(parents=True)
     db.init_db(cfg.state_db)
+    with db.connect(cfg.state_db) as con:
+        db.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision")
     cfg.corrections_dir.mkdir()
     path = cfg.corrections_dir / "kb_001.yaml"
     path.write_text(OLD_RULES, encoding="utf-8")
@@ -101,7 +103,7 @@ def test_io_failure_is_visible_and_retry_cannot_inherit_rules(env, monkeypatch, 
             fault.setattr(corrections.os, "replace", fail_publish)
         # The real API must report a failed operation, not a success notification.
         response = TestClient(create_app()).post("/api/enroll", json={
-            "dir": "New Library", "config": {"max_tokens": 600, "overlap_tokens": 90}})
+            "dir": "New Library", "config": {"max_tokens": 600, "overlap_tokens": 90, "vlm_model": "vision"}})
         assert response.status_code == 422
         assert "correction rules" in response.json()["detail"]
         assert_unpublished(env)
@@ -239,7 +241,7 @@ def test_existing_library_retains_its_own_rules_on_save_and_reactivation(env):
 
 
 def test_reactivation_failure_keeps_status_and_config(env, monkeypatch):
-    service.enroll("New Library", {"max_tokens": 600, "overlap_tokens": 90})
+    service.enroll("New Library", {"max_tokens": 600, "overlap_tokens": 90, "vlm_model": "vision"})
     with db.connect(env.cfg.state_db) as con:
         discovery.mark_inactive(con, "kb_001", reason="user_disabled")
     before = registry(env)
@@ -248,7 +250,7 @@ def test_reactivation_failure_keeps_status_and_config(env, monkeypatch):
         effect.reset_mock()
     monkeypatch.setattr(corrections, "ensure_corrections_file", Mock(side_effect=OSError("disk full")))
     with pytest.raises(ValueError, match="correction rules"):
-        service.enroll("New Library", {"max_tokens": 800})
+        service.enroll("New Library", {"max_tokens": 800, "vlm_model": "vision"})
     assert registry(env) == before
     for effect in env.effects.values():
         effect.assert_not_called()

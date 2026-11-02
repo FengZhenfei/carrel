@@ -1293,6 +1293,8 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             root = Path(tmp)
             state_db = root / "state.sqlite3"
             dbm.init_db(state_db)
+            with dbm.connect(state_db) as con:
+                dbm.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision")
             mirror = root / "mirror"
             (mirror / "新目录").mkdir(parents=True)
             stub = mock.Mock()
@@ -1314,11 +1316,11 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     mock.patch.object(service, "kick_worker"):
                 # Bad draft: validate before enrolling; on failure nothing has happened
                 with self.assertRaises(ValueError):
-                    service.enroll("新目录", {"max_tokens": 8, "overlap_tokens": 80})
+                    service.enroll("新目录", {"max_tokens": 8, "overlap_tokens": 80, "vlm_model": "vision"})
                 with dbm.connect(state_db) as con:
                     self.assertEqual(len(discovery.known_sources(con)), 0)
                 # Good draft: enrolled, and the first parse already carries the user's policy
-                r = service.enroll("新目录", {"max_tokens": 600, "overlap_tokens": 90})
+                r = service.enroll("新目录", {"max_tokens": 600, "overlap_tokens": 90, "vlm_model": "vision"})
                 self.assertEqual(r["outcome"], "new")
                 with dbm.connect(state_db) as con:
                     saved = discovery.get_config(con, r["kb_id"])
@@ -1333,7 +1335,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 # 已开启的库再保存一次:手写的内容原样保留
                 (stub.corrections_dir / "kb_001.yaml").write_text("kb:\n  id: kb_001\nentities:\n  reject: [噪声]\n",
                                                                   encoding="utf-8")
-                self.assertEqual(service.enroll("新目录", {"max_tokens": 600, "overlap_tokens": 90})["outcome"], "already")
+                self.assertEqual(service.enroll("新目录", {"max_tokens": 600, "overlap_tokens": 90, "vlm_model": "vision"})["outcome"], "already")
                 self.assertIn("噪声", (stub.corrections_dir / "kb_001.yaml").read_text(encoding="utf-8"))
 
     def test_console_delete_kb_drops_everything(self) -> None:

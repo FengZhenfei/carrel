@@ -30,7 +30,7 @@ restart. Its listening address and port, and the keys of the other sections
 (such as the model endpoints), still need one, and a key set explicitly in the
 service's environment takes precedence over the file.
 
-To run local embeddings and rerankers, use `./deploy.sh --with-local-models`. Add the vision endpoint to the console model list and select it for each knowledge base. A global default can also be configured with `VLM_BASE_URL`, `VLM_MODEL_ID`, and `VLM_API_KEY`.
+To run local embeddings and rerankers, use `./deploy.sh --with-local-models`. Add the vision endpoint to the console model list and select it for each knowledge base before saving its parsing configuration.
 
 ## Model endpoints
 
@@ -40,7 +40,7 @@ and reranking model services are available with `--with-local-models`.
 | Capability | Settings | Required when |
 |---|---|---|
 | Text embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL_ID`, `EMBEDDING_API_KEY`, `EMBEDDING_DIM` | Indexing and vector search |
-| Image descriptions and table review | Select a multimodal model per knowledge base in the console; `VLM_BASE_URL`, `VLM_MODEL_ID`, `VLM_API_KEY` provide the global default; `KB_IMAGE_MAX_PIXELS` sets the image budget | Processing images and figures; the endpoint must accept image input |
+| Image descriptions and table review | Select a multimodal model per knowledge base in the console; `KB_IMAGE_MAX_PIXELS` sets the image budget | Processing images and figures; the endpoint must accept image input |
 | Graph extraction and summaries | Register a chat model in the console, then select it per knowledge base | Graph building is enabled |
 | Text reranking | `RERANKER_BASE_URL`, `RERANKER_MODEL_ID`, `RERANKER_API_KEY` | Optional; retrieval otherwise uses fusion order |
 | Visual embeddings | `VISUAL_EMBEDDING_ENABLED`, `VISUAL_EMBEDDING_BASE_URL`, `VISUAL_EMBEDDING_MODEL_ID`, `VISUAL_EMBEDDING_DIM`, other `VISUAL_EMBEDDING_*` | Optional pixel-level retrieval; the bundled integration uses local vLLM |

@@ -1106,7 +1106,11 @@ def _validate_config(con, effective: dict[str, Any], updates: dict[str, Any], li
     errors.extend(_validate_rebuild_policy(effective))
     errors.extend(validate_graph_tune_config(
         effective.get("graph_entity_types"), effective.get("graph_tune_sample_size")))
-    name = effective.get("vlm_model")
+    name = str(effective.get("vlm_model") or "")
+    # The parse and graph sections save independently. A graph-only update
+    # must not require changing the parsing model.
+    if not name.strip() and {"vlm_model", "vlm_prompt", "max_tokens", "overlap_tokens"}.intersection(updates):
+        errors.append("Select a multimodal model")
     if name:
         model = db.get_llm(con, str(name))
         if model is None:

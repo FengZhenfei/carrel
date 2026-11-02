@@ -73,7 +73,7 @@ def test_selection_is_passive_and_fresh_for_each_job(setup):
     source, cfg = setup
     limits = {'max_tokens_cap': 3276, 'max_tokens_min': 128}
     with patch.object(service, 'settings', return_value=cfg), patch.object(service, 'chunk_limits', return_value=limits):
-        for name, model in [('vision-a', 'image-a'), ('vision-b', 'image-b'), (None, 'default-image')]:
+        for name, model in [('vision-a', 'image-a'), ('vision-b', 'image-b')]:
             service.update_kb_config(source.kb_id, {'vlm_model': name})
             fresh = parse_job._source_for_file(cfg, source.kb_id)
             assert fresh.vlm_model == name
@@ -81,10 +81,10 @@ def test_selection_is_passive_and_fresh_for_each_job(setup):
         with db.connect(cfg.state_db) as con:
             assert con.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
             assert con.execute('SELECT count(*) FROM graph_builds').fetchone()[0] == 0
-        for bad in ['missing', 'messages-model']:
+        for bad in [None, '', '   ', ' vision-a ', 'missing', 'messages-model']:
             with pytest.raises(ValueError):
                 service.update_kb_config(source.kb_id, {'vlm_model': bad})
-        assert service.get_kb_config(source.kb_id)['config'].get('vlm_model') is None
+        assert service.get_kb_config(source.kb_id)['config']['vlm_model'] == 'vision-b'
 
 
 def test_invalid_type_rejected_before_persistence():
@@ -112,7 +112,59 @@ def test_deleted_reference_is_cleared_and_secret_never_listed(setup):
         config = discovery.get_config(con, source.kb_id)
     assert 'vlm_model' not in config
     assert config['graph_llm'] == {'extract': 'vision-b'}
-    assert parse_job._vlm_endpoint(cfg, parse_job._source_for_file(cfg, source.kb_id))[2] == 'default-image'
+    with pytest.raises(parse_job.NonRetryableParseError, match='No multimodal model configured'):
+        parse_job._vlm_endpoint(cfg, parse_job._source_for_file(cfg, source.kb_id))
+
+
+def test_parse_save_requires_model_but_graph_only_save_is_independent(setup):
+    source, cfg = setup
+    limits = {'max_tokens_cap': 3276, 'max_tokens_min': 128}
+    with patch.object(service, 'settings', return_value=cfg), patch.object(service, 'chunk_limits', return_value=limits):
+        for updates in ({'vlm_model': None}, {'vlm_model': ''}, {'max_tokens': 600}, {'vlm_prompt': 'Read the image.'}):
+            with pytest.raises(ValueError, match='Select a multimodal model'):
+                service.update_kb_config(source.kb_id, updates)
+        service.update_kb_config(source.kb_id, {'graph_auto_append': False})
+        service.update_kb_config(source.kb_id, {'vlm_model': 'vision-a'})
+        service.update_kb_config(source.kb_id, {'max_tokens': 600})
+        saved = service.get_kb_config(source.kb_id)['config']
+        assert saved['vlm_model'] == 'vision-a'
+        assert saved['max_tokens'] == 600
+        assert saved['graph_auto_append'] is False
+
+
+def test_enrollment_rejects_unselected_model_before_creating_library(setup):
+    source, cfg = setup
+    (cfg.mirror_root / 'new-documents').mkdir()
+    limits = {'max_tokens_cap': 3276, 'max_tokens_min': 128}
+    with patch.object(service, 'settings', return_value=cfg), patch.object(service, 'chunk_limits', return_value=limits), \
+         patch.object(service, 'qdrant_client') as vector:
+        with pytest.raises(ValueError, match='Select a multimodal model'):
+            service.enroll('new-documents', {'max_tokens': 400, 'overlap_tokens': 80, 'vlm_model': None})
+        vector.assert_not_called()
+    with db.connect(cfg.state_db) as con:
+        assert con.execute('SELECT count(*) FROM kb_sources').fetchone()[0] == 1
+        assert con.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
+
+
+def test_api_rejects_clearing_model_without_changing_saved_config(setup, monkeypatch):
+    from fastapi.testclient import TestClient
+    from kb_server.main import create_app
+
+    source, cfg = setup
+    monkeypatch.delenv('KB_WEB_TOKEN', raising=False)
+    with db.connect(cfg.state_db) as con:
+        discovery.set_config(con, source.kb_id, {'vlm_model': 'vision-a'})
+        before = con.execute('SELECT config_json FROM kb_sources WHERE kb_id=?', (source.kb_id,)).fetchone()[0]
+    with patch.object(service, 'settings', return_value=cfg), \
+         patch.object(service, 'chunk_limits', return_value={'max_tokens_cap': 3276, 'max_tokens_min': 128}):
+        client = TestClient(create_app())
+        for empty in [None, '', '   ']:
+            result = client.put(f'/api/kbs/{source.kb_id}/config', json={'vlm_model': empty})
+            assert result.status_code == 422
+            assert 'Select a multimodal model' in result.json()['detail']
+    with db.connect(cfg.state_db) as con:
+        assert con.execute('SELECT config_json FROM kb_sources WHERE kb_id=?', (source.kb_id,)).fetchone()[0] == before
+        assert con.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
 
 
 def test_referenced_model_cannot_change_to_incompatible_protocol(setup):
@@ -208,9 +260,11 @@ def test_table_review_uses_same_model_and_endpoint_cache_identity(setup, tmp_pat
     assert calls[-1][1] == 'Bearer review-key' and calls[-1][2]['model'] == 'review-model'
 
 
-def test_empty_default_fails_clearly_without_network(setup):
+@pytest.mark.parametrize('legacy_default', [False, True])
+def test_unselected_model_never_uses_global_default(setup, legacy_default):
     source, cfg = setup
-    cfg.vlm_base_url = cfg.vlm_model_id = ''
+    if not legacy_default:
+        cfg.vlm_base_url = cfg.vlm_model_id = ''
     with patch.object(service.requests, 'get') as request:
         with pytest.raises(parse_job.NonRetryableParseError):
             parse_job._vlm_endpoint(cfg, source)
