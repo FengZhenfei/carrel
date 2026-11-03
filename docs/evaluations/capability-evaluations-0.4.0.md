@@ -352,8 +352,6 @@ Token counts come from the SDK's cumulative usage events. Input already includes
 
 On the 25 real cross-document questions, mean latency rises from 75.1 to 99.7 seconds, and mean cumulative tokens from 114.8k to 181.1k. Single-document completeness remains the same; additional calls and gains are concentrated in more complex evidence gathering.
 
-Two operational issues arise during evaluation. Large graph audits compete with production services for memory and trigger system OOM. An image preprocessing cache mismatch in visual reranking triggers an internal vLLM assertion and a restart. Subsequent offline graph analysis runs separately from retrieval services, and matched comparisons are rerun with the visual-reranker image preprocessing cache set to 0 GiB. Performance data from the fault period is retained separately.
-
 The evaluation also completes 1,962 engineering regression tests, with 2 additional skipped tests and 132 subtests.
 
 ## Appendix: source-grounded question distribution
