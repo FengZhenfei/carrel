@@ -139,10 +139,11 @@ Adding visual reranking reduced document and page-location performance on this t
 |---|---:|---:|---:|---:|---|
 | Published 0.3.0 report: full pipeline | 78 | 88.46% | 0.7327 | 12 | Qwen3-Reranker-0.6B |
 | This 0.4.0 evaluation: full retrieval | 275 | 92.36% | 0.7979 | 10 | Qwen3-Reranker-4B |
+| 0.4.0 supplementary replay: original 0.3.0 questions | 78 | 94.87% | 0.8251 | 12 | Qwen3-Reranker-0.6B |
 
-The two evaluations use different question sets, source collections, parsed assets, reranking models, and rank cutoffs. The table reports each evaluation's measured results; the effects of version changes and model upgrades have not been isolated.
+A supplementary replay uses the 78 location questions from the published 0.3.0 report. **Both runs on these questions use Qwen3-Reranker-0.6B for text reranking**, with graph retrieval and dual reranking enabled and the top 12 hits returned. Hit@5 rises from 69/78 (88.46%) to 74/78 (94.87%), a gain of 6.41 percentage points; MRR@12 rises from 0.7327 to 0.8251. Source-file content hashes match. Target evidence was mapped to the newly parsed chunks, and the mapping was frozen before retrieval. These results measure the updated retrieval pipeline as a whole on the original questions.
 
-The 78 questions in the 0.3.0 report are the chunk-location subset of a 99-question set. This evaluation constructs 275 new questions from 107 source files and uses required evidence groups to check support across multiple chunks. Each evaluation retains its original questions and annotation definitions.
+The main 275-question evaluation uses the 4B reranker with a different document collection, question set, and difficulty mix, including cross-document and multi-evidence tasks. The replay above compares versions using the same questions and the same 0.6B reranker.
 
 The 0.3.0 image subset contains 8 questions whose target evidence is an image. This evaluation's separate set of 16 page-location questions uses images directly as input. The input and evaluation target therefore differ.
 
