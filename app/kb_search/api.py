@@ -10,7 +10,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from . import service
+from . import library, service
 
 router = APIRouter()
 
@@ -40,6 +40,7 @@ class SearchRequest(BaseModel):
     kbs: list[str] | None = None
     top_k: int | None = Field(default=None, ge=1, le=50)
     hints: dict[str, Any] | None = None
+    graph_readback: bool = True
     context: bool = True
     explain: bool = False
     image_b64: str | None = Field(default=None, max_length=12_000_000)   # 图→图(Q17):调用方给图片,base64 或 data URL
@@ -53,9 +54,12 @@ class ContextRequest(BaseModel):
     content_version: str | None = None
     chunk_from: int = Field(ge=0)
     chunk_to: int = Field(ge=0)
+    history: bool = False
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
 
 
 class NeighborsRequest(BaseModel):
+    graph_version: str | None = Field(default=None, min_length=1, max_length=200)
     kb_id: str
     entity: str | None = Field(default=None, max_length=200)      # entity title or alias (case-insensitive)
     entity_id: str | None = Field(default=None, max_length=200)   # or the entity id directly (the id from a previous response)
@@ -80,6 +84,8 @@ class EntitiesRequest(BaseModel):
 
 
 class FactsRequest(BaseModel):
+    graph_version: str | None = Field(default=None, min_length=1, max_length=200)
+    content_version: str | None = Field(default=None, min_length=1, max_length=200)
     kb_id: str
     subject: str | None = Field(default=None, max_length=200)      # 主体的标题或别名(不分大小写)
     subject_id: str | None = Field(default=None, max_length=200)   # 或直接给实体 id
@@ -129,6 +135,7 @@ class DocsRequest(BaseModel):
 
 
 class GrepRequest(BaseModel):
+    doc_versions: dict[str, str] | None = Field(default=None, max_length=500)
     kb_id: str
     history: bool = False
     as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
@@ -148,6 +155,8 @@ class GrepRequest(BaseModel):
 
 
 class CropRequest(BaseModel):
+    history: bool = False
+    as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
     kb_id: str
     point_id: str
     bbox: list[float] = Field(min_length=4, max_length=4)   # 0-1 fractions or 0-1000 per-mille; pixels are not accepted (any value up to 1000 is read as per-mille)
@@ -159,6 +168,8 @@ def _wrap(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"not found: {exc}")
+    except library.StaleReference as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except service.RetrievalUnavailable as exc:
@@ -225,7 +236,7 @@ def _log_search(out: dict[str, Any]) -> None:
 
 @router.post("/search", dependencies=[Depends(require_token)])
 def search(req: SearchRequest) -> dict[str, Any]:
-    out = _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context,
+    out = _wrap(service.search, req.question, kbs=req.kbs, top_k=req.top_k, hints=req.hints, with_context=req.context, graph_readback=req.graph_readback,
                 explain=req.explain, image_bytes=_decode_image(req.image_b64), history=req.history, as_of=req.as_of)
     _log_search(out)
     return out
@@ -233,23 +244,24 @@ def search(req: SearchRequest) -> dict[str, Any]:
 
 @router.post("/context", dependencies=[Depends(require_token)])
 def context(req: ContextRequest) -> dict[str, Any]:
-    return _wrap(service.context, req.kb_id, req.doc_id, req.chunk_from, req.chunk_to, content_version=req.content_version)
+    return _wrap(service.context, req.kb_id, req.doc_id, req.chunk_from, req.chunk_to,
+                 content_version=req.content_version, history=req.history, as_of=req.as_of)
 
 
 @router.get("/image/{kb_id}/{point_id}", dependencies=[Depends(require_token)])
-def image(kb_id: str, point_id: str) -> Response:
-    return _image_response(_wrap(service.image, kb_id, point_id))
+def image(kb_id: str, point_id: str, history: bool = False, as_of: str | None = None) -> Response:
+    return _image_response(_wrap(service.image, kb_id, point_id, history=history, as_of=as_of))
 
 
 @router.post("/crop", dependencies=[Depends(require_token)])
 def crop(req: CropRequest) -> Response:
-    return _image_response(_wrap(service.crop, req.kb_id, req.point_id, req.bbox, pad=req.pad))
+    return _image_response(_wrap(service.crop, req.kb_id, req.point_id, req.bbox, pad=req.pad, history=req.history, as_of=req.as_of))
 
 
 @router.post("/graph/neighbors", dependencies=[Depends(require_token)])
 def graph_neighbors(req: NeighborsRequest) -> dict[str, Any]:
     return _wrap(service.graph_neighbors, req.kb_id, entity=req.entity, entity_id=req.entity_id, limit=req.limit, types=req.types,
-                 direction=req.direction, history=req.history, as_of=req.as_of)
+                 direction=req.direction, history=req.history, as_of=req.as_of, expected_graph_version=req.graph_version)
 
 
 @router.post("/graph/entities", dependencies=[Depends(require_token)])
@@ -261,6 +273,7 @@ def graph_entities(req: EntitiesRequest) -> dict[str, Any]:
 @router.post("/graph/facts", dependencies=[Depends(require_token)])
 def graph_facts(req: FactsRequest) -> dict[str, Any]:
     return _wrap(service.graph_facts, req.kb_id, subject=req.subject, subject_id=req.subject_id, prop=req.prop, match=req.match,
+                 expected_graph_version=req.graph_version, content_version=req.content_version,
                  doc_id=req.doc_id, rel_path=req.rel_path, conflict_only=req.conflict_only, history=req.history, as_of=req.as_of,
                  limit=req.limit, offset=req.offset)
 
@@ -291,5 +304,5 @@ def docs(req: DocsRequest) -> dict[str, Any]:
 @router.post("/grep", dependencies=[Depends(require_token)])
 def grep(req: GrepRequest) -> dict[str, Any]:
     return _wrap(service.grep, req.kb_id, req.phrases, fields=list(req.fields) if req.fields else None, rel_paths=req.rel_paths,
-                 doc_ids=req.doc_ids, limit=req.limit, history=req.history, as_of=req.as_of)
+                 doc_ids=req.doc_ids, doc_versions=req.doc_versions, limit=req.limit, history=req.history, as_of=req.as_of)
 

@@ -17,6 +17,7 @@ from kb_pipeline.chunking.context import payload_text
 import json
 import math
 import threading
+import time
 from typing import Any, Iterable
 
 from kb_pipeline.config import Settings
@@ -460,7 +461,7 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
 
 def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entity_id: str | None, limit: int = 20,
               types: list[str] | None = None, direction: str = "both", history: bool = False, as_of: str | None = None,
-              q: Any = None, driver: Any = None, timeout: float | None = None) -> dict[str, Any]:
+              q: Any = None, expected_graph_version: str | None = None, driver: Any = None, timeout: float | None = None) -> dict[str, Any]:
     """q / driver:服务共用的 Qdrant 客户端与 Neo4j driver;不传 driver 就现建、用完关掉。
     history / as_of:时间口径(见 time_scope);各类关系的条数、总数、实体名下的事实数都按同一口径数,
     time.hidden 是同样条件下被口径筛掉的关系条数。
@@ -478,6 +479,9 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
         driver = neo4j_driver(settings)
     try:
         gv = active_neo4j_graph_version(driver, source.kb_id)
+        if expected_graph_version is not None and gv != expected_graph_version:
+            from .library import StaleReference
+            raise StaleReference("graph_version_changed: repeat the original lookup for a current graph reference")
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
         with driver.session() as session:
@@ -488,8 +492,10 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
                 cands = dense_candidates(settings, source, entity or "", q=q) if entity else []
                 return {"kb_id": source.kb_id, "graph_version": gv, "found": False, "entity": None, "matches": [], "candidates": cands,
                         "neighbors": [], "note": "no entity with that title or alias; pick one of the candidates by id"}
-            # Several entities with the same name (MACD in different scopes): take the one with the most
-            # relations, list the rest in matches so the caller can query by id instead
+            if len(matches) > 1:
+                return {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv,
+                        "found": False, "ambiguous": True, "entity": None, "matches": matches, "candidates": matches,
+                        "neighbors": [], "note": "multiple identities match; select an entity_id using type, scope and sources"}
             matches.sort(key=lambda m: (-int(m.get("degree") or 0), -float(m.get("pagerank") or 0.0)))
             center = matches[0]
             rows = neighbor_rows(session, source.kb_id, gv, str(center["id"]), limit=max(1, min(100, int(limit))), types=types,
@@ -537,14 +543,14 @@ def name_index(session: Any, kb_id: str, gv: str) -> dict[str, Any]:
             return cur
     rows = session.run(
         "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) WHERE " + LIVE_ENTITY +
-        " RETURN e.id AS id, e.title AS title, e.type AS type, e.aliases AS aliases, e.degree AS degree", kb=kb_id, gv=gv).data()
+        " RETURN e.id AS id, e.title AS title, e.type AS type, e.scope AS scope, e.aliases AS aliases, e.degree AS degree", kb=kb_id, gv=gv).data()
     names: dict[str, list[tuple[str, bool]]] = {}
     entities: dict[str, dict[str, Any]] = {}
     for r in rows:
         eid = str(r.get("id") or "")
         if not eid:
             continue
-        entities[eid] = {"id": eid, "title": r.get("title"), "type": r.get("type"), "degree": int(r.get("degree") or 0)}
+        entities[eid] = {"id": eid, "title": r.get("title"), "type": r.get("type"), "scope": r.get("scope"), "degree": int(r.get("degree") or 0)}
         for i, name in enumerate([r.get("title"), *(r.get("aliases") or [])]):
             key = _name_key(name)
             if NAME_MIN_CHARS <= len(key) <= NAME_MAX_CHARS:
@@ -559,9 +565,8 @@ def named_entities(question: str, index: dict[str, Any]) -> list[dict[str, Any]]
     """Entities the question names: a title or alias appears whole in the question (case and spaces ignored; names
     in scripts without word spacing count too).
     A name of letters / digits must not sit inside a longer word; an occurrence wholly covered by a longer name does
-    not count (the "Northwind" inside "Northwind Gateway"); of several entities sharing the name (as title or alias)
-    the one with the most relations is taken, the same choice the neighbours endpoint makes for a name, so what the
-    preview shows is where the next hop will land.
+    not count (the "Northwind" inside "Northwind Gateway"). Shared names retain every matching identity and are
+    marked ambiguous; connection counts must not silently decide which identity a question means.
     Each carries _rank: 2 for a name with letters or digits or of four characters and more, 1 for three characters,
     0 for a two-character word without them (a common word can be an entity too; whether such a short name counts is
     for the caller to decide); the result is ordered by _rank, then by relation count."""
@@ -596,16 +601,18 @@ def named_entities(question: str, index: dict[str, Any]) -> list[dict[str, Any]]
     found: dict[str, dict[str, Any]] = {}
     for start, end in kept:
         key = text[start:end]
-        eid, _ = max(names[key], key=lambda m: (entities[m[0]]["degree"], m[1]))
         rank = 2 if len(key) >= 4 or any(_ascii_word(c) for c in key) else len(key) - 2
-        if eid not in found or rank > found[eid]["_rank"]:
-            found[eid] = {**entities[eid], "_rank": rank, "_key": key}
+        ids = sorted({eid for eid, _ in names[key]})
+        for eid in ids:
+            if eid not in found or rank > found[eid]["_rank"]:
+                found[eid] = {**entities[eid], "_rank": rank, "_key": key, "ambiguous": len(ids) > 1}
     return sorted(found.values(), key=lambda e: (-e["_rank"], -e["degree"], str(e.get("title") or "")))
 
 
 def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versions: dict[str, str], question: str,
                   seeds: list[dict[str, Any]], *, limit: int, per_entity: int = NEIGHBORHOOD_SIZE, driver: Any = None,
-                  timeout: float | None = None, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                  timeout: float | None = None, scope: dict[str, Any] | None = None,
+                  hit_points: list[tuple[str, str]] | None = None) -> list[dict[str, Any]]:
     """/search 附带的「主体的一跳邻域」:调用方(agent)看了它再决定要不要调邻域接口继续走,不必先为每个主体各查一次。
     graph_versions:选中的、有图的库 → 现行图版本(按选库的顺序);seeds:图路返回的实体行(带 kb_id,已按得分降序)。
     主体先取题目里点名的实体(named_entities),不够再按图路种子的得分补,几个库合在一起一共 limit 个:
@@ -620,15 +627,33 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
     from kb_pipeline.graph.neo4j_import import neo4j_driver
     from kb_pipeline.graph.recall import TimedSession
 
+    deadline = time.monotonic() + timeout if timeout else None
     scope = scope or time_scope()
-    seeded = {(str(e.get("kb_id")), str(e.get("id"))) for e in seeds}
     own_driver = driver is None
     if own_driver:
         driver = neo4j_driver(settings)
     try:
         with driver.session() as session:
             if timeout:
-                session = TimedSession(session, timeout)
+                session = TimedSession(session, timeout, deadline=deadline)
+            if hit_points is not None:
+                from kb_pipeline.graph.neo4j_import import graph_uid
+                from . import docstatus
+                if scope["mode"] == "current":
+                    graph_versions = {kb: gv for kb, gv in graph_versions.items()
+                                      if not docstatus.graph_refresh_pending(settings, sources[kb])}
+                chunk_uids = [graph_uid(kb, graph_versions[kb], "QdrantChunkSnapshot", point)
+                              for kb, point in hit_points if kb in graph_versions]
+                if chunk_uids:
+                    seeds = session.run(
+                        f"""UNWIND $uids AS uid
+                        MATCH (c:QdrantChunkSnapshot {{uid: uid}})<-[m:MENTIONED_IN]-(e:Entity)
+                        WHERE e.kb_id = c.kb_id AND e.graph_version = c.graph_version AND {LIVE_ENTITY}
+                        RETURN e.kb_id AS kb_id, e.id AS id, count(DISTINCT c) AS overlap,
+                               sum(coalesce(m.count, 1)) AS mentions
+                        ORDER BY overlap DESC, mentions DESC, kb_id, id LIMIT 4""",
+                        uids=chunk_uids).data()
+            seeded = {(str(e.get("kb_id")), str(e.get("id"))) for e in seeds}
             indexes = {kb: name_index(session, kb, gv) for kb, gv in graph_versions.items()}
             named = [{**e, "kb_id": kb, "named": True} for kb, index in indexes.items() for e in named_entities(question, index)
                      if e["_rank"] >= 2 or (kb, e["id"]) in seeded]
@@ -651,9 +676,9 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
             facts: dict[tuple[str, str], int] = {}
             for kb in graph_versions:
                 from . import docstatus
-                if scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, sources[kb]):
+                if hit_points is None and scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, sources[kb]):
                     continue
-                ids = [s["id"] for s in subjects if s["kb_id"] == kb]
+                ids = [s["id"] for s in subjects if s["kb_id"] == kb and not s.get("ambiguous")]
                 if not ids:
                     continue
                 for r in session.run(
@@ -680,6 +705,11 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
             driver.close()
     out: list[dict[str, Any]] = []
     for s in subjects:
+        if s.get("ambiguous"):
+            out.append({"kb_id": s["kb_id"], "id": s["id"], "title": s.get("title"), "type": s.get("type"),
+                        "scope": s.get("scope"), "graph_version": graph_versions[s["kb_id"]],
+                        "named": True, "ambiguous": True, "neighbors": []})
+            continue
         key = (s["kb_id"], s["id"])
         row = rel_rows.get(key) or {}
         counts: dict[str, int] = {}
@@ -693,6 +723,7 @@ def neighborhoods(settings: Settings, sources: dict[str, KBSource], graph_versio
             if len(top) < per_entity:
                 top.setdefault(str(t.get("other_id")), t)
         out.append({"kb_id": s["kb_id"], "id": s["id"], "title": s.get("title"), "type": s.get("type"), "named": bool(s["named"]),
+                    "scope": s.get("scope"), "graph_version": graph_versions[s["kb_id"]],
                     "relations": total, "facts": facts.get(key, 0),
                     "predicates": [{"type": k, "count": n} for k, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:NEIGHBORHOOD_KINDS]],
                     "neighbors": [{"relation_id": t.get("relation_id"), "type": t.get("type"), "direction": "out" if t.get("outgoing") else "in",
@@ -786,7 +817,7 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
 
 
 def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any], *,
-                   scope: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+                   scope: dict[str, Any] | None = None, doc_id: str | None = None) -> dict[str, list[dict[str, Any]]]:
     """Series evidence uses the same time scope as the fact rows it accompanies."""
     wanted = sorted({str(k) for k in keys if k})
     if not wanted:
@@ -795,9 +826,10 @@ def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any], *,
     effect = in_effect("f", observed="observed", scope=scope)
     rows = session.run(
         f"MATCH (f:Spec {{kb_id: $kb, graph_version: $gv}}) WHERE f.series_key IN $keys AND {effect} "
+        "AND ($doc IS NULL OR f.doc_id = $doc) "
         "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, f.unit AS unit, "
         "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.valid_until AS valid_until, f.time_basis AS time_basis, f.observed_at AS observed_at, f.observed AS observed, f.axis AS axis, f.series_index AS series_index "
-        "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted, day=scope["day"]).data()
+        "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted, day=scope["day"], doc=doc_id).data()
     out: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         members = out.setdefault(str(r["series_key"]), [])
@@ -810,11 +842,11 @@ def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any], *,
 def list_facts(settings: Settings, source: KBSource, *, subject: str | None = None, subject_id: str | None = None,
                prop: str | None = None, match: str = "auto", doc_id: str | None = None, conflict_only: bool = False,
                history: bool = False, as_of: str | None = None,
-               limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, driver: Any = None,
+               limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, expected_graph_version: str | None = None, content_version: str | None = None, driver: Any = None,
                timeout: float | None = None) -> dict[str, Any]:
     """按主体 / 属性 / 文档列出现行图版本里的限定事实,带总数与翻页(「某主体的全部参数」「某属性在各主体上的值」
     「这份文档里登记了哪些事实」「哪些值在不同文档里对不上」用)。
-    主体按 id 或名字(标题 / 别名)找,沿 HAS_SPEC 边取它名下的事实;同名多个时用关系最多的那个,其余列在 matches 里。
+    主体按 id 或名字(标题 / 别名)找,沿 HAS_SPEC 边取它名下的事实;同名多个时返回候选,由调用方选定 ID。
     属性按名字 / 符号 / 规范概念名匹配:match=auto 先精确、一条都没有再按包含;命中的概念键下的各种写法一并带回
     (「TC」「总胆固醇测量结果」被概念规范化折成一个的那些)。
     doc_id 只要出自这份文档的事实;conflict_only 只要带跨文档冲突组的事实,同一组排在一起。各条件之间取交集;
@@ -846,8 +878,16 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
         driver = neo4j_driver(settings)
     try:
         gv = active_neo4j_graph_version(driver, source.kb_id)
+        if expected_graph_version is not None and gv != expected_graph_version:
+            from .library import StaleReference
+            raise StaleReference("graph_version_changed: repeat the original lookup for a current graph reference")
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
+        if content_version is not None:
+            from .library import require_document_version
+            if not doc_id:
+                raise ValueError("content_version requires a document")
+            require_document_version(settings, source, doc_id, content_version, graph_version=gv)
         base["graph_version"] = gv
         with driver.session() as session:
             if timeout:
@@ -860,6 +900,9 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                     cands = dense_candidates(settings, source, subject or "", q=q) if subject else []
                     return {**base, "found": False, "subject": None, "matches": [], "candidates": cands, "total": 0, "count": 0, "facts": [],
                             "note": "no entity with that title or alias; pick one of the candidates by id"}
+                if len(matches) > 1:
+                    return {**base, "found": False, "ambiguous": True, "subject": None, "matches": matches, "candidates": matches,
+                            "total": 0, "count": 0, "facts": [], "note": "multiple identities match; select a subject_id"}
                 matches.sort(key=lambda m: (-int(m.get("degree") or 0), -float(m.get("pagerank") or 0.0)))
                 center = matches[0]
             scope = ("MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $sid})-[:HAS_SPEC]->(f:Spec)" if center is not None
@@ -910,7 +953,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
             records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
             picked = [dict(r.get("row") or {}) for r in records]
             subject_ids = [r.get("subject_id") for r in records]
-            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked), scope=tscope)
+            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked), scope=tscope, doc_id=doc_id)
             properties = None
             if (center is not None or doc_id) and offset == 0:
                 properties = session.run(

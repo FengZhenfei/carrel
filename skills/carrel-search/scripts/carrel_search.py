@@ -188,6 +188,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # Do not forward bearer credentials to redirected destinations.
 
 
+TXT.update({
+    'readback_refs': 'Graph-source originals {labels} ({examined} candidates checked)',
+    'graph_partial': 'Graph exploration partially completed. Direct retrieval status is shown above.',
+    'readback_section': '━━ Graph-source originals',
+})
+
+
+TXT.update({
+    'scope_as_of': 'As of {day}. Fact dates determine scope. Later documents may describe earlier events.',
+    'ambiguous': 'Multiple identities match. Check scope and select an ID.',
+    'indexed_extent': 'This view covers the indexed chunks. Claims about content absent from the original require original-source evidence.',
+    'ambiguous_hood': 'Same-name candidate; check identity',
+    'later_publication': 'document published {day}, after cutoff',
+    'unknown_date': 'unknown document date',
+    'more_leads': 'More graph leads are available.',
+})
+
+
 def read_object(path):
     raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text(encoding="utf-8")
     value = json.loads(raw)
@@ -651,9 +669,9 @@ def also_named(rows):
 
 
 def candidates(envelope):
-    out = [head(envelope), TXT["not_found"]]
+    out = [head(envelope), TXT["ambiguous"] if envelope["result"].get("ambiguous") else TXT["not_found"]]
     for c in (envelope["result"].get("candidates") or []):
-        out.append("  " + str(c.get("title")) + par(c.get("type")) + " id=" + str(c.get("id")) + " — " + flat(c.get("description"), 80))
+        out.append("  " + str(c.get("title")) + par(c.get("type"), c.get("scope")) + " id=" + str(c.get("id")) + " — " + flat(c.get("description"), 80))
     return out
 
 
@@ -695,6 +713,10 @@ def scope_lines(t):
 
 def source_notes(s, ref, parent=None, position=False):
     notes = []
+    if s.get("document_after_cutoff"):
+        notes.append(TXT["later_publication"].format(day=s.get("doc_date") or "?"))
+    elif s.get("doc_date_state") == "unknown":
+        notes.append(TXT["unknown_date"])
     if s.get("doc_status") in ("superseded", "archived"):
         notes.append(TXT["status_doc_archived" if s["doc_status"] == "archived" else "status_doc_superseded"])
     if s.get("doc_status") == "not_started":
@@ -755,10 +777,22 @@ def view_search(envelope, limit=PAGE_BYTES):
     summary = r.get("retrieval_summary") or {}
     src = [s for s in r.get("sources") or [] if isinstance(s, dict)]
     hits = [s for s in src if s.get("role") == "hit"]
-    out = [head(envelope, TXT["state"].format(state=summary.get("evidence_state")),
-                TXT["hits"].format(hits=len(hits)) + (" + " + TXT["neighbors_n"].format(n=len(src) - len(hits)) if len(src) > len(hits) else ""))]
-    if summary.get("no_relevant_content"):
+    followups = [s for s in src if s.get("role") == "graph_followup"]
+    roots = hits + followups
+    has_supplement = any(s.get("accepted") is True for s in followups)
+    empty = summary.get("no_relevant_content") and not has_supplement
+    state = "accepted" if has_supplement else summary.get("evidence_state")
+    out = [head(envelope, TXT["state"].format(state=state),
+                TXT["hits"].format(hits=len(hits)) + (" + " + TXT["neighbors_n"].format(n=len(src) - len(roots)) if len(src) > len(roots) else ""))]
+    if empty:
         out.append(TXT["none"])
+    graph = summary.get("graph") or {}
+    readback = graph.get("readback") or {}
+    if followups:
+        labels = " ".join("S" + str(row["n"]) for row in followups)
+        out.append(TXT["readback_refs"].format(labels=labels, examined=len(readback.get("examined") or [])))
+    if readback.get("status") == "partial" or graph.get("degraded"):
+        out.append(TXT["graph_partial"])
     missed = missed_paths(envelope, hits)
     if missed:
         out.append(TXT["rel_path_none"].format(paths=TXT["list"].join(missed)))
@@ -771,6 +805,10 @@ def view_search(envelope, limit=PAGE_BYTES):
     elif (ranking.get("visual") or {}).get("status") == "skipped":
         out.append("Ranking: image reranking unavailable; text fallback")
     out += scope_lines(summary.get("time") or {})
+    if graph.get("mode") == "discovery" and any(
+        v.get("has_more") for v in ((graph.get("output") or {}).get("records") or {}).values()
+    ):
+        out.append(TXT["more_leads"])
     routing = summary.get("routing") or {}
     if routing.get("weak"):
         out.append(TXT["routing_weak"])
@@ -781,10 +819,10 @@ def view_search(envelope, limit=PAGE_BYTES):
     # Sources come first in the view and their citations are the ones later entries point back at, so they are
     # registered before the other sections are built; which of them are printed in full is decided last, from what
     # the other sections leave of the budget.
-    source_cites = {s.get("n"): cites.put("S" + str(s.get("n")), s.get("cite"), s) for s in hits}
+    source_cites = {s.get("n"): cites.put("S" + str(s.get("n")), s.get("cite"), s) for s in roots}
     tail = []
     files = Files()
-    for s in hits:
+    for s in roots:
         files.add("S" + str(s.get("n")), s.get("file"))
     specs = r.get("specs") or []
     if specs:
@@ -818,6 +856,10 @@ def view_search(envelope, limit=PAGE_BYTES):
         tail.append(TXT["hoods"])
         for h in hoods:
             label = "H" + str(h.get("n"))
+            if h.get("ambiguous"):
+                identity = par(h.get("type"), h.get("scope"), h.get("kb_id"))
+                tail.append("[" + label + "] " + str(h.get("title")) + identity + " · " + TXT["ambiguous_hood"])
+                continue
             bits = [str(h.get("title")) + par(h.get("type")), TXT["named"] if h.get("named") else "", TXT["relations_n"].format(n=h.get("relations")),
                     TXT["facts_n"].format(n=h.get("facts")),
                     TXT["list"].join(str(k.get("type")) + " " + str(k.get("count")) for k in h.get("predicates") or [])]
@@ -826,26 +868,31 @@ def view_search(envelope, limit=PAGE_BYTES):
                      for i, x in enumerate(h.get("neighbors") or [], 1)]
             if items:
                 tail.append("     " + TXT["semi"].join(items))
-    # Entities and relations that read the same are listed once (same-named entities of different scopes are often
-    # matched together), under the label of the first
+    # Display distinct identities even when their names and types coincide.
     seen, lines = set(), []
+    names = [(e.get("title"), e.get("type")) for e in entities]
     for e in entities:
-        text = str(e.get("title")) + par(e.get("type"))
-        if text not in seen and len(lines) < GRAPH_LIST_MAX:
-            seen.add(text)
-            lines.append("[E" + str(e.get("n")) + "] " + text)
+        identity = (e.get("kb_id"), e.get("id") or e.get("n"))
+        if identity in seen or len(lines) >= GRAPH_LIST_MAX:
+            continue
+        seen.add(identity)
+        bits = [e.get("type")]
+        if names.count((e.get("title"), e.get("type"))) > 1:
+            bits.extend([e.get("scope"), e.get("kb_id")])
+        label = "[E" + str(e.get("n")) + "] " + str(e.get("title")) + par(*bits)
+        lines.append(label)
     if lines:
         tail.append(TXT["entities"] + " " + TXT["dot"].join(lines))
     seen, lines = set(), []
     for x in relations:
         text = link(x) + (" [" + status_flag(x) + "]" if status_flag(x) else "")
-        if text not in seen and len(lines) < GRAPH_LIST_MAX:
-            seen.add(text)
+        if (x.get("kb_id"), x.get("id") or x.get("n")) not in seen and len(lines) < GRAPH_LIST_MAX:
+            seen.add((x.get("kb_id"), x.get("id") or x.get("n")))
             lines.append("[R" + str(x.get("n")) + "] " + text)
     if lines:
         tail.append(TXT["relationships"] + " " + TXT["dot"].join(lines))
     tail += files.lines()
-    if hits and not summary.get("no_relevant_content"):
+    if (hits or has_supplement) and not empty:
         tail += ["", TXT["next"]]       # said last, where the agent decides what to do with what it has just read
 
     # Sources. The page is first costed with every hit cut to its opening and every neighbour chunk only named; the
@@ -856,22 +903,22 @@ def view_search(envelope, limit=PAGE_BYTES):
         title = ["", TXT["sec_sources"]]
         near = {}
         for nb in src:
-            if nb.get("role") != "hit":
+            if nb.get("of") is not None and nb.get("role") not in ("hit", "graph_followup"):
                 near.setdefault(nb.get("of"), []).append(nb)
 
         def named(rows):
             return "     " + TXT["neighbor_refs"].format(items=TXT["list"].join("S" + str(nb.get("n")) + par(nb.get("place")) for nb in rows))
 
         firsts, cut = {}, {}
-        for s in hits:
+        for s in roots:
             label = "S" + str(s.get("n"))
             firsts[s.get("n")] = "[" + label + "] " + source_cites[s.get("n")] + notes_of(source_notes(s, cid + ":" + label, position=True))
             cut[s.get("n")] = [firsts[s.get("n")], "     " + flat(source_text(s), OPENING_CHARS)]
-        note = TXT["opening_only"].format(id=cid, labels=TXT["list"].join("S" + str(s.get("n")) for s in hits))
+        note = TXT["opening_only"].format(id=cid, labels=TXT["list"].join("S" + str(s.get("n")) for s in roots))
         left = (limit - PAGE_RESERVE - 200 - nbytes(out) - nbytes(tail) - nbytes(title) - nbytes([note])
-                - sum(nbytes(cut[s.get("n")]) for s in hits) - sum(nbytes([named(rows)]) for rows in near.values()))
+                - sum(nbytes(cut[s.get("n")]) for s in roots) - sum(nbytes([named(rows)]) for rows in near.values()))
         headers, blocks, later, opened = {}, {}, {}, []
-        for i, s in enumerate(hits):
+        for i, s in enumerate(roots):
             label = "S" + str(s.get("n"))
             full = [firsts[s.get("n")], source_text(s, headers, label)]
             extra = nbytes(full) - nbytes(cut[s.get("n")])
@@ -883,7 +930,7 @@ def view_search(envelope, limit=PAGE_BYTES):
                 blocks[s.get("n")] = cut[s.get("n")]
                 later[s.get("n")] = [firsts[s.get("n")], source_text(s)]
                 opened.append(label)
-        for s in hits:
+        for s in roots:
             parent, unprinted = "S" + str(s.get("n")), []
             for nb in near.get(s.get("n")) or []:
                 label = "S" + str(nb.get("n"))
@@ -900,7 +947,10 @@ def view_search(envelope, limit=PAGE_BYTES):
             if unprinted:
                 blocks[s.get("n")].append(named(unprinted))
         body = title + [line for s in hits for line in blocks[s.get("n")]]
-        rest = [line for s in hits for line in later.get(s.get("n")) or []]
+        if followups:
+            body += ["", TXT["readback_section"]]
+            body += [line for s in followups for line in blocks[s.get("n")]]
+        rest = [line for s in roots for line in later.get(s.get("n")) or []]
         if rest:
             # One of the best hits cut to its opening: the answer needs the next page. Otherwise it is supplementary.
             must = any("S" + str(s.get("n")) in opened for s in hits[:TOP_SOURCES])
@@ -921,6 +971,8 @@ def view_context(envelope, limit=PAGE_BYTES):
     else:
         what = TXT["context_plain"].format(doc=doc, n=len(src), tokens=r.get("tokens_total"))
     out = [head(envelope, what)]
+    if r.get("read_extent") == "indexed_chunks":
+        out.append(TXT["indexed_extent"])
     # All chunks are of one document: the first line names it, each chunk carries only its place in it.
     headers = {}
     for s in src:
@@ -1246,6 +1298,12 @@ def compact(envelope, path, limit=PAGE_BYTES, page=1):
 def payload(args, work=None):
     data = read_object(args.request) if getattr(args, "request", None) else {}
     ref = resolve(work, args.ref) if getattr(args, "ref", None) else None
+    doc_names = getattr(args, "in_doc", None) or []
+    doc_refs = [resolve(work, item) for item in ([doc_names] if isinstance(doc_names, str) else doc_names)]
+    documents = [document_of(*item[:3]) for item in doc_refs]
+    parents = ([ref[0]] if ref else []) + [item[0] for item in doc_refs]
+    if parents and args.command in ("context", "crop", "facts", "neighbors", "search", "grep"):
+        inherit_time(args, data, parents)
     if args.command in ('docs', 'grep'):
         if args.kb:
             data['kb_id'] = args.kb
@@ -1262,11 +1320,14 @@ def payload(args, work=None):
                 data['fields'] = args.field
             if args.rel_path:
                 data['rel_paths'] = args.rel_path
-            for item in args.in_doc or []:
-                kb, row = document_of(*resolve(work, item)[:3])
+            for item, (kb, row) in zip(args.in_doc or [], documents):
                 within([data['kb_id']] if data.get('kb_id') else [], kb, '--in-doc ' + item)
                 data['kb_id'] = kb
                 data.setdefault('doc_ids', []).append(row['doc_id'])
+                if row.get('content_version'):
+                    pin = data.setdefault('doc_versions', {}).setdefault(row['doc_id'], row['content_version'])
+                    if pin != row['content_version']:
+                        raise ValueError("Conflicting content versions for one document; refresh the reference.")
             time_scope(args, data)
             if not data.get('phrases'):
                 raise ValueError('grep requires --phrase or phrases in --request')
@@ -1283,14 +1344,20 @@ def payload(args, work=None):
         if args.rel_path:
             hints["rel_paths"] = args.rel_path
         named = list(data.get("kbs") or [])         # named by the caller (--kb or the request file): never widened
-        for item in args.in_doc or []:
-            kb, row = document_of(*resolve(work, item)[:3])
+        for item, (kb, row) in zip(args.in_doc or [], documents):
             if not row.get("doc_id"):
                 raise ValueError("the referenced entry carries no document id: " + item)
             within(named, kb, "--in-doc " + item)
             hints.setdefault("doc_ids", []).append(row["doc_id"])
             if not named and kb not in data.setdefault("kbs", []):
                 data["kbs"].append(kb)      # no knowledge base named: the documents pointed at decide
+        versions = {row["content_version"] for _, row in documents if row.get("content_version")}
+        if versions:
+            if hints.get("content_version"):
+                versions.add(hints["content_version"])
+            if len(versions) != 1 or any(not row.get("content_version") for _, row in documents):
+                raise ValueError("Use a separate scoped search for each versioned document.")
+            hints["content_version"] = versions.pop()
         if hints:
             data["hints"] = hints
         if args.top_k is not None:
@@ -1308,6 +1375,7 @@ def payload(args, work=None):
         if not isinstance(data.get("question"), str) or not data["question"].strip():
             raise ValueError("search requires --question or a question in --request")
     if args.command == "context":
+        time_scope(args, data)
         if ref is not None:
             kb, row = chunk_of(*ref[:3])
             if row.get("doc_id") is None or row.get("chunk_index") is None:
@@ -1331,6 +1399,7 @@ def payload(args, work=None):
         if not data.get("kb_id") or not data.get("doc_id"):
             raise ValueError("context requires --ref or --request")
     if args.command == "crop":
+        time_scope(args, data)
         if ref is not None:
             kb, row = chunk_of(*ref[:3])
             data.update({"kb_id": kb, "point_id": row["point_id"]})
@@ -1385,11 +1454,13 @@ def payload(args, work=None):
             if getattr(args, key, None):
                 data[field] = getattr(args, key)
         if getattr(args, "in_doc", None):
-            kb, row = document_of(*resolve(work, args.in_doc)[:3])
+            kb, row = documents[0]
             within([data["kb_id"]] if data.get("kb_id") else [], kb, "--in-doc " + args.in_doc)
             if not row.get("doc_id"):
                 raise ValueError("the referenced entry carries no document id: " + args.in_doc)
             data["kb_id"], data["doc_id"] = kb, row["doc_id"]
+            if row.get("content_version") and data.setdefault("content_version", row["content_version"]) != row["content_version"]:
+                raise ValueError("Conflicting content version; refresh the reference.")
         if getattr(args, "conflict_only", False):
             data["conflict_only"] = True
         time_scope(args, data)
@@ -1405,7 +1476,32 @@ def payload(args, work=None):
                 data["version"] = args.version
         if not data.get("kb_id"):
             raise ValueError(args.command + " requires --kb")
+    if args.command in ("neighbors", "facts"):
+        for parent, label, entry, _ in ([ref] if ref else []) + doc_refs:
+            if label not in ("E", "H", "N", "F"):
+                continue
+            result = parent.get("result") or {}
+            versions = (result.get("retrieval_summary") or {}).get("graph_versions") or {}
+            version = entry.get("graph_version") or result.get("graph_version") or versions.get(data["kb_id"])
+            if not version or data.setdefault("graph_version", version) != version:
+                raise ValueError("Graph reference has no verifiable common version; repeat the original lookup.")
     return data
+
+
+def inherit_time(args, data, parents):
+    # A new explicit scope takes precedence over the scope carried by a reference.
+    if (getattr(args, "as_of", None) or getattr(args, "history", False)
+            or "as_of" in data or "history" in data):
+        return
+    scopes = {(req.get("as_of"), bool(req.get("history"))) for req in
+              (parent.get("request") or {} for parent in parents)}
+    if len(scopes) > 1:
+        raise ValueError("References have different time scopes. Set --as-of or --history explicitly.")
+    day, history = scopes.pop()
+    if day:
+        data["as_of"] = day
+    if history:
+        data["history"] = True
 
 
 def time_scope(args, data):
@@ -1463,6 +1559,8 @@ def read_context(url, token, timeout, data, whole=False):
             ended = True                # the document ends here
             break
         start += CONTEXT_STEP
+    if whole:
+        merged["read_extent"] = "indexed_chunks"
     if whole and not total and not ended:
         merged["maybe_more"] = True
     for i, row in enumerate(merged.get("sources") or [], 1):
@@ -1504,7 +1602,7 @@ def parser():
         cmd.add_argument("--json", action="store_true", help="Print the complete response instead of the compact view")
         if name in ("search", "context", "crop", "neighbors", "entities", "facts", "schema", "stats", "docs", "grep"):
             cmd.add_argument("--request", help="UTF-8 JSON request file, or - for stdin")
-        if name in ("search", "neighbors", "facts", "grep"):
+        if name in ("search", "context", "neighbors", "facts", "grep", "crop", "image"):
             cmd.add_argument("--history", action="store_true",
                              help="Also what is no longer in effect: replaced statements, ended relations, documents marked replaced or archived")
             cmd.add_argument("--as-of", help="Look back to a day: YYYY, YYYY-MM or YYYY-MM-DD (a year or month means its last day)")
@@ -1639,8 +1737,11 @@ def main(argv=None):
         image_row = None
         if args.command == "image":
             kb, point = args.kb, args.point_id
+            scope = {}
             if args.ref:
-                kb, row = chunk_of(*resolve(work, args.ref)[:3])
+                origin, label, entry, _ = resolve(work, args.ref)
+                kb, row = chunk_of(origin, label, entry)
+                inherit_time(args, scope, [origin])
                 image_row = row
                 within([args.kb] if args.kb else [], kb, "--ref " + args.ref)
                 point, tag = row["point_id"], args.ref.replace(":", "-")
@@ -1648,6 +1749,9 @@ def main(argv=None):
                 raise ValueError("image requires --ref, or --kb with --point-id")
             quote = lambda s: urllib.parse.quote(s, safe="")
             route = "/image/" + quote(kb) + "/" + quote(point)
+            time_scope(args, scope)
+            if scope:
+                route += "?" + urllib.parse.urlencode(scope)
             method, data = "GET", None
         elif args.command in ("neighbors", "entities", "facts", "schema", "stats"):
             route, method, data = "/graph/" + args.command, "POST", payload(args, work)

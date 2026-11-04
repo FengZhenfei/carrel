@@ -9,10 +9,13 @@ import io
 import math
 import re
 import threading
+import time
+import logging
 from typing import Any
 
 import requests
 from opensearchpy import OpenSearch
+from opensearchpy.exceptions import TransportError
 from qdrant_client import models
 
 from kb_pipeline import search_fts
@@ -180,7 +183,24 @@ def bm25_channel(url: str, question: str, collection: str, *, limit: int, identi
     if not client.indices.exists(index=collection, request_timeout=timeout):
         return []
     body = {"size": int(limit), "query": bm25_query(question, identifiers or [], filters), "_source": BM25_SOURCE}
-    response = client.search(index=collection, body=body, request_timeout=timeout)
+    started = time.monotonic()
+    try:
+        response = client.search(index=collection, body=body, request_timeout=timeout)
+    except TransportError as exc:
+        message = str(exc).lower()
+        if exc.status_code not in (400, 500) or not any(term in message for term in
+                ("too_many_clauses", "too_many_nested_clauses", "too many nested clauses", "maxclausecount")):
+            raise
+        remaining = timeout - (time.monotonic() - started) if timeout is not None else None
+        if remaining is not None and remaining <= 0:
+            raise
+        # N-gram expansion is optional; retain the full question, identifier boosts
+        # and hard source filters when this branch exceeds the server clause limit.
+        should = body["query"]["bool"]["should"]
+        fallback = [clause for clause in should if not any(".ngram" in field for field in clause.get("multi_match", {}).get("fields", []))]
+        body = {**body, "query": {"bool": {**body["query"]["bool"], "should": fallback}}}
+        logging.getLogger(__name__).warning("BM25 clause limit: retrying once without path n-grams")
+        response = client.search(index=collection, body=body, request_timeout=remaining)
     rows: list[dict[str, Any]] = []
     for hit in response.get("hits", {}).get("hits", []):
         rows.append({"point_id": str(hit.get("_id")), "score": float(hit.get("_score") or 0.0), "payload": dict(hit.get("_source") or {})})
@@ -261,7 +281,8 @@ def shared_driver(settings: Settings) -> Any:
 
 def graph_channel(settings: Settings, source: KBSource, question: str, *, limit: int, hops: int,
                   vector: list[float] | None = None, lexical_only: bool = False, q: Any = None,
-                  timeout: float | None = None, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+                  timeout: float | None = None, history: bool = False, as_of: str | None = None,
+                  include_chunks: bool = True) -> dict[str, Any]:
     """图路作候选扩展(Q04):调 graph_query,只取切片 id 与图分作特征;实体 / 关系 / 事实 / 页面另外带回来给证据表。
     任何失败(别名版本不一致、Neo4j 不可达、图集合不存在)都只跳过图路,整次查询照常。
     vector:问题向量已经算过就传进来(省一次嵌入);lexical_only:嵌入服务挂了,只用词法种子(Q19)。
@@ -273,9 +294,11 @@ def graph_channel(settings: Settings, source: KBSource, question: str, *, limit:
     try:
         res = graph_query(settings, source, question, hops=int(hops), chunk_limit=int(limit), candidate_limit=int(limit),
                           with_text=True, vector=vector, lexical_only=lexical_only, q=q, driver=shared_driver(settings),
-                          timeout=timeout, history=history, as_of=as_of)
+                          timeout=timeout, history=history, as_of=as_of, include_chunks=include_chunks)
     except Exception as exc:
         return {"chunks": [], "skipped": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if res.get("degraded") and not res.get("graph_version"):
+        return {"chunks": [], "skipped": "; ".join(map(str, res["degraded"]))}
     chunks = [{"point_id": str(c.get("point_id")), "score": float(c.get("graph_score") or c.get("score") or 0.0),
                "chunk_uid": c.get("chunk_uid"), "rel_path": c.get("rel_path"),
                "entities": c.get("entities") or [], "relations": c.get("relations") or []}
@@ -418,11 +441,12 @@ def point_meta(q: Any, collection: str, point_ids: list[str], *, timeout: float 
     out: dict[str, dict[str, Any]] = {pid: {"active": False} for pid in ids}
     for start in range(0, len(ids), 256):
         batch = ids[start:start + 256]
-        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=["is_active", "doc_id", "rel_path", "content_version"],
+        for rec in q.retrieve(collection_name=collection, ids=batch, with_payload=["is_active", "doc_id", "rel_path", "content_version", "chunk_index", "page_idx", "source_locator"],
                               with_vectors=False, timeout=_secs(timeout)):
             pl = rec.payload or {}
             out[str(rec.id)] = {"active": bool(pl.get("is_active", True)), "doc_id": pl.get("doc_id"), "rel_path": pl.get("rel_path"),
-                                "content_version": pl.get("content_version")}
+                                "content_version": pl.get("content_version"), "chunk_index": pl.get("chunk_index"),
+                                "page_idx": pl.get("page_idx"), "source_locator": pl.get("source_locator")}
     return out
 
 

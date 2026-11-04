@@ -583,11 +583,61 @@ class TimedSession:
     """Adds a transaction timeout to every query of the session: Neo4j sets no limit by default, and a query
     keeps running after the caller has given up at its deadline, holding a connection and a thread."""
 
-    def __init__(self, session: Any, timeout: float) -> None:
-        self._session, self._timeout = session, float(timeout)
+    def __init__(self, session: Any, timeout: float, *, deadline: float | None = None) -> None:
+        self._session, self._timeout, self._deadline = session, float(timeout), deadline
 
     def run(self, text: str, **params: Any) -> Any:
-        return self._session.run(Query(text, timeout=self._timeout), **params)
+        remaining = self._timeout if self._deadline is None else min(self._timeout, self._deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("graph discovery budget exhausted")
+        return self._session.run(Query(text, timeout=remaining), **params)
+
+
+class _DeadlineClient:
+    """Apply one discovery deadline to the existing Qdrant read operations."""
+
+    def __init__(self, client: Any, deadline: float) -> None:
+        self.client, self.deadline = client, deadline
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self.client, name)
+        if name not in ("query_points", "scroll", "retrieve"):
+            return method
+
+        def read(*args: Any, **kwargs: Any) -> Any:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("graph discovery budget exhausted")
+            # Qdrant's server timeout is an integer number of seconds.
+            kwargs["timeout"] = min(kwargs.get("timeout") or 10**9, max(1, int(remaining)))
+            return method(*args, **kwargs)
+
+        return read
+
+
+def discovery_sources(session: Any, kb: str, gv: str, entities: dict[str, dict[str, Any]],
+                      relations: dict[str, dict[str, Any]]) -> None:
+    """Bounded provenance samples. These are locators, never chunk-ranking candidates."""
+    patterns = (
+        (entities, "MATCH (e:Entity {kb_id:$kb, graph_version:$gv, id:owner})-[:MENTIONED_IN]->(c:QdrantChunkSnapshot)"),
+        (relations, "MATCH (r:Relation {kb_id:$kb, graph_version:$gv, id:owner})<-[:EVIDENCES]-(tu:TextUnit)"
+                    "<-[:CONTRIBUTES_TO]-(c:QdrantChunkSnapshot)"),
+    )
+    for owners, pattern in patterns:
+        if not owners:
+            continue
+        rows = session.run(
+            "UNWIND $ids AS owner CALL { WITH owner " + pattern +
+            " WHERE coalesce(c.kind, 'body') <> 'boilerplate' "
+            "RETURN DISTINCT c.point_id AS point_id, c.rel_path AS rel_path "
+            "ORDER BY rel_path, point_id LIMIT $sample } RETURN owner, point_id, rel_path",
+            ids=list(owners), kb=kb, gv=gv, sample=SOURCE_SAMPLE + 1).data()
+        for oid, slot in owners.items():
+            found = [r for r in rows if str(r.get("owner")) == oid]
+            sample = found[:SOURCE_SAMPLE]
+            slot["point_ids"] = [str(r["point_id"]) for r in sample if r.get("point_id")]
+            slot["docs"] = sorted({str(r["rel_path"]) for r in sample if r.get("rel_path")})
+            slot["sources_truncated"] = len(found) > SOURCE_SAMPLE
 
 
 STATS_TTL = 600.0
@@ -642,6 +692,7 @@ def graph_query(
     timeout: float | None = None,
     history: bool = False,
     as_of: str | None = None,
+    include_chunks: bool = True,
 ) -> dict[str, Any]:
     """history / as_of:关系与事实的时间口径(currency.query_scope;默认现行)。实体没有时间,不受影响。
     vector:调用方已经算好的问题向量(检索服务里一次嵌入三路共用);lexical_only:嵌入服务不可用时
@@ -663,6 +714,9 @@ def graph_query(
         vector = embedder.embed([question])[0]
     if q is None:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    deadline = time.monotonic() + float(timeout) if timeout and not include_chunks else None
+    if deadline is not None:
+        q = _DeadlineClient(q, deadline)
     seeds_only = seed_filter()
     collections = graph_collections_for(source.collection, graph_version)
     entity_alias, relation_alias = collections["entity"], collections["relation"]
@@ -699,10 +753,16 @@ def graph_query(
     if own_driver:
         driver = neo4j_driver(settings)
     try:
-        gv = graph_version or active_neo4j_graph_version(driver, source.kb_id)
+        if deadline is not None and not graph_version:
+            with driver.session() as version_session:
+                record = TimedSession(version_session, timeout, deadline=deadline).run(
+                    "MATCH (k:KB {kb_id: $kb}) RETURN k.active_graph_version AS gv", kb=source.kb_id).single()
+                gv = str(record["gv"]) if record and record.get("gv") else None
+        else:
+            gv = graph_version or active_neo4j_graph_version(driver, source.kb_id)
         if not gv:
             raise RuntimeError(f"Neo4j has no active graph version for {source.kb_id}")
-        if entity_seeds and str(entity_seeds[0].get("graph_version") or gv) != gv:
+        if any(str(seed.get("graph_version") or gv) != gv for seed in entity_seeds + relation_seeds + specs + pages):
             raise RuntimeError("The Qdrant graph collections and the active Neo4j version disagree; the alias switch may be incomplete")
 
         entity_scores: dict[str, dict[str, Any]] = {}
@@ -719,6 +779,7 @@ def graph_query(
             rid = str(seed.get("gr_id") or "")
             if rid:
                 relation_scores[rid] = {"id": rid, "source": seed.get("source"), "target": seed.get("target"),
+                                        "source_id": seed.get("source_id"), "target_id": seed.get("target_id"),
                                         "type": seed.get("type"), "description": seed.get("description"),
                                         "score": seed["_score"], "hop": 0, "via": seed.get("_via") or "vector",
                                         **{k: seed.get(k) for k in RELATION_TIME_KEYS if seed.get(k) not in (None, "")},
@@ -733,8 +794,8 @@ def graph_query(
 
         with driver.session() as session:
             if timeout:
-                session = TimedSession(session, timeout)
-            stats = version_stats(session, source.kb_id, gv)
+                session = TimedSession(session, timeout, deadline=deadline)
+            stats = version_stats(session, source.kb_id, gv) if include_chunks else {"max_rank": 1.0}
             max_rank = stats["max_rank"]          # pagerank normalization factor
             frontier = list(entity_scores)
             seed_ids = set(entity_scores)          # relations with both ends seeded (in-network) do not decay by hop (GraphRAG local)
@@ -838,112 +899,119 @@ def graph_query(
 
             # Chunk aggregation: entity attribution and relation evidence each weighted by idf (see mention_weight /
             # evidence_weight)
-            n_chunks = stats["n_chunks"]
-            mean_hub = stats["total_mentions"] / n_chunks if n_chunks else 0.0
-            mention_rows = session.run(
-                """
-                UNWIND $ids AS eid
-                MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[m:MENTIONED_IN]->(c:QdrantChunkSnapshot)
-                WHERE coalesce(c.kind, 'body') <> 'boilerplate'
-                RETURN eid, c.point_id AS point_id, c.chunk_uid AS chunk_uid, c.rel_path AS rel_path, m.count AS count,
-                       size([(c)<-[:MENTIONED_IN]-() | 1]) AS hub, coalesce(c.kind, 'body') AS kind
-                """,
-                ids=list(entity_scores), kb=source.kb_id, gv=gv,
-            ).data()
-            entity_df: dict[str, int] = {}
-            entity_docs: dict[str, set[str]] = {}
-            for row in mention_rows:
-                entity_df[str(row["eid"])] = entity_df.get(str(row["eid"]), 0) + 1
-                if row.get("rel_path"):
-                    entity_docs.setdefault(str(row["eid"]), set()).add(str(row["rel_path"]))
-            entity_points = source_points(mention_rows, "eid")
-            for eid, slot in entity_scores.items():
-                slot["docs"] = sorted(entity_docs.get(eid, ()))      # docs of the chunks mentioning it; evaluation locates a cited entity's document by it
-                slot["point_ids"] = entity_points.get(eid, [])
             chunk_scores: dict[str, dict[str, Any]] = {}
-            parts: dict[str, dict[str, Any]] = {}
-            for row in mention_rows:
-                eid = str(row["eid"])
-                escore = entity_scores[eid]["score"]
-                pid = str(row["point_id"])
-                slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": row.get("chunk_uid"),
-                                                     "rel_path": row.get("rel_path"), "score": 0.0, "entities": [], "relations": []})
-                part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": int(row.get("hub") or 0),
-                                              "entity_detail": [], "evidence_detail": []})
-                weight = mention_weight(escore, count=int(row.get("count") or 0), df=entity_df.get(eid, 1), n_chunks=n_chunks)
-                if str(row.get("kind") or "body") == "conclusion":
-                    weight *= CONCLUSION_BOOST          # the document's own conclusion section: the same hit is likelier the answer
-                part["entity"].append(weight)
-                if explain:
-                    part["entity_detail"].append({**{k: entity_scores[eid].get(k) for k in ("title", "type", "score", "hop", "via")},
-                                                  "count": int(row.get("count") or 0), "df": entity_df.get(eid, 1), "weight": weight})
-                slot["entities"].append(entity_scores[eid].get("title"))
-            if relation_scores:
-                evidence_rows = session.run(
+            if not include_chunks:
+                # Only return the bounded frontier; source samples are not recall candidates.
+                entity_scores = dict(sorted(entity_scores.items(), key=lambda item: -item[1]["score"])[:top_entities * 2])
+                relation_scores = dict(sorted(relation_scores.items(), key=lambda item: -item[1]["score"])[:top_relations * 2])
+                discovery_sources(session, source.kb_id, gv, entity_scores, relation_scores)
+            else:
+                n_chunks = stats["n_chunks"]
+                mean_hub = stats["total_mentions"] / n_chunks if n_chunks else 0.0
+                mention_rows = session.run(
                     """
-                    UNWIND $ids AS rid
-                    MATCH (tu:TextUnit {kb_id: $kb, graph_version: $gv})-[:EVIDENCES]->(r:Relation {kb_id: $kb, graph_version: $gv, id: rid})
-                    WHERE coalesce(tu.kind, 'body') <> 'boilerplate'
-                    MATCH (c:QdrantChunkSnapshot)-[:CONTRIBUTES_TO]->(tu)
-                    RETURN rid, c.point_id AS point_id, c.chunk_uid AS chunk_uid, c.rel_path AS rel_path, coalesce(tu.kind, 'body') AS kind
+                    UNWIND $ids AS eid
+                    MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[m:MENTIONED_IN]->(c:QdrantChunkSnapshot)
+                    WHERE coalesce(c.kind, 'body') <> 'boilerplate'
+                    RETURN eid, c.point_id AS point_id, c.chunk_uid AS chunk_uid, c.rel_path AS rel_path, m.count AS count,
+                           size([(c)<-[:MENTIONED_IN]-() | 1]) AS hub, coalesce(c.kind, 'body') AS kind
                     """,
-                    ids=list(relation_scores), kb=source.kb_id, gv=gv,
+                    ids=list(entity_scores), kb=source.kb_id, gv=gv,
                 ).data()
-                relation_df: dict[str, int] = {}
-                for row in evidence_rows:
-                    relation_df[str(row["rid"])] = relation_df.get(str(row["rid"]), 0) + 1
-                for rid, pids in source_points(evidence_rows, "rid").items():
-                    relation_scores[rid]["point_ids"] = pids
-                for row in evidence_rows:
-                    rid = str(row["rid"])
-                    rscore = relation_scores[rid]["score"]
+                entity_df: dict[str, int] = {}
+                entity_docs: dict[str, set[str]] = {}
+                for row in mention_rows:
+                    entity_df[str(row["eid"])] = entity_df.get(str(row["eid"]), 0) + 1
+                    if row.get("rel_path"):
+                        entity_docs.setdefault(str(row["eid"]), set()).add(str(row["rel_path"]))
+                entity_points = source_points(mention_rows, "eid")
+                for eid, slot in entity_scores.items():
+                    slot["docs"] = sorted(entity_docs.get(eid, ()))      # docs of the chunks mentioning it; evaluation locates a cited entity's document by it
+                    slot["point_ids"] = entity_points.get(eid, [])
+                chunk_scores: dict[str, dict[str, Any]] = {}
+                parts: dict[str, dict[str, Any]] = {}
+                for row in mention_rows:
+                    eid = str(row["eid"])
+                    escore = entity_scores[eid]["score"]
                     pid = str(row["point_id"])
                     slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": row.get("chunk_uid"),
                                                          "rel_path": row.get("rel_path"), "score": 0.0, "entities": [], "relations": []})
-                    part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0,
+                    part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": int(row.get("hub") or 0),
                                                   "entity_detail": [], "evidence_detail": []})
-                    weight = evidence_weight(rscore, df=relation_df.get(rid, 1), n_chunks=n_chunks)
+                    weight = mention_weight(escore, count=int(row.get("count") or 0), df=entity_df.get(eid, 1), n_chunks=n_chunks)
                     if str(row.get("kind") or "body") == "conclusion":
-                        weight *= CONCLUSION_BOOST
-                    part["evidence"].append(weight)
-                    r = relation_scores[rid]
+                        weight *= CONCLUSION_BOOST          # the document's own conclusion section: the same hit is likelier the answer
+                    part["entity"].append(weight)
                     if explain:
-                        part["evidence_detail"].append({"label": f"{r.get('source')} -[{r.get('type')}]-> {r.get('target')}",
-                                                        "score": r.get("score"), "hop": r.get("hop"), "via": r.get("via"),
-                                                        "df": relation_df.get(rid, 1), "weight": weight})
-                    slot["relations"].append(f"{r.get('source')} -[{r.get('type')}]-> {r.get('target')}")
-            # Fact hits: their source chunks score as evidence (a fact is usually supported by a few chunks of one
-            # unit, exactly where the answer is)
-            for sp in spec_evidence_seeds(specs):
-                pids = [str(x) for x in (sp.get("point_ids") or [])]
-                for pid in pids:
-                    slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": None, "rel_path": sp.get("rel_path"),
-                                                         "score": 0.0, "entities": [], "relations": []})
-                    part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0, "entity_detail": [], "evidence_detail": []})
-                    weight = evidence_weight(float(sp["_score"]), df=len(pids) or 1, n_chunks=n_chunks)
-                    part["evidence"].append(weight)
-                    slot["relations"].append(f"spec: {sp.get('subject')} · {sp.get('property')}")
+                        part["entity_detail"].append({**{k: entity_scores[eid].get(k) for k in ("title", "type", "score", "hop", "via")},
+                                                      "count": int(row.get("count") or 0), "df": entity_df.get(eid, 1), "weight": weight})
+                    slot["entities"].append(entity_scores[eid].get("title"))
+                if relation_scores:
+                    evidence_rows = session.run(
+                        """
+                        UNWIND $ids AS rid
+                        MATCH (tu:TextUnit {kb_id: $kb, graph_version: $gv})-[:EVIDENCES]->(r:Relation {kb_id: $kb, graph_version: $gv, id: rid})
+                        WHERE coalesce(tu.kind, 'body') <> 'boilerplate'
+                        MATCH (c:QdrantChunkSnapshot)-[:CONTRIBUTES_TO]->(tu)
+                        RETURN rid, c.point_id AS point_id, c.chunk_uid AS chunk_uid, c.rel_path AS rel_path, coalesce(tu.kind, 'body') AS kind
+                        """,
+                        ids=list(relation_scores), kb=source.kb_id, gv=gv,
+                    ).data()
+                    relation_df: dict[str, int] = {}
+                    for row in evidence_rows:
+                        relation_df[str(row["rid"])] = relation_df.get(str(row["rid"]), 0) + 1
+                    for rid, pids in source_points(evidence_rows, "rid").items():
+                        relation_scores[rid]["point_ids"] = pids
+                    for row in evidence_rows:
+                        rid = str(row["rid"])
+                        rscore = relation_scores[rid]["score"]
+                        pid = str(row["point_id"])
+                        slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": row.get("chunk_uid"),
+                                                             "rel_path": row.get("rel_path"), "score": 0.0, "entities": [], "relations": []})
+                        part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0,
+                                                      "entity_detail": [], "evidence_detail": []})
+                        weight = evidence_weight(rscore, df=relation_df.get(rid, 1), n_chunks=n_chunks)
+                        if str(row.get("kind") or "body") == "conclusion":
+                            weight *= CONCLUSION_BOOST
+                        part["evidence"].append(weight)
+                        r = relation_scores[rid]
+                        if explain:
+                            part["evidence_detail"].append({"label": f"{r.get('source')} -[{r.get('type')}]-> {r.get('target')}",
+                                                            "score": r.get("score"), "hop": r.get("hop"), "via": r.get("via"),
+                                                            "df": relation_df.get(rid, 1), "weight": weight})
+                        slot["relations"].append(f"{r.get('source')} -[{r.get('type')}]-> {r.get('target')}")
+                # Fact hits: their source chunks score as evidence (a fact is usually supported by a few chunks of one
+                # unit, exactly where the answer is)
+                for sp in spec_evidence_seeds(specs):
+                    pids = [str(x) for x in (sp.get("point_ids") or [])]
+                    for pid in pids:
+                        slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": None, "rel_path": sp.get("rel_path"),
+                                                             "score": 0.0, "entities": [], "relations": []})
+                        part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0, "entity_detail": [], "evidence_detail": []})
+                        weight = evidence_weight(float(sp["_score"]), df=len(pids) or 1, n_chunks=n_chunks)
+                        part["evidence"].append(weight)
+                        slot["relations"].append(f"spec: {sp.get('subject')} · {sp.get('property')}")
+                        if explain:
+                            part["evidence_detail"].append({"label": f"spec: {sp.get('text')}", "score": sp["_score"], "hop": 0,
+                                                            "via": sp.get("_via"), "df": len(pids), "weight": weight})
+                # Page hits: the source chunks of subject / timeline pages count as evidence too (the pages themselves
+                # are returned separately)
+                for pg in pages[:3]:
+                    if float(pg.get("_score") or 0) < PAGE_EVIDENCE_MIN_SCORE:
+                        continue
+                    pids = [str(x) for x in (pg.get("point_ids") or [])][:8]
+                    for pid in pids:
+                        slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": None, "rel_path": None,
+                                                             "score": 0.0, "entities": [], "relations": []})
+                        part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0, "entity_detail": [], "evidence_detail": []})
+                        weight = evidence_weight(float(pg["_score"]) * 0.8, df=len(pids) or 1, n_chunks=n_chunks)
+                        part["evidence"].append(weight)
+                        slot["relations"].append(f"page: {pg.get('title')}")
+                for pid, part in parts.items():
+                    chunk_scores[pid]["score"] = chunk_score(part["entity"], part["evidence"], hub=part["hub"], mean_hub=mean_hub)
                     if explain:
-                        part["evidence_detail"].append({"label": f"spec: {sp.get('text')}", "score": sp["_score"], "hop": 0,
-                                                        "via": sp.get("_via"), "df": len(pids), "weight": weight})
-            # Page hits: the source chunks of subject / timeline pages count as evidence too (the pages themselves
-            # are returned separately)
-            for pg in pages[:3]:
-                if float(pg.get("_score") or 0) < PAGE_EVIDENCE_MIN_SCORE:
-                    continue
-                pids = [str(x) for x in (pg.get("point_ids") or [])][:8]
-                for pid in pids:
-                    slot = chunk_scores.setdefault(pid, {"point_id": pid, "chunk_uid": None, "rel_path": None,
-                                                         "score": 0.0, "entities": [], "relations": []})
-                    part = parts.setdefault(pid, {"entity": [], "evidence": [], "hub": 0, "entity_detail": [], "evidence_detail": []})
-                    weight = evidence_weight(float(pg["_score"]) * 0.8, df=len(pids) or 1, n_chunks=n_chunks)
-                    part["evidence"].append(weight)
-                    slot["relations"].append(f"page: {pg.get('title')}")
-            for pid, part in parts.items():
-                chunk_scores[pid]["score"] = chunk_score(part["entity"], part["evidence"], hub=part["hub"], mean_hub=mean_hub)
-                if explain:
-                    chunk_scores[pid]["explain"] = {"hub": part["hub"], "mean_hub": mean_hub, "n_chunks": n_chunks,
-                                                    "entities": part["entity_detail"], "relations": part["evidence_detail"]}
+                        chunk_scores[pid]["explain"] = {"hub": part["hub"], "mean_hub": mean_hub, "n_chunks": n_chunks,
+                                                        "entities": part["entity_detail"], "relations": part["evidence_detail"]}
     finally:
         if own_driver:
             driver.close()

@@ -10,6 +10,8 @@ unfinished stages are reported as degraded evidence.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from kb_pipeline.chunking.context import payload_text
 
 import os
@@ -290,7 +292,8 @@ def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[st
     scope = scope or {"mode": "current"}
     jobs = {kb: pool.submit(channels.graph_channel, settings, settings.sources[kb], question, limit=ss.graph_k, hops=ss.graph_hops,
                             vector=vector, lexical_only=vector is None, q=q, timeout=timeout,
-                            history=scope["mode"] == "history", as_of=scope["day"] if scope.get("as_of") else None)
+                            history=scope["mode"] == "history", as_of=scope["day"] if scope.get("as_of") else None,
+                            include_chunks=ss.graph_mode == "fused")
             for kb in graph_kbs}
     for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"chunks": [], "skipped": _err(val)}
@@ -759,7 +762,7 @@ def _mark_accepted(ordered: list[dict[str, Any]], status: str, floor: float | No
 
 
 def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = None, hints: dict[str, Any] | None = None,
-           with_context: bool = True, explain: bool = False, image_bytes: bytes | None = None, history: bool = False,
+           with_context: bool = True, graph_readback: bool = True, explain: bool = False, image_bytes: bytes | None = None, history: bool = False,
            as_of: str | None = None) -> dict[str, Any]:
     """history / as_of:时间口径(kb_pipeline.graph.currency.query_scope)。默认只用现行的:更正文件里标了被取代 / 归档 /
     过了有效期的文档不进结果,关系与事实只给现行的;as_of 回看某一天;history 全给,非现行的标出来。"""
@@ -773,12 +776,20 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     settings, ss, q = runtime()
     until = t0 + float(ss.request_budget) if ss.request_budget > 0 else float("inf")
     image_query = bool(image_bytes)
+    text_profile = ss.text_discovery and not image_query
+    if text_profile:
+        ss = replace(ss, graph_mode="off" if ss.graph_mode == "off" else "discovery", mmr_enabled=False, visual_enabled=False)
+        settings = replace(settings, visual_reranker_base_url="")
     hint_used, hint_ignored = channels.parse_hints(hints)
     doc_hint = {k: v for k, v in hint_used.items() if k != "block_types"} or None
+    if image_query and ss.graph_mode != "off":
+        # Document restrictions cannot be enforced on cross-document edges.
+        ss = replace(ss, graph_mode="neighborhood" if ss.neighborhoods > 0 and not doc_hint else "off")
     timings: dict[str, int] = {}
     degraded: list[str] = []
     entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, driver=_graph_driver(settings))
     by_id = {e["kb_id"]: e for e in entries}
+    scope = {**scope, "graph_versions": {kb: e["graph_version"] for kb, e in by_id.items() if e.get("graph_version")}}
     stale = next((e["degraded"] for e in entries if e.get("degraded")), None)
     if stale:
         degraded.append(f"catalog: {stale}")
@@ -829,7 +840,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     chosen = [k for k in routing["chosen"] if k in probe]
     # The graph / visual channels run only on the chosen knowledge bases, then fusion per knowledge base
     t = time.time()
-    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope)
+    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope) if ss.graph_mode == "fused" else {}
     visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint, until=until, excluded=excluded)
     per_kb: dict[str, dict[str, Any]] = {kb: _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k, excluded=excluded.get(kb))
                                          for kb in chosen}
@@ -853,7 +864,8 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             degraded.append("budget: widen skipped")
         else:
             t = time.time()
-            graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until, scope))
+            if ss.graph_mode == "fused":
+                graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until, scope))
             visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint, until=until,
                                          excluded=excluded))
             for kb in rest:
@@ -929,12 +941,50 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         neighbor_span=ss.neighbor_span, question=question)
     degraded.extend(dict.fromkeys(context_gaps))
     timings["evidence_ms"] = int((time.time() - t) * 1000)
+    # Date annotations belong to direct evidence, and must not depend on the optional graph mode or its budget.
+    t = time.time()
+    doc_marked = docstatus.annotate(settings, sources, scope)
+    date_versions = scope.get("graph_versions") or {}
+    if sources and _left(ss.channel_timeout, until) > 0:
+        try:
+            dates = docstatus.document_dates(settings, sources, date_versions,
+                                             driver=_graph_driver(settings) if date_versions else None,
+                                             timeout=_left(ss.channel_timeout, until))
+            for row in sources:
+                date = dates.get((str(row.get("kb_id") or ""), str(row.get("doc_id") or "")))
+                if date:
+                    row["doc_date"] = date
+                if scope.get("as_of"):
+                    row["doc_date_state"] = "known" if date else "unknown"
+                    row["document_after_cutoff"] = bool(date and date > scope["day"])
+        except Exception as exc:
+            degraded.append(f"doc_dates: {type(exc).__name__}")
+    timings["doc_status_ms"] = int((time.time() - t) * 1000)
+    evidence_degraded = list(degraded)
+    discovery_started = time.time()
+    independent_graph = ss.graph_mode in ("discovery", "neighborhood")
+    if independent_graph:
+        until = min(until, discovery_started + ss.graph_budget)
+        degraded = []
+    if ss.graph_mode == "discovery":
+        from kb_pipeline.graph.recall import _DeadlineClient
+        q = _DeadlineClient(q, time.monotonic() + max(0.0, until - time.time()))
+        graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope)
+        for kb in chosen:
+            graph = graphs.get(kb) or {}
+            per_kb[kb]["graph"] = None if graph.get("skipped") else graph
+            if graph.get("skipped"):
+                degraded.append(f"{kb}:graph: {graph['skipped']}")
+        timings["discovery_recall_ms"] = int((time.time() - discovery_started) * 1000)
     source_ns = {str(r.get("point_id")): int(r["n"]) for r in sources}
     entities: list[dict[str, Any]] = []
     relations: list[dict[str, Any]] = []
     specs: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
     graph_versions: dict[str, str | None] = {}
+    if ss.graph_mode == "neighborhood":
+        graph_versions.update({kb: date_versions[kb] for kb in chosen
+                               if by_id[kb].get("has_graph") is not False and date_versions.get(kb)})
     for kb in chosen:
         g = per_kb[kb].get("graph") or {}
         if g:
@@ -953,15 +1003,18 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     # Source point verification for derived evidence (Codex S03 / R1): whether the points that facts /
     # pages / entities / relations refer to are still active and which document they belong to; a point
     # already in Sources uses its payload directly
-    meta: dict[str, dict[str, Any]] = {str(r.get("point_id")): {"active": True, "doc_id": r.get("doc_id"), "rel_path": r.get("rel_path"),
-                                                                 "content_version": r.get("content_version")} for r in sources}
+    meta: dict[str, dict[str, Any]] = {str(r.get("point_id")): {**{key: r.get(key) for key in
+        ("kb_id", "doc_id", "rel_path", "content_version", "chunk_index", "page_idx", "source_locator")}, "active": True} for r in sources}
     t = time.time()
     for kb in chosen:
         want = {str(p) for row in specs + pages + entities + relations if row.get("kb_id") == kb for p in (row.get("point_ids") or [])} - set(meta)
         if want:
+            if _left(ss.channel_timeout, until) <= 0:
+                degraded.append(f"{kb}:point_meta: budget exhausted")
+                continue
             try:
-                meta.update(channels.point_meta(q, settings.sources[kb].collection, sorted(want),
-                                                timeout=_left(ss.channel_timeout, until) or 1.0))
+                meta.update({pid: {**m, "kb_id": kb} for pid, m in channels.point_meta(
+                    q, settings.sources[kb].collection, sorted(want), timeout=_left(ss.channel_timeout, until)).items()})
             except Exception as exc:
                 degraded.append(f"{kb}:point_meta: {type(exc).__name__}")
     timings["verify_ms"] = int((time.time() - t) * 1000)
@@ -997,7 +1050,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         kept_pages = [pg for pg in pages if (pg.get("point_ids") or []) and all(in_scope.get(str(x)) for x in pg["point_ids"])]
         hints_scope["pages_dropped"] = len(pages) - len(kept_pages)
         pages = kept_pages
-        kept_entities = [e for e in entities if (e.get("docs") or []) and set(map(str, e["docs"])) <= allowed_paths]
+        kept_entities = [e for e in entities if not e.get("sources_truncated") and (e.get("docs") or []) and set(map(str, e["docs"])) <= allowed_paths]
         hints_scope["entities_dropped"] = len(entities) - len(kept_entities)
         entities = kept_entities
         hints_scope["relations_omitted"] = len(relations)
@@ -1007,11 +1060,20 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     # version, so it is marked and must not serve as a current basis; rows whose source points could not be
     # checked (the main store did not return them) are not marked
     for row in entities + relations:
-        pids = [str(p) for p in (row.get("point_ids") or []) if str(p) in point_active]
-        if pids:
-            active = sum(1 for p in pids if point_active[p])
-            row["sources_active"] = f"{active}/{len(pids)}"
-            row["source_valid"] = active > 0
+        all_pids = list(map(str, row.get("point_ids") or []))
+        pids = [pid for pid in all_pids if pid in point_active]
+        active = sum(1 for p in pids if point_active[p])
+        row["sources_active"] = f"{active}/{len(all_pids)}"
+        row["source_state"] = ("verified" if all_pids and active == len(all_pids) and not row.get("sources_truncated")
+                               else "partial" if active else "invalid" if all_pids and len(pids) == len(all_pids) else "unverified")
+        row["source_valid"] = active > 0 if pids else None
+        if ss.graph_mode == "discovery":
+            verified = [pid for pid in pids if point_active[pid]]
+            row["evidence"] = [{"point_id": pid, **{key: meta[pid].get(key) for key in
+                ("doc_id", "rel_path", "content_version", "chunk_index", "page_idx", "source_locator")}}
+                for pid in verified[:4]]
+            row["point_ids"] = verified[:4]
+            row["sources_truncated"] = bool(row.get("sources_truncated")) or len(verified) > 4
     specs = spec_rows(specs, source_ns=source_ns, limit_hints=ss.spec_hint_limit, point_active=point_active)
     from . import graphwalk
 
@@ -1031,7 +1093,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         timings["spec_evidence_ms"] = int((time.time() - t) * 1000)
     subjects = list(buckets["keys"]) if buckets and buckets.get("mode") == "subject" else []
     pages = page_rows(pages, subjects=subjects, text_budget_tokens=ss.page_text_tokens, point_active=point_active)[:6]
-    if evidence_state != "accepted":
+    if evidence_state != "accepted" and ss.graph_mode != "discovery":
         for row in specs + pages:
             row["state"] = evidence_state
     # The one-hop neighbourhood of the subjects: for the entities the question names (filled up with graph route seeds),
@@ -1042,14 +1104,20 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     graph_kbs = [kb for kb in chosen if graph_versions.get(kb)]
     if ss.neighborhoods > 0 and graph_kbs and not doc_hint:
         t = time.time()
-        timeout = _left(min(ss.channel_timeout, NEIGHBORHOOD_TIMEOUT), until)
+        image_leads = ss.graph_mode == "neighborhood"
+        limit = min(ss.neighborhoods, 2) if image_leads else ss.neighborhoods
+        options = {}
+        if image_leads:
+            options = {"per_entity": 2, "hit_points": [(r["kb_id"], r["point_id"]) for r in sources
+                       if r["role"] == "hit" and r.get("accepted") is True and r["kb_id"] in graph_kbs][:3]}
+        timeout = _left(min(ss.channel_timeout, 2.0 if image_leads else NEIGHBORHOOD_TIMEOUT), until)
         if timeout <= 0:
             degraded.append("budget: neighborhoods skipped")
         else:
             try:
                 job = _pool(ss).submit(graphwalk.neighborhoods, settings, {kb: settings.sources[kb] for kb in graph_kbs},
-                                       {kb: str(graph_versions[kb]) for kb in graph_kbs}, question, entities, limit=ss.neighborhoods,
-                                       driver=channels.shared_driver(settings), timeout=timeout, scope=scope)
+                                       {kb: str(graph_versions[kb]) for kb in graph_kbs}, question, entities, limit=limit,
+                                       driver=channels.shared_driver(settings), timeout=timeout, scope=scope, **options)
                 ok, val = _collect({"*": job}, time.time() + timeout)["*"]
             except Exception as exc:
                 ok, val = False, exc
@@ -1058,21 +1126,12 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             else:
                 degraded.append(f"neighborhoods: {type(val).__name__}")
         timings["neighborhood_ms"] = int((time.time() - t) * 1000)
-    # 来源的文档日期与(回看、history 时)文档状态:调用方据此判断说法的新旧;取不回来只记降级
-    t = time.time()
-    doc_marked = docstatus.annotate(settings, sources, scope)
-    timeout = _left(ss.channel_timeout, until)
-    if sources and timeout > 0:
-        try:
-            dates = docstatus.document_dates(settings, sources, graph_versions,
-                                             driver=channels.shared_driver(settings) if graph_versions else None, timeout=timeout)
-            for r in sources:
-                d = dates.get((str(r.get("kb_id") or ""), str(r.get("doc_id") or "")))
-                if d:
-                    r["doc_date"] = d
-        except Exception as exc:
-            degraded.append(f"doc_dates: {type(exc).__name__}")
-    timings["doc_status_ms"] = int((time.time() - t) * 1000)
+    graph_degraded = list(degraded) if independent_graph else []
+    if independent_graph:
+        for row in entities + relations + specs + pages + neighborhoods:
+            row["role"] = "discovery"
+        degraded = evidence_degraded
+        timings["discovery_ms"] = int((time.time() - discovery_started) * 1000)
     rerank_max = max((float(c.get("score_rerank") or 0.0) for c in cands), default=0.0) if reranked else None
     summary = {
         "kbs": chosen, "routing": routing, "identifiers": identifiers, "image_query": image_query,
@@ -1084,34 +1143,76 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         "buckets": buckets, "selection": selection, "downweighted": downweighted,
         "degraded": degraded,
         "evidence_state": evidence_state,
+        "graph": {"mode": ss.graph_mode, "degraded": graph_degraded,
+                  "state": "disabled" if ss.graph_mode == "off" else ("partial" if graph_degraded else ("ok" if graph_versions else "unavailable")),
+                  "versions": graph_versions, "entities": len(entities[:24]), "relationships": len(relations[:24]),
+                  "facts": len(specs), "pages": len(pages), "neighborhoods": len(neighborhoods)},
         "low_confidence": bool(degraded) or evidence_state != "accepted",
         "no_relevant_content": (not hits) or evidence_state == "diagnostic",
         "sources": {**src_stats, "page_tokens": sum(int(r.get("_tokens") or 0) for r in pages)},
         "timings_ms": {**timings, "total_ms": int((time.time() - t0) * 1000)},
         "hints": hints or {}, "hints_applied": bool(hint_used), "hints_used": hint_used, "hints_ignored": hint_ignored, "hints_scope": hints_scope,
         # 时间口径:按文档状态排除了几份文档(各库)、来源里有几条非现行文档(回看 / history 时)
-        "time": {"mode": scope["mode"], "day": scope["day"],
+        "time": {"mode": scope["mode"], "day": scope["day"], "text_time_filter": "not_applied",
                  "excluded_documents": {kb: len(v) for kb, v in excluded.items() if v}, "non_current_sources": doc_marked},
     }
     if not explain:
         for r in sources:
             r.pop("entities", None); r.pop("relations", None)
-    return {
+    lead_fields = ("role", "point_ids", "sources_truncated", "evidence", "source_state") if ss.graph_mode == "discovery" else ()
+    result = {
         "question": question, "kbs": chosen,
         # the knowledge bases' folder names: callers build the cited path as "folder name / rel_path" without
         # another catalog call
         "kb_names": {kb: str(settings.sources[kb].source_root) for kb in chosen if getattr(settings.sources.get(kb), "source_root", None)},
         "sources": sources, "doc_aggs": doc_aggs(sources),
-        "entities": numbered(entities[:24], ENTITY_FIELDS + ("kb_id",)),
-        "relationships": numbered(relations[:24], RELATION_FIELDS + ("kb_id",)),
-        "neighborhoods": numbered(neighborhoods, NEIGHBORHOOD_FIELDS + ("kb_id",)),
-        "specs": numbered(specs, SPEC_FIELDS + ("state", "kb_id")),
-        "pages": numbered(pages, PAGE_FIELDS + ("state", "kb_id")),
+        "entities": numbered(entities[:24], ENTITY_FIELDS + ("kb_id",) + lead_fields),
+        "relationships": numbered(relations[:24], RELATION_FIELDS + ("kb_id", "source_id", "target_id") + lead_fields),
+        "neighborhoods": numbered(neighborhoods, NEIGHBORHOOD_FIELDS + ("kb_id", "role", "ambiguous", "scope", "graph_version")),
+        "specs": numbered(specs, SPEC_FIELDS + ("state", "kb_id", "role")),
+        "pages": numbered(pages, PAGE_FIELDS + ("state", "kb_id", "role")),
         "retrieval_summary": summary,
     }
+    if ss.graph_mode == "discovery":
+        from .evidence import budget_discovery
+        leads, budget = budget_discovery(result, ss.graph_context_tokens)
+        result.update(leads)
+        summary["graph"]["output"] = budget
+    if text_profile and ss.graph_mode == "discovery":
+        from .readback import read_originals
+
+        summary["primary_evidence_state"] = evidence_state
+        graph_summary = summary["graph"]
+        readback = {"status": "disabled", "added": 0, "tokens": 0, "source_numbers": [], "examined": []}
+        if graph_readback and with_context and rerank_active(settings, ss):
+            started = time.time()
+            if started < until:
+                job = _pool(ss).submit(read_originals, settings, ss, q, result, scope, doc_hint or {}, until,
+                                       _graph_driver(settings))
+                ok, value = _collect({"readback": job}, until)["readback"]
+            else:
+                ok, value = False, TimeoutError("graph readback deadline reached")
+            if ok:
+                additional, readback = value
+                sources.extend(additional)
+                if any(row.get("accepted") for row in additional):
+                    summary["evidence_state"] = "accepted"
+                    summary["no_relevant_content"] = False
+                    summary["low_confidence"] = bool(degraded)
+            else:
+                readback["status"] = "partial"
+                graph_summary["state"] = "partial"
+                graph_summary["degraded"].append(f"readback: {type(value).__name__}")
+            summary["timings_ms"]["readback_ms"] = int((time.time() - started) * 1000)
+        graph_summary["readback"] = readback
+        summary["timings_ms"]["total_ms"] = int((time.time() - t0) * 1000)
+    return result
 
 
-def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_version: str | None = None) -> dict[str, Any]:
+def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_version: str | None = None,
+            history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+    from kb_pipeline.graph.currency import query_scope
+
     settings, ss, q = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
@@ -1122,39 +1223,45 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
     from .evidence import source_row
 
     sources = [source_row(i, {"point_id": r.get("point_id"), "kb_id": kb_id}, r, role="context") for i, r in enumerate(rows, 1)]
+    scope = query_scope(history=history, as_of=as_of)
+    sources = [row for row in sources if docstatus.allowed(settings, settings.sources[kb_id], row.get("rel_path"), scope)]
+    if scope.get("as_of"):
+        entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, driver=_graph_driver(settings))
+        scope["graph_versions"] = {e["kb_id"]: e.get("graph_version") for e in entries}
+    sources, time_stats = docstatus.annotate_dates(settings, sources, scope, driver=_graph_driver(settings), timeout=ss.channel_timeout)
     root = getattr(settings.sources[kb_id], "source_root", None)
     return {"kb_id": kb_id, "kb_name": str(root) if root else None, "doc_id": doc_id, "sources": sources,
+            "time": {"mode": scope["mode"], "day": scope["day"], **time_stats},
             "tokens_total": sum(int(s["token_count"]) for s in sources)}
 
 
-def image(kb_id: str, point_id: str) -> dict[str, Any]:
-    """Original image bytes of an image chunk (Q26): the bitmap embedded in the PDF first, then a
-    high-resolution render of the page bbox, and only last the image in the parse cache."""
+def image(kb_id: str, point_id: str, *, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+    """Fetch the source image within the same document scope as context."""
+    from kb_pipeline.graph.currency import query_scope
     from . import images
 
-    settings, ss, q = runtime()
+    settings, _, q = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
-    payload = images.locate(q, settings.sources[kb_id].collection, point_id)
+    source = settings.sources[kb_id]
+    scope = query_scope(history=history, as_of=as_of)
+    payload = images.locate(q, source.collection, point_id)
+    if not docstatus.allowed(settings, source, payload.get("rel_path"), scope):
+        raise KeyError("image unavailable in the requested document scope")
     return images.original_image(settings, payload)
 
 
-def crop(kb_id: str, point_id: str, bbox: list[float], *, pad: int = 16) -> dict[str, Any]:
-    """Crop the original image along the caller's box (Q25): the box may be 0-1 fractions or 0-1000
-    per-mille; the DGX does a deterministic crop only, no recognition of any kind."""
+def crop(kb_id: str, point_id: str, bbox: list[float], *, pad: int = 16,
+         history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     from . import images
 
-    settings, ss, q = runtime()
-    if kb_id not in settings.sources:
-        raise KeyError(kb_id)
-    payload = images.locate(q, settings.sources[kb_id].collection, point_id)
-    full = images.original_image(settings, payload)
+    full = image(kb_id, point_id, history=history, as_of=as_of)
     return images.crop_image(full, bbox, pad=pad)
 
 
 def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | None = None, limit: int = 20,
                     types: list[str] | None = None, direction: str = "both", history: bool = False,
-                    as_of: str | None = None) -> dict[str, Any]:
+                    as_of: str | None = None, expected_graph_version: str | None = None) -> dict[str, Any]:
     """图谱邻域(agent 自己走图用):一个实体的一跳关系,带谓语、方向、权重、对端、时间与状态、证据切片;
     默认只给现行的关系(history / as_of 见 currency.query_scope);没开图谱的库按 404 报。"""
     from . import graphwalk
@@ -1165,7 +1272,7 @@ def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | N
     if not entity and not entity_id:
         raise ValueError("entity or entity_id is required")
     return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
-                               history=history, as_of=as_of, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+                               history=history, as_of=as_of, expected_graph_version=expected_graph_version, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
 def graph_entities(kb_id: str, *, types: list[str] | None = None, uppers: list[str] | None = None, kind: str = "all",
@@ -1243,6 +1350,7 @@ FACT_FIELDS = tuple(f for f in SPEC_FIELDS if f not in ("sources", "score")) + (
 
 def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | None = None, prop: str | None = None,
                 match: str = "auto", doc_id: str | None = None, rel_path: str | None = None, conflict_only: bool = False,
+                expected_graph_version: str | None = None, content_version: str | None = None,
                 history: bool = False, as_of: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     """按主体 / 属性 / 文档 / 冲突查限定事实:行结构与 /search 的 specs 相同,带总数与翻页;
     主体、属性、文档、conflict_only 至少给一个(什么都不给就是整库的事实,该走翻页更明确的列法)。
@@ -1261,7 +1369,7 @@ def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | Non
     doc_id = library.resolve_doc(settings, kb_id, doc_id=doc_id, rel_path=rel_path)
     return graphwalk.list_facts(settings, settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
                                 doc_id=doc_id, conflict_only=conflict_only, history=history, as_of=as_of, limit=limit, offset=offset,
-                                fields=FACT_FIELDS, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+                                fields=FACT_FIELDS, expected_graph_version=expected_graph_version, content_version=content_version, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
 
 
 def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None, page_id: str | None = None, entity_id: str | None = None,
@@ -1299,7 +1407,7 @@ def docs(kb_id: str, *, dir: str | None = None, name: str | None = None, include
 
 
 def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
-         doc_ids: list[str] | None = None, limit: int = 30, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+         doc_ids: list[str] | None = None, doc_versions: dict[str, str] | None = None, limit: int = 30, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     """Literal phrase counts: in how many chunks and which documents each phrase appears, with the first few hits
     and a literal check; an unreachable keyword index is reported as 503."""
     from . import library
@@ -1318,7 +1426,7 @@ def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel
     # no later candidate filter that could repair a truncated exclusion list.
     excluded = docstatus.excluded_paths(settings, source, scope, max_paths=None)
     try:
-        result = library.grep(settings, source, phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, limit=limit,
+        result = library.grep(settings, source, phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, doc_versions=doc_versions, limit=limit,
                               client=channels.os_client(settings.opensearch_url), timeout=ss.channel_timeout, excluded_paths=excluded)
     except (KeyError, ValueError, sqlite3.Error):
         raise                   # state-database errors are not the keyword index's; they go to the common error handling as they are (a lock is reported as 503)

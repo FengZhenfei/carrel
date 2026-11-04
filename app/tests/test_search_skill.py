@@ -207,15 +207,15 @@ def test_document_and_phrase_references_preserve_scope_and_version(client, tmp_p
     dref = d['call_id'] + ':D9'
     assert client.main(base + ['grep', '--phrase', 'term', '--in-doc', dref, '--as-of', '2024', '--json']) == 0
     g = json.loads(capsys.readouterr().out)
-    assert calls[-1] == ('POST', '/grep', {'kb_id': 'example', 'doc_ids': ['doc'], 'phrases': ['term'], 'as_of': '2024', 'limit': 8})
+    assert calls[-1] == ('POST', '/grep', {'kb_id': 'example', 'doc_ids': ['doc'], 'doc_versions': {'doc': 'v8'}, 'phrases': ['term'], 'as_of': '2024', 'limit': 8})
     gref = g['call_id'] + ':G1'
     assert client.main(base + ['context', '--ref', gref, '--json']) == 0
     capsys.readouterr()
     assert calls[-1] == ('POST', '/context', {'kb_id': 'example', 'doc_id': 'doc', 'chunk_from': 1,
-                                             'chunk_to': 3, 'content_version': 'v8'})
+                                             'chunk_to': 3, 'content_version': 'v8', 'as_of': '2024'})
     assert client.main(base + ['search', '--question', 'Meaning?', '--in-doc', dref, '--json']) == 0
     capsys.readouterr()
-    assert calls[-1][2] == {'question': 'Meaning?', 'kbs': ['example'], 'hints': {'doc_ids': ['doc']}}
+    assert calls[-1][2] == {'question': 'Meaning?', 'kbs': ['example'], 'hints': {'doc_ids': ['doc'], 'content_version': 'v8'}}
     count = len(calls)
     assert client.main(base + ['grep', '--kb', 'other', '--in-doc', dref, '--phrase', 'term']) == 1
     capsys.readouterr()
@@ -301,3 +301,93 @@ def test_source_availability_supports_current_and_previous_field(client):
     row = {"subject":"Sample","property":"Output","value":"8"}
     for field in ("source_valid", "verified"):
         assert client.TXT["stale"] in client.fact_line({**row,field:False})
+
+
+def test_graph_originals_are_independent_paginated_and_citable(client, tmp_path, capsys):
+    def source(number, role, text):
+        return {"n": number, "role": role, "kb_id": "sample", "doc_id": "doc" + str(number),
+                "point_id": "p" + str(number), "chunk_index": 1, "content_version": "v1",
+                "rel_path": str(number) + ".md", "text": text, "place": "page 2"}
+
+    direct = source(1, "hit", "DIRECT PASSAGE. " * 180)
+    neighbor = dict(source(2, "neighbor", "NEIGHBOR PASSAGE"), of=1)
+    extra = source(3, "graph_followup", "ADDITIONAL ORIGINAL. " * 200 + "END OF ORIGINAL.")
+    result = {"sources": [direct, neighbor, extra], "kbs": ["sample"], "kb_names": {"sample": "Library"},
+              "retrieval_summary": {"graph": {"readback": {"examined": [{}, {}], "source_numbers": [3]}}}}
+    client.add_cites(result)
+    envelope = {"call_id": "ab12cd", "operation": "search", "request": {}, "result": result}
+    (tmp_path / "ab12cd.json").write_text(json.dumps(envelope))
+    pages = client.pages_of(client.view_search(envelope, limit=2400), 2400)
+    assert len(pages) > 1
+    assert "S3" in "\n".join(pages[0])
+    rendered = "\n".join(line for page in pages for line in page)
+    assert extra["file"] in rendered
+    assert rendered.index("[S1]") < rendered.index("[S3]")
+    assert "END OF ORIGINAL." in rendered
+    assert client.show(tmp_path, ["ab12cd:S3"]) == 0
+    assert extra["text"] in capsys.readouterr().out
+    _, _, row, _ = client.resolve(tmp_path, "ab12cd:S3")
+    assert (row["point_id"], row["doc_id"], row["content_version"]) == ("p3", "doc3", "v1")
+
+
+def test_same_name_entities_and_partial_graph_keep_grounded_sources(client):
+    result = {"kbs": ["kb"], "retrieval_summary": {"evidence_state": "accepted", "graph": {"degraded": ["budget"]}},
+              "entities": [{"n": i, "title": "Atlas", "type": "System", "kb_id": "kb", "id": str(i),
+                            "scope": scope} for i, scope in [(1, "West"), (2, "East")]],
+              "neighborhoods": [{"n": 1, "id": "west", "title": "Atlas", "type": "System", "scope": "West",
+                                 "ambiguous": True, "neighbors": []}],
+              "sources": [{"n": 1, "role": "hit", "text": "grounded passage", "point_id": "p1"}]}
+    envelope = {"call_id": "ab12cd", "operation": "search", "request": {}, "result": result}
+    view = "\n".join(client.view_search(envelope))
+    assert all(x in view for x in ("[E1]", "[E2]", "West", "East", "grounded passage", client.TXT["graph_partial"], client.TXT["ambiguous_hood"]))
+    ambiguous = client.candidates({"result": {"ambiguous": True, "candidates": result["entities"]},
+                                   "call_id": "ab12cd", "operation": "neighbors"})
+    assert client.TXT["ambiguous"] in ambiguous
+
+
+@pytest.mark.parametrize("command,ref", [("context", "S1"), ("neighbors", "E1"), ("facts", "E1")])
+def test_followup_inherits_original_time_and_preserves_explicit_override(client, tmp_path, command, ref):
+    envelope = {"request": {"as_of": "2025"}, "result": {
+        "graph_version": "g1", "kb_id": "k", "sources": [{"n": 1, "point_id": "p", "doc_id": "d", "content_version": "v1", "chunk_index": 4}],
+        "entities": [{"n": 1, "id": "entity", "title": "sample"}]}}
+    (tmp_path / "ab12cd.json").write_text(json.dumps(envelope))
+    def body(*options):
+        args = client.parser().parse_args([command, "--ref", "ab12cd:" + ref, *options])
+        return client.payload(args, tmp_path)
+    assert body()["as_of"] == "2025"
+    assert body("--as-of", "2023")["as_of"] == "2023"
+    assert body("--history")["history"] and "as_of" not in body("--history")
+
+
+def test_whole_read_describes_the_indexed_representation(client, monkeypatch):
+    row = {"chunk_index": 0, "chunk_total": 1, "text": "Extracted body."}
+    def request(*args):
+        return json.dumps({"sources": [row], "tokens_total": 4}).encode(), {}
+    monkeypatch.setattr(client, "request", request)
+    data = {"kb_id": "sample", "doc_id": "doc", "chunk_from": 0, "chunk_to": 0}
+    result = client.read_context("http://example", "", 5, data, whole=True)
+    envelope = {"call_id": "ab12cd", "operation": "context", "request": data, "result": result}
+    assert result["read_extent"] == "indexed_chunks"
+    assert client.TXT["indexed_extent"] in client.view_context(envelope)
+    assert "read_extent" not in client.read_context("http://example", "", 5, data)
+
+
+def test_mixed_time_references_require_explicit_scope(client, tmp_path):
+    for call, day in [("aa0011", "2023"), ("bb0022", "2024")]:
+        item = {"n": 1, "kb_id": "kb", "doc_id": call, "rel_path": "example.md"}
+        (tmp_path / (call + ".json")).write_text(json.dumps({"request": {"as_of": day}, "result": {"docs": [item]}}))
+    args = ["search", "--question", "Which date?", "--in-doc", "aa0011:D1", "--in-doc", "bb0022:D1"]
+    with pytest.raises(ValueError, match="different time scopes"):
+        client.payload(client.parser().parse_args(args), tmp_path)
+    body = client.payload(client.parser().parse_args(args + ["--as-of", "2025"]), tmp_path)
+    assert body["as_of"] == "2025" and body["hints"]["doc_ids"] == ["aa0011", "bb0022"]
+
+
+def test_accepted_supplement_is_visible_in_an_older_cached_response(client):
+    row = {"n": 1, "role": "graph_followup", "accepted": True, "text": "Verified source.",
+           "point_id": "p", "doc_id": "d", "kb_id": "k", "rel_path": "sample.md"}
+    envelope = {"call_id": "ad1234", "operation": "search", "result": {"kbs": ["k"], "sources": [row],
+                "retrieval_summary": {"evidence_state": "diagnostic", "no_relevant_content": True}}}
+    view = client.view_search(envelope)
+    assert client.TXT["state"].format(state="accepted") in view[0]
+    assert client.TXT["none"] not in view and client.TXT["next"] in view

@@ -133,12 +133,19 @@ class SearchSettings:
                                   # with graph route seeds); 0 = none. Measured on 2026-10-02: a few subjects with 8 relations each, one per
                                   # line, come to 500-600 characters; every extra round of deliberation costs an agent half a minute to five
                                   # minutes while one query takes about a second, so the leads for the first hop come with the first search
+    graph_mode: str = "fused"      # fused: candidate expansion; discovery: separate leads after evidence; off: no graph
+    graph_budget: float = 5.0       # discovery, provenance and neighborhoods share this part of the request budget
+    text_discovery: bool = False    # text-only profile; image requests use the regular settings
+    graph_context_tokens: int = 0      # optional estimated JSON cap; 0 keeps the bounded lead set
 
 
 def load_search_settings(env: Mapping[str, str] | None = None) -> SearchSettings:
     """env: where the values come from, the process environment by default; the long-running service passes
     the set computed from the env file's current content (service._search_env)."""
     env = os.environ if env is None else env
+    graph_mode = str(env.get("KB_SEARCH_GRAPH_MODE", "fused")).strip().lower()
+    if graph_mode not in ("off", "fused", "discovery"):
+        raise ValueError("KB_SEARCH_GRAPH_MODE must be off, fused or discovery")
     return SearchSettings(
         host=str(env.get("KB_SEARCH_HOST", "0.0.0.0")),
         port=_int(env, "KB_SEARCH_PORT", 9810),
@@ -189,4 +196,8 @@ def load_search_settings(env: Mapping[str, str] | None = None) -> SearchSettings
         page_text_tokens=_int(env, "KB_SEARCH_PAGE_TEXT_TOKENS", 1200),
         spec_hint_limit=_int(env, "KB_SEARCH_SPEC_HINT_LIMIT", 8),
         neighborhoods=_int(env, "KB_SEARCH_NEIGHBORHOODS", 4),
+        graph_mode=graph_mode,
+        text_discovery=_bool(env, "KB_SEARCH_TEXT_DISCOVERY", False),
+        graph_budget=max(0.1, min(30.0, _float(env, "KB_SEARCH_GRAPH_BUDGET", 5.0))),
+        graph_context_tokens=max(0, _int(env, "KB_SEARCH_GRAPH_CONTEXT_TOKENS", 0)),
     )

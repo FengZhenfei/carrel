@@ -121,6 +121,48 @@ collection that does not exist yet counts as empty), its entry reports `chunks`
 and `has_graph` as `null` with a `degraded` note, searches still try its graph,
 and the catalog is rebuilt after about 15 seconds.
 
+### Direct evidence and graph discovery
+
+Set `KB_SEARCH_TEXT_DISCOVERY=true` to enable the text query profile. The service ranks vector and keyword candidates with the text reranker and token MMR disabled. It then verifies graph source versions and appends one round of originals to `sources` with `role=graph_followup`. The round examines up to 24 candidates and appends up to six chunks within 2,400 estimated tokens. `retrieval_summary.graph.readback` records the verified locators, appended source numbers and status. Set `graph_readback=false` on a request to skip the round. Requests with `context=false` also skip it.
+
+Image queries keep a shared top-K for text and visual hits. When graph exploration is enabled, the service attaches up to two one-hop subjects with up to two neighbors each after ranking. Named entities take priority, followed by entities mentioned in the first three accepted hits. These leads are available for follow-up. Graph chunks do not enter image-query ranking. Document-scoped queries omit the neighborhood.
+
+`KB_SEARCH_GRAPH_MODE` selects `fused` (the existing default), `off`, or
+`discovery`. In `discovery` mode, vector and keyword candidates finish text
+reranking, document quotas, deduplication and context assembly before graph
+exploration begins. Graph chunks and scores do not enter that ranking. The
+pure-text candidate configuration also sets `KB_SEARCH_MMR=false`; keyword
+weighting and document quotas remain enabled.
+
+Graph leads reuse `entities`, `relationships`, `specs`, `pages` and
+`neighborhoods`, with `role: "discovery"`. Representative evidence locators
+include document ID, chunk index and content version. Source checks distinguish
+verified, partial, invalid and unverified provenance; active provenance does
+not establish the truth of a model-extracted claim.
+
+`KB_SEARCH_GRAPH_BUDGET` bounds this phase (5 seconds by default), within the
+overall request deadline. `KB_SEARCH_GRAPH_CONTEXT_TOKENS` bounds its estimated
+JSON token count when positive; the default `0` keeps all leads within the existing
+record-count limits. JSON estimates differ from the Skill's compact display tokens.
+With a positive cap, whole records are admitted round-robin;
+omitted counts and `has_more` appear in `retrieval_summary.graph.output`.
+Fact conditions are not shortened to make a record fit. Existing graph APIs
+provide the remaining detail. Graph failures are reported under
+`retrieval_summary.graph.degraded`, independently of direct-evidence confidence.
+
+Name-based neighbors and facts queries return `ambiguous: true` and candidate
+identities when multiple entities match. Select an ID using type, scope and
+source information. Connection counts do not decide identity.
+
+`as_of` filters structured facts and series by the times stated in the source.
+Later publications may describe earlier events, so search passages and `/context`
+are not excluded solely by their document dates. Their response reports
+`text_time_filter: "not_applied"`; callers check event times in the source text.
+Known document dates remain in `doc_date`, with `document_after_cutoff: true`
+for later publications; unknown dates use `doc_date_state: "unknown"`.
+`/context` accepts `as_of` and `history`; explicit document-governance rules
+continue to apply.
+
 ### Text and image reranking
 
 Configuring `VISUAL_RERANKER_BASE_URL` adds image reranking to the normal search
@@ -569,3 +611,5 @@ Question sets also accept `required_facts`, `forbidden_facts`, `required_relatio
 ```
 
 Only declared checks enter each denominator. Retrieval errors count as failed checks. These checks complement hit rates and MRR with fact fidelity, source coverage, relation paths and explicit time scope. They use deterministic matching, not model grading.
+
+Versioned document references pin keyword lookups and graph facts to their source version. Following an entity or relation requires its original graph version. On HTTP 409, repeat the original lookup before following the new reference. Original images and crops inherit the source query’s date or history scope. An explicit `KB_SEARCH_GRAPH_MODE=off` also disables discovery in the text profile. In text discovery, `primary_evidence_state` describes direct ranking and `evidence_state` includes accepted graph-source passages.

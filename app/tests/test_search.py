@@ -1218,8 +1218,8 @@ class OrchestrationTests(unittest.TestCase):
                 return [{"point_id": "p1", "score": 0.8, "payload": docs["p1"]}, {"point_id": "p3", "score": 0.6, "payload": docs["p3"]}] + list(extra_vec or [])
             return [{"point_id": "p9", "score": 0.3, "payload": docs["p9"]}]
 
-        def fake_hoods(settings, sources, graph_versions, question, seeds, *, limit, driver=None, timeout=None, scope=None):
-            calls["hoods"] = {"kbs": list(sources), "question": question, "seeds": [e.get("title") for e in seeds], "graph_versions": graph_versions,
+        def fake_hoods(settings, sources, graph_versions, question, seeds, *, limit, driver=None, timeout=None, scope=None, **options):
+            calls["hoods"] = {"options": options, "kbs": list(sources), "question": question, "seeds": [e.get("title") for e in seeds], "graph_versions": graph_versions,
                               "limit": limit, "timeout": timeout, "scope": scope}
             if callable(hoods):
                 return hoods()
@@ -1250,7 +1250,7 @@ class OrchestrationTests(unittest.TestCase):
                 mock.patch.object(graphwalk, "neighborhoods", side_effect=fake_hoods), \
                 mock.patch.object(graphwalk, "point_payloads", side_effect=fake_points), \
                 mock.patch.object(docstatus, "document_dates", side_effect=lambda settings, rows, gvs, **kw: dict(doc_dates or {})), \
-                mock.patch.object(Reranker, "score", fake_rerank):
+                   mock.patch.object(Reranker, "score", fake_rerank):
             out = service.search(question, kbs=kbs, explain=True, image_bytes=image, hints=hints, history=history, as_of=as_of)
         return out, calls
 
@@ -1751,14 +1751,12 @@ class GraphWalkTests(unittest.TestCase):
         with self._driver(log).session() as session:
             index = graphwalk.name_index(session, "kb_005", "v1")
         named = graphwalk.named_entities("zk200 和 example gateway 的网关延迟对比,FAIL 时怎么热备份", index)
-        # case and spaces are ignored; names covered by a longer one (Example, Gateway) do not count; AI does not match inside FAIL;
-        # of same-named entities the one with more relations is taken (e5); names with letters or digits, or of four characters and
-        # more, come first, three-character ones next, two-character words without letters last
-        self.assertEqual([(e["id"], e["_rank"]) for e in named], [("e1", 2), ("e2", 2), ("e8", 1), ("e5", 0), ("e7", 0)])
-        # aliases count; of several sharing the name the one with the most relations is taken (e2 shares it as an alias, e9 as its
-        # title), the same entity a lookup by name on the neighbours endpoint lands on
-        self.assertEqual([e["id"] for e in graphwalk.named_entities("Gateway 怎么配", index)], ["e2"])
-        self.assertEqual([e["id"] for e in graphwalk.named_entities("ZK 200 的时延", index)], ["e1", "e7"])           # an extra space in the question, and an alias
+        # 不分大小写、不计空格;被更长的名字盖住的(Example、Gateway)不算;AI 不在 FAIL 里命中;同名身份都保留(e5、e4);
+        # 带英文数字的或四个字以上的在前,三个字的其次,两个字的中文词最后
+        self.assertEqual([(e["id"], e["_rank"]) for e in named], [("e1", 2), ("e2", 2), ("e8", 1), ("e5", 0), ("e7", 0), ("e4", 0)])
+        # 别名也算；同名的不同身份全部返回，不能用连接度决定身份。
+        self.assertEqual([e["id"] for e in graphwalk.named_entities("Gateway 怎么配", index)], ["e2", "e9"])
+        self.assertEqual([e["id"] for e in graphwalk.named_entities("ZK 200 的时延", index)], ["e1", "e7"])           # 问题里多一个空格、用的是别名
         self.assertEqual(graphwalk.named_entities("今天天气怎么样", index), [])
         self.assertEqual(graphwalk.named_entities("", index), [])
 
@@ -2109,6 +2107,8 @@ class ApiTests(unittest.TestCase):
                 if "replace(toLower(e.title), ' ', '') = $name" in text:
                     rows = [{"id": "e-small", "title": "ZK200", "type": "device", "upper": "entity", "scope": None, "description": "", "pagerank": 0.1, "degree": 2, "aliases": []},
                             {"id": "e-main", "title": "ZK200", "type": "device", "upper": "entity", "scope": None, "description": "", "pagerank": 0.2, "degree": 30, "aliases": []}]
+                elif "id: $id" in text:
+                    rows = [{"id": kw["id"], "title": "ZK200", "type": "device", "scope": "selected", "degree": 30}]
                 elif "RETURN DISTINCT f.concept_key AS key" in text:
                     rows = [] if " = $p" in text else [{"key": "c-vcc"}]            # nothing exact, containment hits one concept
                 elif "count(f) AS total" in text:
@@ -2143,8 +2143,12 @@ class ApiTests(unittest.TestCase):
         driver = SimpleNamespace(session=lambda: Session(), close=mock.Mock())
         src = SimpleNamespace(kb_id="kb_002", collection="kb_002", source_root="datasheets")
         with mock.patch("kb_pipeline.graph.neo4j_import.active_neo4j_graph_version", return_value=gv):
-            out = graphwalk.list_facts(SimpleNamespace(), src, subject=" ZK 200 ", prop=" Voltage ", limit=3, offset=2, fields=service.FACT_FIELDS, q=Q(), driver=driver)
-        self.assertEqual((out["found"], out["subject"]["id"], [m["id"] for m in out["matches"]]), (True, "e-main", ["e-small"]))    # several with the same name: the best connected one, the rest listed
+            ambiguous = graphwalk.list_facts(SimpleNamespace(), src, subject=" ZK 200 ", prop=" Voltage ", q=Q(), driver=driver)
+            self.assertTrue(ambiguous["ambiguous"])
+            self.assertFalse(ambiguous["found"])
+            self.assertEqual({m["id"] for m in ambiguous["matches"]}, {"e-main", "e-small"})
+            out = graphwalk.list_facts(SimpleNamespace(), src, subject_id="e-main", prop=" Voltage ", limit=3, offset=2, fields=service.FACT_FIELDS, q=Q(), driver=driver)
+        self.assertEqual((out["found"], out["subject"]["id"], [m["id"] for m in out["matches"]]), (True, "e-main", []))    # explicit identity, retaining fact/property/pagination coverage
         self.assertEqual(next(kw for t, kw in log if "$name" in t)["name"], "zk200")                                               # case and spaces do not matter
         self.assertEqual(out["property"], {"query": "Voltage", "matched": "contains", "concepts": 1})                              # containment only when nothing matched exactly
         self.assertEqual((out["total"], out["offset"], out["count"], out["has_more"], out["kb_name"]), (5, 2, 3, False, "datasheets"))
@@ -2743,10 +2747,11 @@ class SkillClientTests(unittest.TestCase):
                                          {"relation_id": "r2", "type": "related_to", "direction": "out", "directed": False, "other": {"id": "e2", "title": "Example Gateway", "degree": 9}}]}],
         "entities": [{"n": 1, "kb_id": "kb_005", "id": "e1", "title": "ZK200", "type": "product"},
                      {"n": 2, "kb_id": "kb_005", "id": "e9", "title": "ZK200", "type": "product"}],
-        "relationships": [{"n": 1, "kb_id": "kb_005", "source": "ZK200", "type": "supports", "target": "hot standby"},
-                          {"n": 2, "kb_id": "kb_005", "source": "ZK200", "type": "supports", "target": "hot standby"}],
-        "retrieval_summary": {"evidence_state": "accepted", "degraded": ["kb_005:graph"], "routing": {"weak": True}}}}
+        "relationships": [{"n": 1, "kb_id": "kb_005", "id": "r1", "source": "ZK200", "type": "supports", "target": "hot standby"},
+                          {"n": 2, "kb_id": "kb_005", "id": "r1", "source": "ZK200", "type": "supports", "target": "hot standby"}],
+        "retrieval_summary": {"evidence_state": "accepted", "graph_versions": {"kb_005": "g1"}, "degraded": ["kb_005:graph"], "routing": {"weak": True}}}}
     NEIGHBORS = {"call_id": "bbbbbb", "operation": "neighbors", "result": {
+        "graph_version": "g1",
         "kb_id": "kb_005", "kb_name": "products", "found": True, "entity": {"id": "e1", "title": "ZK200", "type": "product", "facts": 12},
         "total": 30, "count": 3, "predicates": [{"type": "part_of", "count": 20}],
         "matches": [{"id": "e9", "title": "ZK200", "type": "module", "degree": 2}],
@@ -2817,9 +2822,9 @@ class SkillClientTests(unittest.TestCase):
         self.assertIn("[P1] subject · ZK200 · sources active 2/2: A gateway controller. (has body text, show aaaaaa:P1) — products/vendor/manual.pdf (one of 2 documents)", view)
         self.assertIn("[H1] ZK200 (product) · named in the question · 30 relations · 12 facts · part_of 20, supports 10", view)
         self.assertIn("     H1.1 ←part_of Control module (4); H1.2 —related_to— Example Gateway (9)", view)
-        # entities and relations that read the same are listed once; a matched relation comes without a direction, so
+        # distinct identities retain separate references; a matched relation comes without a direction, so
         # its two ends are joined neutrally instead of by an arrow
-        self.assertIn("Entities: [E1] ZK200 (product)", view)
+        self.assertIn("Entities: [E1] ZK200 (product · kb_005) · [E2] ZK200 (product · kb_005)", view)
         relations = [line for line in view if line.startswith("Relations (")]
         self.assertEqual(len(relations), 1)
         self.assertTrue(relations[0].endswith("): [R1] ZK200 —supports— hot standby"))
@@ -2916,14 +2921,14 @@ class SkillClientTests(unittest.TestCase):
             self.assertEqual(build("context", "--ref", "aaaaaa:F3"),                                      # with evidence: the chunk that holds its value
                              {"kb_id": "kb_005", "doc_id": "d1", "chunk_from": 11, "chunk_to": 13, "content_version": "v1"})
             # walking on: a listed entity, a subject of the neighbourhood block, one of its far ends, the far end of a relation
-            self.assertEqual(build("neighbors", "--ref", "aaaaaa:E1"), {"kb_id": "kb_005", "entity_id": "e1"})
+            self.assertEqual(build("neighbors", "--ref", "aaaaaa:E1"), {"graph_version": "g1", "kb_id": "kb_005", "entity_id": "e1"})
             self.assertEqual(build("neighbors", "--ref", "aaaaaa:H1.2", "--type", "supports", "--limit", "5"),
-                             {"kb_id": "kb_005", "entity_id": "e2", "limit": 5, "types": ["supports"]})
-            self.assertEqual(build("neighbors", "--ref", "bbbbbb:N1"), {"kb_id": "kb_005", "entity_id": "e7"})
-            self.assertEqual(build("facts", "--ref", "aaaaaa:H1", "--property", "weight"), {"kb_id": "kb_005", "subject_id": "e1", "property": "weight"})
+                             {"graph_version": "g1", "kb_id": "kb_005", "entity_id": "e2", "limit": 5, "types": ["supports"]})
+            self.assertEqual(build("neighbors", "--ref", "bbbbbb:N1"), {"graph_version": "g1", "kb_id": "kb_005", "entity_id": "e7"})
+            self.assertEqual(build("facts", "--ref", "aaaaaa:H1", "--property", "weight"), {"graph_version": "g1", "kb_id": "kb_005", "subject_id": "e1", "property": "weight"})
             self.assertEqual(build("crop", "--ref", "aaaaaa:S2", "--bbox", "0.1,0.2,0.5,0.6"), {"kb_id": "kb_005", "point_id": "p2", "bbox": [0.1, 0.2, 0.5, 0.6]})
             self.assertEqual(build("search", "--question", "failover time", "--in-doc", "aaaaaa:S1", "--block-type", "table"),
-                             {"question": "failover time", "kbs": ["kb_005"], "hints": {"block_types": ["table"], "doc_ids": ["d1"]}})
+                             {"question": "failover time", "kbs": ["kb_005"], "hints": {"block_types": ["table"], "doc_ids": ["d1"], "content_version": "v1"}})
             # a reference never leads outside the knowledge bases the caller named: the conflict is an error, the
             # scope is neither widened nor quietly replaced
             self.assertEqual(build("search", "--question", "failover time", "--kb", "kb_005", "--in-doc", "aaaaaa:S1")["kbs"], ["kb_005"])

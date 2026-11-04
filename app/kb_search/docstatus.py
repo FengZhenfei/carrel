@@ -111,6 +111,9 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
     """(kb_id, doc_id) → 文档日期:有图的库查图库的 Document 节点(建图时定的),其余按文件名认;认不出就不给。"""
     from kb_pipeline.graph.temporal import name_date
 
+    import time
+
+    deadline = time.monotonic() + timeout if timeout else None
     rows = list(rows)
     out: dict[tuple[str, str], str] = {}
     by_kb: dict[str, set[str]] = {}
@@ -122,7 +125,7 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
 
         with driver.session() as session:
             if timeout:
-                session = TimedSession(session, timeout)
+                session = TimedSession(session, timeout, deadline=deadline)
             for kb, ids in by_kb.items():
                 gv = graph_versions.get(kb)
                 if not gv:
@@ -138,6 +141,34 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
             if found:
                 out[key] = found
     return out
+
+
+def annotate_dates(settings: Settings, rows: list[dict[str, Any]], scope: dict[str, Any], *,
+               driver: Any = None, timeout: float | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep retrospective sources; document dates are not fact occurrence dates.
+
+    Only structured assertions can apply the fact-time cutoff. Unknown document
+    dates stay explicit, and later publications remain available for source checks.
+    """
+    stats: dict[str, Any] = {"documents_after_cutoff": 0, "unknown_dates": 0, "text_time_filter": "not_applied"}
+    if not scope.get("as_of") or not rows:
+        return rows, stats
+    try:
+        dates = document_dates(settings, rows, scope.get("graph_versions") or {}, driver=driver, timeout=timeout)
+    except Exception as exc:
+        dates = document_dates(settings, rows, {})
+        stats["degraded"] = f"document_dates: {type(exc).__name__}"
+    for row in rows:
+        date = dates.get((str(row.get("kb_id") or ""), str(row.get("doc_id") or "")))
+        if date:
+            row["doc_date"], row["doc_date_state"] = date, "known"
+            if date > scope["day"]:
+                stats["documents_after_cutoff"] += 1
+        else:
+            row["doc_date_state"] = "unknown"
+            stats["unknown_dates"] += 1
+        row["document_after_cutoff"] = bool(date and date > scope["day"])
+    return rows, stats
 
 
 def graph_refresh_pending(settings: Settings, source: KBSource) -> bool:

@@ -193,6 +193,30 @@ def resolve_doc(settings: Settings, kb_id: str, *, doc_id: str | None, rel_path:
     return found
 
 
+class StaleReference(ValueError):
+    """A stored reference cannot be resolved against its original version."""
+
+
+def require_document_version(settings, source, doc_id, version, *, graph_version=None):
+    kb, sep, file_key = doc_id.partition(":")
+    if not sep or kb != source.kb_id or not version:
+        raise ValueError("a versioned document reference needs a document in the requested knowledge base")
+    with db.connect(settings.state_db) as con:
+        rows = con.execute(
+            "SELECT DISTINCT c.content_version FROM files f JOIN chunks c ON c.file_id = f.file_id "
+            "WHERE f.kb_id = ? AND f.file_key = ? AND f.status != 'deleted' "
+            "AND c.collection = ? AND c.status = 'active'", (kb, file_key, source.collection))
+        if {r[0] for r in rows} != {version}:
+            raise StaleReference("document_version_changed: refresh the document reference")
+        if graph_version is not None:
+            rows = con.execute(
+                "SELECT DISTINCT c.content_version FROM graph_builds b JOIN graph_build_chunks c "
+                "ON c.graph_build_id = b.graph_build_id WHERE b.source_collection = ? "
+                "AND b.graph_version = ? AND c.doc_id = ?", (source.collection, graph_version, doc_id))
+            if {r[0] for r in rows} != {version}:
+                raise StaleReference("graph_document_version_unavailable: facts cannot be verified for this document version")
+
+
 def active_versions(settings: Settings, collection: str) -> list[str]:
     """Every content version of the active chunks in this collection: the literal count uses it to filter out old
     versions the keyword index has not dropped yet."""
@@ -279,7 +303,7 @@ def _total(resp: dict[str, Any]) -> int:
 
 
 def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
-         doc_ids: list[str] | None = None, limit: int = 30, client: Any = None, timeout: float | None = None,
+         doc_ids: list[str] | None = None, doc_versions: dict[str, str] | None = None, limit: int = 30, client: Any = None, timeout: float | None = None,
          excluded_paths: list[str] | None = None) -> dict[str, Any]:
     """Literal phrase counts: for each phrase, in how many chunks and which documents it appears (the analyzer's
     phrase match), plus the first limit hits (sorted by path and chunk index).
@@ -296,7 +320,18 @@ def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: li
     scope = {"rel_paths": [str(x) for x in dict.fromkeys(rel_paths or []) if str(x).strip()],
              "doc_ids": [str(x) for x in dict.fromkeys(doc_ids or []) if str(x).strip()]}
     filters: list[dict[str, Any]] = [{"terms": {"content_version": active_versions(settings, source.collection)}}]
-    if scope["doc_ids"]:
+    if doc_versions:
+        if set(doc_versions) - set(scope["doc_ids"]):
+            raise ValueError("doc_versions must refer to requested doc_ids")
+        alternatives = []
+        for doc_id, version in doc_versions.items():
+            require_document_version(settings, source, doc_id, version)
+            alternatives.append({"bool": {"filter": [{"term": {"doc_id": doc_id}}, {"term": {"content_version": version}}]}})
+        unpinned = [doc for doc in scope["doc_ids"] if doc not in doc_versions]
+        if unpinned:
+            alternatives.append({"terms": {"doc_id": unpinned}})
+        filters.append({"bool": {"should": alternatives, "minimum_should_match": 1}})
+    elif scope["doc_ids"]:
         filters.append({"terms": {"doc_id": scope["doc_ids"]}})
     if scope["rel_paths"]:
         filters.append({"terms": {"rel_path": scope["rel_paths"]}})

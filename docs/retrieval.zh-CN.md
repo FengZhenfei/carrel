@@ -56,6 +56,22 @@ Skill 从一次检索开始。简单问题直接使用已有证据；比较和�
 
 目录缓存 `KB_SEARCH_CATALOG_TTL` 秒（默认 60），开启或关闭知识库时立即重建。只有库里还有活跃文档时 `has_graph` 才为 true。建目录时某个库的向量库读不出来（集合尚未创建按空库处理），该条目的 `chunks` 和 `has_graph` 为 `null` 并带 `degraded` 说明，检索照常尝试它的图谱，这份目录约 15 秒后重建。
 
+### 直接证据与图谱探索
+
+设置 `KB_SEARCH_TEXT_DISCOVERY=true` 可为文字查询启用已验证的配置。服务对向量与关键词候选做文本重排，关闭词元 MMR，然后按图谱线索核验来源版本并读取一轮原文。追加块以 `role=graph_followup` 排在原有 `sources` 之后。每轮最多核查 24 个候选，追加 6 块、2,400 个估算 token。`retrieval_summary.graph.readback` 返回核查过的定位、追加块编号和状态。`graph_readback=false` 可按请求关闭这一步，`context=false` 也会跳过。
+
+带图查询的文本和图片候选仍共用一份 Top-K。启用图谱时，服务在排完原文后最多附上两个主体，每个主体最多两个一跳邻居，供 Agent 追问。优先选择问题点名的实体，再从前三条已接受的直接命中里找主体。图谱切块不进入带图查询的主排序。限定文档范围时省略邻域。
+
+`KB_SEARCH_GRAPH_MODE` 可选 `fused`（现有默认值）、`off`、`discovery`。`discovery` 先完成向量与关键词候选的文本重排、文档配额、原文去重和上下文组装，再探索图谱；图谱切片和分数不进入正文排序。纯文本候选配置还设置 `KB_SEARCH_MMR=false`，保留关键词加权和文档配额。
+
+图谱线索沿用 `entities`、`relationships`、`specs`、`pages`、`neighborhoods` 字段，标记 `role: "discovery"`。代表性来源带文档 ID、切片序号和内容版本。来源状态区分已核验、部分核验、失效和未核验；来源存在并不代表模型抽取的声明一定正确。
+
+`KB_SEARCH_GRAPH_BUDGET` 限定该阶段的总耗时（默认 5 秒），同时受请求总预算约束。`KB_SEARCH_GRAPH_CONTEXT_TOKENS` 可选限制线索 JSON 的估算 token 数，默认 `0`，保留现有条数上限内的全部线索；JSON 估算不等于 Skill 压缩展示后的输入 token。设置正数时，各类线索轮流按完整记录加入，省略数量和 `has_more` 位于 `retrieval_summary.graph.output`。不会截断事实条件来凑预算；完整细节通过现有图谱接口读取。图谱降级单独记录在 `retrieval_summary.graph.degraded`，不改变直接证据的置信状态。
+
+按名字查询邻域或事实时，如果命中多个身份，返回 `ambiguous: true` 及候选列表，由调用方结合类型、作用域和来源选择 ID；不再用连接数决定身份。
+
+`as_of` 按原文声明的事实时间筛选结构化事实与序列。后发文档可以回顾较早发生的事，因此正文检索与 `/context` 不按文档发布时间硬排除来源；响应标明 `text_time_filter: "not_applied"`，由调用方核对原文中的事实时间。已知文档日期保留为 `doc_date`，晚于截止日时标记 `document_after_cutoff: true`，未知日期标记 `doc_date_state: "unknown"`。`/context` 接受 `as_of`、`history`，已有显式文档治理规则继续生效。
+
 ### 图文分路重排
 
 配置 `VISUAL_RERANKER_BASE_URL` 后，图片重排自动参与检索，`KB_SEARCH_RERANK` 统一控制两路，无需单独启用。未配置图片端点或没有图片候选时，沿用文本流程。
@@ -281,3 +297,5 @@ cd app
 ```
 
 每项指标只统计声明了该检查的题目；检索报错计为未通过。它们在命中率和 MRR 之外补充事实准确性、来源覆盖、关联路径和时间范围检查，采用确定性匹配，不调用模型评分。
+
+从带版本的文档引用查关键词或事实时沿用该文档版本；沿实体或关系追问时核验起始图谱版本。收到 HTTP 409 时重新定位来源，再沿新引用继续。原图与裁图继承来源查询的截止日期或历史口径。 显式设置 `KB_SEARCH_GRAPH_MODE=off` 时，文本策略也关闭图谱。文本探索响应的 `primary_evidence_state` 保留主排序状态，`evidence_state` 包含补查后交付的有效原文。

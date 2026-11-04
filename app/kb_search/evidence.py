@@ -375,6 +375,42 @@ def doc_aggs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(agg.values(), key=lambda a: (a["best_n"], -a["hits"]))
 
 
+def budget_discovery(blocks: dict[str, list[dict[str, Any]]], budget: int) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Compact leads, then admit whole records round-robin within their own budget.
+
+    Facts keep their qualifiers intact. Large records are omitted with counts, not
+    rewritten into partial claims; full details remain available through graph APIs.
+    """
+    import json
+
+    order = ("specs", "relationships", "entities", "neighborhoods", "pages")
+    output: dict[str, list[dict[str, Any]]] = {key: [] for key in order}
+    used = 0
+    for i in range(max((len(blocks.get(key, [])) for key in order), default=0)):
+        for key in order:
+            if i >= len(blocks.get(key, [])):
+                continue
+            row = dict(blocks[key][i])
+            if row.get("description") and len(row["description"]) > 200:
+                row["description"] = row["description"][:200]
+                row["description_truncated"] = True
+            if row.get("evidence"):
+                evidence = row["evidence"]
+                row["evidence"] = [{k: e[k] for k in ("point_id", "doc_id", "chunk_index", "content_version", "rel_path", "page_idx", "active", "located") if e.get(k) is not None}
+                                   for e in evidence[:2]]
+                row["point_ids"] = [e["point_id"] for e in row["evidence"] if e.get("point_id")]
+                if len(evidence) > 2:
+                    row["evidence_truncated"] = True
+            row["n"] = len(output[key]) + 1
+            cost = count_tokens(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+            if budget <= 0 or used + cost <= budget:
+                output[key].append(row)
+                used += cost
+    counts = {key: {"available": len(blocks.get(key, [])), "returned": len(output[key]),
+                    "has_more": len(output[key]) < len(blocks.get(key, []))} for key in order}
+    return output, {"budget_tokens": budget, "estimated_tokens": used, "records": counts}
+
+
 def numbered(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[dict[str, Any]]:
     """Entity / relation / fact tables: numbered in order, keeping only the fields the client cites."""
     out = []
