@@ -17,13 +17,13 @@ manages knowledge bases, models, and processing tasks. A bundled
 [search skill](skills/carrel-search/SKILL.md) connects agents such as Claude
 Code and Codex to the retrieval service.
 
-**[0.4.0 capability evaluation — full technical report](docs/evaluations/capability-evaluations-0.4.0.md)**
+**[0.4.1 general retrieval benchmarks and codebase capabilities](docs/evaluations/retrieval-0.4.1.md)** · [Full 0.4.0 capability evaluation](docs/evaluations/capability-evaluations-0.4.0.md)
 
 [Features](#features) · [Evaluation](#capability-evaluation) · [Design](#design) · [Quick start](#quick-start) · [Agent integration](#agent-integration) · [Documentation](#documentation)
 
 ## Features
 
-**0.4.0:** [Changes and upgrade steps](docs/releases/0.4.0.md).
+[0.4.1 changes and upgrade steps](docs/releases/0.4.1.md)
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
@@ -43,21 +43,9 @@ Code and Codex to the retrieval service.
 
 ## Capability evaluation
 
-The 0.4.0 evaluation covers **5 knowledge bases and 3,587 files**, with 275
-source-grounded retrieval questions, 75 questions in an answer comparison, and 100 synthetic
-questions for temporal, conflict, ontology, and other evidence-handling scenarios.
+Across 275 text queries, 0.4.1 reached **93.45%** evidence Hit@5 and **0.8141** MRR@10. In a separate study of 24 code questions, Haiku answered **13** completely from the first response and **23** with Skill follow-up. [0.4.1 evaluation](docs/evaluations/retrieval-0.4.1.md)
 
-- **Source retrieval:** evidence Hit@5 of **92.36%** and MRR@10 of **0.7979**.
-- **Cross-document answers:** Skill follow-up queries increased the share of
-  answers covering all required points from **60% to 76%** on 25 real-document
-  questions.
-- **Graph and ontology behavior:** source traceability, temporal cutoffs,
-  conflicting claims, topic evolution, and graph rebuilds are evaluated
-  separately, including differences between cache reuse and fresh extraction.
-
-The [full technical report](docs/evaluations/capability-evaluations-0.4.0.md) includes
-models and test conditions, retrieval ablations, anonymized question-and-answer
-examples, graph stability results, latency, and token usage.
+The full 0.4.0 evaluation also covers graph rebuild stability, time-scoped evidence, conflicts and ontology governance. [Full 0.4.0 technical report](docs/evaluations/capability-evaluations-0.4.0.md)
 
 ## How it works
 
@@ -179,6 +167,7 @@ for authentication, response status, and citations.
 | [Configuration](docs/configuration.md) | Model endpoints, folders, per-base settings, and access control |
 | [Architecture](docs/architecture.md) | Parsing, graph construction, retrieval, and code layout |
 | [Retrieval and API](docs/retrieval.md) | Agent setup, endpoints, evidence status, and evaluation |
+| [Retrieval and codebase evaluation (0.4.1)](docs/evaluations/retrieval-0.4.1.md) | Document retrieval, page-image location, Skill follow-up and cross-file code analysis |
 | [Capability evaluation (0.4.0)](docs/evaluations/capability-evaluations-0.4.0.md) | Full technical report: retrieval, answers, temporal evidence, conflicts, ontology, rebuild stability, latency, and token usage |
 | [Operations and development](docs/operations.md) | Console, CLI, scheduling, troubleshooting, and tests |
 | [Test scope](docs/testing.md) | Shared regression contracts, deployment-specific checks, and live evaluations |

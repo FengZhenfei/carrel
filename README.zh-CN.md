@@ -10,13 +10,13 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 你可以用它管理持续更新的产品资料、研究文献、合同、会议纪要等文档。Web 控制台用于管理知识库、模型和处理任务；配套的 [检索 Skill](skills/carrel-search/SKILL.md) 可供 Claude Code、Codex 等智能体接入。
 
-**[0.4.0 知识库能力测评 · 完整技术报告](docs/evaluations/capability-evaluations-0.4.0.zh-CN.md)**
+**[0.4.1 通用检索复测与代码库能力专项测评](docs/evaluations/retrieval-0.4.1.zh-CN.md)** · [0.4.0 完整能力测评](docs/evaluations/capability-evaluations-0.4.0.zh-CN.md)
 
 [核心功能](#核心功能) · [能力测评](#知识库能力测评) · [设计思路](#设计思路) · [快速开始](#快速开始) · [接入智能体](#接入智能体) · [文档](#文档)
 
 ## 核心功能
 
-**0.4.0：** [更新内容与升级步骤](docs/releases/0.4.0.zh-CN.md)。
+[0.4.1 更新内容与升级步骤](docs/releases/0.4.1.zh-CN.md)
 
 - **多格式解析：** 支持 PDF、Word、PowerPoint、表格、图片、HTML、Markdown、Notebook、源代码及工作流文件，按文件格式采用相应的处理方式。[格式说明](docs/architecture.zh-CN.md#入库流程)。
 - **自动更新：** 定时发现文件变化，更新索引，并维护已启用的知识图谱。
@@ -27,13 +27,9 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 ## 知识库能力测评
 
-0.4.0 测评覆盖 **5 个知识库、3,587 个文件**，包含 275 道原文检索题、75 道回答对照题，以及用于时序、冲突、本体等证据处理场景的 100 道合成题。
+0.4.1 沿用 275 道文字检索题，证据 Hit@5 为 **93.45%**，MRR@10 为 **0.8141**。另测 24 道代码题，Haiku 仅看首轮检索答全了 **13 道**，允许 Skill 补查后答全了 **23 道**。[0.4.1 测评报告](docs/evaluations/retrieval-0.4.1.zh-CN.md)
 
-- **原文检索：** 证据 Hit@5 为 **92.36%**，MRR@10 为 **0.7979**。
-- **跨文档回答：** 在 25 道真实资料题中，Skill 定向补查将关键要点完整率从 **60% 提高到 76%**。
-- **图谱与本体：** 分别检查来源追溯、截止日期、冲突声明、主题演进与图谱重建，并区分缓存复用和独立重新抽取的表现。
-
-[完整技术报告](docs/evaluations/capability-evaluations-0.4.0.zh-CN.md) 包含模型与测试条件、检索消融对照、脱敏问答示例、图谱稳定性结果、耗时与 token 用量。
+0.4.0 的完整测评另覆盖图谱重建稳定性、时序、冲突与本体治理。[0.4.0 完整技术报告](docs/evaluations/capability-evaluations-0.4.0.zh-CN.md)
 
 ## 工作方式
 
@@ -116,6 +112,7 @@ curl -sS http://127.0.0.1:9810/search \
 | [配置说明](docs/configuration.zh-CN.md) | 模型接口、资料目录、单库设置与访问控制 |
 | [架构说明](docs/architecture.zh-CN.md) | 解析、建图、检索流程与代码结构 |
 | [检索与 API](docs/retrieval.zh-CN.md) | 智能体接入、接口、证据状态与评测 |
+| [通用检索复测与代码库能力专项（0.4.1）](docs/evaluations/retrieval-0.4.1.zh-CN.md) | 文档检索、图片定位、Skill 补查与跨文件代码分析 |
 | [知识库能力测评（0.4.0）](docs/evaluations/capability-evaluations-0.4.0.zh-CN.md) | 完整技术报告：检索、回答、时序、冲突、本体、重建稳定性、耗时与 token 用量 |
 | [运维与开发](docs/operations.zh-CN.md) | 控制台、命令行、定时任务、排障和测试 |
 | [测试适用范围](docs/testing.zh-CN.md) | 通用回归契约、部署专项检查与真实服务评测 |
