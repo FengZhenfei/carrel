@@ -127,6 +127,15 @@ def active_graph(kb_id=None):
     )
 
 
+def owns_graph_build(request, build) -> bool:
+    """A child can publish its terminal build state before dispatch cleanup finishes."""
+    return bool(
+        request and build is not None and request["status"] == "running"
+        and request.get("pid") and request["pid"] == build["worker_pid"]
+        and int(build["started_at"] or 0) >= int(request.get("started") or request["created"])
+    )
+
+
 def cancel_graph(kb_id):
     """Cancel dispatch as well as the brief interval before the build writes its state row."""
     import signal

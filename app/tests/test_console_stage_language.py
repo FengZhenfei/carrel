@@ -66,6 +66,11 @@ for (const lang of ["zh", "en"]) {
   assert.equal(run("stageFraction('图片描述 (VLM 3/10)')"), run("stageFraction('Describing images (VLM 3/10)')"));
   assert.equal(run("graphStagePct('完成')"), 100);
   assert.equal(run("graphStagePct('Done')"), 100);
+  for (const [zh, en] of [["排队中", "Queued"], ["启动建图", "Starting graph build"]]) {
+    assert.equal(run(`t(${JSON.stringify(en)})`), lang === "zh" ? zh : en);
+    assert.equal(run(`graphStagePct(${JSON.stringify(zh)})`), 0);
+    assert.equal(run(`graphStagePct(${JSON.stringify(en)})`), 0);
+  }
 }
 '''
     subprocess.run([node, "-e", script, str(root)], check=True, capture_output=True, text=True)

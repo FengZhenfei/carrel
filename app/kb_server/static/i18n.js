@@ -195,6 +195,7 @@ const ZH_EN = {
   "建图状态": "Graph status",
   "重新解析": "Re-parsing",
   "排队中": "Queued",
+  "启动建图": "Starting graph build",
   "解析 {0}/{1} · {2}%": "Parsing {0}/{1} · {2}%",
   "建图 · {0}%": "Building graph · {0}%",
   "时间进度:{0}%": "elapsed: {0}%",
@@ -896,7 +897,7 @@ function translate(s) {
 const EN_ZH = new Map();
 for (const [zh, en] of Object.entries(ZH_EN)) if (!EN_ZH.has(en)) EN_ZH.set(en, zh);
 // When one English string maps to several Chinese ones, server strings use these
-for (const [en, zh] of Object.entries({ "Done": "完成", "Queued": "入队", "Started": "开始处理", "Text embedding": "文本向量化",
+for (const [en, zh] of Object.entries({ "Done": "完成", "Queued": "排队中", "Started": "开始处理", "Text embedding": "文本向量化",
   "Visual embedding": "视觉向量化", "Files": "文件", "Delete": "删除", "Restart": "重启", "Save": "保存" })) EN_ZH.set(en, zh);
 const STAGE_PART_ZH = { subjects: "主体", timelines: "时间线", sources: "来源", narration: "叙述", entities: "实体", relations: "关系", facts: "事实", pages: "页面" };
 const EN_ZH_PATTERNS = [

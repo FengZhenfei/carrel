@@ -2226,6 +2226,7 @@ function graphStagesFor(weights) {
 function graphStagePct(stg, weights) {
   stg = translate(stg);
   if (!stg) return 2;
+  if (stg === "Queued" || stg === "Starting graph build") return 0;
   if (stg === "Preparing labels") return 0;
   if (stg === "Done") return 100;
   const aliases = { "Merge & resolution": "Entity resolution",

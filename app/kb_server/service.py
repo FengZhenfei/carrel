@@ -221,19 +221,20 @@ def _graph_status(con, kb_id: str, dir_name: str, config: dict[str, Any]) -> str
     """Graph build status, using the same vocabulary as the parse status dot: disabled (graph build not
     turned on) / pending (turned on, not built yet) / running (build in progress) / ok (built) /
     failed (last build failed) / stopped (interrupted, cache still there)."""
+    row = con.execute(
+        "SELECT status, started_at, worker_pid FROM graph_builds WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
+        (kb_id,),
+    ).fetchone()
     if os.getenv('KB_RUNTIME') == 'container':
-        from kb_runtime.queue import active_graph
-        if active_graph(kb_id):
+        from kb_runtime.queue import active_graph, owns_graph_build
+        request = active_graph(kb_id)
+        if request and not owns_graph_build(request, row):
             return 'running'
     effective = dict(discovery.DEFAULTS)
     effective.update(discovery.DIR_DEFAULTS.get(dir_name, {}))
     effective.update(config)
     if not effective.get("graph_enabled"):
         return "disabled"
-    row = con.execute(
-        "SELECT status FROM graph_builds WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
-        (kb_id,),
-    ).fetchone()
     if row is None:
         return "pending"
     status = str(row["status"])
@@ -309,11 +310,13 @@ def _graph_build_info(con, kb_id: str, collection: str = "") -> dict[str, Any] |
         (kb_id,),
     ).fetchone()
     if os.getenv('KB_RUNTIME') == 'container' and (row is None or row['status'] != 'running'):
-        from kb_runtime.queue import active_graph
+        from kb_runtime.queue import active_graph, owns_graph_build
         request = active_graph(kb_id)
-        if request:
-            return {'status': 'running', 'stage': 'queued', 'started_at': int(request['created']),
-                    'progress': {}, 'queued': True, 'paused': False}
+        if request and not owns_graph_build(request, row):
+            queued = request['status'] == 'queued'
+            return {'status': 'running', 'stage': 'Queued' if queued else 'Starting graph build',
+                    'started_at': int(request.get('started') or request['created']),
+                    'progress': {}, 'queued': queued, 'paused': False}
     if row is None:
         return None
     info = dict(row)

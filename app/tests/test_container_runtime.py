@@ -268,3 +268,61 @@ def test_pending_graph_pause_keeps_assets_and_operator_intent(runtime_env, monke
         config = discovery.get_config(con, source.kb_id)
         assert config["graph_paused"] and config["graph_enabled"]
     assert original.read_text() == "Keep the original"
+
+
+@pytest.mark.parametrize("status,expected", [("done", "ok"), ("failed", "failed"), ("cancelled", "stopped")])
+def test_terminal_graph_is_not_queued_while_dispatch_finishes(runtime_env, monkeypatch, status, expected):
+    """The child records its outcome before cleanup / exit and the runtime's next poll."""
+    from kb_pipeline import db, discovery
+    from kb_pipeline.config import load_settings
+    from kb_server import service
+
+    bootstrap.initialize()
+    cfg = load_settings(os.environ["KB_ENV_FILE"])
+    (cfg.mirror_root / "Synthetic").mkdir(parents=True)
+    monkeypatch.setattr(service, "settings", lambda: cfg)
+    with db.connect(cfg.state_db) as con:
+        source, _ = discovery.enroll(con, cfg.mirror_root, "Synthetic")
+        discovery.set_config(con, source.kb_id, {"graph_enabled": True})
+        bid = db.begin_graph_build(con, source_key=source.kb_id, kb_id=source.kb_id,
+                                   source_collection=source.collection, graph_version="v1")
+        con.execute("UPDATE graph_builds SET status=?,stage='Done',started_at=100,finished_at=120,worker_pid=700 "
+                    "WHERE graph_build_id=?", (status, bid))
+    request_id = queue.enqueue("graph-build", {"kb_id": source.kb_id})
+    with queue.connect() as con:
+        con.execute("UPDATE requests SET status='running',created=100.1,started=100.2,pid=700 WHERE id=?", (request_id,))
+    with db.connect(cfg.state_db) as con:
+        assert service._graph_status(con, source.kb_id, "Synthetic", {"graph_enabled": True}) == expected
+        info = service._graph_build_info(con, source.kb_id)
+        assert info["status"] == status and info["graph_version"] == "v1"
+        assert not info.get("queued")
+        assert con.execute("SELECT COUNT(*) FROM graph_builds").fetchone()[0] == 1
+    # The dispatch still owns the process: concurrency and cancellation gates must keep seeing it.
+    assert queue.active_graph(source.kb_id)["status"] == "running"
+
+
+@pytest.mark.parametrize("request_status,stage", [("queued", "Queued"), ("running", "Starting graph build")])
+def test_new_graph_dispatch_is_visible_over_previous_success(runtime_env, monkeypatch, request_status, stage):
+    from kb_pipeline import db, discovery
+    from kb_pipeline.config import load_settings
+    from kb_server import service
+
+    bootstrap.initialize()
+    cfg = load_settings(os.environ["KB_ENV_FILE"])
+    (cfg.mirror_root / "Synthetic").mkdir(parents=True)
+    monkeypatch.setattr(service, "settings", lambda: cfg)
+    with db.connect(cfg.state_db) as con:
+        source, _ = discovery.enroll(con, cfg.mirror_root, "Synthetic")
+        bid = db.begin_graph_build(con, source_key=source.kb_id, kb_id=source.kb_id,
+                                   source_collection=source.collection, graph_version="v1")
+        # Old and new dispatch may start in the same integer second; PID distinguishes them.
+        con.execute("UPDATE graph_builds SET status='done',started_at=100,finished_at=100,worker_pid=700 "
+                    "WHERE graph_build_id=?", (bid,))
+    request_id = queue.enqueue("graph-build", {"kb_id": source.kb_id})
+    with queue.connect() as con:
+        con.execute("UPDATE requests SET status=?,created=100.3,started=100.4,pid=701 WHERE id=?", (request_status, request_id))
+    with db.connect(cfg.state_db) as con:
+        assert service._graph_status(con, source.kb_id, "Synthetic", {"graph_enabled": True}) == "running"
+        info = service._graph_build_info(con, source.kb_id)
+        assert info["stage"] == stage
+        assert info["queued"] is (request_status == "queued")
