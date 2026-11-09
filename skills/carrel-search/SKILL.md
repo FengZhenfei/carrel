@@ -22,6 +22,8 @@ python3 "$SKILL_DIR/scripts/carrel_search.py" search --question "<the user's que
   | To do this | Subcommand |
   |---|---|
   | Read the original around a chunk | `context --ref a1b2c3:S3` (`--before` / `--after` set how many chunks on each side, 1 by default; read on with `--after` when the matter continues on the following pages). A fact (F) and a neighbourhood relation (N) can be read back the same way |
+  | Read returned originals without summaries and graph leads | `show a1b2c3 --sources`; follow its numbered pages or read specific S references |
+  | Verify document identity, publication time or version | `context --ref a1b2c3:S3 --opening` reads the first indexed chunk, preserving the document version and time scope |
   | Read a whole document (a whole table, a whole report) | `context --ref a1b2c3:S3 --whole`: one command, printed page by page; a document of more than 300 chunks is read in parts with `--before` / `--after` |
   | See the original picture, crop a part | `image --ref a1b2c3:S6`; `crop --ref a1b2c3:S6 --bbox 0.1,0.2,0.6,0.8`. View the saved file. `crop` only cuts a part out; it is no sharper than the original |
   | Walk one hop along the graph from an entity | `neighbors --ref a1b2c3:H1` (E, `H1.2` and N work the same; `--type` takes one kind of relation only, `--limit` up to 100) |

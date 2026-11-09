@@ -203,6 +203,8 @@ TXT.update({
     'later_publication': 'document published {day}, after cutoff',
     'unknown_date': 'unknown document date',
     'more_leads': 'More graph leads are available.',
+    'sources_hint': 'Read returned originals without summaries or graph leads: show {id} --sources. This reads saved evidence, not a new query.',
+    'sources_view': 'Original source text only; source numbers and relevance flags are unchanged.',
 })
 
 
@@ -757,6 +759,40 @@ def source_notes(s, ref, parent=None, position=False):
     return notes
 
 
+def view_sources(envelope, limit=PAGE_BYTES):
+    """A separate saved-evidence view; it neither reranks nor drops source text."""
+    result = envelope.get("result") or {}
+    cid = envelope["call_id"]
+    summary = result.get("retrieval_summary") or {}
+    has_supplement = any(s.get("role") == "graph_followup" and s.get("accepted") is True
+                         for s in result.get("sources") or [])
+    state = "accepted" if has_supplement else summary.get("evidence_state")
+    out = [head(envelope, TXT["state"].format(state=state) if state else ""), TXT["sources_view"]]
+    if summary.get("no_relevant_content") and not has_supplement:
+        out.append(TXT["none"])
+    if summary.get("degraded"):
+        out.append(TXT["degraded"].format(items="; ".join(str(x) for x in summary["degraded"])))
+    out += scope_lines(summary.get("time") or result.get("time") or {})
+    rows = result.get("sources") or []
+    # Show one ranked root per document before extra passages. Stable S labels
+    # refer to the original response even when display order changes.
+    roots = [s for s in rows if s.get("role") in ("hit", "graph_followup")]
+    seen, first, remaining = set(), [], []
+    for row in roots:
+        identity = (row.get("kb_id"), row.get("doc_id"), row.get("content_version"))
+        (remaining if identity in seen else first).append(row)
+        seen.add(identity)
+    ordered = first + remaining + [s for s in rows if s.get("role") not in ("hit", "graph_followup")]
+    files = Files()
+    for row in ordered:
+        label = "S" + str(row.get("n"))
+        parent = "S" + str(row["of"]) if row.get("of") is not None else None
+        out += ["", "[" + label + "] " + str(row.get("cite") or row.get("rel_path") or "")
+                + notes_of(source_notes(row, cid + ":" + label, parent, position=True)), source_text(row)]
+        files.add(label, row.get("file"))
+    return out + files.lines()
+
+
 def missed_paths(envelope, hits):
     """The --rel-path values that matched no document. Filtered to a document that exists, the vector channel always
     has some chunk to return (it has no score threshold), so no hit and no candidate from a vector channel that ran
@@ -815,6 +851,8 @@ def view_search(envelope, limit=PAGE_BYTES):
     if routing.get("widened"):
         out.append(TXT["routing_widened"])
     out.append(TXT["ref_hint"].format(id=cid, label="S3"))
+    if src:
+        out.append(TXT["sources_hint"].format(id=cid))
     cites = Cites()
     # Sources come first in the view and their citations are the ones later entries point back at, so they are
     # registered before the other sections are built; which of them are printed in full is decided last, from what
@@ -978,7 +1016,7 @@ def view_context(envelope, limit=PAGE_BYTES):
     for s in src:
         label = "S" + str(s.get("n"))
         where = s.get("place") or (TXT["chunk_at"].format(k=int(s["chunk_index"]) + 1) if s.get("chunk_index") is not None else "")
-        out.append("[" + label + "] " + str(where) + notes_of(source_notes(s, envelope["call_id"] + ":" + label)))
+        out.append("[" + label + "] " + str(where) + notes_of(source_notes(s, envelope["call_id"] + ":" + label, position=True)))
         out.append(source_text(s, headers, label))
     if r.get("maybe_more") and src:
         out.append(TXT["maybe_more"].format(n=len(src), m=CONTEXT_MAX - 1, ref=envelope["call_id"] + ":S" + str(src[-1].get("n"))))
@@ -1283,13 +1321,14 @@ def page_limit(cfg):
     return value
 
 
-def compact(envelope, path, limit=PAGE_BYTES, page=1):
-    view = VIEWS.get(envelope["operation"])
+def compact(envelope, path, limit=PAGE_BYTES, page=1, sources_only=False):
+    view = view_sources if sources_only else VIEWS.get(envelope["operation"])
     if view is None:
         return json.dumps(envelope, ensure_ascii=False, indent=2, allow_nan=False)
     cid = envelope["call_id"]
     head = TXT["page_head"].format(id=cid, op=envelope["operation"], page="{page}", total="{total}")
-    out = one_page(pages_of(view(envelope, limit), limit), page, cid, head)
+    what = cid + (" --sources" if sources_only else "")
+    out = one_page(pages_of(view(envelope, limit), limit), page, what, head)
     return "\n".join(out + ["", TXT["full"].format(path=path)])
 
 
@@ -1391,6 +1430,8 @@ def payload(args, work=None):
                 if total > CONTEXT_MAX:
                     raise ValueError(too_long(total))
                 lo, hi = 0, (total or CONTEXT_MAX) - 1
+            if getattr(args, "opening", False):
+                lo = hi = 0
             if hi - lo + 1 > CONTEXT_MAX:
                 raise ValueError("one context command reads up to " + str(CONTEXT_MAX) + " chunks")
             data.update({"kb_id": kb, "doc_id": row["doc_id"], "chunk_from": lo, "chunk_to": hi})
@@ -1597,6 +1638,7 @@ def parser():
             cmd.add_argument("refs", nargs="+", help="A call id (prints its compact view again) or references such as 3fa2c1:S3")
             cmd.add_argument("--json", action="store_true", help="Print every field of a source or page as JSON")
             cmd.add_argument("--page", type=int, help="With a call id: the page of its compact view to print (default 1)")
+            cmd.add_argument("--sources", action="store_true", help="Read only the original source text saved in one response")
             continue
         cmd.add_argument("--output", help="Also save to this new file (pictures: save here instead of the work directory)")
         cmd.add_argument("--json", action="store_true", help="Print the complete response instead of the compact view")
@@ -1624,7 +1666,9 @@ def parser():
         if name == "context":
             cmd.add_argument("--before", type=int, default=1, help="Chunks to read before the referenced one (default 1)")
             cmd.add_argument("--after", type=int, default=1, help="Chunks to read after the referenced one (default 1)")
-            cmd.add_argument("--whole", action="store_true", help="Read the whole document the referenced entry is in")
+            extent = cmd.add_mutually_exclusive_group()
+            extent.add_argument("--whole", action="store_true", help="Read the whole document the referenced entry is in")
+            extent.add_argument("--opening", action="store_true", help="Read the first indexed chunk to verify document identity, date or version")
         if name == "crop":
             cmd.add_argument("--bbox", help="x0,y0,x1,y1 as 0-1 ratios or 0-1000 per mille")
             cmd.add_argument("--pad", type=int)
@@ -1676,19 +1720,21 @@ def parser():
     return p
 
 
-def show(work, refs, raw=False, page=None, limit=PAGE_BYTES):
+def show(work, refs, raw=False, page=None, limit=PAGE_BYTES, sources_only=False):
     calls = [ref for ref in refs if re.fullmatch(r"[0-9a-f]{6}", ref)]
+    if sources_only and (len(refs) != 1 or len(calls) != 1 or raw):
+        raise ValueError("--sources requires one call id, without --json; use entry references to read specific sources")
     if page is not None and calls and len(refs) > 1:
         raise ValueError("--page goes with one call id (show 3fa2c1 --page 2) or with entry references only")
     lines = []
     for ref in refs:
         if ref in calls:
-            print(compact(stored(work, ref), work / (ref + ".json"), limit, page or 1))
+            print(compact(stored(work, ref), work / (ref + ".json"), limit, page or 1, sources_only=sources_only))
             continue
         envelope, letter, entry, child = resolve(work, ref)
         if letter == "S" and not raw:
             parent = "S" + str(entry.get("of")) if entry.get("role") != "hit" and entry.get("of") else None
-            lines.append("[" + ref + "] " + str(entry.get("cite") or "") + notes_of(source_notes(entry, ref, parent)))
+            lines.append("[" + ref + "] " + str(entry.get("cite") or "") + notes_of(source_notes(entry, ref, parent, position=True)))
             lines.append(str(entry.get("text") or "").strip())
         elif letter == "P" and not raw:
             docs = entry.get("docs_cite") or []
@@ -1727,7 +1773,7 @@ def main(argv=None):
         work = work_dir(cfg)
         limit = page_limit(cfg)
         if args.command == "show":
-            return show(work, args.refs, args.json, args.page, limit)
+            return show(work, args.refs, args.json, args.page, limit, sources_only=args.sources)
         call_id = new_call(work)
         if args.output and Path(args.output).expanduser().exists():
             raise FileExistsError("output already exists; choose a new filename")

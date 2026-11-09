@@ -160,3 +160,8 @@ Text discovery appends graph-source originals to `sources` with `role=graph_foll
 A scoped search using a versioned reference pins the content version. Query documents with different versions separately and combine their evidence.
 
 Versioned document references pin keyword lookups and graph facts to their source version. Following an entity or relation requires its original graph version. On HTTP 409, repeat the original lookup before following the new reference. Original images and crops inherit the source query’s date or history scope.
+
+
+### Focused evidence reading
+
+`show CALL --sources` reads only the saved source passages, with stable S references, quality flags and complete pagination. `context --ref CALL:S1 --opening` reads chunk 0 of the same document version and inherits its time scope. It does not infer missing metadata. Use the normal context route for nearby text; `--opening` and `--whole` are mutually exclusive.

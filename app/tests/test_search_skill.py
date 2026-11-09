@@ -20,6 +20,67 @@ def client():
     return module
 
 
+def test_sources_view_preserves_complete_evidence_and_scope_without_compiled_leads(client):
+    envelope = {'call_id':'abc123','operation':'search','request':{'as_of':'2024'},'result':{
+        'retrieval_summary':{'time':{'mode':'as_of','day':'2024-12-31'}},
+        'sources':[
+            {'n':1,'role':'hit','kb_id':'k','doc_id':'a','content_version':'v1','text':'First original.',
+             'chunk_index':8,'chunk_total':20,'doc_date':'2025-01-02','document_after_cutoff':True},
+            {'n':2,'role':'hit','kb_id':'k','doc_id':'a','content_version':'v1','text':'Second original.'},
+            {'n':3,'role':'graph_followup','kb_id':'k','doc_id':'b','content_version':'v4',
+             'text':'Supplementary original.','accepted':False},
+            {'n':4,'role':'neighbor','of':1,'text':'Neighbor original.'}],
+        'pages':[{'summary':'Compiled text must not displace originals'}]}}
+    before = copy.deepcopy(envelope)
+    text = client.compact(envelope, Path('/unused'), sources_only=True)
+    assert all(s['text'] in text for s in envelope['result']['sources'])
+    assert text.index('[S3]') < text.index('[S2]')
+    assert '2024-12-31' in text and '2025-01-02' in text
+    assert client.TXT['not_accepted'] in text
+    assert 'Compiled text must not displace originals' not in text
+    assert envelope == before
+
+
+def test_sources_paging_remains_in_sources_mode(client):
+    envelope = {'call_id':'abc123','operation':'search','result':{'sources':[
+        {'n':i,'role':'hit','doc_id':str(i),'text':f'original-{i}\n'+('body line\n'*180)}
+        for i in range(1,5)]}}
+    pages = client.pages_of(client.view_sources(envelope), 4000)
+    assert len(pages) > 1
+    first = client.compact(envelope, Path('/unused'), limit=4000, sources_only=True)
+    assert 'show abc123 --sources --page 2' in first
+    all_pages = '\n'.join(client.compact(envelope, Path('/unused'), limit=4000, page=i+1, sources_only=True)
+                          for i in range(len(pages)))
+    assert all('original-'+str(i) in all_pages for i in range(1,5))
+
+
+def test_sources_view_keeps_diagnostic_status(client):
+    envelope={'call_id':'abc123','operation':'search','result':{'sources':[
+        {'n':1,'role':'hit','text':'Related but unsupported','accepted':False}],
+        'retrieval_summary':{'evidence_state':'diagnostic','no_relevant_content':True,
+                             'degraded':['text timeout']}}}
+    text='\n'.join(client.view_sources(envelope))
+    assert client.TXT['none'] in text and 'text timeout' in text
+    assert 'diagnostic' in text and client.TXT['not_accepted'] in text
+    envelope['result']['sources'].append({'n':2,'role':'graph_followup',
+                                         'text':'Verified complementary original','accepted':True})
+    text='\n'.join(client.view_sources(envelope))
+    assert 'evidence: accepted' in text and client.TXT['none'] not in text
+
+
+def test_opening_read_is_version_and_time_scoped(client, tmp_path):
+    envelope = {'call_id':'abc123','operation':'search','request':{'as_of':'2024'},'result':{'sources':[
+        {'n':1,'kb_id':'k','doc_id':'doc','point_id':'point','chunk_index':80,
+         'content_version':'v7','chunk_total':100}]}}
+    (tmp_path/'abc123.json').write_text(json.dumps(envelope))
+    args = client.parser().parse_args(['context','--ref','abc123:S1','--opening'])
+    body = client.payload(args, tmp_path)
+    assert body == {'kb_id':'k','doc_id':'doc','content_version':'v7',
+                    'chunk_from':0,'chunk_to':0,'as_of':'2024'}
+    with pytest.raises(SystemExit):
+        client.parser().parse_args(['context','--ref','abc123:S1','--opening','--whole'])
+
+
 def test_uncertain_readings_override_a_confident_hint(client):
     row = {"subject": "Pump", "property": "pressure", "value": 25, "unit": "kPa",
            "hint": "Pump pressure is certainly 25 kPa", "confidence": "low", "comparable": False,
