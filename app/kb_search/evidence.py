@@ -73,6 +73,8 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
     for key in ("score_rerank", "score_rerank_visual", "score_fusion", "score_final"):
         if cand.get(key) is not None:
             row["scores"][key] = cand[key]
+    if payload.get("doc_date"):
+        row["doc_date"] = payload["doc_date"]
     return row
 
 

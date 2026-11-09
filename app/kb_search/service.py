@@ -1220,6 +1220,19 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
         entries = store.catalog(ttl=ss.catalog_ttl)
         scope["graph_versions"] = {e["kb_id"]: e.get("graph_version") for e in entries}
     sources, time_stats = store.graph.annotate_dates(sources, scope, timeout=ss.channel_timeout)
+    # Current/history readback needs the same document metadata as search. Raw
+    # chunks often lack doc_date; a metadata failure must not hide the originals.
+    missing_dates = [row for row in sources if not row.get("doc_date")]
+    if missing_dates and not scope.get("as_of"):
+        try:
+            versions = {e["kb_id"]: e.get("graph_version") for e in store.catalog(ttl=ss.catalog_ttl)}
+            dates = store.graph.document_dates(missing_dates, versions, timeout=ss.channel_timeout)
+            for row in missing_dates:
+                date = dates.get((str(row.get("kb_id") or ""), str(row.get("doc_id") or "")))
+                if date:
+                    row["doc_date"] = date
+        except Exception as exc:
+            time_stats["degraded"] = f"doc_dates: {type(exc).__name__}"
     root = getattr(settings.sources[kb_id], "source_root", None)
     return {"kb_id": kb_id, "kb_name": str(root) if root else None, "doc_id": doc_id, "sources": sources,
             "time": {"mode": scope["mode"], "day": scope["day"], **time_stats},
