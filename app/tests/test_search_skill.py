@@ -433,6 +433,15 @@ def test_whole_read_describes_the_indexed_representation(client, monkeypatch):
     assert "read_extent" not in client.read_context("http://example", "", 5, data)
 
 
+def test_context_keeps_parent_sections_for_time_scope(client):
+    row = {"n": 1, "place": "Deliveries", "section_path": ["Report", "2023 results", "Deliveries"],
+           "text": "Orders completed: 42.", "chunk_index": 2, "chunk_total": 5}
+    envelope = {"call_id": "ab12cd", "operation": "context", "result": {"sources": [row]}}
+    view = "\n".join(client.view_context(envelope))
+    assert "[S1] Report / 2023 results / Deliveries" in view
+    assert "Orders completed: 42." in view
+
+
 def test_mixed_time_references_require_explicit_scope(client, tmp_path):
     for call, day in [("aa0011", "2023"), ("bb0022", "2024")]:
         item = {"n": 1, "kb_id": "kb", "doc_id": call, "rel_path": "example.md"}

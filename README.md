@@ -23,7 +23,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-[0.4.3 changes and upgrade steps](docs/releases/0.4.3.md) — Consistent document publication, version-bound evidence, table parsing repairs, and bundled code grammars.
+[0.4.3 changes and upgrade steps](docs/releases/0.4.3.md) — Consistent document publication, version-bound evidence, document and section time context, table parsing repairs, and bundled code grammars.
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited

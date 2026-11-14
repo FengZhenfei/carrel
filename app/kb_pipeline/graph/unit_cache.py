@@ -22,6 +22,11 @@ def fingerprints(base, units, deterministic_ids, tables):
             names = {tables._name(profile, values)[0].casefold() for profile, values in tables._rows(unit)[0]}
             material = [base, "table-identity-v1", TABLE_VERSION, profiles, sorted(names & ambiguous)]
         else:
+            material = [base]
+        if getattr(unit, "time_contexts", None):
+            from .time_context import VERSION as TIME_VERSION
+            material += [TIME_VERSION, unit.time_contexts]
+        elif material == [base]:
             result[unit.unit_id] = base
             continue
         result[unit.unit_id] = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]

@@ -50,7 +50,7 @@ TXT = {
     "doc_date": "document date {d}",
     "status_superseded": "superseded by a later statement",
     "status_ended": "ended (the stated end date has passed)",
-    "status_not_started": "not yet started on that date",
+    "status_not_started": "outside the date cutoff",
     "status_doc_superseded": "source document superseded",
     "status_doc_archived": "source document archived",
     "period": "{a}–{b}",
@@ -200,7 +200,8 @@ TXT.update({
     'ambiguous': 'Multiple identities match. Check scope and select an ID.',
     'indexed_extent': 'This view covers the indexed chunks. Claims about content absent from the original require original-source evidence.',
     'ambiguous_hood': 'Same-name candidate; check identity',
-    'later_publication': 'document published {day}, after cutoff',
+    'status_time_unknown': 'time unresolved',
+    'later_publication': 'document date {day}, after cutoff; check fact time',
     'unknown_date': 'unknown document date',
     'more_leads': 'More graph leads are available.',
     'sources_hint': 'Read returned originals without summaries or graph leads: show {id} --sources. This reads saved evidence, not a new query.',
@@ -627,12 +628,15 @@ def fact_body(row):
 
 
 def fact_time(row):
+    if row.get("time_basis") == "unknown" and row.get("period_text"):
+        return str(row["period_text"]) + " (time unresolved)"
     when = str(row.get("when") or row.get("valid_from") or row.get("observed_at") or row.get("observed") or "").strip()
     label = {"reported": "reported observation", "document": "document date"}.get(row.get("time_basis"))
-    return when + (" (" + label + ")" if when and label else "")
+    period = str(row.get("period_text") or "").strip()
+    return when + (" (" + label + ")" if when and label else "") + (" · " + period if period and period != when else "")
 
 
-STATUS_TXT = {"superseded": "status_superseded", "ended": "status_ended", "not_started": "status_not_started",
+STATUS_TXT = {"time_unknown": "status_time_unknown", "superseded": "status_superseded", "ended": "status_ended", "not_started": "status_not_started",
               "doc_superseded": "status_doc_superseded", "doc_archived": "status_doc_archived"}
 
 
@@ -665,6 +669,10 @@ def relation_time(row):
         bits.append(TXT["period"].format(a=a, b=b))
     elif a or b:
         bits.append(TXT["since"].format(a=a) if a else TXT["until"].format(b=b))
+    if row.get("observed_at"):
+        bits.append("reported observation " + str(row["observed_at"]))
+    if row.get("period_text"):
+        bits.append(str(row["period_text"]))
     first, last = row.get("observed_first"), row.get("observed_last")
     if first:
         bits.append(TXT["seen"].format(a=first) if not last or last == first else TXT["seen_range"].format(a=first, b=last))
@@ -1021,11 +1029,13 @@ def view_context(envelope, limit=PAGE_BYTES):
     out = [head(envelope, what)]
     if r.get("read_extent") == "indexed_chunks":
         out.append(TXT["indexed_extent"])
-    # All chunks are of one document: the first line names it, each chunk carries only its place in it.
+    # Keep parent sections: a leaf heading alone loses inherited scope when the
+    # parser has flattened Markdown heading levels into chunk text.
     headers = {}
     for s in src:
         label = "S" + str(s.get("n"))
-        where = s.get("place") or (TXT["chunk_at"].format(k=int(s["chunk_index"]) + 1) if s.get("chunk_index") is not None else "")
+        section = " / ".join(str(x) for x in s.get("section_path") or [] if x)
+        where = section or s.get("place") or (TXT["chunk_at"].format(k=int(s["chunk_index"]) + 1) if s.get("chunk_index") is not None else "")
         out.append("[" + label + "] " + str(where) + notes_of(source_notes(s, envelope["call_id"] + ":" + label, position=True)))
         out.append(source_text(s, headers, label))
     if r.get("maybe_more") and src:

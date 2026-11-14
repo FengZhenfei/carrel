@@ -29,6 +29,7 @@ from typing import Any, Iterable
 
 from . import prompts
 from .quality import relation_qualifier, relation_semantics, traversable_relation
+from .time_context import time_fields
 from .resolution import is_identifier_like
 from .extract import entity_key, normalize_name
 from .units import UNIT_KINDS, Unit
@@ -354,6 +355,7 @@ def merge_extractions(
                 slot = relations[rkey] = {
                     "source_key": sk, "target_key": tk, "predicate": predicate,
                     **relation_semantics(r),
+                    **time_fields(r),
                     "directed": predicate != prompts.DEFAULT_PREDICATE,
                     "descriptions": [], "description_sources": [], "strength_sum": 0.0, "evidence": 0, "unit_ids": [],
                     "predicate_raw": Counter(), "kinds": Counter(), "doc_ids": [], "periods": Counter(),
@@ -443,6 +445,7 @@ def merge_extractions(
             "source": src["title"], "target": tgt["title"],
             "predicate": rel["predicate"], "directed": rel["directed"],
             **relation_semantics(rel),
+            **time_fields(rel),
             "descriptions": rel["descriptions"], "description_sources": rel["description_sources"], "description": "",
             "strength_sum": round(float(rel["strength_sum"]), 3), "evidence": int(rel["evidence"]),
             "unit_ids": sorted(rel["unit_ids"], key=lambda u: unit_order.get(u, 0)),

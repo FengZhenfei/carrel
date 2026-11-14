@@ -155,6 +155,8 @@ def _ended(row: dict[str, Any], day: str) -> bool:
 def row_status(row: dict[str, Any], *, day: str, as_of: bool = False) -> str:
     """Query-scope status, not a judgment of business validity or truth."""
     if as_of:
+        if row.get("time_basis") == "unknown":
+            return "time_unknown"
         start = str(row.get("valid_from") or row.get("observed_at") or row.get("observed_first") or row.get("observed") or "")
         if _after(start, day):
             return STATUS_NOT_STARTED
@@ -187,7 +189,8 @@ def cypher_in_effect(var: str, *, observed: str, as_of: bool) -> str:
              f"WHEN coalesce({v}.observed_at, '') <> '' THEN {v}.observed_at "
              f"ELSE coalesce({v}.{observed}, '') END")
     started = f"(NOT ({start}) =~ '[0-9]{{4}}.*' OR ({start}) <= left($day, size({start})))"
-    return f"({started} AND {until})"
+    known = f"coalesce({v}.time_basis, '') <> 'unknown'"
+    return f"({known} AND {started} AND {until})"
 
 
 def query_scope(*, history: bool = False, as_of: Any = None, today: str | None = None) -> dict[str, Any]:

@@ -141,6 +141,7 @@ def spec_payload(f: dict[str, Any], *, kb_id: str, source_collection: str, graph
         "ref_min_num": f.get("ref_min_num"), "ref_max_num": f.get("ref_max_num"), "bound_distance": f.get("bound_distance"),
         "valid_from": f.get("valid_from") or None, "valid_until": f.get("valid_until") or None, "axis": f.get("axis") or None,
         "when": when_text(f) or None, "period_text": f.get("period_text") or None,
+        "time_source": f.get("time_source") or None,
         "series_key": f.get("series_key") or None, "series_len": f.get("series_len"), "series_index": f.get("series_index"),
         "conflict_group": f.get("conflict_group") or None,
         # 时间证据与显式文档治理;默认保留各时间点的原文声明
@@ -272,6 +273,9 @@ def relation_payload(r: dict[str, Any], *, kb_id: str, source_collection: str, g
         # 原文写明的起止时间、来源文档日期、兼容旧版的取代字段和文档治理状态。
         "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
         "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+        "observed_at": r.get("observed_at") or None, "period_text": r.get("period_text") or None,
+        "time_source": r.get("time_source") or None,
+        "time_basis": r.get("time_basis") or None,
         "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
         "doc_status": r.get("doc_status") or None, "lapses": True if r.get("lapses") else None,
         "doc_ids": list(r.get("doc_ids") or [])[:16] or None,

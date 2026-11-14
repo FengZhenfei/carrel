@@ -21,6 +21,7 @@ from typing import Any
 
 from . import prompts
 from .quality import relation_qualifier, relation_semantics
+from .time_context import prompt_context, apply_time_context, time_fields
 from .tabletext import expand_wide_tables
 from .llm import ChatClient, LLMSpec
 from .units import UNIT_KINDS, Unit
@@ -533,6 +534,7 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                 "predicate_raw": normalize_predicate(predicate_raw),
                 "description": description, "strength": _strength(strength),
                 **relation_semantics(metadata),
+                **{k: metadata[k] for k in ("observed_at", "period_text", "time_source_id", "time_source_quote") if metadata.get(k)},
                 "valid_from": valid_from, "valid_until": valid_until,
             })
         else:
@@ -573,6 +575,7 @@ def consolidate(entities: list[dict[str, Any]], relations: list[dict[str, Any]])
                 "predicate": r["predicate"], "predicate_raw": r.get("predicate_raw", ""),
                 "descriptions": [], "strength": float(r.get("strength") or 1.0),
                 **relation_semantics(r),
+                **time_fields(r),
                 "valid_from": "", "valid_until": "",
             }
         slot["strength"] = max(slot["strength"], float(r.get("strength") or 1.0))
@@ -603,8 +606,9 @@ def _absorb_description(descriptions: list[str], desc: str) -> None:
 
 
 def prompt_hash() -> str:
+    from .time_context import INSTRUCTIONS, VERSION
     parts = [prompts.GRAPH_EXTRACTION_PROMPT, prompts.TABLE_GRAPH_EXTRACTION_PROMPT,
-             prompts.DEFAULT_EXAMPLES, prompts.CONTINUE_PROMPT, prompts.LOOP_PROMPT]
+             prompts.DEFAULT_EXAMPLES, prompts.CONTINUE_PROMPT, prompts.LOOP_PROMPT, INSTRUCTIONS, VERSION]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -658,7 +662,7 @@ class GraphExtractor:
         prompt = render_extract_prompt(expand_wide_tables(unit.text) or unit.text, section=unit.section_label, schema=self.schema,
                                        document=unit.document_label, unit_kind=unit.kind, has_table=has_table,
                                        document_date=str(getattr(unit, "doc_date", "") or ""))
-        messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
+        messages: list[dict[str, str]] = [{"role": "user", "content": prompt + "\n" + prompt_context(unit)}]
         entities: list[dict[str, Any]] = []
         relations: list[dict[str, Any]] = []
         stats: dict[str, Any] = {"records": 0, "malformed": 0, "unknown_types": 0, "unknown_predicates": 0, "gleanings": 0,
@@ -677,7 +681,7 @@ class GraphExtractor:
                 section=unit.section_label, schema=self.schema, document=unit.document_label,
                 unit_kind=unit.kind, has_table=has_table,
                 document_date=str(getattr(unit, "doc_date", "") or ""), table_recovery=True)
-            response, n = self._ask([{"role": "user", "content": recovery}], stats)
+            response, n = self._ask([{"role": "user", "content": recovery + "\n" + prompt_context(unit)}], stats)
             calls += n
             stats["table_recovery"] = 1
             stats["gleanings"] += 1
@@ -707,6 +711,10 @@ class GraphExtractor:
         context = "\n".join([unit.text or "", unit.document_label or "", unit.section_label or "", unit.rel_path or ""])
         entities, relations, ungrounded = ground_records(entities, relations, context=context, example_names=self.example_names)
         stats["ungrounded"] = ungrounded
+        for row in relations:
+            apply_time_context(row, dict(row), unit)
+            row.pop("time_source_id", None)
+            row.pop("time_source_quote", None)
         entities, relations = consolidate(entities, relations)
         return ExtractionResult(unit_id=unit.unit_id, entities=entities, relations=relations, calls=calls, stats=stats)
 

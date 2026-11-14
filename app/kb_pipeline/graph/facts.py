@@ -587,6 +587,7 @@ def fact_id(unit_id: str, fact: dict[str, Any]) -> str:
         str(fact.get("valid_from") or ""),        # the same property split by period in one table (2024 / 2025 columns) is two facts
         str(fact.get("valid_until") or ""),
         str(fact.get("observed_at") or ""),
+        str(fact.get("period_text") or "") if fact.get("time_basis") == "unknown" else "",
         str(fact.get("fact_kind") or "observation"),
     ])
     return "f" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -594,6 +595,8 @@ def fact_id(unit_id: str, fact: dict[str, Any]) -> str:
 
 def when_text(fact: dict[str, Any]) -> str:
     """Readable form of the time / version a fact applies to (validity period or document axis value)."""
+    if fact.get("time_basis") == "unknown":
+        return str(fact.get("period_text") or "")
     lo, hi = str(fact.get("valid_from") or ""), str(fact.get("valid_until") or "")
     if lo and hi and lo != hi:
         return f"{lo}~{hi}"
@@ -676,6 +679,8 @@ def retain_source_time(fact: dict[str, Any], unit: Unit) -> None:
     doc_date = str(getattr(unit, "doc_date", "") or "")
     if not doc_date or fact.get("valid_from") != doc_date:
         return
+    if fact.get("time_source") and fact["time_source"] in getattr(unit, "time_contexts", []):
+        return
     quote = str(fact.get("period_text") or "").strip()
     norm = lambda x: re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(x))).casefold()
     if quote and norm(quote) in norm(unit.text):
@@ -700,24 +705,30 @@ def render_facts_prompt(unit: Unit, *, document: str, subjects: Iterable[str], m
     两段提示词都带文档日期:相对日期、缺年份的日期按它换算。"""
     from .temporal import axis_value_kind
 
+    from .time_context import prompt_context
+
     subject_text = ", ".join(str(s) for s in subjects if str(s).strip()) or "(unknown)"
     axis_value = axis or getattr(unit, "axis", "") or ""
     doc_date = str(getattr(unit, "doc_date", "") or "") or (axis_value if axis_value_kind(axis_value) == "date" else "")
     doc_version = axis_value if axis_value_kind(axis_value) == "version" else ""
     if narrative:
-        return prompts.NARRATIVE_FACTS_PROMPT.format(
+        rendered = prompts.NARRATIVE_FACTS_PROMPT.format(
             document=document or unit.rel_path or "(unknown)", section=unit.section_label,
-            document_date=doc_date or "(unknown)", subjects=subject_text, input_text=unit.text, max_facts=int(max_facts))
-    return prompts.FACTS_PROMPT.format(
-        document=document or unit.rel_path or "(unknown)", section=unit.section_label,
-        document_date=doc_date or "(unknown)", document_version=doc_version or "(unknown)",
-        subjects=subject_text, input_text=((expand_wide_tables(unit.text) if FACTS_EXPAND_WIDE_TABLES else None) or unit.text),
-        max_facts=int(max_facts),
-    )
+            document_date=doc_date or "(unknown)", subjects=subject_text, input_text=unit.text,
+            time_context=prompt_context(unit), max_facts=int(max_facts))
+    else:
+        rendered = prompts.FACTS_PROMPT.format(
+            document=document or unit.rel_path or "(unknown)", section=unit.section_label,
+            document_date=doc_date or "(unknown)", document_version=doc_version or "(unknown)",
+            subjects=subject_text, input_text=((expand_wide_tables(unit.text) if FACTS_EXPAND_WIDE_TABLES else None) or unit.text),
+            time_context=prompt_context(unit), max_facts=int(max_facts),
+        )
+    return rendered
 
 
 def facts_prompt_hash() -> str:
-    return hashlib.sha256((prompts.FACTS_PROMPT + prompts.NARRATIVE_FACTS_PROMPT).encode("utf-8")).hexdigest()[:16]
+    from .time_context import INSTRUCTIONS, VERSION
+    return hashlib.sha256((prompts.FACTS_PROMPT + prompts.NARRATIVE_FACTS_PROMPT + INSTRUCTIONS + VERSION).encode("utf-8")).hexdigest()[:16]
 
 
 NARRATIVE_FACTS_MIN_TOKENS = 40
@@ -859,6 +870,8 @@ class FactExtractor:
                 continue
             retain_source_time(fact, unit)
             recover_observation_date(fact, unit.text)
+            from .time_context import apply_time_context
+            apply_time_context(fact, raw, unit)
             if glued and mark_ambiguous_source(fact, glued):
                 ambiguous += 1
             if value_conflicts and mark_evidence_conflict(fact, value_conflicts):
@@ -943,6 +956,8 @@ def link_facts(facts: list[dict[str, Any]], entities: list[dict[str, Any]], *, u
                 f["time_basis"] = "explicit"
             elif f.get("observed_at"):
                 f["time_basis"] = "reported"
+            elif f.get("period_text") or getattr(unit, "time_contexts", None):
+                f["time_basis"] = "unknown"
             else:
                 f["time_basis"] = "document" if axis or doc_date else "unknown"
             if f.get("ref_min_num") is not None or f.get("ref_max_num") is not None:
@@ -1256,7 +1271,7 @@ def normalize_measurements(facts: list[dict[str, Any]], entities: list[dict[str,
         conds = dict(f.get("conditions") or {})
         # A date condition records an observation; it is not an effective start.
         # Never replace explicit bounds or collapse a compound date to its first date.
-        if not any(f.get(k) for k in ("valid_from", "valid_until", "observed_at")):
+        if not any(f.get(k) for k in ("valid_from", "valid_until", "observed_at")) and not (f.get("time_basis") == "unknown" and f.get("period_text")):
             for k in list(conds):
                 if not _PERIOD_KEY_RE.search(str(k)):
                     continue

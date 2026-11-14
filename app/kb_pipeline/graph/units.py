@@ -230,6 +230,7 @@ class Unit:
     doc_date: str = ""
     content_version: str = ""
     source_locations: list[dict[str, Any]] = field(default_factory=list)
+    time_contexts: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def document_label(self) -> str:
@@ -263,6 +264,7 @@ class Unit:
             doc_date=str(data.get("doc_date") or ""),
             content_version=str(data.get("content_version") or ""),
             source_locations=[dict(x) for x in data.get("source_locations") or [] if isinstance(x, dict)],
+            time_contexts=[dict(x) for x in data.get("time_contexts") or [] if isinstance(x, dict)],
         )
 
 
@@ -424,6 +426,8 @@ def build_units(chunks: list[ChunkRef], *, kb_id: str, unit_chunks: int = DEFAUL
     order = 0
     for doc_id in sorted(by_doc):
         doc_chunks = sorted(by_doc[doc_id], key=lambda c: (c.chunk_index, c.chunk_uid))
+        from .time_context import chunk_contexts, context_key
+        time_scopes = chunk_contexts(doc_chunks)
         block_sizes: dict[str, int] = {}
         for c in doc_chunks:
             block_sizes[c.block_id] = block_sizes.get(c.block_id, 0) + 1
@@ -436,6 +440,7 @@ def build_units(chunks: list[ChunkRef], *, kb_id: str, unit_chunks: int = DEFAUL
             unit = _flush(current, texts, kb_id=kb_id, order=order, conclusion_headings=headings, boilerplate_headings=boiler, listing_headings=listing)
             if unit is not None:
                 unit.axis = str(axes.get(unit.doc_id) or "")
+                unit.time_contexts = time_scopes[current[0].chunk_uid]
                 units.append(unit)
                 order += 1
             current, texts = [], []
@@ -444,7 +449,9 @@ def build_units(chunks: list[ChunkRef], *, kb_id: str, unit_chunks: int = DEFAUL
             section = tuple(c.section_path)
             same_table = pending_table is not None and c.block_id == pending_table
             if current and not same_table:
-                if limit == 1:
+                if context_key(time_scopes[c.chunk_uid]) != context_key(time_scopes[current[0].chunk_uid]):
+                    flush()                                   # no time scope may bleed into its sibling
+                elif limit == 1:
                     flush()                                   # no merging: one chunk per unit
                 elif section != tuple(current[0].section_path) and len(current) >= fold_min:
                     flush()

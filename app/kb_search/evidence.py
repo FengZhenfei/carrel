@@ -463,9 +463,14 @@ def spec_hint(sp: dict[str, Any]) -> str | None:
     if cond:
         tail.append(f"@ {cond}")
     when = str(sp.get("when") or sp.get("valid_from") or sp.get("observed_at") or sp.get("observed") or "").strip()
+    if sp.get("time_basis") == "unknown":
+        when = ""
+        tail.append("· time unresolved")
     if when:
         basis = {"document": "document date", "reported": "reported observation"}.get(sp.get("time_basis"))
         tail.append(f"· {when}" + (f" ({basis})" if basis else ""))
+    if sp.get("period_text"):
+        tail.append("· " + str(sp["period_text"]))
     return f"{head} = {value}" + (" " + " ".join(tail) if tail else "")
 
 

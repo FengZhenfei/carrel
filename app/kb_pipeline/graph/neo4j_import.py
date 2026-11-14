@@ -505,6 +505,9 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "evidence_kind": r.get("evidence_kind") or "body",
             "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
             "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+            "observed_at": r.get("observed_at") or None, "period_text": r.get("period_text") or None,
+            "time_source": json.dumps(r["time_source"], ensure_ascii=False) if r.get("time_source") else None,
+            "time_basis": r.get("time_basis") or None,
             "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
             "doc_status": r.get("doc_status") or None, "lapses": bool(r.get("lapses")),
         }))
@@ -524,6 +527,9 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
                 # 关系的时间与新旧:检索默认只走现行的边,回看某一天按起止、观察时间与被取代的时间判(currency.cypher_in_effect)
                 "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
                 "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
+                "observed_at": r.get("observed_at") or None, "period_text": r.get("period_text") or None,
+                "time_source": json.dumps(r["time_source"], ensure_ascii=False) if r.get("time_source") else None,
+                "time_basis": r.get("time_basis") or None,
                 "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,
                 "doc_status": r.get("doc_status") or None, "lapses": bool(r.get("lapses")),
             }),
@@ -576,6 +582,7 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             "ref_min_num": f.get("ref_min_num"), "ref_max_num": f.get("ref_max_num"), "bound_distance": f.get("bound_distance"),
             "valid_from": f.get("valid_from") or None, "valid_until": f.get("valid_until") or None, "axis": f.get("axis") or None,
             "period_text": f.get("period_text") or None,
+            "time_source": json.dumps(f["time_source"], ensure_ascii=False) if f.get("time_source") else None,
             "series_key": f.get("series_key") or None, "series_len": f.get("series_len"), "series_index": f.get("series_index"),
             "conflict_group": f.get("conflict_group") or None,
             "superseded_by": f.get("superseded_by") or None, "superseded_on": f.get("superseded_on") or None,

@@ -32,6 +32,11 @@ def relation_semantics(row: dict[str, Any]) -> dict[str, Any]:
 def relation_qualifier(row: dict[str, Any]) -> str:
     """Contradictory or differently qualified assertions must never share an edge ID."""
     value = relation_semantics(row)
+    # Observations in different reporting windows are separate assertions.
+    if row.get("observed_at"):
+        value["observed_at"] = str(row["observed_at"])
+    elif row.get("time_basis") == "unknown" and row.get("period_text"):
+        value["unresolved_period"] = str(row["period_text"])
     # Ordinary unconditional edges retain the compact key used by deterministic extractors.
     if value == {"polarity": "affirmed", "target_polarity": "affirmed", "modality": "actual", "conditions": {}}:
         return ""

@@ -14,6 +14,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 from kb_pipeline.chunking.context import payload_text
+from kb_pipeline.graph.facts import when_text
 
 import json
 import math
@@ -30,7 +31,7 @@ ENTITY_FIELDS = ("id", "title", "type", "upper", "type_path", "kind", "scope", "
                  "external_ids", "doc_count", "first_seen", "last_seen")
 ENTITY_RETURN = ", ".join(f"e.{k} AS {k}" for k in ENTITY_FIELDS)
 # 关系的时间与状态字段(建图时写在 RELATED_TO 边上),每条邻居关系原样带回、再按口径算 status
-RELATION_TIME_FIELDS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
+RELATION_TIME_FIELDS = ("valid_from", "valid_until", "observed_first", "observed_last", "observed_at", "period_text", "time_source", "time_basis", "superseded_by", "superseded_on", "doc_status",
                         "lapses", "polarity", "target_polarity", "modality", "conditions_json", "quality_state", "traversable")
 EVIDENCE_PER_RELATION = 3
 EVIDENCE_PER_FACT = 3
@@ -75,7 +76,7 @@ FACT_MATCH = {
 _FACT_BASIC = ("id", "subject", "property", "symbol", "concept", "concept_key", "value", "min", "typ", "max", "unit", "unit_canonical",
                "valid_from", "valid_until", "series_key", "series_index", "conflict_group", "section", "doc_id",
                "observed", "superseded_by", "superseded_on", "doc_status", "source_kind", "lapses",
-               "fact_kind", "time_basis", "observed_at", "subject_origin", "quality_state", "flag_status", "extraction_evidence",
+               "fact_kind", "time_basis", "observed_at", "period_text", "time_source", "subject_origin", "quality_state", "flag_status", "extraction_evidence",
                "source_locator", "evidence_precision", "evidence_unit_ids", "subject_origin", "value_json")
 SERIES_MEMBERS_MAX = 40             # 一条序列最多带几档(体检指标一年一档,几十档已经很长)
 PAGE_KINDS = ("subject", "timeline", "source", "index")
@@ -846,14 +847,14 @@ def series_members(session: Any, kb_id: str, gv: str, keys: Iterable[Any], *,
         f"MATCH (f:Spec {{kb_id: $kb, graph_version: $gv}}) WHERE f.series_key IN $keys AND {effect} "
         "AND ($doc IS NULL OR f.doc_id = $doc) "
         "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, f.unit AS unit, "
-        "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.valid_until AS valid_until, f.time_basis AS time_basis, f.observed_at AS observed_at, f.observed AS observed, f.axis AS axis, f.series_index AS series_index "
+        "f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.valid_until AS valid_until, f.time_basis AS time_basis, f.period_text AS period_text, f.observed_at AS observed_at, f.observed AS observed, f.axis AS axis, f.series_index AS series_index "
         "ORDER BY series_key, coalesce(f.series_index, 0), f.id", kb=kb_id, gv=gv, keys=wanted, day=scope["day"], doc=doc_id).data()
     out: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         members = out.setdefault(str(r["series_key"]), [])
         if len(members) < SERIES_MEMBERS_MAX:
-            members.append({**{k: r.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical", "valid_from", "valid_until", "time_basis", "observed_at", "observed", "series_index")},
-                            "when": r.get("valid_from") or r.get("observed_at") or r.get("axis") or r.get("observed")})
+            members.append({**{k: r.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical", "valid_from", "valid_until", "time_basis", "period_text", "observed_at", "observed", "series_index")},
+                            "when": when_text(r) or None})
     return out
 
 

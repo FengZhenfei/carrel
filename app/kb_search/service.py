@@ -42,6 +42,7 @@ SETTINGS_TTL = 60.0
 ENTITY_FIELDS = ("id", "title", "type", "upper", "kind", "scope", "score", "hop", "via", "docs", "description", "source_valid", "sources_active")
 # 关系与事实带时间与状态(status:current / superseded / ended / not_started / doc_superseded / doc_archived,见 currency)
 RELATION_FIELDS = ("id", "source", "type", "target", "status", "valid_from", "valid_until", "observed_first", "observed_last",
+                   "observed_at", "period_text", "time_source", "time_basis",
                    "superseded_by", "score", "hop", "via", "description", "source_valid", "sources_active",
                    "polarity", "target_polarity", "modality", "conditions", "quality_state", "traversable", "type_violation")
 SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "source_valid", "series_text", "conflict", "conflict_note",
@@ -49,7 +50,7 @@ SPEC_FIELDS = ("id", "hint", "sources", "sources_active", "source_valid", "serie
                "when", "valid_from", "valid_until", "status", "observed", "superseded_by", "superseded_on", "doc_status", "source_kind",
                "series_key", "series_index", "conflict_group", "conditions", "conditions_text", "kinds", "quality",
                "confidence", "comparable", "fact_kind", "time_basis", "observed_at", "subject_origin", "quality_state", "flag_status", "extraction_evidence", "text", "note", "score", "rel_path", "section", "point_ids", "evidence",
-               "source_locator", "evidence_precision", "evidence_unit_ids", "subject_origin", "value_json")
+               "source_locator", "evidence_precision", "evidence_unit_ids", "subject_origin", "value_json", "period_text", "time_source")
 PAGE_FIELDS = ("id", "kind", "title", "score", "summary", "text", "text_truncated", "compiled", "compiled_day", "time_mode", "source_paths", "source_valid", "sources_active", "docs", "series", "point_ids")
 NEIGHBORHOOD_FIELDS = ("id", "title", "type", "named", "relations", "facts", "predicates", "neighbors")
 NEIGHBORHOOD_TIMEOUT = 5.0          # subject neighbourhoods are leads that come along: wait at most this long for a slow graph database, never hold the request up

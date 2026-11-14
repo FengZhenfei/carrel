@@ -260,11 +260,14 @@ Document version, if known: {document_version}
 Section: {section}
 Candidate subjects (local objects first; document-level candidates are hints, not owners of every value): {subjects}
 
+Source time context for this unit (apply it to matching observations unless local evidence gives another time):
+{time_context}
+
 Text:
 {input_text}
 
 Return JSON only, in this exact shape:
-{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "...", "value": "...", "min": "...", "typ": "...", "max": "...", "unit": "...", "conditions": {{"...": "..."}}, "flag": "...", "ref_min": "...", "ref_max": "...", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
+{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "...", "value": "...", "min": "...", "typ": "...", "max": "...", "unit": "...", "conditions": {{"...": "..."}}, "flag": "...", "ref_min": "...", "ref_max": "...", "valid_from": "...", "valid_until": "...", "observed_at": "...", "period_text": "...", "time_source_id": "", "time_source_quote": "", "note": "..."}}]}}
 
 Rules:
 - One fact per (subject, property, set of conditions). When columns or rows differ by a condition (grade, range, mode, period, variant, temperature, version, configuration...), emit one fact per condition and spell the condition out in "conditions" as {{"condition name": "condition value"}}.
@@ -277,7 +280,8 @@ Rules:
 - Put a single value in "value"; ranges or min / typ / max columns in "min" / "typ" / "max"; the unit separately in "unit"; keep numbers exactly as written; leave fields you do not have as "".
 - "flag": the document's own marker attached to this value (an arrow ↑ / ↓, H / L, 异常, out of range, exceeds the limit, changed since the previous version), copied as written; otherwise "".
 - "ref_min" / "ref_max": the reference range or specification limits the document shows for this value (a 参考区间 / reference range / limit column); otherwise "".
-- "valid_from" / "valid_until": ISO dates (YYYY-MM-DD, YYYY-MM or YYYY) of the period the value applies to, ONLY when the table, its caption or the text states a date or period for it, and "period_text" is that statement copied verbatim. Turn relative or year-less dates (next month, 月底, 3月5日) into absolute dates using the document date; when it is unknown, leave them in "period_text" only. Never guess dates: leave all three "" when the text gives none.
+- Use ISO dates (YYYY-MM-DD, YYYY-MM or YYYY). "observed_at" is the observation/event date, or the END of a completed reporting/experiment window; a dated population statistic may also have an observed_at. "valid_from" / "valid_until" are only for explicitly effective states, not reporting windows. "period_text" copies the supporting time expression. If an applicable TIME CONTEXT is supplied below, use its time_source_id and time_source_quote; otherwise use local time evidence. Never substitute publication date for missing fact time. Resolve relative/year-less expressions from the stated context anchor, otherwise the document date; keep unresolved expressions in period_text.
+- For explicitly annual/monthly aggregates, use the end of the stated reporting window. Distinguish fiscal years from calendar years: a fiscal year uses its supported calendar-context mapping, not December 31. If a fiscal period cannot be resolved, keep period_text and leave dates empty. Calendar-year/month aggregates use their calendar end. An ordinary event dated only to a year/month keeps that precision; do not turn it into an aggregate.
 - Do not invent or compute values; skip rows without a value; at most {max_facts} facts.
 """
 
@@ -288,13 +292,16 @@ Document date, if known: {document_date}
 Section: {section}
 Candidate subjects (local objects first; document-level candidates are hints, not owners of every value): {subjects}
 
+Source time context for this unit (apply it to matching observations unless local evidence gives another time):
+{time_context}
+
 Text:
 {input_text}
 
 A fact records a stated observation, assignment, status, progress, deadline, decision, quantity or attribute. Reference statements describe specifications, examples or populations rather than an individual observation or current state. Preserve these distinctions. Advice and uncommitted plans are not completed events or current states; preserve their qualification when recording a concrete reference value. Definitions and aliases belong in the entity/relationship extraction.
 
 Return JSON only, in this exact shape:
-{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "", "value": "...", "min": "", "typ": "", "max": "", "unit": "...", "conditions": {{}}, "flag": "...", "ref_min": "", "ref_max": "", "valid_from": "...", "valid_until": "...", "period_text": "...", "note": "..."}}]}}
+{{"facts": [{{"subject": "...", "subject_origin": "explicit|context|unresolved", "fact_kind": "observation|state|reference", "evidence": "short verbatim supporting passage", "property": "...", "symbol": "", "value": "...", "min": "", "typ": "", "max": "", "unit": "...", "conditions": {{}}, "flag": "...", "ref_min": "", "ref_max": "", "valid_from": "...", "valid_until": "...", "observed_at": "...", "period_text": "...", "time_source_id": "", "time_source_quote": "", "note": "..."}}]}}
 
 Rules:
 - "subject" is the specific local object the value belongs to. Population statistics, equipment settings, examples and other people's results do not belong to the document owner. Candidate names are only hints; use the local generic subject if no individual is identified.
@@ -303,8 +310,9 @@ Rules:
 - "fact_kind": "state" for a continuing assignment/status/configuration explicitly in force; "observation" for measurements, events or experiment results; "reference" for specifications, examples or general statistics. Do not interpret a new observation as replacing an old one.
 - "property" is what the state is about, in a short phrase in the text's own wording (owner, status, progress, due date, decision, budget, blood pressure ...). Use the same phrase for the same kind of state, so that states at different dates can be compared.
 - "value" is the state itself, copied from the text (a person's name, a status word, a percentage, a date, a number); put a separate unit in "unit"; leave fields you do not have as "".
-- "valid_from": the date the state applies from when the text states one; otherwise the document date. "valid_until": only when the text states an end. Turn relative or year-less dates (next week, end of the month, 下周, 月底, 3月5日) into absolute dates (YYYY-MM-DD, YYYY-MM or YYYY) using the document date; "period_text" is the time expression copied verbatim.
+- Use ISO dates (YYYY-MM-DD, YYYY-MM or YYYY). "observed_at" is the observation/event date, or the END of a completed reporting/experiment window; a dated population statistic may also have an observed_at. "valid_from" / "valid_until" are only for explicitly effective states, not reporting windows. "period_text" copies the supporting time expression. If an applicable TIME CONTEXT is supplied below, use its time_source_id and time_source_quote; otherwise use local time evidence. Never substitute publication date for missing fact time. Resolve relative/year-less expressions from the stated context anchor, otherwise the document date; keep unresolved expressions in period_text.
 - "flag": a marker the text attaches to the state (delayed, at risk, abnormal, ↑, ↓) copied as written; otherwise "".
+- For explicitly annual/monthly aggregates, use the end of the stated reporting window. Distinguish fiscal years from calendar years: a fiscal year uses its supported calendar-context mapping, not December 31. If a fiscal period cannot be resolved, keep period_text and leave dates empty. Calendar-year/month aggregates use their calendar end. An ordinary event dated only to a year/month keeps that precision; do not turn it into an aggregate.
 - Do not invent or infer states the text does not state; at most {max_facts} facts. Return {{"facts": []}} when there are none.
 """
 

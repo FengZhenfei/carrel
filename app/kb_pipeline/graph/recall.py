@@ -23,6 +23,7 @@ from ..models import KBSource
 from ..vector.qdrant import client as qdrant_client, graph_collection_alias, graph_collection_name
 from .neo4j_import import active_neo4j_graph_version, neo4j_driver
 from .quality import relation_semantics, traversable_relation
+from .facts import when_text
 
 
 def mention_weight(entity_score: float, *, count: int, df: int, n_chunks: int) -> float:
@@ -530,7 +531,7 @@ def _query_points(q: Any, collection: str, vector: list[float], limit: int, quer
 
 SOURCE_SAMPLE = 16
 SERIES_MEMBERS_MAX = 40
-RELATION_TIME_KEYS = ("valid_from", "valid_until", "observed_first", "observed_last", "superseded_by", "superseded_on", "doc_status",
+RELATION_TIME_KEYS = ("valid_from", "valid_until", "observed_first", "observed_last", "observed_at", "period_text", "time_source", "time_basis", "superseded_by", "superseded_on", "doc_status",
                       "lapses", "polarity", "target_polarity", "modality", "conditions_json", "quality_state", "traversable")
 
 
@@ -576,6 +577,7 @@ def spec_result_row(sp: dict[str, Any]) -> dict[str, Any]:
         "fact_kind": sp.get("fact_kind"), "subject_origin": sp.get("subject_origin"),
         "quality_state": sp.get("quality_state"), "flag_status": sp.get("flag_status"), "extraction_evidence": sp.get("extraction_evidence"),
         "time_basis": sp.get("time_basis"), "observed_at": sp.get("observed_at"),
+        "period_text": sp.get("period_text"), "time_source": sp.get("time_source"),
         "observed": sp.get("observed"), "superseded_by": sp.get("superseded_by"), "superseded_on": sp.get("superseded_on"),
         "doc_status": sp.get("doc_status"), "source_kind": sp.get("source_kind"), "lapses": sp.get("lapses"),
     }
@@ -818,6 +820,7 @@ def graph_query(
                     WITH eid, r, n ORDER BY r.weight DESC
                     WITH eid, collect({rid: r.id, type: r.type, weight: r.weight, description: r.description,
                                        valid_from: r.valid_from, valid_until: r.valid_until, observed_first: r.observed_first,
+                                       observed_at: r.observed_at, period_text: r.period_text, time_source: r.time_source, time_basis: r.time_basis,
                                        observed_last: r.observed_last, superseded_by: r.superseded_by, superseded_on: r.superseded_on,
                                        polarity: r.polarity, target_polarity: r.target_polarity, modality: r.modality,
                                        conditions_json: r.conditions_json, quality_state: r.quality_state, traversable: r.traversable,
@@ -885,15 +888,15 @@ def graph_query(
                     + cypher_in_scope("f", observed="observed", scope=scope) + " "
                     "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, "
                     "f.unit AS unit, f.unit_canonical AS unit_canonical, f.valid_from AS valid_from, f.axis AS axis, "
-                    "f.observed_at AS observed_at, f.observed AS observed, f.time_basis AS time_basis, "
+                    "f.observed_at AS observed_at, f.observed AS observed, f.time_basis AS time_basis, f.period_text AS period_text, "
                     "f.series_index AS series_index ORDER BY series_key, coalesce(f.series_index, 0), f.id",
                     kb=source.kb_id, gv=gv, keys=series_keys, day=scope["day"],
                 ).data()):
                     members = series_of.setdefault(str(row["series_key"]), [])
                     if len(members) < SERIES_MEMBERS_MAX:
                         members.append({**{k: row.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical",
-                                                                    "valid_from", "observed_at", "observed", "time_basis", "series_index")},
-                                        "when": row.get("valid_from") or row.get("observed_at") or row.get("axis") or row.get("observed")})
+                                                                    "valid_from", "observed_at", "observed", "time_basis", "period_text", "series_index")},
+                                        "when": when_text(row) or None})
             page_doc_ids = sorted({str(d) for pg in pages for d in (pg.get("doc_ids") or [])})
             if page_doc_ids:
                 for row in (native.document_paths(page_doc_ids) if native is not None else session.run(
