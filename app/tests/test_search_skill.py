@@ -421,7 +421,7 @@ def test_followup_inherits_original_time_and_preserves_explicit_override(client,
 
 
 def test_whole_read_describes_the_indexed_representation(client, monkeypatch):
-    row = {"chunk_index": 0, "chunk_total": 1, "text": "Extracted body."}
+    row = {"chunk_index": 0, "chunk_total": 1, "text": "Extracted body.", "content_version": "v1"}
     def request(*args):
         return json.dumps({"sources": [row], "tokens_total": 4}).encode(), {}
     monkeypatch.setattr(client, "request", request)

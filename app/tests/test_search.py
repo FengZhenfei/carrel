@@ -716,11 +716,11 @@ class RerankerReuseTests(unittest.TestCase):
 
         gets, posts = [], []
 
-        def fake_get(url, timeout=None):
+        def fake_get(url, timeout=None, allow_redirects=False):
             gets.append(url)
             return Resp({"data": [{"id": f"model-{len(gets)}"}]})
 
-        def fake_post(url, json=None, timeout=None):
+        def fake_post(url, json=None, timeout=None, allow_redirects=False):
             posts.append(json["model"])
             return Resp({"results": [{"index": 0, "relevance_score": 0.7}]}, ok=json["model"] != "gone")
 
@@ -1204,7 +1204,7 @@ class OrchestrationTests(unittest.TestCase):
                 raise RuntimeError("qdrant timed out")
             return {i: docs[i] for i in ids if i in docs}
 
-        def fake_points(q, c, ids, *, keys=None, timeout=None):
+        def fake_points(q, c, ids, *, keys=None, timeout=None, store=None):
             calls.setdefault("points", []).append(sorted(ids))
             if "points" in broken:
                 raise RuntimeError("qdrant timed out")
@@ -3060,7 +3060,7 @@ class SkillClientTests(unittest.TestCase):
             def fake(url, token, timeout, method, route, data=None):
                 asked.append((data["chunk_from"], data["chunk_to"]))
                 last = data["chunk_to"] if total is None else min(data["chunk_to"], total - 1)
-                rows = [dict({"n": 1, "chunk_index": i, "text": "x"}, **({"chunk_total": total} if lengths and total else {})) for i in range(data["chunk_from"], last + 1)]
+                rows = [dict({"n": 1, "chunk_index": i, "text": "x", "content_version": "v1"}, **({"chunk_total": total} if lengths and total else {})) for i in range(data["chunk_from"], last + 1)]
                 return json.dumps({"kb_id": "kb_x", "doc_id": "d1", "sources": rows, "tokens_total": len(rows)}).encode(), {}
             return fake
 

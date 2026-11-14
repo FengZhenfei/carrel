@@ -3,7 +3,7 @@
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.14.2
-certifi==2026.7.22
+certifi==2026.10.18
 charset-normalizer==3.5.1
 click==8.4.2
 distro==1.9.0
@@ -30,7 +30,7 @@ openpyxl==3.1.5
 opensearch-protobufs==1.2.0
 opensearch-py==3.2.0
 packaging==26.3
-pillow==12.3.0
+pillow==13.0.0
 pluggy==1.6.0
 portalocker==3.2.0
 protobuf==7.35.1
@@ -54,6 +54,6 @@ tree-sitter-language-pack==1.16.1
 truststore==0.10.4
 typing_extensions==4.16.0
 typing-inspection==0.4.4
-urllib3==2.7.0
+urllib3==2.8.0
 uvicorn==0.52.4
 xlrd==2.0.2

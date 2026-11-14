@@ -12,10 +12,11 @@ from .contracts import Storage
 
 def get_storage(settings: Any, *, vector_client: Any = None, query_timeout: float | None = None,
                 previous: Storage | None = None) -> Storage:
+    from .publication import guard
     backend = getattr(settings, "storage_backend", "standard")
     if backend == "light":
         from .light import LightStorage
-        return LightStorage(settings)
+        return guard(LightStorage(settings))
     if backend != "standard":
         raise ValueError(f"Storage backend is not implemented: {backend!r}")
     from .standard import StandardStorage
@@ -23,4 +24,4 @@ def get_storage(settings: Any, *, vector_client: Any = None, query_timeout: floa
     # Reuse the connection without mutating the settings held by in-flight requests.
     if isinstance(previous, StandardStorage) and store._client_key == previous._client_key:
         store._client = previous._client
-    return store
+    return guard(store)

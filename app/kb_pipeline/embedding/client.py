@@ -4,7 +4,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from openai import OpenAI, omit
+from openai import OpenAI, DefaultHttpxClient, omit
 
 
 _CLIENT_LOCK = threading.Lock()
@@ -19,7 +19,8 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     with _CLIENT_LOCK:
         client = _CLIENTS.get(key)
         if client is None:
-            client = OpenAI(api_key=api_key or "not-required", base_url=base_url, timeout=120, max_retries=0)
+            client = OpenAI(api_key=api_key or "not-required", base_url=base_url, timeout=120, max_retries=0,
+                            http_client=DefaultHttpxClient(follow_redirects=False))
             _CLIENTS[key] = client
     return client
 
@@ -95,7 +96,11 @@ class EmbeddingClient:
             for attempt in range(1, self.retry + 1):
                 try:
                     resp = self.client.embeddings.create(model=self.model_id, input=batch, dimensions=self.dim, **self.request_options)
-                    batch_vectors = [item.embedding for item in resp.data]
+                    indices = [item.index for item in resp.data]
+                    if (any(type(index) is not int for index in indices)
+                            or sorted(indices) != list(range(len(batch)))):
+                        raise EmbeddingDimensionError("embedding response has missing, duplicate or invalid indices")
+                    batch_vectors = [item.embedding for item in sorted(resp.data, key=lambda item: item.index)]
                     if len(batch_vectors) != len(batch):
                         raise RuntimeError(
                             f"embedding response size mismatch: input={len(batch)} output={len(batch_vectors)}"

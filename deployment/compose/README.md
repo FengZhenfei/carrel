@@ -10,6 +10,10 @@ DuckDB and SQLite inside the persistent application directory.
 LLM, Embedding and Reranker services are configured independently in the console.
 Their weights and servers are not part of this deployment.
 
+The application image includes grammar libraries for Carrel's supported code languages.
+They are prepared during the image build, so code parsing does not need to download them
+on first use. Python parsing uses Python's built-in AST.
+
 ## Start
 
 Install Docker with Compose v2. From the repository root:

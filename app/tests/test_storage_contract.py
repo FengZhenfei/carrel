@@ -20,7 +20,7 @@ from test_scanner_worker import _parse_harness, _rescan
 
 
 def test_factory_is_lazy_reuses_connections_and_rejects_unknown_backend():
-    settings = SimpleNamespace(qdrant_url="http://unused", qdrant_api_key="secret")
+    settings = SimpleNamespace(qdrant_url="http://unused", qdrant_api_key="secret", state_db=None)
     with patch.object(standard, "vector_client", return_value=object()) as create:
         first = get_storage(settings, query_timeout=7)
         create.assert_not_called()
@@ -31,7 +31,7 @@ def test_factory_is_lazy_reuses_connections_and_rejects_unknown_backend():
         create.assert_called_once_with(settings.qdrant_url, settings.qdrant_api_key, timeout=7)
         refreshed = get_storage(settings, query_timeout=7, previous=first)
         assert refreshed._q is first._q
-        changed = get_storage(SimpleNamespace(qdrant_url="http://other", qdrant_api_key="secret"),
+        changed = get_storage(SimpleNamespace(qdrant_url="http://other", qdrant_api_key="secret", state_db=None),
                               query_timeout=7, previous=first)
         assert changed._client is None
     with pytest.raises(ValueError, match="not implemented"):
@@ -41,7 +41,7 @@ def test_factory_is_lazy_reuses_connections_and_rejects_unknown_backend():
 @pytest.fixture
 def local_store():
     q = QdrantClient(":memory:")
-    store = get_storage(SimpleNamespace(opensearch_url="http://unused"), vector_client=q)
+    store = standard.StandardStorage(SimpleNamespace(opensearch_url="http://unused"), vector_client=q)
     store.chunks.ensure("kb_synthetic", VectorLayout(4, 4))
     try:
         yield store, q

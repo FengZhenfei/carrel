@@ -269,7 +269,7 @@ def relation_payload(r: dict[str, Any], *, kb_id: str, source_collection: str, g
         "type": r.get("predicate"), "directed": bool(r.get("directed")),
         **relation_semantics(r), "quality_state": relation_quality(r), "traversable": traversable_relation(r),
         "description": r.get("description"),
-        # 时间与状态(方案附录第 3 条):原文写明的起止、各来源文档的日期(观察时间)、是否被更新的说法取代
+        # 原文写明的起止时间、来源文档日期、兼容旧版的取代字段和文档治理状态。
         "valid_from": r.get("valid_from") or None, "valid_until": r.get("valid_until") or None,
         "observed_first": r.get("observed_first") or None, "observed_last": r.get("observed_last") or None,
         "superseded_by": r.get("superseded_by") or None, "superseded_on": r.get("superseded_on") or None,

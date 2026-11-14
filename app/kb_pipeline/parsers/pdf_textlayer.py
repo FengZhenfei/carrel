@@ -159,6 +159,15 @@ def splice_rendered(blocks: list[ParsedBlock], rendered: list[ParsedBlock], page
             continue
         target = pages[int(block.page_idx) - 1]
         block.page_idx = target
+        for key in ("page_start", "page_end"):
+            value = block.metadata.get(key)
+            if isinstance(value, int) and 1 <= value <= len(pages):
+                block.metadata[key] = pages[value - 1]
+        for key in ("source_regions", "table_note_sources"):
+            if block.metadata.get(key):
+                block.metadata[key] = [{**region, "page": pages[region["page"] - 1]}
+                    if isinstance(region.get("page"), int) and 1 <= region["page"] <= len(pages)
+                    else dict(region) for region in block.metadata[key]]
         block.block_id = f"rendered-{block.block_id}"
         block.metadata["rendered_page"] = True
         by_page.setdefault(target, []).append(block)

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import time
 from urllib.request import urlopen
 
@@ -84,7 +85,7 @@ def initialize():
             if sep and key.strip() in defaults:
                 continue
             lines.append(line)
-        lines.extend(f"{k}={v}" for k, v in defaults.items())
+        lines.extend(f"{k}={shlex.quote(v) if v else ''}" for k, v in defaults.items())
         env_file.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as out:

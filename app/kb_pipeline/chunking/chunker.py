@@ -21,6 +21,7 @@ Overhaul after the 2026-09-05 sampling audit:
 from __future__ import annotations
 
 import re
+import hashlib
 from dataclasses import replace
 from typing import Any
 
@@ -865,7 +866,8 @@ def blocks_to_chunks(
         block = resolve_sections(piece["block"])
         idx = per_block.get(block.block_id, 0)
         per_block[block.block_id] = idx + 1
-        chunk_uid = f"{kb_id}:{file_key}:{content_version}:{parser_profile}:{block.block_id}:{idx}"
+        digest = hashlib.sha256(evidence_text(piece["text"], block.metadata).encode("utf-8")).hexdigest()
+        chunk_uid = f"{kb_id}:{file_key}:{content_version}:{parser_profile}:{block.block_id}:{idx}:{digest}"
         result.append(
             UnifiedChunk(
                 chunk_uid=chunk_uid,
@@ -875,6 +877,12 @@ def blocks_to_chunks(
                 token_count=piece["tokens"],
             )
         )
+    # The complete layout is part of every reference: even unchanged text may
+    # acquire different positions or neighbors after a reparse.
+    from ..utils import stable_json_hash
+    revision = stable_json_hash([(c.chunk_uid, c.block.metadata, c.block.page_idx) for c in result])
+    for chunk in result:
+        chunk.chunk_uid += ":" + revision
     return result
 
 

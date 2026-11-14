@@ -120,6 +120,7 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
     for r in rows:
         if r.get("kb_id") and r.get("doc_id"):
             by_kb.setdefault(str(r["kb_id"]), set()).add(str(r["doc_id"]))
+    expected = {(str(r.get("kb_id")), str(r.get("doc_id"))): r.get("content_version") for r in rows}
     if driver is not None:
         from kb_pipeline.graph.recall import TimedSession
 
@@ -131,8 +132,8 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
                 if not gv:
                     continue
                 for rec in session.run("MATCH (d:Document {kb_id: $kb, graph_version: $gv}) WHERE d.doc_id IN $ids "
-                                       "RETURN d.doc_id AS doc_id, d.date AS date", kb=kb, gv=str(gv), ids=sorted(ids)).data():
-                    if rec.get("date"):
+                                       "RETURN d.doc_id AS doc_id, d.date AS date, d.content_version AS content_version", kb=kb, gv=str(gv), ids=sorted(ids)).data():
+                    if rec.get("date") and rec.get("content_version") and rec["content_version"] == expected.get((kb, str(rec["doc_id"]))):
                         out[(kb, str(rec["doc_id"]))] = str(rec["date"])
     for r in rows:
         key = (str(r.get("kb_id") or ""), str(r.get("doc_id") or ""))

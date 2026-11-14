@@ -19,13 +19,20 @@ Original files and parsing artifacts retain their existing paths.
 
 The Standard adapters delegate to the existing storage implementations. Parsing,
 chunking, entity extraction, schema evolution, ranking and evidence assembly retain
-their existing algorithms. Source identifiers, document versions, graph versions,
-time scopes and source locators pass through the boundary unchanged.
+their existing algorithms. Document versions, graph versions, time scopes and
+source locators pass through the boundary unchanged.
 
-Standard version publication retains its original order: write the new vectors, import the
+Document publication writes vectors first, then commits the complete chunk ledger,
+indexed version and cleanup job in one SQLite transaction. Both backends check
+retrieval and evidence reads against that ledger. Partial writes remain unpublished;
+old-point retirement and keyword synchronization retry through the existing queue.
+Chunk identifiers include the evidence text and document layout, and context
+readbacks can pin `chunk_revision` as well as the file's `content_version`.
+
+Standard graph publication retains its original order: write the new vectors, import the
 graph projection, switch vector aliases, activate the graph projection, then record
-success. An activation failure restores the previous aliases. Keyword-index failures
-still enqueue a separate synchronization job. Retrieval reads active chunks; console
+success. An activation failure restores the previous aliases, including removing
+an optional page alias when the target version has no page index. Console
 previews can read the preceding ledger version while a reparse is being published.
 
 Connections are created on demand. Concurrent calls on one adapter share its vector
@@ -48,6 +55,10 @@ withdrawal. Model responses and the OpenSearch transport are controlled fixtures
 Existing regressions also cover incremental graph builds, deletion and rename,
 publication rollback, resume, time/conflict retrieval, image references and endpoint
 configuration refresh.
+
+`test_publication_integrity.py` injects vector-write, cleanup and ledger-commit
+failures against real LanceDB and in-memory Qdrant. It also verifies missing-index
+recovery, revision invalidation and keyword counts over published chunks.
 
 `test_storage_live.py` runs the same file lifecycle against real Qdrant,
 OpenSearch and Neo4j servers. It also builds two graph versions, checks source

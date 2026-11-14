@@ -228,6 +228,7 @@ class Unit:
     axis: str = ""
     # 文档日期(不管轴是日期还是版本,能认出日期就有):抽取提示词的 Document date 行、关系的观察时间
     doc_date: str = ""
+    content_version: str = ""
     source_locations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -260,6 +261,7 @@ class Unit:
             value_conflicts=[dict(x) for x in (data.get("value_conflicts") or []) if isinstance(x, dict)],
             axis=str(data.get("axis") or ""),
             doc_date=str(data.get("doc_date") or ""),
+            content_version=str(data.get("content_version") or ""),
             source_locations=[dict(x) for x in data.get("source_locations") or [] if isinstance(x, dict)],
         )
 
@@ -299,6 +301,9 @@ def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any
             if not text.strip():
                 continue
             ref = by_point.get(str(point_id), {})
+            from ..db import chunk_text_sha
+            if ref.get("text_sha") and ref["text_sha"] != chunk_text_sha(text):
+                raise RuntimeError("Graph source text changed after the chunk ledger was frozen")
             section = [str(s) for s in (payload.get("section_path") or []) if str(s).strip()]
             out.append(ChunkRef(
                 point_id=str(point_id),
@@ -378,6 +383,7 @@ def _flush(unit_chunks: list[ChunkRef], texts: list[str], *, kb_id: str, order: 
         kind=kind,
         unit_id=unit_id_for(kb_id, first.doc_id, text, positions=[c.chunk_index for c in unit_chunks], render_tag=render_tag),
         doc_id=first.doc_id,
+        content_version=first.content_version,
         rel_path=first.rel_path,
         section_path=list(first.section_path),
         block_ids=block_ids,

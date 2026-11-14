@@ -8,6 +8,9 @@ Light 使用持久化应用目录中的 LanceDB、DuckDB 和 SQLite。
 
 LLM、Embedding、Reranker 继续在控制台独立配置接口，部署不包含这些模型的服务或权重。
 
+应用镜像预装 Carrel 已支持代码语言的语法解析库，在镜像构建时准备好，
+首次解析代码时无需再下载。Python 代码使用 Python 自带的 AST 解析。
+
 ## 启动
 
 安装 Docker 和 Compose v2，在仓库根目录执行：

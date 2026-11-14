@@ -304,7 +304,7 @@ def _total(resp: dict[str, Any]) -> int:
 
 def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: list[str] | None = None, rel_paths: list[str] | None = None,
          doc_ids: list[str] | None = None, doc_versions: dict[str, str] | None = None, limit: int = 30, client: Any = None, timeout: float | None = None,
-         excluded_paths: list[str] | None = None) -> dict[str, Any]:
+         excluded_paths: list[str] | None = None, published_ids: list[str] | None = None) -> dict[str, Any]:
     """Literal phrase counts: for each phrase, in how many chunks and which documents it appears (the analyzer's
     phrase match), plus the first limit hits (sorted by path and chunk index).
     The cjk analyzer turns CJK text into bigrams, so phrase matching is approximate (a phrase also matches the same
@@ -320,6 +320,8 @@ def grep(settings: Settings, source: KBSource, phrases: list[str], *, fields: li
     scope = {"rel_paths": [str(x) for x in dict.fromkeys(rel_paths or []) if str(x).strip()],
              "doc_ids": [str(x) for x in dict.fromkeys(doc_ids or []) if str(x).strip()]}
     filters: list[dict[str, Any]] = [{"terms": {"content_version": active_versions(settings, source.collection)}}]
+    if published_ids is not None:
+        filters = [{"ids": {"values": published_ids}}]
     if doc_versions:
         if set(doc_versions) - set(scope["doc_ids"]):
             raise ValueError("doc_versions must refer to requested doc_ids")

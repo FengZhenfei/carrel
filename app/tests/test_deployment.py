@@ -331,6 +331,9 @@ class DeploymentAssetTests(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
+            # The published image uses GitHub's public owner name in lowercase.
+            # Exempt only this registry reference; other occurrences stay checked.
+            text = text.replace("ghcr.io/fengzhenfei/carrel:", "ghcr.io/<public-repository>:")
             for pat in patterns:
                 if pat in ICLOUD_PATTERNS and rel.startswith(ICLOUD_EXAMPLE_PATHS):
                     continue

@@ -461,7 +461,7 @@ Propose between {min_predicates} and {max_predicates} relationship predicates th
 Rules:
 - Each predicate is a short lower_snake_case verb phrase (e.g. part_of, requires, depends_on, conforms_to, has_parameter, recommends, calls, signed_by, located_in).
 - Each predicate carries a one-sentence definition and the parent categories allowed at its source and target ends (use the parent categories above; use ["*"] when any category is allowed).
-- "single_valued": true only when each source can have at most one target for this predicate at any one time, so that a newer statement replaces an older one (for example a person's reports_to, a project's owned_by, a task's has_status); false for everything that can hold several targets at once or describes general knowledge (where something occurs, what it is related to, what it consists of).
+- Set "single_valued" to true only when the domain rules allow at most one target per source at a given time. Use false when targets can coexist or when cardinality is uncertain. Carrel retains competing source claims for review.
 - Do not include the generic fallback related_to; it is always available.
 - Relations between events (one event before another, at the same time, causing another, resulting in an outcome) are built in; do not propose them.
 - Prefer predicates that are specific to this domain over generic ones.

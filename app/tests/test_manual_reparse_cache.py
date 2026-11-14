@@ -155,7 +155,7 @@ def test_console_button_refreshes_cache_and_retry_keeps_old_index_until_success(
         assert len(active) == 1
         assert active[0]["text_sha"] == db.chunk_text_sha("revision 2")
         assert h.args["upsert"][4][0]["text"] == "revision 2"
-        assert h.calls[-4:] == ["upsert", "mark_old", "mark_stale", "fts"]
+        assert h.calls[-4:] == ["upsert", "collection", "mark_stale", "fts"]
 
 
 def test_single_and_whole_kb_requests_upgrade_pending_work_without_duplicates(tmp_path):

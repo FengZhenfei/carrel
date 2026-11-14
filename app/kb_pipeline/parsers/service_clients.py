@@ -110,6 +110,7 @@ def call_mineru_sync(
                     files=[("files", (input_path.name, f, "application/octet-stream"))],
                     data=request_data,
                     timeout=(10, timeout),
+                    allow_redirects=False,
                 )
             break
         except requests.ConnectionError as exc:

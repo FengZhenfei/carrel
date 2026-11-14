@@ -90,7 +90,24 @@ journalctl --user -u carrel-web --since -5min
 
 默认维护只处理项目资产。清理用户级 uv/pip 缓存或 Docker 缓存需显式设置 `KB_HOST_HOUSEKEEPING=1`。
 
-每夜备份只留不可再生的内容：状态库（各库配置、模型注册表、抽取与事实缓存）、管线 env、compose 的 `.env` 以及 `runtime/eval` 下的题集，原样复制到 `backups/state/<时间戳>/`，只保留最近 `KB_BACKUP_KEEP`（7）份。向量、索引、图谱和解析缓存都能从镜像重建。恢复时先停定时器和两个服务，从最新一份放回两个 env 与 `runtime/state/kb-pipeline.db`，用 `docker compose up -d` 起容器，再起服务和定时器；状态库里的缓存还在的话，整库重建不会再调用远端模型。
+### 备份与恢复
+
+每夜备份保留状态库（各库配置、模型注册表、抽取与事实缓存）、管线 env、compose 的 `.env` 以及 `runtime/eval` 下的题集，复制到 `backups/state/<时间戳>/`，保留最近 `KB_BACKUP_KEEP`（7）份。向量、关键词索引和图谱可从原始文件重建。
+
+恢复时先停止调度和应用服务，放回 env 文件与 `runtime/state/kb-pipeline.db`，启动存储服务，再使用恢复后的配置执行：
+
+```bash
+kb scan --repair-indexes --no-detect-deletes --dry-run
+kb scan --repair-indexes --no-detect-deletes
+kb worker --once --max-jobs 100000
+kb status
+kb fts rebuild
+kb graph build
+```
+
+`--repair-indexes` 会逐一核对已发布切块，给索引缺失或不完整的文档排入普通解析任务。存储连接失败会停止核对，不会被当作索引丢失。执行核对前先结束正在运行的解析任务；入库完成后重建关键词索引和已开启的图谱，确认检索及原文回读正常，再恢复调度。
+
+MinerU 缓存、文件内容及解析设置匹配时可以复用原始解析结果；恢复向量索引仍会重新调用 Embedding。图谱抽取复用状态库中匹配的缓存，新建或变化的抽取单元仍会调用模型。“整库重新解析”会主动刷新解析缓存，这个恢复流程不需要使用该按钮。
 
 ## 命令行参考
 

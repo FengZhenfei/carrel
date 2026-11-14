@@ -191,16 +191,25 @@ def _verified_row_key(old: list[list[str]], new: list[list[str]], index: int, sp
     return True
 
 
-def _identity_columns(rows: list[list[str]]) -> int:
+def _row_key(row: list[str], columns: tuple[int, ...]) -> tuple[str, ...]:
+    return tuple(_norm(row[i]).rstrip(":：") for i in columns)
+
+
+def _identity_columns(rows: list[list[str]]) -> tuple[int, ...]:
     # A repeated first-column category is common. The shortest unique populated
     # prefix identifies a row without depending on a domain or a model response.
-    if not rows or not rows[0]:
-        return 0
-    for width in range(1, min(3, len(rows[0])) + 1):
-        keys = [tuple(_norm(c).rstrip(":：") for c in row[:width]) for row in rows]
+    # Ignore wholly empty columns when choosing keys, but keep their positions
+    # in the table and in all cell-level checks. Partly empty columns still
+    # prevent alignment: a value elsewhere is not a substitute for a missing key.
+    if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+        return ()
+    populated = tuple(i for i in range(len(rows[0])) if any(_norm(row[i]) for row in rows))
+    for width in range(1, min(3, len(populated)) + 1):
+        columns = populated[:width]
+        keys = [_row_key(row, columns) for row in rows]
         if all(all(k) for k in keys) and len(set(keys)) == len(keys):
-            return width
-    return 0
+            return columns
+    return ()
 
 
 def _expand_review_spans(old, new, html):
@@ -219,12 +228,97 @@ def _expand_review_spans(old, new, html):
     return out
 
 
-def _native_row_text(rows, index, width, spans):
+def _restore_review_empty_columns(old, new):
+    """Restore omitted blank columns only when every retained cell is unchanged."""
+    if not old or len(old) != len(new) or any(len(r) != len(old[0]) for r in old):
+        return new
+    columns = [j for j in range(len(old[0])) if any(_norm(r[j]) for r in old)]
+    if not columns or len(columns) == len(old[0]):
+        return new
+    if any(len(b) != len(columns) or any(_norm(a[j]) != _norm(v) for j, v in zip(columns, b))
+           for a, b in zip(old, new)):
+        return new
+    out = [[""] * len(old[0]) for _ in old]
+    for row, values in zip(out, new):
+        for j, value in zip(columns, values):
+            row[j] = value
+    return out
+
+
+def _recover_native_row_keys(rows, native, spans):
+    """Fill missing first-column labels with exact body and positional evidence.
+
+    Native PDF extraction can split a wrapped cell into several rows. Join only
+    its blank-label continuations, then require all non-label cells to match the
+    original table, in order. Existing labels and every other cell stay intact.
+    """
+    if (not rows or len(rows[0]) < 2 or not any(not r[0].strip() for r in rows if r)
+            or not native or any(len(r) != len(rows[0]) for r in rows + native)):
+        return rows, []
+    groups = []
+    for row in native:
+        if row[0].strip():
+            groups.append([row])
+        elif groups:
+            groups[-1].append(row)
+        else:
+            return rows, []
+    if len(groups) != len(rows):
+        return rows, []
+    keys = [_norm(g[0][0]).rstrip(":：") for g in groups]
+    if not all(keys) or len(set(keys)) != len(keys):
+        return rows, []
+    def same_cell(ocr, source):
+        a, b = _norm(ocr), _norm(source)
+        # Reuse PDF font-map matching, restricted to one ideograph per radical.
+        # Numbers, units, signs and every other character must still be exact.
+        return (len(a) == len(b) and all(x == y or (
+            "CJK RADICAL" in unicodedata.name(y, "")
+            and "CJK UNIFIED IDEOGRAPH" in unicodedata.name(x, "")) for x, y in zip(a, b))
+            and _span_present(b, a))
+    anchors = []
+    for row, group, key in zip(rows, groups, keys):
+        if any(not same_cell(row[j], "".join(r[j] for r in group)) for j in range(1, len(row))):
+            return rows, []
+        before = _norm(row[0]).rstrip(":：")
+        # Some labels carry a printed symbol absent from the text layer. Retain
+        # that original label verbatim; it is never replaced by the native label.
+        prefix = before[:-len(key)] if before.endswith(key) else before
+        if before and (not before.endswith(key) or any(unicodedata.category(c)[0] not in "PS" for c in prefix)):
+            return rows, []
+        found = [s["bbox"] for s in spans if s.get("bbox") and _norm(s.get("text", "")).rstrip(":：") == key]
+        if len(found) != 1:
+            return rows, []
+        anchors.append(found[0])
+    if (max(b[0] for b in anchors) >= min(b[2] for b in anchors)
+            or any(a[3] > b[1] for a, b in zip(anchors, anchors[1:]))):
+        return rows, []
+    out = [list(r) for r in rows]
+    recovered = []
+    for i, (row, group, box) in enumerate(zip(rows, groups, anchors)):
+        if row[0].strip():
+            continue
+        # The label must sit to the left of its own first body line, not beside
+        # a different row, in the caption or among numbers elsewhere in the PDF.
+        peers = [s for s in spans if s.get("bbox") and len(_norm(s.get("text", ""))) >= 2
+                 and any(_norm(s["text"]) in _norm(v) for v in group[0][1:] if v.strip())
+                 and s["bbox"][0] >= box[2]
+                 and min(box[3], s["bbox"][3]) - max(box[1], s["bbox"][1])
+                     >= .5 * min(box[3] - box[1], s["bbox"][3] - s["bbox"][1])]
+        if not peers:
+            return rows, []
+        out[i][0] = group[0][0].strip()
+        recovered.append({"row": i, "text": out[i][0], "bbox": list(box)})
+    return out, recovered
+
+
+def _native_row_text(rows, index, columns, spans):
     """Text in a row band anchored by a unique source key; empty when ambiguous."""
     anchors = []
     for row in rows:
         choices = []
-        for cell in row[:width]:
+        for column in columns:
+            cell = row[column]
             key = _norm(cell).rstrip(":：")
             found = [s for s in spans if key and s.get("bbox") and key in _norm(s.get("text", ""))]
             if len(found) == 1:
@@ -263,6 +357,41 @@ def _review_row(old, new, native, row_native, native_cells=None):
     return _review_preserves_rows([expanded], [new], native)
 
 
+def _missing_source_lines(missing: list[str], native: str, spans: list[dict]) -> list[str]:
+    """Keep the printed line around a missing span, including short values.
+
+    A font change can split one date or measurement into several PDF spans.
+    Join horizontal spans on their printed baseline, not by font-box height
+    or PDF drawing order. Use only lines containing a detected omission;
+    an unmatched span remains a fallback.
+    """
+    source_lines = native.splitlines()
+    if spans and all(len(s.get("origin", [])) == 2 and s.get("line_dir") == [1.0, 0.0]
+                     for s in spans):
+        rows: dict[float, list[dict]] = {}
+        for span in spans:
+            # Ignore only floating-point noise in a shared PDF baseline.
+            rows.setdefault(round(span["origin"][1], 2), []).append(span)
+        source_lines = []
+        for _, row in sorted(rows.items()):
+            parts, end = [], None
+            for span in sorted(row, key=lambda s: s["origin"][0]):
+                if end is not None and span["bbox"][0] - end > .5:
+                    parts.append(" ")
+                parts.append(span.get("text", ""))
+                end = span["bbox"][2]
+            source_lines.append("".join(parts))
+    lines = []
+    covered = set()
+    for line in source_lines:
+        body = table_evidence_text(line)
+        matches = {span for span in missing if span.strip() and _span_present(span, body)}
+        if matches:
+            lines.append(line.strip())
+            covered.update(matches)
+    return list(dict.fromkeys(lines + [span for span in missing if span not in covered]))
+
+
 def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                       model_id: str, cache_dir: Path, vlm_options: dict | None = None) -> dict[str, int]:
     stats = {"requested": 0, "accepted": 0, "unverified": 0}
@@ -274,14 +403,25 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
         image = Path(block.metadata.get("table_review_image") or "")
         original = block.table_markdown or block.text
         accepted = False
+        block.metadata.pop("table_review_error", None)
+        block.metadata.pop("table_review", None)
         old_grid = _pipe_grid(original)
-        identity_width = _identity_columns(old_grid)
-        alignable = identity_width > 0
+        old_grid, recovered = _recover_native_row_keys(old_grid, block.metadata.get("table_native_grid") or [],
+                                                      block.metadata.get("table_native_spans") or [])
+        if recovered:
+            notes = [s for s in original.splitlines() if s.strip() and not s.strip().startswith("|")]
+            original = "\n".join(notes + [grid_to_markdown(old_grid) or ""])
+            block.text = block.table_markdown = original
+            block.metadata["table_row_key_recoveries"] = recovered
+        identity_columns = _identity_columns(old_grid)
+        alignable = bool(identity_columns)
+        reason = ("missing_model_credentials" if not api_key else "missing_image" if not image.is_file()
+                  else "missing_table_body" if not old_grid else "ambiguous_row_keys" if not alignable
+                  else "verification_incomplete")
         native_grid = block.metadata.get("table_native_grid") or []
-        if (not identity_width or len(native_grid) != len(old_grid)
+        if (not identity_columns or len(native_grid) != len(old_grid)
                 or any(len(a) != len(b) for a, b in zip(old_grid, native_grid))
-                or any([_norm(c).rstrip(":：") for c in a[:identity_width]] !=
-                       [_norm(c).rstrip(":：") for c in b[:identity_width]]
+                or any(_row_key(a, identity_columns) != _row_key(b, identity_columns)
                        for a,b in zip(old_grid,native_grid))):
             native_grid = []
         if api_key and image.is_file() and alignable:
@@ -295,19 +435,20 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 raise
             except Exception as exc:
                 data = {}
+                reason = "request_failed"
                 block.metadata["table_review_error"] = type(exc).__name__
             new_grid = data.get("rows") or []
             if not all(isinstance(row, list) and all(isinstance(c, str) for c in row) for row in new_grid):
                 new_grid = []
+            new_grid = _restore_review_empty_columns(old_grid, new_grid)
             new_grid = _expand_review_spans(old_grid, new_grid, str((block.metadata.get("source_item") or {}).get("table_body") or ""))
             verified = []
             if (not data.get("error") and len(new_grid) == len(old_grid)
                     and all(len(a) == len(b) for a, b in zip(old_grid, new_grid))):
                 spans = block.metadata.get("table_native_spans") or []
                 verified = [(
-                    [_norm(c).rstrip(":：") for c in a[:identity_width]] ==
-                    [_norm(c).rstrip(":：") for c in b[:identity_width]] and
-                    _review_row(a, b, native, _native_row_text(old_grid, i, identity_width, spans),
+                    _row_key(a, identity_columns) == _row_key(b, identity_columns) and
+                    _review_row(a, b, native, _native_row_text(old_grid, i, identity_columns, spans),
                                 native_grid[i] if native_grid else None)) or
                     _verified_row_key(old_grid, new_grid, i, spans)
                     for i, (a, b) in enumerate(zip(old_grid, new_grid))]
@@ -332,14 +473,14 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                     for s in block.metadata.get("table_missing_spans") or [])
                 block.metadata["table_review"] = {"status": "accepted" if accepted else "partial", "model": model_id,
                                                    "rows_verified": sum(verified), "rows_total": len(verified)}
+                if not accepted:
+                    block.metadata["table_review"]["reason"] = "source_text_missing" if all(verified) else "rows_unverified"
                 if accepted:
                     stats["accepted"] += 1
                 else:
                     original = block.text
         if not accepted:
             stats["unverified"] += 1
-            reason = ("missing_model_credentials" if not api_key else "missing_image" if not image.is_file()
-                      else "ambiguous_row_keys" if not alignable else "verification_incomplete")
             block.metadata.setdefault("table_review", {"status": "unverified", "model": model_id, "reason": reason})
             # Retain independently read text as evidence, without inventing a cell
             # assignment. This also works when no VLM is configured.
@@ -348,6 +489,8 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 # Keep the source's labelled rows, including one-character values,
                 # when the model cannot establish which empty cell owns a value.
                 missing = [native]
+            else:
+                missing = _missing_source_lines(missing, native, block.metadata.get("table_native_spans") or [])
             evidence = "\n".join(s for s in dict.fromkeys(missing + ([legend] if legend else []))
                                  if s and _norm(s) not in _norm(original))
             if evidence:

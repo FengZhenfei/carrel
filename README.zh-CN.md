@@ -16,7 +16,7 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 ## 核心功能
 
-[0.4.2 更新内容与升级步骤](docs/releases/0.4.2.zh-CN.md) — Light／Standard 双版本、容器部署与独立模型配置。
+[0.4.3 更新内容与升级步骤](docs/releases/0.4.3.zh-CN.md) — 入库发布一致性、证据版本绑定、表格解析修复与代码语法资源预装。
 
 - **多格式解析：** 支持 PDF、Word、PowerPoint、表格、图片、HTML、Markdown、Notebook、源代码及工作流文件，按文件格式采用相应的处理方式。[格式说明](docs/architecture.zh-CN.md#入库流程)。
 - **自动更新：** 定时发现文件变化，更新索引，并维护已启用的知识图谱。
@@ -101,13 +101,18 @@ cd carrel
 
 为智能体安装配套的 [carrel-search Skill](skills/carrel-search/SKILL.md)，或直接调用检索 API：
 
+容器首次启动会在 `data/config/knowledge-base.env` 中生成 `KB_SEARCH_TOKEN`。
+将该值填入 `CARREL_SEARCH_TOKEN`：
+
 ```bash
+export CARREL_SEARCH_TOKEN='你的检索令牌'
 curl -sS http://127.0.0.1:9810/search \
+  -H "Authorization: Bearer $CARREL_SEARCH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"question": "资料中对交付和验收有哪些要求？", "top_k": 8}'
 ```
 
-如果设置了 `KB_SEARCH_TOKEN`，请求中需增加 `Authorization: Bearer …` 请求头。智能体部署在其他主机时，在其环境中配置 `CARREL_SEARCH_BASE_URL` 和 `CARREL_SEARCH_TOKEN`。
+智能体部署在其他主机时，在其环境中配置 `CARREL_SEARCH_BASE_URL` 和 `CARREL_SEARCH_TOKEN`。
 
 返回内容包括原文片段，以及可用的图谱证据和图像信息。智能体可以继续补取上下文、查看原图或追查关系，再组织回答。认证、结果状态与引用方式见 [检索与 API](docs/retrieval.zh-CN.md)。
 

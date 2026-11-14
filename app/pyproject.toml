@@ -1,6 +1,6 @@
 [project]
 name = "carrel"
-version = "0.4.2"
+version = "0.4.3"
 description = "Carrel: Ontology-Augmented Generation for AI agents. Local knowledge-base ingestion pipeline, console and search service."
 license = "MIT"
 requires-python = ">=3.12"
@@ -13,13 +13,16 @@ dependencies = [
   "numpy>=2,<3",
   "tiktoken>=0.11.0,<1",
   "requests>=2.32.0,<3",
+  "urllib3>=2.8.0,<3",
+  "certifi>=2026.10.18,<2027",
   "openpyxl>=3.1.5,<4",
-  "Pillow>=11.0.0,<13",
+  "Pillow>=13.0.0,<14",
   "xlrd>=2.0.1,<3",
   "lxml>=5.0.0,<7",
   "neo4j>=5.28.0,<6.0.0",
   "opensearch-py>=2.8,<4",
   "fastapi>=0.115,<1",
+  "starlette>=1.6,<2",
   "uvicorn>=0.30,<1",
   "tree-sitter>=0.23,<1",
   "tree-sitter-language-pack>=0.7,<2",
@@ -33,7 +36,7 @@ dependencies = [
 # it the service falls back to the parser's cached images and /health says so.
 pdf-images = ["pymupdf>=1.24,<2"]   # pinned in requirements-pdf-images.lock
 # Embedded LanceDB/DuckDB storage for the Light deployment edition.
-light = ["lancedb>=0.41.0,<0.42", "duckdb>=2.0.0,<3", "pyarrow>=22.0.0,<23"]
+light = ["lancedb>=0.41.0,<0.42", "duckdb>=2.0.0,<3", "pyarrow>=23.0.1,<24"]
 
 [project.scripts]
 # `kb` is the historical name used throughout the scripts and units; `carrel`

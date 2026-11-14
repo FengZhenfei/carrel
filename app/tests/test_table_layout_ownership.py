@@ -37,9 +37,9 @@ def test_notes_on_different_baselines_are_not_a_key_value_row():
 
 
 def test_composite_identity_accepts_repeated_categories_but_not_duplicate_rows():
-    assert _identity_columns([['Category','ID','Value'],['Part','x1','4'],['Part','x2','4']])==2
-    assert _identity_columns([['Part','x1','4'],['Part','x1','4']])==0
-    assert _identity_columns([['','x1'],['','x2']])==0
+    assert _identity_columns([['Category','ID','Value'],['Part','x1','4'],['Part','x2','4']])==(0,1)
+    assert _identity_columns([['Part','x1','4'],['Part','x1','4']])==()
+    assert _identity_columns([['','x1'],['','x2']])==(1,)
 
 
 def test_only_declared_merged_cells_can_be_expanded():
@@ -102,7 +102,7 @@ def test_native_row_anchor_does_not_require_every_other_key_to_be_one_font_span(
     spans=[{'text':'Head','bbox':[10,0,30,10]},{'text':'ing','bbox':[31,0,40,10]},
            {'text':'Origin','bbox':[10,20,40,30]},{'text':'Full suffix','bbox':[50,20,100,30]},
            {'text':'Date','bbox':[10,40,40,50]},{'text':'Unrelated','bbox':[50,40,100,50]}]
-    native=_native_row_text(rows,1,1,spans)
+    native=_native_row_text(rows,1,(0,),spans)
     assert 'Full suffix' in native and 'Unrelated' not in native
 
 

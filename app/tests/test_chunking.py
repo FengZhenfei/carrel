@@ -139,7 +139,7 @@ class ChunkLimitBoundTests(unittest.TestCase):
         self.assertFalse(lim["live"])
         self.assertEqual(lim["effective_max_model_len"], 4096)
         self.assertEqual(lim["max_tokens_cap"], 3276)
-        self.assertIn("falling back", limits_module.validate_chunk_config(9999, 80, lim)[0])
+        self.assertRegex(limits_module.validate_chunk_config(9999, 80, lim)[0], r"falling back|兜底")
 
 
 class ChunkDiagnosticsTests(unittest.TestCase):
@@ -694,7 +694,9 @@ class ChunkStructureTests(unittest.TestCase):
         # Every cell of a split row carries its own column name (a column without a name in the header is called
         # "column N"), and such chunks no longer carry the header rows
         self.assertTrue(all(p.startswith("名称: B | ") and "---" not in p for p in pieces[1:]), pieces[1:])
-        for name in ("描述", "column 3"):
+        for alternatives in (("描述",), ("column 3", "列3")):
+            name = next((name for name in alternatives if any(f"{name}: " in p for p in pieces)), None)
+            self.assertIsNotNone(name, alternatives)
             self.assertEqual("".join(p.split(f"{name}: ", 1)[1] for p in pieces if f"{name}: " in p), long_cell)
 
     def test_code_fence_travels_whole_and_splits_by_line_when_too_big(self) -> None:
@@ -1051,7 +1053,7 @@ class EmbeddingRejectionTests(unittest.TestCase):
                 verdict = accepts(list(input))
                 if verdict is not True:
                     raise http(*verdict)
-                return SimpleNamespace(data=[SimpleNamespace(embedding=[0.0] * dimensions) for _ in input])
+                return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * dimensions) for i, _ in enumerate(input)])
 
         client = EmbeddingClient(base_url="http://embed.test/v1", api_key="k", model_id="m", dim=4,
                                  batch_size=batch_size, retry=2, sleep_seconds=0)
@@ -1138,7 +1140,9 @@ class EmbeddingRejectionTests(unittest.TestCase):
                 row = con.execute("SELECT status, retry_count, error, finished_at FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         self.assertTrue(result.startswith("failed:"), result)
         self.assertEqual((row["status"], row["retry_count"]), ("failed", 0))           # settled at once, no retries with backoff
-        self.assertIn("The embedding service rejected chunk 2/3 (block_id=b2, ", row["error"])
+        self.assertIn("NonRetryableParseError", row["error"])
+        self.assertIn("2/3", row["error"])
+        self.assertIn("block_id=b2", row["error"])
         self.assertIn("maximum context length is 8192 tokens", row["error"])
         long_ago = {"error": row["error"], "finished_at": 1}
         self.assertTrue(scheduler._failed_parse_blocks_auto_requeue(long_ago))          # past the cooldown the scan still does not requeue it

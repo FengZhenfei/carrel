@@ -23,7 +23,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-[0.4.2 changes and upgrade steps](docs/releases/0.4.2.md) — Light and Standard editions, container deployment, and independent model configuration.
+[0.4.3 changes and upgrade steps](docs/releases/0.4.3.md) — Consistent document publication, version-bound evidence, table parsing repairs, and bundled code grammars.
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
@@ -145,13 +145,17 @@ task progress in the console before making your first query.
 Install the bundled [carrel-search skill](skills/carrel-search/SKILL.md)
 in your agent, or call the API directly:
 
+The first container start creates `KB_SEARCH_TOKEN` in
+`data/config/knowledge-base.env`. Set `CARREL_SEARCH_TOKEN` to that value:
+
 ```bash
+export CARREL_SEARCH_TOKEN='your search token'
 curl -sS http://127.0.0.1:9810/search \
+  -H "Authorization: Bearer $CARREL_SEARCH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"question": "What are the delivery and acceptance requirements?", "top_k": 8}'
 ```
 
-If you set `KB_SEARCH_TOKEN`, add an `Authorization: Bearer …` header.
 For a remote agent,
 configure `CARREL_SEARCH_BASE_URL` and `CARREL_SEARCH_TOKEN` in its environment.
 

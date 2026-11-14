@@ -190,7 +190,7 @@ class ParseCacheTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-            def post(self, url, *, files, data, timeout):
+            def post(self, url, *, files, data, timeout, allow_redirects=False):
                 sent.append(dict(data))
                 return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"md_content": "# 标题"})
 
@@ -985,8 +985,10 @@ class DocxChartTests(unittest.TestCase):
             "销售额", self._series("2023", quarters, [10, 20, 10, 30]), self._series("2024", quarters, [10, None, 0.1 + 0.2, 30]),
             self._series("完成率", quarters, [0.06, 0.916666666666667, 1, 0.5], "0%")))
         self.assertEqual((title, axes), ("销售额", ["季度"]))
+        header = table.splitlines()[0]
+        self.assertIn(header, ("| Series | Category | Value |", "| 系列 | 类别 | 值 |"))
         self.assertEqual(table.splitlines(), [
-            "| Series | Category | Value |", "| --- | --- | --- |",
+            header, "| --- | --- | --- |",
             "| 2023 | Q1 | 10 |", "| 2023 | Q2 | 20 |", "| 2023 | Q3 | 10 |", "| 2023 | Q4 | 30 |",     # the 10 of Q3 is still there
             "| 2024 | Q1 | 10 |", "| 2024 | Q2 |  |", "| 2024 | Q3 | 0.3 |", "| 2024 | Q4 | 30 |",       # values equal to the previous series are kept; an empty point keeps its place
             "| 完成率 | Q1 | 6% |", "| 完成率 | Q2 | 92% |", "| 完成率 | Q3 | 100% |", "| 完成率 | Q4 | 50% |",
@@ -1065,11 +1067,13 @@ class DocxChartTests(unittest.TestCase):
         east, south = out[2], out[5]
         self.assertEqual((east.title, east.metadata["section_path"]), ("华东区销售额", ["一、华东区"]))
         self.assertEqual((south.title, south.metadata["section_path"]), ("华南区销售额", ["二、华南区"]))
-        self.assertEqual((east.block_type, east.caption), ("table", "Chart data; axes: 季度"))
+        self.assertEqual(east.block_type, "table")
+        self.assertIn(east.caption, ("Chart data; axes: 季度", "图表数据;坐标轴: 季度"))
         chunks = blocks_to_chunks(kb_id="kb", file_key=1, content_version="v", parser_profile="p", blocks=out,
                                   max_tokens=400, overlap_tokens=0)
         text = next(c.text for c in chunks if c.block.block_id == "docx-chart-0001")
-        self.assertIn("TITLE: 华东区销售额\nCAPTION: Chart data; axes: 季度\n| Series | Category | Value |", text)
+        self.assertIn(f"TITLE: 华东区销售额\nCAPTION: {east.caption}\n", text)
+        self.assertTrue(any(header in text for header in ("| Series | Category | Value |", "| 系列 | 类别 | 值 |")))
         self.assertIn("| 2024 | Q3 | 10 |", text)
         self.assertEqual(parser_profile_for_path(Path("a.docx")), "docx-mineru-ooxml-vlm-v10+source-v1")
 
@@ -1810,7 +1814,7 @@ class TableHeaderCandidateTests(unittest.TestCase):
     def test_dispimg_formula_becomes_a_placeholder(self) -> None:
         from kb_pipeline.parsers.native_table import normalize_cell
 
-        self.assertEqual(normalize_cell('=DISPIMG("ID_3F2A",1)'), "(image)")
+        self.assertIn(normalize_cell('=DISPIMG("ID_3F2A",1)'), ("(image)", "(图片)"))
         self.assertEqual(normalize_cell("普通"), "普通")
 
     def test_notes_above_the_header_are_kept_whole_and_only_once(self) -> None:
@@ -1915,8 +1919,9 @@ class VisualContractTests(unittest.TestCase):
         self.assertIn("decorative", vlm.RESULT_SCHEMA["required"])
         self.assertIs(vlm.EMPTY_RESULT["decorative"], False)
         guide = getattr(vlm, "_FIELD_GUIDE", "") + vlm.DEFAULT_PROMPT
-        for needle in ("UI screenshot", "output mermaid", "lists every name", "decorative"):
-            self.assertIn(needle, guide)
+        for alternatives in (("UI screenshot", "界面截图"), ("output mermaid", "不要输出 mermaid"),
+                             ("lists every name", "逐个列出图中出现的每个名称"), ("decorative",)):
+            self.assertTrue(any(needle in guide for needle in alternatives), alternatives)
         self.assertIs(vlm.normalize_result({"kind": "photo", "decorative": "true"})["decorative"], True)
         self.assertIs(vlm.normalize_result({"kind": "photo"})["decorative"], False)
 
@@ -3333,7 +3338,7 @@ class PdfTextLayerTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-            def post(self, url, files=None, data=None, timeout=None):
+            def post(self, url, files=None, data=None, timeout=None, allow_redirects=False):
                 posts.append(dict(data))
                 return SimpleNamespace(raise_for_status=lambda: None, json=lambda: json.loads(json.dumps(payload)))
         return Session

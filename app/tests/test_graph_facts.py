@@ -512,7 +512,8 @@ class FactsSpineTests(unittest.TestCase):
 
         out = activate_graph_aliases(FakeQ(), source_collection="kb_003", graph_version="v1")
         self.assertEqual(out["skipped"], ["graph_003_page"])
-        self.assertEqual(set(out["targets"]), {"graph_003_entity", "graph_003_relation", "graph_003_spec"})
+        self.assertEqual(set(out["targets"]), {"graph_003_entity", "graph_003_relation", "graph_003_spec", "graph_003_page"})
+        self.assertIsNone(out["targets"]["graph_003_page"])
         self.assertEqual(len(ops), 3)
 
         class MissingEntity(FakeQ):

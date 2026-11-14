@@ -1388,7 +1388,8 @@ class DependencyDeclarationTests(unittest.TestCase):
     # import names that differ from the distribution name
     DISTRIBUTION = {"yaml": "pyyaml", "pil": "pillow", "opensearchpy": "opensearch-py", "fitz": "pymupdf"}
     TRANSITIVE = {"numpy", "pydantic", "httpx"}   # brought in by qdrant-client / fastapi / openai, versions follow theirs
-    NOT_IMPORTED = {"tree-sitter"}            # runtime of the grammar package; the code only imports tree_sitter_language_pack
+    # Grammar runtime plus security floors for requests' transport and CA bundle.
+    NOT_IMPORTED = {"tree-sitter", "urllib3", "certifi"}
     OPTIONAL = {"pymupdf", "lancedb", "duckdb", "pyarrow"}  # imported only for the selected optional feature
 
     def _imported(self) -> set[str]:

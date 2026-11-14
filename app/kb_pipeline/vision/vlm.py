@@ -14,7 +14,7 @@ from ..parse_cache import reusable_in_run, write_cache
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI, omit
+from openai import DefaultHttpxClient, OpenAI, omit
 
 from ..llm_compat import CompatibleRequest, generation_parameters, sdk_arguments
 from ..parsers.errors import JobCancelled, service_unreachable
@@ -168,6 +168,7 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
             client = OpenAI(
                 api_key=api_key or "not-required",
                 base_url=base_url,
+                http_client=DefaultHttpxClient(follow_redirects=False),
                 timeout=float(os.getenv("VLM_TIMEOUT_SECONDS", "180")),
                 max_retries=int(os.getenv("VLM_MAX_RETRIES", "1")),
             )

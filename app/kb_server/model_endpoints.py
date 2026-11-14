@@ -216,12 +216,12 @@ def _check_embedding_change(con, cfg, role: str, current: dict, row: dict) -> No
     busy = busy or con.execute("SELECT 1 FROM graph_builds WHERE status='running' LIMIT 1").fetchone()
     if busy or build_lock_held(build_lock_path(cfg)):
         raise ValueError("Wait for parsing and graph tasks to finish before changing embedding settings")
-    changed_space = any(row[k] != current[k] for k in ("model_id", "dim"))
+    changed_space = any(row[k] != current[k] for k in ("base_url", "model_id", "dim"))
     if changed_space:
         indexed = con.execute("SELECT 1 FROM chunks LIMIT 1").fetchone()
         indexed = indexed or con.execute("SELECT 1 FROM graph_builds WHERE status='done' LIMIT 1").fetchone()
         if indexed:
-            raise ValueError("Embedding model or dimensions cannot change while indexes exist; reinitialize indexes first")
+            raise ValueError("Embedding endpoint, model or dimensions cannot change while indexes exist; reinitialize indexes first")
         if row["dim"] != current["dim"] and con.execute("SELECT 1 FROM kb_sources LIMIT 1").fetchone():
             raise ValueError("Embedding dimensions cannot change while knowledge-base collections exist")
 

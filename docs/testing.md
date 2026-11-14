@@ -13,6 +13,7 @@ covered by that layer.
 | Governance | `test_correction_api`, `test_enrollment_corrections` | Validate and scope corrections, detect stale evidence, protect library identity and handle concurrent changes. |
 | Retrieval and agents | `test_search`, `test_retrieval_quality`, `test_dual_rerank`, `test_search_skill` | Preserve ranking, evidence quality, source scope and agent-facing result structure. |
 | Lifecycle and console | `test_scanner_worker`, `test_graph_build`, `test_console_api`, `test_console_stage_language` | Queue ownership, cancellation, resume, publication, bilingual output and progress. |
+| Publication and access boundaries | `test_publication_integrity`, `test_audit_boundaries` | Partial writes, stale references, restore reconciliation, batch-vector alignment, mounted-route authentication and redirect handling. |
 | Public deployment | `test_deployment`, `test_remote_vlm_deployment`, `test_reranker_endpoints`, `test_maintenance_ops` | Public Compose profiles, endpoint configuration, local service controls and maintenance templates. |
 | Platform integration | `test_macos_sync` and installed-unit checks in `test_maintenance_ops` | Host-specific shell behavior and installed service definitions. |
 

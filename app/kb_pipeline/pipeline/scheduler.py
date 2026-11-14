@@ -107,7 +107,7 @@ def schedule_file(
         cancelled = db.cancel_pending_jobs_for_file(
             con, str(old["file_id"]),
             "cancelled because the file changed again before this attempt started",
-            exclude_job_types={"delete"},
+            exclude_job_types={"delete", "fts_sync"},
         )
         if cancelled:
             print(f"[scan] superseded {cancelled} queued job(s) for {file.source_path}", flush=True)
@@ -242,12 +242,11 @@ def requeue_failed_lifecycle_jobs(con: sqlite3.Connection, *, ingest_run_id: str
             if key != current_key:
                 continue  # the row moved on; the normal scan path owns the new key
         if job_type == "fts_sync":
-            # Keyword index compensation: only re-queue while the file still exists and the version is unchanged
-            # (a new version is synced by its own parse). The compensation job used to borrow the
-            # metadata_update type with an fts-retry:… key, which never matched (Codex review F06)
+            # Cleanup belongs to the published version, even when newer source
+            # bytes are waiting for parsing. A newer publication supersedes it.
             if file_status == "deleted":
                 continue
-            if key != db.fts_sync_dedupe_key(file_id, str(file_row["content_version"] or "")):
+            if key != db.fts_sync_dedupe_key(file_id, str(file_row["indexed_version"] or file_row["content_version"] or "")):
                 continue
         if dry_run:
             requeued += 1

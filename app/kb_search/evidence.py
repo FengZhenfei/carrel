@@ -48,6 +48,7 @@ def source_row(n: int, cand: dict[str, Any], payload: dict[str, Any], *, role: s
         "kb_id": cand.get("kb_id") or payload.get("kb_id"), "point_id": cand.get("point_id") or payload.get("point_id"),
         "chunk_uid": payload.get("chunk_uid"), "doc_id": payload.get("doc_id"), "content_version": payload.get("content_version"),
         "chunk_index": payload.get("chunk_index"), "chunk_total": payload.get("chunk_total"),
+        "chunk_revision": payload.get("chunk_revision"),
         "doc": payload.get("filename"), "rel_path": payload.get("rel_path"), "doc_type": payload.get("doc_type"),
         "position": position(payload), "place": place(payload), "page_idx": payload.get("page_idx"),
         "page_end": payload.get("page_end"),

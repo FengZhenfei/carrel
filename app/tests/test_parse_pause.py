@@ -99,15 +99,17 @@ def test_pause_during_index_commit_does_not_leave_half_written_state(tmp_path, f
     with _parse_harness(str(tmp_path)) as h:
         h.hooks["upsert"] = lambda: pause(h)
         if fail_after_commit:
-            def fail(): raise RuntimeError("write interrupted")
-            h.hooks["mark_old"] = fail
+            def fail():
+                pause(h)
+                raise RuntimeError("write interrupted")
+            h.hooks["upsert"] = fail
         result = worker.run_once(h.con, settings=h.settings)
         if fail_after_commit:
             assert result.startswith("retry:")
             assert job(h)["retry_count"] == 1
         else:
             assert result.startswith("parse-done:")
-            assert h.calls[-4:] == ["upsert", "mark_old", "mark_stale", "fts"]
+            assert h.calls[-4:] == ["upsert", "collection", "mark_stale", "fts"]
             assert db.get_file_by_id(h.con, h.file_id)["indexed_version"]
         assert worker.run_once(h.con, settings=h.settings) == "no-job"
 

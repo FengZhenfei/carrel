@@ -212,8 +212,7 @@ def activate_graph_aliases(
         raise RuntimeError(f"cannot activate missing graph collection(s): {missing}")
     skipped = [alias for alias in optional_aliases if not collection_exists(q, targets[alias])]
     for alias in skipped:
-        targets.pop(alias, None)
-        previous.pop(alias, None)
+        targets[alias] = None
     changed = _set_alias_targets(q, previous=previous, targets=targets)
     return {"previous": previous, "targets": targets, "changed": changed, "skipped": skipped}
 

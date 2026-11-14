@@ -19,6 +19,22 @@ def package(locators):
 
 
 class ReadbackTests(unittest.TestCase):
+    def test_identical_text_from_independent_documents_keeps_both_sources(self):
+        settings = SimpleNamespace(sources={"k": SimpleNamespace(collection="collection")},
+                                   reranker_base_url="http://ranker")
+        data = package([lead("second", "b")])
+        text = "Each source independently reports the same operating pressure."
+        data["sources"] = [{"n": 1, "kb_id": "k", "point_id": "first", "doc_id": "a",
+                            "content_version": "v1", "text": text}]
+        q = Mock()
+        q.retrieve.return_value = [SimpleNamespace(id="second", payload=dict(
+            doc_id="b", is_active=True, content_version="v1", text=text, rel_path="b.md"))]
+        with patch.object(readback.docstatus, "allowed", return_value=True), \
+             patch.object(readback.docstatus, "annotate"), patch.object(readback, "rerank", return_value=[.9]):
+            rows, _ = readback.read_originals(settings, load_search_settings({}), q, data, {},
+                                             {}, time.time()+5, None)
+        self.assertEqual([r["doc_id"] for r in rows], ["b"])
+
     def test_stitched_pieces_and_duplicate_leads_do_not_displace_other_documents(self):
         data = package([lead("head"), lead("piece"), lead("first"), lead("first"),
                         *[lead(str(i)) for i in range(30)], lead("second", "b")])
@@ -37,7 +53,7 @@ class ReadbackTests(unittest.TestCase):
         names = ["ok", "changed", "retired", "outside", "moved", "archived", "copy"]
         data = package([lead(pid) for pid in names])
         data["sources"] = [{"n": 1, "kb_id": "k", "point_id": "base", "doc_id": "a",
-                            "text": "Previously returned passage."}]
+                            "content_version": "v1", "text": "Previously returned passage."}]
         points = []
         for name in names:
             payload = dict(doc_id="other" if name=="moved" else "a", is_active=name!="retired",

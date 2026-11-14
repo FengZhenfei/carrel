@@ -1455,6 +1455,7 @@ _JOBS_MIGRATIONS = (
     # the first ingest of a new knowledge base is O(N^2).
     "CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_collection_status ON chunks(collection, status)",
+    "CREATE INDEX IF NOT EXISTS idx_chunks_collection_point ON chunks(collection, point_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_kb_type_status ON jobs(kb_id, job_type, status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key)",
     "CREATE INDEX IF NOT EXISTS idx_files_kb_path ON files(kb_id, source_path)",

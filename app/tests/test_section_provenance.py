@@ -30,7 +30,8 @@ def test_late_section_does_not_inherit_first_section(overlap):
     baseline = deepcopy(merged)
     for b in baseline: b.metadata.pop("section_spans")
     before, after = chunks(baseline, overlap=overlap), chunks(merged, overlap=overlap)
-    assert [(c.chunk_uid, c.text) for c in before] == [(c.chunk_uid, c.text) for c in after]
+    assert [c.text for c in before] == [c.text for c in after]
+    assert {c.chunk_uid for c in before}.isdisjoint(c.chunk_uid for c in after)  # provenance changes invalidate references
     for c in after:
         paths = c.block.metadata["section_paths"]
         if "Alpha" in c.text: assert ["Manual", "Alpha"] in paths

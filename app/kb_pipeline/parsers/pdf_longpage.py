@@ -111,6 +111,16 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
             label_seg = segments[tile - 1]
             region["bbox"] = original_box(region.get("bbox"), label_seg)
             region["page"] = label_seg["page"]
+        for key in ("source_regions", "table_note_sources"):
+            regions = []
+            for region in block.metadata.get(key, []):
+                tile = region.get("page")
+                if not isinstance(tile, int) or not 1 <= tile <= len(segments):
+                    raise ValueError("segmented PDF source region has no valid source page")
+                region_seg = segments[tile - 1]
+                regions.append({**region, "bbox": original_box(region.get("bbox"), region_seg), "page": region_seg["page"]})
+            if regions:
+                block.metadata[key] = regions
         block.metadata["source_tile"] = {"tile": tile_no, **seg}
         # source_item describes the parser input. Keep its tile coordinates nested,
         # while the public page_idx/bbox always locate the original document.

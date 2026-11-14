@@ -742,10 +742,11 @@ def _mark_accepted(ordered: list[dict[str, Any]], status: str, floor: float | No
     if status in ("ok", "floor_lowered", "below_threshold") and floor is not None:
         for c in ordered:
             vis = (c.get("scores") or {}).get("score_visual")
+            text_accepted = status != "below_threshold" and float(c.get("score_rerank") or 0.0) >= floor
             if image_query and vis is not None:
-                c["accepted"] = float(vis) >= 0.5
+                c["accepted"] = text_accepted or float(vis) >= 0.5
             else:
-                c["accepted"] = status != "below_threshold" and float(c.get("score_rerank") or 0.0) >= floor
+                c["accepted"] = text_accepted
         return "accepted" if any(c.get("accepted") for c in ordered) else "diagnostic"
     if status == "ok":
         for c in ordered:
@@ -1201,6 +1202,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
 
 
 def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_version: str | None = None,
+            chunk_revision: str | None = None,
             history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     from kb_pipeline.graph.currency import query_scope
 
@@ -1212,6 +1214,12 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
     rows = store.chunks.context(settings.sources[kb_id].collection, doc_id=doc_id, chunk_from=chunk_from, chunk_to=chunk_to,
                                   content_version=content_version)
     from .evidence import source_row
+    if content_version and not rows:
+        from .library import require_document_version
+        require_document_version(settings, settings.sources[kb_id], doc_id, content_version)
+    if chunk_revision and (not rows or any(r.get("chunk_revision") != chunk_revision for r in rows)):
+        from .library import StaleReference
+        raise StaleReference("document_chunk_revision_changed: refresh the document reference")
 
     sources = [source_row(i, {"point_id": r.get("point_id"), "kb_id": kb_id}, r, role="context") for i, r in enumerate(rows, 1)]
     scope = query_scope(history=history, as_of=as_of)

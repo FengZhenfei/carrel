@@ -143,7 +143,7 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                                     str(block.metadata.get("source_footnote") or "")]))
             # get_text(sort=True) inserts spaces between cells. Compare individual
             # spans, not whole rows joined across Markdown column separators.
-            native_spans = [s for b in page.get_text("dict", clip=rect).get("blocks", [])
+            native_spans = [{**s, "line_dir": line.get("dir")} for b in page.get_text("dict", clip=rect).get("blocks", [])
                             for line in b.get("lines", []) for s in line.get("spans", [])]
             # PDF drawing order can write a wrapped line bottom-first. Evidence
             # supplements follow visible top-to-bottom, then left-to-right order.
@@ -182,7 +182,8 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                 pass
             block.metadata["table_native_grid"] = candidates[0] if native and len(candidates) == 1 else []
             block.metadata["table_source_text"] = native
-            block.metadata["table_native_spans"] = [{"text": s.get("text", ""), "bbox": list(s["bbox"])}
+            block.metadata["table_native_spans"] = [{"text": s.get("text", ""), "bbox": list(s["bbox"]),
+                "origin": list(s.get("origin", [])), "line_dir": list(s.get("line_dir") or [])}
                 for s in native_spans if s.get("bbox") and native]
             block.metadata["table_source_legend"] = legend
             block.metadata["table_review_reasons"] = reasons

@@ -24,11 +24,12 @@ class LightStorage:
     def with_deadline(self, deadline):
         scoped = copy(self)
         scoped.deadline = deadline
-        scoped.chunks = copy(self.chunks)
+        from .publication import PublishedChunks, guard
+        scoped.chunks = copy(self.chunks.raw if isinstance(self.chunks, PublishedChunks) else self.chunks)
         scoped.chunks.deadline = deadline
         scoped.keywords = LightKeywords(scoped.chunks, settings=self.settings)
         scoped.graph = LightGraph(scoped)
-        return scoped
+        return guard(scoped)
 
     def catalog(self, *, ttl, force=False):
         from kb_search.catalog import build_catalog
@@ -217,7 +218,9 @@ class LightGraph:
 
     def document_dates(self,sources,versions,*,timeout=None):
         from kb_search.docstatus import document_dates
+        sources = list(sources)
         dates = document_dates(self.settings,sources,{})
+        expected = {(r.get("kb_id"), r.get("doc_id")): r.get("content_version") for r in sources}
         deadline = time.monotonic() + timeout if timeout is not None else None
         for kb,version in versions.items():
             if not version or kb not in self.settings.sources:
@@ -225,7 +228,7 @@ class LightGraph:
             with self.reader(self.settings.sources[kb],version,
                     timeout=max(0,deadline-time.monotonic()) if deadline is not None else None) as reader:
                 for row in reader.nodes('Document'):
-                    if row.get('date'):
+                    if row.get('date') and row.get('content_version') and row['content_version'] == expected.get((kb, row.get('doc_id'))):
                         dates[kb,str(row['doc_id'])] = str(row['date'])
         return dates
 

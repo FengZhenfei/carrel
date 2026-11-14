@@ -21,6 +21,13 @@ def test_every_diagnostic_current_and_saved(lang):
       'long_visual':'2 images whose recognized text exceeds 2.5× the budget; VLM / MinerU output may have run away',
       'headerless_tables':'3/8 table chunks have no header',
       'table_source_alignment':'3 tables retain source text whose cell alignment needs review',
+      'table_review_missing_body':'1 tables could not be reviewed: no extracted table rows',
+      'table_review_ambiguous_rows':'2 tables could not be reviewed: row identifiers are ambiguous',
+      'table_review_missing_model':'3 tables could not be reviewed: model credentials are missing',
+      'table_review_missing_image':'4 tables could not be reviewed: source images are missing',
+      'table_review_request_failed':'5 table review requests failed; source text retained',
+      'table_review_partial':'6 tables were partly verified; unverified source text retained',
+      'table_review_unconfirmed':'7 table review results could not be verified; source text retained',
       'visual_output_truncated':'1 visual responses reached the output limit; only complete facts were retained'}
     script=r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');

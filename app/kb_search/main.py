@@ -4,15 +4,26 @@ import os
 import sqlite3
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-from .api import router
+from .api import router, require_token
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Carrel search service", docs_url="/docs", openapi_url="/openapi.json")
     app.include_router(router)
+
+    @app.middleware("http")
+    async def _authenticate_before_body(request: Request, call_next):
+        from starlette._utils import get_route_path
+        path = get_route_path(request.scope)
+        if path not in ("/health", "/openapi.json", "/docs", "/docs/oauth2-redirect") or request.method != "GET":
+            try:
+                require_token(request)
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return await call_next(request)
 
     @app.exception_handler(Exception)
     async def _readable_errors(request: Request, exc: Exception):

@@ -58,8 +58,9 @@ class StandardStorage:
 
     def with_deadline(self, deadline):
         from ..graph.recall import _DeadlineClient
-        return StandardStorage(self.settings, vector_client=_DeadlineClient(self._q, deadline),
-                               query_timeout=self._query_timeout)
+        from .publication import guard
+        return guard(StandardStorage(self.settings, vector_client=_DeadlineClient(self._q, deadline),
+                                     query_timeout=self._query_timeout))
 
 
 class StandardChunks:
@@ -232,7 +233,7 @@ class StandardGraph:
     def neighbors(self, source, **options):
         from kb_search import channels, graphwalk
         return graphwalk.neighbors(self._settings, source, q=self._storage._q,
-                                   driver=channels.shared_driver(self._settings), **options)
+                                   driver=channels.shared_driver(self._settings), store=self._storage.chunks, **options)
 
     def entities(self, source, **options):
         from kb_search import channels, graphwalk
@@ -242,7 +243,7 @@ class StandardGraph:
     def facts(self, source, **options):
         from kb_search import channels, graphwalk
         return graphwalk.list_facts(self._settings, source, q=self._storage._q,
-                                    driver=channels.shared_driver(self._settings), **options)
+                                    driver=channels.shared_driver(self._settings), store=self._storage.chunks, **options)
 
     def pages(self, source, **options):
         from kb_search.graphwalk import list_pages
@@ -255,7 +256,7 @@ class StandardGraph:
 
     def locate_facts(self, collections, specs, sources, *, timeout=None):
         from kb_search.graphwalk import locate_facts
-        return locate_facts(self._storage._q, collections, specs, sources, timeout=timeout)
+        return locate_facts(self._storage._q, collections, specs, sources, timeout=timeout, store=self._storage.chunks)
 
     def stats(self, kb_id, *, timeout=None):
         from kb_search import channels, graphwalk
@@ -281,7 +282,7 @@ class StandardGraph:
     def read_originals(self, search_settings, result, scope, hint, until):
         from kb_search.readback import read_originals
         return read_originals(self._settings, search_settings, self._storage._q, result, scope, hint, until,
-                              self.optional_driver())
+                              self.optional_driver(), store=self._storage)
 
 
     def check(self):

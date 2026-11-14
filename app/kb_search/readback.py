@@ -97,19 +97,21 @@ def read_originals(settings, ss, q, result, scope, hint, until, driver, *, store
         scores = rerank(ranker, result["question"], eligible, window_tokens=ss.rerank_window_tokens,
                         overlap_tokens=ss.rerank_overlap_tokens)
         ranked = sorted(zip(scores, eligible), key=lambda x: (-x[0], x[1]["kb_id"], x[1]["point_id"]))
-        texts = [" ".join(s["text"].split()) for s in result["sources"]]
+        texts = [(s.get("kb_id"), s.get("doc_id"), s.get("content_version"), " ".join(s["text"].split()))
+                 for s in result["sources"]]
         for score, item in ranked:
             if score < ss.rerank_threshold or len(added) >= MAX_SOURCES:
                 break
             payload = item["payload"]
             text = payload_text(payload)
             normalized = " ".join(text.split())
-            if not normalized or any(normalized in existing for existing in texts):
+            provenance = (item["kb_id"], payload.get("doc_id"), payload.get("content_version"))
+            if not normalized or any(provenance == entry[:3] and normalized in entry[3] for entry in texts):
                 continue
             size = count_tokens(text)
             if used + size > TOKEN_BUDGET:
                 continue
-            texts.append(normalized)
+            texts.append((*provenance, normalized))
             used += size
             item.update(score_rerank=score, recall_sources=["graph_readback"], accepted=True)
             row = source_row(len(result["sources"]) + len(added) + 1, item, payload, role="graph_followup")

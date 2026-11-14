@@ -10,7 +10,7 @@ from ..headings import detect_toc_pages
 from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, clean_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx, walk_dicts
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
-from .mineru_quality import recover_pdf_items
+from .mineru_quality import merge_table_placeholders, recover_pdf_items
 from .pdf_code import repair_code_items
 from .pdf_table_layout import attach_table_notes
 
@@ -66,6 +66,7 @@ def mineru_pdf_blocks(
     content = extract_content_list(payload)
     items = recover_pdf_items(content if content else list(walk_dicts(payload)), payload)
     items = attach_table_notes(repair_code_items(items, path), path)
+    items = merge_table_placeholders(items, path)
 
     blocks: list[ParsedBlock] = []
     seen: set[tuple] = set()
@@ -138,7 +139,9 @@ def mineru_pdf_blocks(
             metadata["source_footnote"] = footnote
         if item.get("_pdf_table_note_sources"):
             metadata["table_note_sources"] = item["_pdf_table_note_sources"]
-            metadata["source_regions"] = [{"page": page, "bbox": bbox(item)}] + item["_pdf_table_note_sources"]
+        if item.get("_pdf_table_note_sources") or item.get("_pdf_merged_table_sources"):
+            metadata["source_regions"] = ([{"page": page, "bbox": bbox(item)}]
+                + list(item.get("_pdf_merged_table_sources") or []) + list(item.get("_pdf_table_note_sources") or []))
         if item.get("_pdf_code_label_sources"):
             metadata["code_context_sources"] = [dict(r) for r in item["_pdf_code_label_sources"]]
         if item.get("_pdf_code_language"):

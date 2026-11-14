@@ -32,7 +32,9 @@ class Reranker:
             self.models_url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
         self.model_id = model_id
         self.timeout = timeout
-        self.request_options = {"headers": {"Authorization": f"Bearer {api_key}"}} if api_key else {}
+        self.request_options = {"allow_redirects": False}
+        if api_key:
+            self.request_options["headers"] = {"Authorization": f"Bearer {api_key}"}
         # Model discovery may depend on the account; never share it across keys.
         self.cache_key = self.models_url + (":" + hashlib.sha256(api_key.encode()).hexdigest() if api_key else "")
 

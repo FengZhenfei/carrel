@@ -425,8 +425,7 @@ def graph_cache_fingerprint(settings: Settings, source: KBSource) -> str:
         "models": {step: spec.model_id for step, spec in sorted(specs.items())},
         "entity_types": list(schema.entity_types),
         "predicates": [str(p.get("name") or "") for p in schema.predicates],
-        # 谓词的描述、端点约束与单值与否也进指纹:它们进抽取提示词,也决定事后的类型越界标记与新旧取代 —— 改了
-        # 只比名字就会沿用按旧定义抽出来 / 标出来的阶段产物
+        # 谓词定义参与指纹计算。描述、端点约束或基数变更后,需重新计算受影响的抽取或统计产物。
         "predicate_defs": [
             {"name": str(p.get("name") or ""), "description": str(p.get("description") or ""),
              "source_parents": sorted(str(x) for x in (p.get("source_parents") or ())),
@@ -1278,7 +1277,7 @@ def build_graph(
                 cache.close()
             stage("Computing weights and chunk attribution")
             stats["weights"] = compute_weights(entities, relations, n_units=len(units))
-            # 关系的观察时间与新旧(单值关系:最新的说法现行,更早的标被取代)
+            # 记录来源日期与明确的状态区间,统计单值关系中的多个候选值。
             from .currency import relation_currency
 
             stats["currency"] = relation_currency(relations, units_by_id, predicates=schema.predicates, entities=entities)
@@ -1972,7 +1971,7 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any = None, st
                                "unparseable_version_timestamp")}
 
     def prune_records() -> int:
-        if dry_run:
+        if dry_run or errors:
             return 0
         with db.connect(settings.state_db) as con:
             return db.prune_graph_builds(con, source.kb_id, keep_versions=kept)

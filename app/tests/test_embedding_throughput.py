@@ -38,7 +38,7 @@ def test_text_concurrent_batches_preserve_order_progress_and_limit(monkeypatch):
                 gate.set()
             time.sleep(0.01)
             finished.append(batch[0])
-            return SimpleNamespace(data=[SimpleNamespace(embedding=[float(x), 1.0]) for x in batch])
+            return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[float(x), 1.0]) for i, x in enumerate(batch)])
         finally:
             with lock:
                 active -= 1
@@ -58,7 +58,7 @@ def test_text_rejected_input_has_global_index_across_concurrent_batches(monkeypa
     def create(**kw):
         if bad in kw["input"]:
             raise Rejected("input too long")
-        return SimpleNamespace(data=[SimpleNamespace(embedding=[0.0, 1.0]) for _ in kw["input"]])
+        return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0, 1.0]) for i, _ in enumerate(kw["input"])])
     client = text_embedder(monkeypatch, create, concurrency=2)
     with pytest.raises(text_client.EmbeddingInputRejected) as caught:
         client.embed(["a", "b", "c", bad, "e"])

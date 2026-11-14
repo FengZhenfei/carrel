@@ -86,7 +86,9 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def _require_token(request: Request, call_next):
-        if token and request.url.path.startswith("/api"):
+        from starlette._utils import get_route_path
+        path = get_route_path(request.scope)
+        if token and (path == "/api" or path.startswith("/api/")):
             auth = request.headers.get("authorization") or ""
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
             if not given or not hmac.compare_digest(given.encode(), token.encode()):

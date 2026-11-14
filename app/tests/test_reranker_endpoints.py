@@ -20,7 +20,7 @@ def test_explicit_model_sends_bearer_without_model_discovery(monkeypatch):
     get.assert_not_called()
     post.assert_called_once_with("https://models.example/v2/rerank",
         json={"model": "chosen-model", "query": "question", "documents": ["first", "second"]},
-        timeout=20.0, headers={"Authorization": "Bearer test-key"})
+        timeout=20.0, allow_redirects=False, headers={"Authorization": "Bearer test-key"})
 
 
 def test_discovery_cache_is_scoped_to_credentials(monkeypatch):
@@ -45,7 +45,7 @@ def test_anonymous_local_endpoint_keeps_model_discovery(monkeypatch):
     monkeypatch.setattr(module._session, "get", get)
     monkeypatch.setattr(module._session, "post", post)
     assert module.Reranker("http://localhost:8102").score("q", ["d"]) == [0.8]
-    get.assert_called_once_with("http://localhost:8102/v1/models", timeout=5.0)
+    get.assert_called_once_with("http://localhost:8102/v1/models", timeout=5.0, allow_redirects=False)
     assert post.call_args.args == ("http://localhost:8102/v1/rerank",)
     assert "headers" not in post.call_args.kwargs
 

@@ -126,20 +126,23 @@ def run_once(
             db.mark_job_done(con, job["job_id"], current_worker_id)
             return f"metadata-done:{job['job_id']}"
         if job_type == "fts_sync":
-            # Keyword index compensation (queued when OpenSearch could not be written during the parse): rewrite
-            # the full-text index from this file's active points in Qdrant. Void it when the file was deleted or
-            # changed version -- the new version's parse syncs by itself. A failed write raises as usual and
-            # takes the failure / backoff retry path below; the failure record hangs on this job and stays
-            # visible until the index is filled in (Codex review F06).
+            # Finish cleanup for the published version, then refresh keywords.
+            # A later publication or deletion supersedes this job. Failures use
+            # the existing retry/backoff queue without rerunning parsing.
             if settings:
                 file_row = db.get_file_by_id(con, str(job["file_id"]))
                 payload = json.loads(str(job["payload_json"] or "{}"))
                 wanted = str(payload.get("content_version") or "")
                 if (file_row and str(file_row["status"]) != "deleted"
-                        and (not wanted or wanted == str(file_row["content_version"] or ""))):
+                        and (not wanted or wanted == str(file_row["indexed_version"] or file_row["content_version"] or ""))):
                     store = get_storage(settings)
-                    _sync_fts_doc(store, file_row)
-                    print(f"[fts] compensation synced file={file_row['source_path']}", flush=True)
+                    from ..storage.publication import reconcile_document, publication_lock
+                    con.commit()
+                    with publication_lock(settings.state_db, str(file_row["collection"])):
+                        file_row = db.get_file_by_id(con, str(job["file_id"]))
+                        if file_row:
+                            reconcile_document(store, con, file_row)
+                            print(f"[fts] compensation synced file={file_row['source_path']}", flush=True)
                 else:
                     print(f"[fts] compensation superseded job={job['job_id']}", flush=True)
                 # Also resolve the failure records of earlier attempts under this key (the ones the scan

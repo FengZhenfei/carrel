@@ -420,7 +420,7 @@ class LightKeywords:
         return {"terms": counts, "sizes": sizes}
 
     def grep(self, source, phrases, *, fields=None, rel_paths=None, doc_ids=None, doc_versions=None,
-             limit=30, timeout=None, excluded_paths=None):
+             limit=30, timeout=None, excluded_paths=None, published_ids=None):
         from collections import Counter
         from kb_search import library
         from ..search_fts import doc_source
@@ -437,11 +437,14 @@ class LightKeywords:
                "scope": {"rel_paths": len(paths), "doc_ids": len(docs)}, "results": [],
                "note": "Literal phrase matches in the active document versions."}
         versions = set(library.active_versions(self.settings, source.collection))
+        published = set(published_ids) if published_ids is not None else None
         records = []
         if self.chunks.exists(source.collection):
             rows = self.chunks._rows(source.collection, self.chunks._filters({"rel_paths": paths, "doc_ids": docs}, excluded_paths))
             for row in rows:
                 payload = json.loads(row["payload"])
+                if published is not None and row['id'] not in published:
+                    continue
                 if payload.get("content_version") not in versions:
                     continue
                 if payload.get("doc_id") in (doc_versions or {}) and payload.get("content_version") != doc_versions[payload["doc_id"]]:

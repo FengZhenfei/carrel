@@ -102,7 +102,7 @@ def relation_currency(relations: list[dict[str, Any]], units_by_id: dict[str, Un
 # Default: all source assertions except explicitly governed documents.
 # as_of: source time scope; history: include explicitly governed documents too.
 STATUS_CURRENT = "current"
-STATUS_SUPERSEDED = "superseded"            # 有更新的说法(单值关系 / 事实序列里的更早一档)
+STATUS_SUPERSEDED = "superseded"            # 旧版关系与事实的状态值,保留兼容性
 STATUS_ENDED = "ended"                      # 原文写明的一段状态,止期已过
 STATUS_NOT_STARTED = "not_started"          # 回看某一天时:那天还没开始(或还没有任何文档提到)
 STATUS_DOC_SUPERSEDED = "doc_superseded"    # 来源文档全都被更正文件标成被取代 / 过了有效期

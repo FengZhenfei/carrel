@@ -449,11 +449,13 @@ def strip_markdown_comments(md: str) -> str:
     if "<!--" not in md:
         return md
     try:
-        from tree_sitter_language_pack import get_parser
+        from .code_symbols import _get_parser
 
-        block_parser = get_parser("markdown")
-        inline_parser = get_parser("markdown_inline")
-        html_parser = get_parser("html")
+        block_parser = _get_parser("markdown")
+        inline_parser = _get_parser("markdown_inline")
+        html_parser = _get_parser("html")
+        if any(parser is None for parser in (block_parser, inline_parser, html_parser)):
+            return md
         data = md.encode("utf-8")
         fm_start, fm_end = _frontmatter_span(data)
         ranges: list[tuple[int, int]] = []

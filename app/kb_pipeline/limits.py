@@ -218,7 +218,7 @@ def normalize_predicates(value: Any, *, limit: int | None = None) -> tuple[dict[
             "description": str(item.get("description") or "").strip()[:200],
             "source_parents": list(dict.fromkeys(str(p).strip() for p in (item.get("source_parents") or []) if str(p).strip())),
             "target_parents": list(dict.fromkeys(str(p).strip() for p in (item.get("target_parents") or []) if str(p).strip())),
-            # 没写就是多值:只有模式里显式声明单值的关系才做「新值取代旧值」(ontology 模块说明)
+            # 没写就是多值。显式声明单值供建图统计有多个候选值的关系。
             "multivalued": multivalued is not False,
             "core": bool(item.get("core")),
         })

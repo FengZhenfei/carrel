@@ -244,8 +244,14 @@ def work_dir(cfg):
     directory, else a folder under the system temporary directory, created for this user only (responses hold
     document text). Entries older than a day are removed."""
     root = os.environ.get("CARREL_SEARCH_WORK_DIR") or cfg.get("work_dir")
-    path = Path(str(root)).expanduser() if root else Path(tempfile.gettempdir()) / "carrel-search"
+    path = Path(str(root)).expanduser() if root else Path(tempfile.gettempdir()) / ("carrel-search-" + str(os.getuid()))
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Never read or overwrite another user's pre-created cache or a symlink.
+    import stat
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("work_dir must be a directory owned by the current user, not a symlink")
+    path.chmod(0o700)
     limit = time.time() - KEEP_SECONDS
     try:
         for item in path.iterdir():
@@ -342,6 +348,10 @@ def stored(work, call_id):
     path = work / (call_id + ".json")
     if not path.exists():
         raise ValueError("no stored response " + call_id + " in " + str(work) + " (responses are kept for a day)")
+    import stat
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("stored response must be a regular file owned by the current user")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -1437,6 +1447,8 @@ def payload(args, work=None):
             data.update({"kb_id": kb, "doc_id": row["doc_id"], "chunk_from": lo, "chunk_to": hi})
             if row.get("content_version"):
                 data["content_version"] = row["content_version"]
+            if row.get("chunk_revision"):
+                data["chunk_revision"] = row["chunk_revision"]
         if not data.get("kb_id") or not data.get("doc_id"):
             raise ValueError("context requires --ref or --request")
     if args.command == "crop":
@@ -1582,10 +1594,29 @@ def read_context(url, token, timeout, data, whole=False):
     if not isinstance(lo, int) or not isinstance(hi, int) or (hi - lo < CONTEXT_STEP and not whole):
         return json.loads(request(url, token, timeout, "POST", "/context", data)[0])
     merged, total, start, ended = None, 0, lo, False
+    version = data.get("content_version")
+    revision = data.get("chunk_revision")
     while start <= hi:
         part = dict(data, chunk_from=start, chunk_to=min(start + CONTEXT_STEP - 1, hi))
+        if version:
+            part["content_version"] = version
+        if revision:
+            part["chunk_revision"] = revision
         result = json.loads(request(url, token, timeout, "POST", "/context", part)[0])
         rows = result.get("sources") or []
+        versions = {row.get("content_version") for row in rows if isinstance(row, dict)}
+        if rows and (len(versions) != 1 or None in versions or "" in versions):
+            raise ValueError("Context response is missing a consistent document version; search again")
+        returned = next(iter(versions), None)
+        if version and returned and version != returned:
+            raise ValueError("Document changed during context read; search again")
+        version = version or returned
+        revisions = {row.get("chunk_revision") for row in rows}
+        if len(revisions) > 1 or (revision and revisions and revisions != {revision}):
+            raise ValueError("Document chunk layout changed during context read; search again")
+        revision = revision or next(iter(revisions), None)
+        if rows and [r.get("chunk_index") for r in rows] != list(range(start, start + len(rows))):
+            raise ValueError("Context response contains gaps or duplicate chunks; search again")
         if merged is None:
             merged = result
             total = next((int(row["chunk_total"]) for row in rows if isinstance(row, dict) and row.get("chunk_total")), 0)
@@ -1597,6 +1628,11 @@ def read_context(url, token, timeout, data, whole=False):
             merged["sources"] = (merged.get("sources") or []) + rows
             merged["tokens_total"] = (merged.get("tokens_total") or 0) + (result.get("tokens_total") or 0)
         if len(rows) < part["chunk_to"] - part["chunk_from"] + 1:
+            expected_end = min(part["chunk_to"] + 1, total) if total else part["chunk_to"] + 1
+            if total and len(rows) < max(0, expected_end - start):
+                raise ValueError("Context response is incomplete; search again")
+            if not total:
+                merged["maybe_more"] = True
             ended = True                # the document ends here
             break
         start += CONTEXT_STEP
@@ -1612,7 +1648,7 @@ def read_context(url, token, timeout, data, whole=False):
 def save_new(path, content):
     destination = Path(path).expanduser().absolute()
     # Exclusive creation: a mistyped output path must not replace user data.
-    with destination.open("xb") as f:
+    with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
         f.write(content)
     return str(destination)
 

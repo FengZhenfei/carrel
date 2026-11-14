@@ -160,9 +160,11 @@ def test_markdown_html_comments_respect_attributes_and_unicode_offsets():
     assert strip_markdown_comments(expected) == expected
 
 
-def test_markdown_grammar_failure_keeps_original_source():
+@pytest.mark.parametrize("failure", [LookupError("grammar unavailable"),
+                                    Exception("grammar cache is read-only")])
+def test_markdown_grammar_failure_keeps_original_source(failure):
     source = "Use `<!--\nliteral marker\n-->` as a marker."
-    with patch("tree_sitter_language_pack.get_parser", side_effect=LookupError("grammar unavailable")):
+    with patch("tree_sitter_language_pack.get_parser", side_effect=failure):
         assert strip_markdown_comments(source) == source
 
 

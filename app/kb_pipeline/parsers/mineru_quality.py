@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
 from lxml import etree, html
 
 from ..headings import is_page_footer
-from .common import bbox, item_text, label_of, page_idx, walk_dicts
+from .common import bbox, caption_of, footnote_of, item_text, label_of, page_idx, walk_dicts
 
 
 def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
@@ -42,12 +43,18 @@ def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
             item["type"] = "title" if cover or (page_idx(item) == first_page and height >= 25) else "text"
             if item["type"] == "title":
                 item["text_level"] = 1
-    ends = _merged_table_ends(payload)
+    continuations = {}
+    ends = _merged_table_ends(payload, continuations=continuations)
     for item in items:
         if "table" in label_of(item):
             key = (page_idx(item), Path(str(item.get("img_path") or item.get("image_path") or "")).name)
             if key in ends:
                 item["source_page_end"] = ends[key]
+                merged, regions = continuations[key]
+                # The content_list body must be the same complete table, not
+                # just a similarly named or partially recovered entry.
+                if _table_rows(item.get("table_body") or item.get("html") or "") == merged:
+                    item["_merged_table_continuations"] = regions
     # MinerU can append discarded headers after the page body. Restore only the
     # recovered items to their geometric neighbours; keep the other reading order.
     for item in list(items):
@@ -72,6 +79,66 @@ def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
             index = next(i for i, v in enumerate(items) if v is target[1])
             items.insert(index if below else index + 1, item)
     return items
+
+
+def merge_table_placeholders(items: list[dict], path=None) -> list[dict]:
+    """Fold proven upstream continuation placeholders into their owning table.
+
+    Run after note attachment so continuation footnotes and their locations
+    travel with the parent. An uncertain or nonempty entry remains independent.
+    """
+    items = [dict(item) for item in items]
+    claims = defaultdict(list)
+    for parent_index, parent in enumerate(items):
+        for region in parent.pop("_merged_table_continuations", []):
+            box = region["bbox"]
+            candidates = [i for i, child in enumerate(items)
+                if i != parent_index and label_of(child) == "table"
+                and page_idx(child) == region["page"] and not item_text(child) and not caption_of(child)
+                and not (child.get("img_path") or child.get("image_path"))
+                and (cb := bbox(child)) and max(abs(a-b) for a,b in zip(cb, box)) <= 2]
+            if len(candidates) == 1:
+                claims[candidates[0]].append((parent_index, region))
+    removed = set()
+    for child_index, owners in claims.items():
+        if len(owners) != 1:
+            continue
+        parent_index, region = owners[0]
+        parent, child = items[parent_index], items[child_index]
+        if not _continuation_text_covered(parent, child, path):
+            continue
+        parent["table_footnote"] = list(dict.fromkeys(s for s in (footnote_of(parent), footnote_of(child)) if s))
+        parent["_pdf_table_note_sources"] = (list(parent.get("_pdf_table_note_sources") or [])
+                                            + list(child.get("_pdf_table_note_sources") or []))
+        parent["_pdf_merged_table_sources"] = list(parent.get("_pdf_merged_table_sources") or []) + [region]
+        removed.add(child_index)
+    return [item for i, item in enumerate(items) if i not in removed]
+
+
+def _continuation_text_covered(parent: dict, child: dict, path) -> bool:
+    # Retain a placeholder if its native PDF text still contributes evidence
+    # missing from the merged OCR table. This is the same span check used by
+    # table review; an upstream merge alone cannot prove OCR completeness.
+    if path is None:
+        return True
+    try:
+        import pymupdf
+        doc = pymupdf.open(path)
+    except Exception:
+        return True  # No native evidence is available to the review layer either.
+    from .pdf_evidence import _norm, _rect, _span_present, table_evidence_text
+    with doc:
+        page = page_idx(child)
+        if page is None or not 1 <= page <= len(doc):
+            return False
+        page = doc[page - 1]
+        spans = [s.get("text", "").strip() for block in page.get_text("dict", clip=_rect(page, bbox(child))).get("blocks", [])
+                 for line in block.get("lines", []) for s in line.get("spans", [])]
+    if any("\ufffd" in s or "\x00" in s for s in spans):
+        return True
+    body = table_evidence_text("\n".join([item_text(parent), caption_of(parent), footnote_of(parent), footnote_of(child)]))
+    return all(_span_present(s, body) for s in spans
+               if len(_norm(s)) >= 2 and not re.fullmatch(r"[\s\-‐‑‒–—]+", s))
 
 
 def _middle_pages(payload: dict) -> list[dict]:
@@ -107,10 +174,25 @@ def _tables(blocks: list[dict]) -> list[tuple[str, list[tuple[str, ...]]]]:
     return out
 
 
-def _merged_table_ends(payload: dict) -> dict[tuple[int, str], int]:
+def _table_region(page: dict, image_name: str) -> dict | None:
+    size = page.get("page_size") or []
+    if len(size) != 2 or not all(isinstance(v, (int, float)) and v > 0 for v in size):
+        return None
+    matches = [bbox(block) for block in page.get("preproc_blocks") or []
+               if any(name == image_name for name, _ in _tables([block]))]
+    if len(matches) != 1 or not matches[0]:
+        return None
+    box = [v / size[i % 2] * 1000 for i, v in enumerate(matches[0])]
+    if not (0 <= box[0] < box[2] <= 1000 and 0 <= box[1] < box[3] <= 1000):
+        return None
+    return {"page": page_idx(page), "bbox": box}
+
+
+def _merged_table_ends(payload: dict, *, continuations: dict | None = None) -> dict[tuple[int, str], int]:
     # preproc_blocks retain physical-page fragments; para_blocks may already
     # contain a merged table whose content_list entry names only its first page.
     pages = _middle_pages(payload)
+    pages_by_number = {page_idx(p): p for p in pages}
     originals = {page_idx(p): _tables(p.get("preproc_blocks") or []) for p in pages}
     ends = {}
     for page in pages:
@@ -124,19 +206,26 @@ def _merged_table_ends(payload: dict) -> dict[tuple[int, str], int]:
                 continue
             remaining = merged[len(first):]
             end = start
+            regions = []
             while remaining and end + 1 in originals:
                 # Require an exact, unique row-sequence match on the adjacent
                 # page. Shared column labels alone never establish provenance.
                 candidates = []
-                for _, rows in originals[end + 1]:
+                for name, rows in originals[end + 1]:
                     if rows and rows[0] == first[0]:
                         rows = rows[1:]
                     if rows and remaining[:len(rows)] == rows:
-                        candidates.append(rows)
+                        candidates.append((name, rows))
                 if len(candidates) != 1:
                     break
-                remaining = remaining[len(candidates[0]):]
+                name, rows = candidates[0]
+                remaining = remaining[len(rows):]
                 end += 1
+                region = _table_region(pages_by_number[end], name)
+                if region is not None:
+                    regions.append(region)
             if not remaining:
                 ends[(start, image_name)] = end
+                if continuations is not None:
+                    continuations[(start, image_name)] = (merged, regions)
     return ends

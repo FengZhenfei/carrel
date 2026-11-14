@@ -476,7 +476,7 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
 
 def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entity_id: str | None, limit: int = 20,
               types: list[str] | None = None, direction: str = "both", history: bool = False, as_of: str | None = None,
-              q: Any = None, expected_graph_version: str | None = None, driver: Any = None, timeout: float | None = None, native: Any = None) -> dict[str, Any]:
+              q: Any = None, expected_graph_version: str | None = None, driver: Any = None, timeout: float | None = None, native: Any = None, store: Any = None) -> dict[str, Any]:
     """q / driver:服务共用的 Qdrant 客户端与 Neo4j driver;不传 driver 就现建、用完关掉。
     history / as_of:时间口径(见 time_scope);各类关系的条数、总数、实体名下的事实数都按同一口径数,
     time.hidden 是同样条件下被口径筛掉的关系条数。
@@ -524,7 +524,7 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
     finally:
         if own_driver:
             driver.close()
-    backfill_evidence(q, source.collection, rows, store=native.store.chunks if native is not None else None, anchors=[center.get("title"), *(center.get("aliases") or [])])
+    backfill_evidence(q, source.collection, rows, store=native.store.chunks if native is not None else store, anchors=[center.get("title"), *(center.get("aliases") or [])])
     for r in rows:
         r.pop("_names", None)
     # Number of relations under the same filter (not bounded by limit): tells the caller whether what it got is everything
@@ -861,7 +861,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                prop: str | None = None, match: str = "auto", doc_id: str | None = None, conflict_only: bool = False,
                history: bool = False, as_of: str | None = None,
                limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, expected_graph_version: str | None = None, content_version: str | None = None, driver: Any = None,
-               timeout: float | None = None, native: Any = None) -> dict[str, Any]:
+               timeout: float | None = None, native: Any = None, store: Any = None) -> dict[str, Any]:
     """按主体 / 属性 / 文档列出现行图版本里的限定事实,带总数与翻页(「某主体的全部参数」「某属性在各主体上的值」
     「这份文档里登记了哪些事实」「哪些值在不同文档里对不上」用)。
     主体按 id 或名字(标题 / 别名)找,沿 HAS_SPEC 边取它名下的事实;同名多个时返回候选,由调用方选定 ID。
@@ -1034,7 +1034,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
     meta: dict[str, dict[str, Any]] | None = None
     if (q is not None or native is not None) and any(cited.values()):
         try:
-            meta = point_payloads(q, source.collection, [p for pids in cited.values() for p in pids], store=native.store.chunks if native is not None else None)
+            meta = point_payloads(q, source.collection, [p for pids in cited.values() for p in pids], store=native.store.chunks if native is not None else store)
         except Exception as exc:
             degraded.append(f"point_meta: {type(exc).__name__}")
     # conclusions only from source points that were checked: when the main collection gave nothing back the state

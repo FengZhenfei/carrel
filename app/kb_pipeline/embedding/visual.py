@@ -83,6 +83,7 @@ class VisualEmbeddingClient:
         return {
             "contract_version": VISUAL_EMBED_CONTRACT_VERSION,
             "model_id": self.model_id,
+            "base_url": self.base_url,
             "dim": self.dim,
             "instruction_sha256": hashlib.sha256(self.instruction.encode("utf-8")).hexdigest(),
             "max_pixels": self.max_pixels,

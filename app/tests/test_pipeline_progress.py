@@ -12,7 +12,7 @@ def test_embedding_progress_does_not_change_batches_or_order(monkeypatch):
     calls = []
     def create(**kwargs):
         calls.append(kwargs["input"])
-        return SimpleNamespace(data=[SimpleNamespace(embedding=[float(t)]) for t in kwargs["input"]])
+        return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[float(t)]) for i, t in enumerate(kwargs["input"])])
 
     monkeypatch.setattr(client, "_client_for", lambda *_: SimpleNamespace(embeddings=SimpleNamespace(create=create)))
     embedder = client.EmbeddingClient(base_url="http://example.invalid", api_key="", model_id="example",

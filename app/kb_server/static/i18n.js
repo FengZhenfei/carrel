@@ -1057,6 +1057,13 @@ const DIAGNOSTIC_LABELS = {
   long_visual: ["{0} 张图片的识别文本超过预算 {1} 倍", "{0} images have recognized text over {1}× the budget"],
   headerless_tables: ["{0}/{1} 个表格切片缺少表头", "{0}/{1} table chunks have no header"],
   table_source_alignment: ["{0} 处表格的部分行列归属未确认，原文已保留", "Source text retained; table regions with unverified cell alignment: {0}"],
+  table_review_missing_body: ["{0} 处表格未提取到表体，无法复核；原文已保留", "{0} tables have no extracted rows to review; source text retained"],
+  table_review_ambiguous_rows: ["{0} 处表格无法确定唯一行标识，未进行复核；原文已保留", "{0} tables lack unique row identifiers and were not reviewed; source text retained"],
+  table_review_missing_model: ["{0} 处表格缺少模型凭据，未进行复核；原文已保留", "{0} tables were not reviewed because model credentials are missing; source text retained"],
+  table_review_missing_image: ["{0} 处表格缺少原图，未进行复核；原文已保留", "{0} tables were not reviewed because source images are missing; source text retained"],
+  table_review_request_failed: ["{0} 处表格复核请求失败，原文已保留", "{0} table review requests failed; source text retained"],
+  table_review_partial: ["{0} 处表格仅部分内容通过复核，未确认内容的原文已保留", "{0} tables were partly verified; unverified source text retained"],
+  table_review_unconfirmed: ["{0} 处表格复核结果未通过行列与内容校验，原文已保留", "{0} table review results did not pass alignment and content checks; source text retained"],
   visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留可用结果", "{0} visual responses reached the output limit; available results were retained"]
 };
 // Length statistics alone do not establish missing or broken meaning.
@@ -1082,6 +1089,16 @@ function diagnosticLabel(reason, compact = false) {
   let template = templates[en ? 1 : 0];
   if (compact && reason.key === "fragmented") template = en ? "Short text chunks: {0}/{1}" : "短文本 {0}/{1}";
   if (compact && reason.key === "table_source_alignment") template = en ? "Unverified tables: {0}" : "{0} 处表格对齐未确认";
+  const tableReviewCompact = {
+    table_review_missing_body: ["{0} 处表格缺少表体", "Missing table rows: {0}"],
+    table_review_ambiguous_rows: ["{0} 处表格行标识不明确", "Ambiguous table rows: {0}"],
+    table_review_missing_model: ["{0} 处表格复核缺少模型凭据", "Missing review credentials: {0}"],
+    table_review_missing_image: ["{0} 处表格复核缺少原图", "Missing review images: {0}"],
+    table_review_request_failed: ["{0} 处表格复核请求失败", "Table review requests failed: {0}"],
+    table_review_partial: ["{0} 处表格部分确认", "Partly verified tables: {0}"],
+    table_review_unconfirmed: ["{0} 处表格复核结果未确认", "Unverified table review results: {0}"]
+  };
+  if (compact && tableReviewCompact[reason.key]) template = tableReviewCompact[reason.key][en ? 1 : 0];
   if (compact && reason.key === "visual_output_truncated") template = en ? "Visual output limit: {0}" : "{0} 处图片识别达上限";
   // Unknown old argument layouts fall back to the readable saved message.
   if ([...template.matchAll(/\{(\d+)\}/g)].some(m => args[+m[1]] == null)) return t(reason.message || reason.key);

@@ -24,7 +24,8 @@ def native(tmp_path):
     source=NS(kb_id='synthetic', collection='synthetic', source_root='Synthetic', name='Synthetic')
     settings=NS(storage_backend='light', storage_root=tmp_path/'store', runtime_dir=tmp_path/'runtime',
                 state_db=tmp_path/'state.db', sources={'synthetic':source})
-    store=get_storage(settings)
+    from kb_pipeline.storage.light import LightStorage
+    store=LightStorage(settings)
     store.chunks.ensure(source.collection,VectorLayout(4,4))
     store.chunks.write(source.collection,['point-7'],[{'text':[1.,0.,0.,0.]}],[dict(kb_id=source.kb_id,
         doc_id='source:7',is_active=True,content_version='content1',chunk_index=0,chunk_uid='u1',
@@ -32,6 +33,7 @@ def native(tmp_path):
     def stage(version,activate=True):
         b=bundle(version)
         b['documents'][0]['date']='2026-03-01'
+        b['documents'][0]['content_version']='content1'
         b['entities'][0].update(aliases=['Alpha Unit'],ids=['old-orion'],external_ids=['system:X17'])
         b['entities'][1]['type']='property'
         b['has_spec_edges']=[dict(entity_uid=b['entities'][0]['uid'],spec_uid=f['uid']) for f in b['specs']]
@@ -70,7 +72,7 @@ def test_facts_time_conflicts_series_pagination_and_identity(native):
     assert graph.facts(source,fields=FACT_FIELDS,conflict_only=True,as_of='2025')['facts']==[]
     pages=[graph.facts(source,fields=FACT_FIELDS,history=True,limit=2,offset=i) for i in (0,2,4)]
     assert len({r['id'] for p in pages for r in p['facts']})==5
-    assert graph.document_dates([],{'synthetic':'v1'})[('synthetic','source:7')]=='2026-03-01'
+    assert graph.document_dates([{'kb_id':'synthetic','doc_id':'source:7','content_version':'content1'}],{'synthetic':'v1'})[('synthetic','source:7')]=='2026-03-01'
     assert graph.neighbors(source,entity='ORION',entity_id=None,direction='out')['neighbors']
     assert graph.neighbors(source,entity='ORION',entity_id=None,direction='in')['neighbors']==[]
     from kb_search.library import StaleReference

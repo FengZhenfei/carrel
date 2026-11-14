@@ -411,6 +411,7 @@ def load_bundle(output_dir: Path, *, source: KBSource, graph_version: str) -> di
             props = common_props(source, gv, "Document", unit.doc_id)
             props.update(clean_props({
                 "id": unit.doc_id, "doc_id": unit.doc_id, "title": unit.rel_path or unit.doc_id,
+                "content_version": unit.content_version,
                 "rel_path": unit.rel_path, "filename": Path(unit.rel_path).name if unit.rel_path else None,
                 "source_collection": source.collection, "units": 0,
                 # 文档日期(文件名 / 正文开头定下的):关系的观察时间、类型覆盖的周数都从它来

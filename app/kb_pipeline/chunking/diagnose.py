@@ -148,10 +148,24 @@ def chunk_diagnostics(
     if headerless_tables and headerless_tables * 4 > len(table_chunks):
         flag("headerless_tables", f"{headerless_tables}/{len(table_chunks)} table chunks have no header", headerless_tables, len(table_chunks))
     evidence_blocks = blocks if blocks is not None else list({c.block.block_id: c.block for c in chunks}.values())
-    reviews = sum(1 for b in evidence_blocks if (b.metadata.get("table_review") or {}).get("status") in {"unverified", "partial"})
-    stats["table_reviews_unverified"] = reviews
-    if reviews:
-        flag("table_source_alignment", f"{reviews} tables retain source text whose cell alignment needs review", reviews)
+    review_reasons = Counter()
+    review_labels = {
+        "missing_table_body": ("table_review_missing_body", "tables could not be reviewed: no extracted table rows"),
+        "ambiguous_row_keys": ("table_review_ambiguous_rows", "tables could not be reviewed: row identifiers are ambiguous"),
+        "missing_model_credentials": ("table_review_missing_model", "tables could not be reviewed: model credentials are missing"),
+        "missing_image": ("table_review_missing_image", "tables could not be reviewed: source images are missing"),
+        "request_failed": ("table_review_request_failed", "table review requests failed; source text retained"),
+        "partial": ("table_review_partial", "tables were partly verified; unverified source text retained"),
+        "verification_incomplete": ("table_review_unconfirmed", "table review results could not be verified; source text retained"),
+    }
+    for block in evidence_blocks:
+        review = block.metadata.get("table_review") or {}
+        if review.get("status") in {"unverified", "partial"}:
+            review_reasons["partial" if review["status"] == "partial" else review.get("reason", "unknown")] += 1
+    stats["table_reviews_unverified"] = sum(review_reasons.values())
+    for reason, count in sorted(review_reasons.items()):
+        key, message = review_labels.get(reason, ("table_source_alignment", "tables retain source text whose cell alignment needs review"))
+        flag(key, f"{count} {message}", count)
     truncated = sum(bool(b.metadata.get("vlm_truncated")) for b in evidence_blocks)
     stats["visual_outputs_truncated"] = truncated
     if truncated:

@@ -374,6 +374,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
             # Deferred-but-present files seed the seen set; schedule_file may
             # still re-key a moved file below, which is why this is not simply
             # current_seen_ids.
+            if getattr(args, "repair_indexes", False):
+                from .storage.publication import repair_indexes
+                repaired = repair_indexes(state_con, get_storage(settings), source.kb_id,
+                                           ingest_run_id=run_id, dry_run=args.dry_run)
+                stats.jobs += repaired
+                print(f"[scan] index repair kb={source.kb_id} documents={repaired} dry_run={args.dry_run}")
             seen_ids: set[int] = set(too_recent_keys)
             for file in files:
                 change_type, job_id = schedule_file(
@@ -1372,6 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser("scan")
     scan.add_argument("--dry-run", action="store_true")
+    scan.add_argument("--repair-indexes", action="store_true", help="Verify published chunks after restore and queue missing document indexes")
     scan.add_argument("--limit", type=int, default=None)
     scan.add_argument("--source", default=None, help="Source key; see `kb config`")
     scan.add_argument("--no-detect-deletes", action="store_true", help="Skip delete detection for this scan")

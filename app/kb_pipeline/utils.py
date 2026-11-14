@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,12 @@ def load_env_file(path: str | Path) -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip().strip("'\"")
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            parts = shlex.split(value, comments=True)
+            if len(parts) != 1:
+                raise ValueError(f"Invalid environment value for {key}")
+            value = parts[0]
         os.environ.setdefault(key, value)
 
 

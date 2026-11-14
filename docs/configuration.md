@@ -39,6 +39,8 @@ API Key; embedding endpoints also specify dimensions. Text embeddings are
 required, while the other three roles can be disabled individually. Deploying
 and starting model servers remains separate from configuring their endpoints.
 
+A different endpoint can expose a different vector space even when its model ID and dimensions match. Changing the endpoint, model or dimensions requires reinitializing existing indexes first. Rotating credentials or adjusting batch size and concurrency retains the indexes.
+
 Each LLM has **Multimodal** and **Request concurrency** settings. Mark a model as
 multimodal to make it selectable for image descriptions (currently via the
 OpenAI-compatible protocol). Saving a multimodal model sends a synthetic image
@@ -64,7 +66,7 @@ Parsing workers read settings after claiming each new task; newly started graph
 jobs read them too. Search refreshes within a minute. Saving does not trigger
 parsing or graph building. Batch size and request concurrency take effect on the
 next task, without rebuilding indexes or invalidating image-vector caches. Other
-embedding changes wait for active parsing and graph jobs to finish. The console rejects a different embedding model or dimension
+embedding changes wait for active parsing and graph jobs to finish. The console rejects a different embedding endpoint URL, model ID or dimension
 while indexes exist. Changing vector spaces requires reinitializing the indexes
 and generating new vectors; changing dimensions also requires recreating the
 knowledge-base collections. Reranker changes do not require reindexing.

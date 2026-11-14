@@ -49,6 +49,7 @@ class SearchRequest(BaseModel):
 
 
 class ContextRequest(BaseModel):
+    chunk_revision: str | None = None
     kb_id: str
     doc_id: str
     content_version: str | None = None
@@ -94,7 +95,7 @@ class FactsRequest(BaseModel):
     doc_id: str | None = Field(default=None, max_length=200)       # 只要出自这份文档的事实
     rel_path: str | None = Field(default=None, max_length=1000)    # 或按库内路径指定文档
     conflict_only: bool = False                                    # 只要带跨文档冲突组的事实;主体、属性、文档、本项至少给一个
-    history: bool = False                                          # 序列里更早的档位、被取代 / 过期的也要
+    history: bool = False                                          # 也纳入被显式文档治理规则隐藏的来源
     as_of: str | None = Field(default=None, pattern=AS_OF_PATTERN)
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0, le=1_000_000)
@@ -245,7 +246,7 @@ def search(req: SearchRequest) -> dict[str, Any]:
 @router.post("/context", dependencies=[Depends(require_token)])
 def context(req: ContextRequest) -> dict[str, Any]:
     return _wrap(service.context, req.kb_id, req.doc_id, req.chunk_from, req.chunk_to,
-                 content_version=req.content_version, history=req.history, as_of=req.as_of)
+                 content_version=req.content_version, chunk_revision=req.chunk_revision, history=req.history, as_of=req.as_of)
 
 
 @router.get("/image/{kb_id}/{point_id}", dependencies=[Depends(require_token)])

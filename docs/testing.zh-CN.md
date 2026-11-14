@@ -11,6 +11,7 @@ Carrel 将源码回归、部署检查和真实知识库评测分别维护。每�
 | 治理 | `test_correction_api`、`test_enrollment_corrections` | 更正校验和适用范围、证据失效、知识库身份隔离及并发修改。 |
 | 检索与智能体 | `test_search`、`test_retrieval_quality`、`test_dual_rerank`、`test_search_skill` | 排名、证据质量、来源范围与智能体接口结构。 |
 | 生命周期与控制台 | `test_scanner_worker`、`test_graph_build`、`test_console_api`、`test_console_stage_language` | 队列归属、取消、续跑、版本发布、中英文显示和进度。 |
+| 发布与访问边界 | `test_publication_integrity`、`test_audit_boundaries` | 部分写入、旧引用、恢复核对、批量向量对应、子路径鉴权和重定向处理。 |
 | 公共部署 | `test_deployment`、`test_remote_vlm_deployment`、`test_reranker_endpoints`、`test_maintenance_ops` | 公共 Compose 组合、接口配置、本地服务控制及维护模板。 |
 | 平台集成 | `test_macos_sync` 及 `test_maintenance_ops` 中的已安装单元检查 | 特定主机的脚本行为和服务定义。 |
 

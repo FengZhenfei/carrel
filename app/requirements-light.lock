@@ -5,4 +5,4 @@ duckdb==2.0.0
 lance-namespace==0.13.0
 lance-namespace-urllib3-client==0.13.0
 lancedb==0.41.0
-pyarrow==22.0.0
+pyarrow==23.0.1

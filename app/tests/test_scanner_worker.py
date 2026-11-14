@@ -1301,7 +1301,7 @@ class ParseCommitPointTests(unittest.TestCase):
             h.hooks["upsert"] = lambda: db.request_job_cancel(h.con, h.job_id, "cancelled from the console")
             result = worker_mod.run_once(h.con, settings=h.settings)
             self.assertTrue(result.startswith("parse-done:"), result)
-            self.assertEqual(h.calls[-4:], ["upsert", "mark_old", "mark_stale", "fts"])
+            self.assertEqual(h.calls[-4:], ["upsert", "collection", "mark_stale", "fts"])
             self.assertEqual(self._job(h)["status"], "done")
             self.assertEqual(self._indexed(h), (1, True))      # the state database caught up with the vector store
 
@@ -1313,13 +1313,13 @@ class ParseCommitPointTests(unittest.TestCase):
             raise RuntimeError("qdrant went away")
 
         with tempfile.TemporaryDirectory() as tmp, _parse_harness(tmp) as h:
-            h.hooks["mark_old"] = cancel_then_fail
+            h.hooks["upsert"] = cancel_then_fail
             result = worker_mod.run_once(h.con, settings=h.settings)
             self.assertTrue(result.startswith("retry:"), result)
             job = self._job(h)
             self.assertEqual((job["status"], int(job["retry_count"]), int(job["cancel_requested"] or 0)), ("retry", 1, 0))
             # the retry is no longer stopped by the old cancellation and finishes the indexing
-            del h.hooks["mark_old"]
+            del h.hooks["upsert"]
             h.con.execute("UPDATE jobs SET next_attempt_at = 0 WHERE job_id = ?", (h.job_id,))
             h.con.commit()
             result = worker_mod.run_once(h.con, settings=h.settings)
@@ -2180,18 +2180,6 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 busy, _ = maintenance.service_busy(stub)
             self.assertTrue(busy)
 
-    def test_fts_degrade_branches_assign_fts_result(self) -> None:
-        """B1 / B5: the keyword-index degradation branch must assign fts_result, and the empty-document path needs the
-        same degradation."""
-        src = _repo_file("app/kb_pipeline/pipeline/parse_job.py")
-        main = src.split('stage("Keyword indexing")', 1)[1].split('stage("Done", force=True)', 1)[0]
-        degraded = main.split("except Exception as exc:", 1)[1]
-        self.assertIn('fts_result = {"inserted_rows": 0, "deferred": True}', degraded)
-        empty = src.split("def _finish_empty_document", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("try:\n        fts_result = store.keywords.sync_document(", empty)
-        self.assertIn('fts_result = {"inserted_rows": 0, "deferred": True}', empty)
-        self.assertIn("_defer_fts_sync(", empty)      # 09-06 evening: the compensation job became its own fts_sync type (F06)
-
     def test_unsupported_route_is_a_deterministic_failure(self) -> None:
         """B6: a format with no parse route raises NonRetryableParseError, and the worker no longer goes through 5
         backoff rounds."""
@@ -2279,7 +2267,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 # 2. The worker runs the compensation: OpenSearch still down → backoff retry, the failure record still
                 #    hangs under it
                 with mock.patch("kb_pipeline.storage.standard.vector_client"), \
-                        mock.patch.object(worker_mod, "_sync_fts_doc", side_effect=RuntimeError("still down")):
+                        mock.patch("kb_pipeline.storage.publication.reconcile_document", side_effect=RuntimeError("still down")):
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("retry:"), result)
                 self.assertEqual(con.execute("SELECT status FROM jobs WHERE job_id=?", (fts_job,)).fetchone()[0], "retry")
@@ -2294,7 +2282,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 # 4. OpenSearch is back: the worker rewrites the index from the active points, the job completes and
                 #    the failure record is resolved
                 with mock.patch("kb_pipeline.storage.standard.vector_client"), \
-                        mock.patch.object(worker_mod, "_sync_fts_doc") as synced:
+                        mock.patch("kb_pipeline.storage.publication.reconcile_document") as synced:
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("fts-sync-done:"), result)
                 synced.assert_called_once()
@@ -2307,7 +2295,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                                        file_key=file.file_key, job_type="fts_sync", priority=60,
                                        payload={"content_version": "old-version"}, dedupe_key=db.fts_sync_dedupe_key(fid, "old-version"))
                 with mock.patch("kb_pipeline.storage.standard.vector_client"), \
-                        mock.patch.object(worker_mod, "_sync_fts_doc") as synced:
+                        mock.patch("kb_pipeline.storage.publication.reconcile_document") as synced:
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("fts-sync-done:"), result)
                 synced.assert_not_called()

@@ -6,8 +6,8 @@
 
 每个库的模式(自动归纳的、人工上传的)以 LinkML 子集为原生格式存进版本环:
 · 类型是 class,is_a 指向上层类或另一个类型(多层);abstract 的类型不进抽取菜单,只用来按上层查询;
-· 关系是 slot,domain / range(或 any_of)指向类;没写 multivalued 的关系按多值处理,
-  只有显式写 multivalued: false 的才做「新值取代旧值」;
+· 关系是 slot,domain / range(或 any_of)指向类。没写 multivalued 的关系按多值处理。
+  显式写 multivalued: false 声明单值,建图保留各来源的陈述并统计有多个候选值的组。
 · 作用域(global 跨文档 / document 按文档隔开)、语言、场景画像放 annotations。
 Carrel 只读写这个子集;完整校验、生成 OWL / SHACL 留在插件侧用 LinkML 工具链做。
 

@@ -412,67 +412,43 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         )
         for chunk in chunks
     ]
-    # From here on the job counts as committed; the later stages only record progress and no longer check for
-    # cancellation: points are being written to the vector store, and stopping now would leave "new chunks in the
-    # vector store, old chunks in the state database", which a re-parse of the same version does not heal
-    # because the scan judges the file unchanged.
+    from ..utils import stable_json_hash
+    revision = stable_json_hash([c.chunk_uid for c in chunks])
+    for payload in payloads:
+        payload["chunk_revision"] = revision
+    # Complete this publication before accepting a cancellation. Unpublished
+    # points remain invisible if a write fails or the worker exits.
     committed[0] = True
-    store.chunks.write(
-        collection,
-        point_ids,
-        named_vectors,
-        payloads,
-        max_bytes=settings.qdrant_upsert_max_bytes,
-    )
-    store.chunks.retire_previous(
-        collection,
-        kb_id=str(write_row["kb_id"]),
-        file_key=int(write_row["file_key"]),
-        active_content_version=content_version,
-    )
-    stale_points = store.chunks.retire_stale(
-        collection,
-        kb_id=str(write_row["kb_id"]),
-        file_key=int(write_row["file_key"]),
-        active_chunk_uids={chunk.chunk_uid for chunk in chunks},
-    )
-    if stale_points:
-        print(f"[parse] inactive stale qdrant points={stale_points} file={file_row['source_path']}", flush=True)
-
-
-    stage("Keyword indexing")
-    # The keyword index is retrieval's second leg, not a precondition for indexing. The Qdrant points are
-    # already written at this point: letting an OpenSearch fault fail the whole job would only rerun the full
-    # MinerU + embedding 5 times and still leave the "Qdrant has the new version, SQLite records the old one"
-    # inconsistency. Degrade to one failures record + a separate (idempotent) fts_sync job.
-    try:
-        fts_result = store.keywords.sync_document(
-            collection=collection,
-            doc_id=f"{write_row['kb_id']}:{write_row['file_key']}",
+    from ..storage.publication import publication_lock
+    con.commit()  # progress events must not hold SQLite's write lock while waiting
+    with publication_lock(settings.state_db, collection):
+        store.chunks.write(
+            collection,
+            point_ids,
+            named_vectors,
+            payloads,
+            max_bytes=settings.qdrant_upsert_max_bytes,
         )
-        print(
-            f"[fts] sync-doc collection={collection} doc_id={fts_result['doc_id']} "
-            f"deleted={fts_result.get('deleted_rows')} inserted={fts_result.get('inserted_rows')}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[fts] sync deferred collection={collection} error={exc!r}", flush=True)
-        event(f"Keyword indexing failed, a retry task was queued: {exc!r}"[:600])
-        # The degraded branch must assign fts_result too: the return string at the end of the function refers
-        # to it, and leaving it out means a NameError, with the job recorded as failed and retried 5 times --
-        # while Qdrant and SQLite were actually both written (2026-09-06 health check B1)
-        fts_result = {"inserted_rows": 0, "deferred": True}
-        _defer_fts_sync(con, job, write_row, collection=collection, content_version=content_version, exc=exc)
+        cleanup_id = _publish_document(con, job, write_row, chunks, point_ids, parser_profile, chunk_diag=chunk_diag)
+
+        stage("Keyword indexing")
+        # The ledger is published. Retire obsolete points and refresh keywords;
+        # a failure leaves the durable cleanup job to retry without parsing again.
+        try:
+            from ..storage.publication import reconcile_document
+            fts_result = reconcile_document(store, con, write_row)
+            con.execute("DELETE FROM jobs WHERE job_id=? AND status='queued'", (cleanup_id,))
+            print(
+                f"[fts] sync-doc collection={collection} doc_id={fts_result['doc_id']} "
+                f"deleted={fts_result.get('deleted_rows')} inserted={fts_result.get('inserted_rows')}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[fts] sync deferred collection={collection} error={exc!r}", flush=True)
+            event(f"Index cleanup failed, a retry task was queued: {exc!r}"[:600])
+            fts_result = {"inserted_rows": 0, "deferred": True}
+            _defer_fts_sync(con, job, write_row, collection=collection, content_version=content_version, exc=exc)
     stage("Done", force=True)
-    db.replace_chunks(
-        con,
-        file_id=str(write_row["file_id"]),
-        collection=str(write_row["collection"]),
-        content_version=content_version,
-        chunks=chunks,
-        point_ids=point_ids,
-    )
-    db.mark_file_indexed(con, str(write_row["file_id"]), content_version, parser_profile, chunk_diag=chunk_diag)
     elapsed = int(time.time() - started)
     print(
         f"[parse] done job={job['job_id']} chunks={len(chunks)} points={len(point_ids)} "
@@ -600,7 +576,7 @@ def _defer_fts_sync(con, job, write_row, *, collection: str, content_version: st
         file_key=int(write_row["file_key"]),
         job_type="fts_sync",
         priority=60,
-        payload={"reason": "fts sync retry after OpenSearch failure", "content_version": content_version},
+        payload={"reason": "retry document index cleanup", "content_version": content_version},
         dedupe_key=db.fts_sync_dedupe_key(str(write_row["file_id"]), content_version),
     )
     db.add_failure(
@@ -612,6 +588,30 @@ def _defer_fts_sync(con, job, write_row, *, collection: str, content_version: st
         error_message=str(exc),
     )
     return fts_job_id
+
+def _publish_document(con, job, row, chunks, point_ids, parser_profile, *, chunk_diag=None, missing_source=False):
+    """One SQLite commit publishes a whole document plus its cleanup task."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        current = db.get_file_by_id(con, str(row["file_id"]))
+        if not current or current["status"] == "deleted" or current["content_version"] != row["content_version"]:
+            raise JobCancelled("document changed during publication")
+        db.replace_chunks(con, file_id=row["file_id"], collection=row["collection"],
+                          content_version=row["content_version"], chunks=chunks, point_ids=point_ids)
+        db.mark_file_indexed(con, row["file_id"], row["content_version"], parser_profile, chunk_diag=chunk_diag)
+        if missing_source:
+            con.execute("UPDATE files SET status='skipped',indexed_version=NULL,indexed_parser_profile=NULL WHERE file_id=?", (row["file_id"],))
+        cleanup_id = db.enqueue_job(con, ingest_run_id=str(job["ingest_run_id"] or "") or None,
+            file_id=row["file_id"], kb_id=row["kb_id"], collection=row["collection"], file_key=row["file_key"],
+            job_type="fts_sync", priority=60,
+            payload={"reason": "finish document publication", "content_version": row["content_version"]},
+            dedupe_key=db.fts_sync_dedupe_key(row["file_id"], row["content_version"]))
+        con.commit()
+        return cleanup_id
+    except BaseException:
+        con.rollback()
+        raise
+
 
 def _finish_empty_document(
     con: sqlite3.Connection,
@@ -643,39 +643,19 @@ def _finish_empty_document(
 
     store = get_storage(settings)
     collection = str(write_row["collection"])
-    stale_points = 0
-    if store.chunks.exists(collection):
-        stale_points = store.chunks.retire_stale(
-            collection,
-            kb_id=str(write_row["kb_id"]),
-            file_key=int(write_row["file_key"]),
-            active_chunk_uids=set(),
-        )
-    try:
-        fts_result = store.keywords.sync_document(
-            collection=collection,
-            doc_id=f"{write_row['kb_id']}:{write_row['file_key']}",
-        )
-    except Exception as exc:
-        # Same degradation as the main path: the keyword index is not a precondition for indexing; on an
-        # OpenSearch fault record one failures row + queue an idempotent retry job, and the empty document is
-        # still marked indexed (2026-09-06 health check B5)
-        print(f"[fts] sync deferred (empty document) collection={collection} error={exc!r}", flush=True)
-        _defer_fts_sync(con, job, write_row, collection=collection, content_version=content_version, exc=exc)
-        fts_result = {"inserted_rows": 0, "deferred": True}
-    db.mark_chunks_inactive(con, str(write_row["file_id"]))
-    if missing_source:
-        con.execute("UPDATE files SET status='skipped', indexed_version=NULL, indexed_parser_profile=NULL WHERE file_id=? AND content_version=?",
-                    (str(write_row["file_id"]), content_version))
-        db.add_job_event(con, str(job["job_id"]), "info", "Git LFS original missing; placeholder content removed from active indexes")
-        return f"parse-missing-source:{job['job_id']}:inactive_points={stale_points}"
-    db.mark_file_indexed(con, str(write_row["file_id"]), content_version, parser_profile)
-    print(
-        f"[parse] empty document indexed file={write_row['source_path']} "
-        f"inactive_points={stale_points} fts_rows={fts_result['inserted_rows']}",
-        flush=True,
-    )
-    return f"parse-empty:{job['job_id']}:inactive_points={stale_points}"
+    from ..storage.publication import publication_lock, reconcile_document
+    con.commit()
+    with publication_lock(settings.state_db, collection):
+        retired = con.execute("SELECT count(*) FROM chunks WHERE file_id=? AND status='active'",
+                              (write_row['file_id'],)).fetchone()[0]
+        cleanup_id = _publish_document(con, job, write_row, [], [], parser_profile, missing_source=missing_source)
+        try:
+            reconcile_document(store, con, write_row)
+            con.execute("DELETE FROM jobs WHERE job_id=? AND status='queued'", (cleanup_id,))
+        except Exception as exc:
+            _defer_fts_sync(con, job, write_row, collection=collection, content_version=content_version, exc=exc)
+    outcome = "parse-missing-source" if missing_source else "parse-empty"
+    return f"{outcome}:{job['job_id']}:inactive_points={retired}"
 
 
 def vlm_progress_callback(stage_cb, model_id=None):

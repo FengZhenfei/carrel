@@ -149,16 +149,39 @@ the next one as usual.
 Maintenance covers project data by default. Set `KB_HOST_HOUSEKEEPING=1` to
 also clear user-level uv/pip caches and prune Docker caches.
 
+### Backup and restore
+
 The nightly backup keeps what cannot be recomputed: the state database
 (library configuration, model registry, extraction and fact caches), the
 pipeline env file, the compose `.env` and the evaluation sets under
 `runtime/eval`, as plain copies in `backups/state/<stamp>/` with the newest
 `KB_BACKUP_KEEP` (7) kept. Vectors, indexes, graphs and the parse cache are
-rebuilt from the mirror. To restore, stop the timers and the two services, put
-the env files and `runtime/state/kb-pipeline.db` back from the newest copy,
-start the containers with `docker compose up -d`, then the services and the
-timers; with the caches in the state database intact, a full rebuild does not
-call the remote models again.
+rebuilt from the mirror. To restore, stop the scheduler and application services,
+restore the env files and `runtime/state/kb-pipeline.db`, and start the storage
+services. Before resuming normal work, run the following with the restored env:
+
+```bash
+kb scan --repair-indexes --no-detect-deletes --dry-run
+kb scan --repair-indexes --no-detect-deletes
+kb worker --once --max-jobs 100000
+kb status
+kb fts rebuild
+kb graph build
+```
+
+`--repair-indexes` checks every published chunk against the storage backend and
+queues ordinary parsing for documents whose index is missing or incomplete. A
+storage connection error stops verification; it does not schedule a rebuild.
+Finish pending parsing before running this check. Keyword rebuilding follows
+successful ingestion; `graph build` rebuilds the enabled graphs. Resume the
+scheduler after verification and a source readback succeed.
+
+MinerU output can be reused when the parse cache, source bytes and parser settings
+match. Embeddings are generated again for restored indexes. Graph extraction can
+reuse matching entries from the restored state database; new or changed units
+still call the configured model. **Reparse entire library** explicitly refreshes
+parse caches; it is not required for this recovery workflow.
+
 
 ## CLI reference
 
