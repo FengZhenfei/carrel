@@ -12,7 +12,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:v0.21.0
 FROM ${BASE_IMAGE}
 
 ARG FLAVOR=gpu
-ARG MINERU_VERSION=3.4.4
+ARG MINERU_VERSION=3.4.5
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 ENV PIP_INDEX_URL=${PIP_INDEX_URL} \

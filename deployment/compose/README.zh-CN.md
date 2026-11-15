@@ -51,8 +51,14 @@ docker compose logs -f app
 `CARREL_IMAGE=carrel-app:local` 是本地构建的镜像名称。使用已发布镜像时，
 将 `CARREL_IMAGE` 改为对应镜像地址，执行 `docker compose pull app`，
 再执行 `docker compose up -d --no-build app`。
-仓库的镜像工作流可在版本标签或手动触发时构建 amd64、arm64 镜像；
-增加工作流本身不会发布镜像。
+镜像工作流发布 amd64、arm64 应用镜像。主分支推送会更新
+`ghcr.io/fengzhenfei/carrel:main` 和 `sha-<提交号>` 标签；版本标签推送发布对应的
+版本镜像。主分支更新不会覆盖版本标签或 `latest`，也支持手动触发。
+
+MinerU 由 Compose 单独构建，默认版本为 **3.4.5**。已有部署需将 `.env` 中的
+`MINERU_VERSION` 改为 `3.4.5`，再执行 `docker compose up -d --build mineru`。
+仅拉取应用镜像不会升级解析服务。保留原有模型和输出挂载目录，升级不会主动触发
+重新解析或建图。缓存结果保留原解析版本，新结果记录 MinerU 实际返回的版本。
 
 需要镜像加速时，可配置 `CARREL_PYTHON_IMAGE`、`MINERU_BASE_IMAGE` 和数据库镜像地址。
 `PIP_INDEX_URL` 设置构建时的 Python 包索引。GPU 解析使用

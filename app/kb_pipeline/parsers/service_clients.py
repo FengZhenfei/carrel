@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -10,6 +11,17 @@ import requests
 
 from ..parse_cache import reusable_in_run, write_cache
 from .mineru_backend import resolve_backend
+
+
+def mineru_parser_profile(payload: dict, fallback: str) -> str:
+    """Describe the producer of this result, including cache reads."""
+    producer = payload.get("_kb_mineru") or {}
+    version = str(producer.get("version") or "") if isinstance(producer, dict) else ""
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        version = str(payload.get("version") or "")
+    if re.fullmatch(r"\d+\.\d+\.\d+", version):
+        return re.sub(r"^mineru-\d+\.\d+\.\d+-", f"mineru-{version}-", fallback)
+    return fallback
 
 
 def _local_service_session() -> requests.Session:

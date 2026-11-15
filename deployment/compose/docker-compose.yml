@@ -48,13 +48,13 @@ services:
     networks: [carrel]
 
   mineru:
-    image: carrel-mineru:${MINERU_VERSION:-3.4.4}-${MINERU_FLAVOR:-cpu}
+    image: carrel-mineru:${MINERU_VERSION:-3.4.5}-${MINERU_FLAVOR:-cpu}
     build:
       context: ./mineru
       args:
         FLAVOR: ${MINERU_FLAVOR:-cpu}
         BASE_IMAGE: ${MINERU_BASE_IMAGE:-python:3.12-slim}
-        MINERU_VERSION: ${MINERU_VERSION:-3.4.4}
+        MINERU_VERSION: ${MINERU_VERSION:-3.4.5}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         TORCH_CPU_INDEX_URL: ${TORCH_CPU_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     container_name: ${COMPOSE_PROJECT_NAME:-carrel}-mineru

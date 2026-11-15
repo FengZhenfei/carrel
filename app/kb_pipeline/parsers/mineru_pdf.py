@@ -9,7 +9,7 @@ from ..models import ParsedBlock
 from ..headings import detect_toc_pages
 from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, clean_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx, walk_dicts
-from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
+from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown, mineru_parser_profile
 from .mineru_quality import merge_table_placeholders, recover_pdf_items
 from .pdf_code import repair_code_items
 from .pdf_table_layout import attach_table_notes
@@ -164,7 +164,7 @@ def mineru_pdf_blocks(
         blocks.append(
             ParsedBlock(
                 parser="mineru",
-                parser_profile=PDF_PARSER_PROFILE,
+                parser_profile=mineru_parser_profile(payload, PDF_PARSER_PROFILE),
                 doc_type="pdf",
                 block_type=block_type,
                 text=text,
@@ -188,7 +188,7 @@ def mineru_pdf_blocks(
     return markdown_to_blocks(
         clean_text(md),
         parser="mineru",
-        parser_profile=PDF_PARSER_PROFILE,
+        parser_profile=mineru_parser_profile(payload, PDF_PARSER_PROFILE),
         doc_type="pdf",
     )
 

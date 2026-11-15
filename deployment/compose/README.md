@@ -55,8 +55,17 @@ docker compose logs -f app
 `CARREL_IMAGE=carrel-app:local` names the locally built image. To use an already
 published image, set `CARREL_IMAGE` to its registry reference, then run
 `docker compose pull app` and `docker compose up -d --no-build app`.
-The repository's image workflow builds both amd64 and arm64 images on version tags
-or manual dispatch. Adding the workflow does not publish an image by itself.
+The image workflow publishes amd64 and arm64 application images. Main-branch pushes
+update `ghcr.io/fengzhenfei/carrel:main` and a `sha-<commit>` tag; version-tag pushes
+publish the corresponding release image. Main updates leave release tags and `latest`
+unchanged. Manual dispatch is also supported.
+
+MinerU is built separately by Compose and defaults to **3.4.5**. For an existing
+installation, set `MINERU_VERSION=3.4.5` in `.env`, then run
+`docker compose up -d --build mineru`. Pulling the application image alone does not
+upgrade the parser. Keep the existing model and output mounts: an upgrade does not
+schedule reparsing or graph rebuilding. Cached results retain their producer version;
+new results record the version returned by MinerU.
 
 For a registry mirror, set `CARREL_PYTHON_IMAGE`, `MINERU_BASE_IMAGE` and the database
 image variables. `PIP_INDEX_URL` controls the Python package index used during build.

@@ -7,7 +7,7 @@ from typing import Any
 from ..models import ParsedBlock
 from .common import bbox, caption_of, clean_text, footnote_of, item_text, label_of, markdown_to_blocks, maybe_int
 from .mineru_pdf import MinerUServiceError, resolve_image_path, save_mineru_images
-from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
+from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown, mineru_parser_profile
 
 
 def mineru_pptx_blocks(
@@ -41,7 +41,7 @@ def mineru_pptx_blocks(
         return markdown_to_blocks(
             md,
             parser="mineru",
-            parser_profile="mineru-3.4.4-pptx-v1",
+            parser_profile=mineru_parser_profile(payload, "mineru-3.4.4-pptx-v1"),
             doc_type="pptx",
         )
 
@@ -75,7 +75,7 @@ def mineru_pptx_blocks(
         blocks.append(
             ParsedBlock(
                 parser="mineru",
-                parser_profile="mineru-3.4.4-pptx-v1",
+                parser_profile=mineru_parser_profile(payload, "mineru-3.4.4-pptx-v1"),
                 doc_type="pptx",
                 block_type=block_type,
                 text=text,
@@ -134,7 +134,7 @@ def aggregate_mineru_slide_blocks(blocks: list[ParsedBlock], path: Path) -> list
         merged.append(
             ParsedBlock(
                 parser="mineru",
-                parser_profile="mineru-3.4.4-pptx-v1+slide-merge-v1",
+                parser_profile=slide_blocks[0].parser_profile + "+slide-merge-v1",
                 doc_type="pptx",
                 block_type="slide",
                 text=text,

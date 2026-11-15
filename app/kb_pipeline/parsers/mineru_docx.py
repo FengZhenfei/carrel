@@ -6,7 +6,7 @@ from ..models import ParsedBlock
 from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx
 from .mineru_pdf import MinerUServiceError, resolve_image_path, save_mineru_images
-from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown
+from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown, mineru_parser_profile
 
 def _table_meta(item: dict, block_type: str) -> dict:
     """Table blocks: rows whose stacked lines MinerU concatenated into one string are flagged first
@@ -49,7 +49,7 @@ def mineru_docx_blocks(
         return markdown_to_blocks(
             md,
             parser="mineru",
-            parser_profile="mineru-3.4.4-docx-v1",
+            parser_profile=mineru_parser_profile(payload, "mineru-3.4.4-docx-v1"),
             doc_type="docx",
         )
 
@@ -101,7 +101,7 @@ def mineru_docx_blocks(
         blocks.append(
             ParsedBlock(
                 parser="mineru",
-                parser_profile="mineru-3.4.4-docx-v1",
+                parser_profile=mineru_parser_profile(payload, "mineru-3.4.4-docx-v1"),
                 doc_type="docx",
                 block_type=block_type,
                 text=text,
