@@ -397,6 +397,26 @@ def normalize_result(data: Any) -> dict[str, Any]:
     return result
 
 
+def _raw_tail_runaway(raw: str, finish_reason: str) -> bool:
+    """Inspect an unfinished JSON string before prefix repair discards it.
+
+    Repeated JSON keys or complete table cells are not a runaway tail. Only a
+    long, highly repetitive unfinished string in a length-limited reply counts.
+    """
+    if finish_reason != "length":
+        return False
+    start = None
+    escaped = False
+    for i, char in enumerate(raw):
+        if escaped:
+            escaped = False
+        elif char == "\\" and start is not None:
+            escaped = True
+        elif char == '"':
+            start = i + 1 if start is None else None
+    return start is not None and _compressible(raw[start:])
+
+
 def complete_json_prefix(raw: str) -> str | None:
     """A truncated schema-constrained response is a valid-JSON *prefix* (the
     grammar guarantees no syntax error before the cut). Closing the open
@@ -580,6 +600,10 @@ def caption_image(
                 or (data.get("decorative") is True and data.get("confidence") == "high")):
             data = None
 
+    if data is not None and _raw_tail_runaway(content, finish_reason):
+        data["runaway"] = True
+    first_data = data if data and any(data.get(k) for k in ("summary", "title", "facts", "text_verbatim", "entities")) else None
+    first_finish = finish_reason
     length_retried = False
     _log_caption_usage(resp, max_tokens)
     if (finish_reason == "length" and data and not data.get("runaway") and max_tokens < 8192
@@ -594,8 +618,11 @@ def caption_image(
         try:
             retry_response = _compatible_completion(client, CompatibleRequest(base_url, model_id, "openai", retry_body), api_key=api_key)
             _log_caption_usage(retry_response, retry_body[token_key])
-            candidate = parse_jsonish(retry_response.choices[0].message.content or "")
+            candidate_content = retry_response.choices[0].message.content or ""
+            candidate = parse_jsonish(candidate_content)
             candidate_finish = str(getattr(retry_response.choices[0], "finish_reason", "") or "")
+            if _raw_tail_runaway(candidate_content, candidate_finish):
+                candidate["runaway"] = True
             if (not candidate.get("runaway") and any(candidate.get(k) for k in ("summary", "facts", "text_verbatim", "entities"))
                     and (candidate_finish == "stop" or len(json.dumps(candidate)) >= len(json.dumps(data or {})))):
                 data, finish_reason = candidate, candidate_finish
@@ -628,12 +655,23 @@ def caption_image(
             }
         ]
         degraded_request = CompatibleRequest(base_url, model_id, "openai", retry)
-        resp = _compatible_completion(client, degraded_request, api_key=api_key)
+        try:
+            resp = _compatible_completion(client, degraded_request, api_key=api_key)
+        except JobCancelled:
+            raise
+        except Exception:
+            if not first_data:
+                raise
+            resp = None
         constrained = "response_format" in degraded_request.body
-        content = resp.choices[0].message.content or ""
-        finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
+        content = (resp.choices[0].message.content or "") if resp else ""
+        finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "") if resp else first_finish
         obj = parse_structured(content) if constrained else None
         data = normalize_result(obj) if obj is not None else parse_jsonish(content)
+        if _raw_tail_runaway(content, finish_reason):
+            data["runaway"] = True
+        if first_data and not any(data.get(k) for k in ("summary", "facts", "text_verbatim", "entities")):
+            data, finish_reason = first_data, first_finish
         data["vlm_degraded_retry"] = True
         if data.get("runaway"):
             # Still repeating despite the stronger repetition penalty: the runaway items were already

@@ -14,7 +14,7 @@ from .pdf_longpage import prepare_long_pages, restore_page_coordinates
 from ..vision.vlm import compose_prompt
 from .table_check import high_confidence
 from .table_repair import repair_ambiguous_tables
-from .table_repair import review_pdf_tables
+from .table_repair import review_pdf_tables, route_image_only_tables
 from .pdf_evidence import add_pdf_region_evidence, supplement_visible_forms
 from .pdf_code import recover_native_code
 from .pdf_table_layout import restore_ruled_continuation_columns
@@ -114,6 +114,7 @@ def parse_pdf_enhanced(
     # Review original per-page tables before cross-page merging changes ownership.
     review_pdf_tables(blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
                       cache_dir=cache_dir, vlm_options=vlm_options)
+    route_image_only_tables(blocks)
     blocks = merge_mineru_text_blocks(blocks, target_tokens=merge_target_tokens)
     blocks = merge_split_tables(blocks)
     if layer_info.get("lost"):

@@ -25,7 +25,7 @@ from ..vision.images import file_hash
 from .common import grid_to_markdown, html_table_to_grid, html_table_spans
 from .table_check import GLUED_KINDS, expand_glued_rows, high_confidence
 from .errors import JobCancelled
-from .pdf_evidence import normalize_ranges, _span_present, table_evidence_text
+from .pdf_evidence import normalize_ranges, _span_present, source_span_present, table_evidence_text
 
 TABLE_ROWS_PROMPT = """This image is a table cropped from a document. Some cells contain several lines stacked vertically (one line per test condition), and an OCR pass merged those lines into one string.
 The table has {width} columns; its header row reads: {header}.
@@ -392,6 +392,104 @@ def _missing_source_lines(missing: list[str], native: str, spans: list[dict]) ->
     return list(dict.fromkeys(lines + [span for span in missing if span not in covered]))
 
 
+def _source_cells(block: ParsedBlock) -> list[list[str]]:
+    # Native cells and the review image cover only page_idx/bbox. MinerU may
+    # already have merged continuation pages into this block before review.
+    if block.metadata.get("page_end", block.page_idx) != block.page_idx:
+        return []
+    regions = block.metadata.get("source_regions") or block.metadata.get("table_source_regions") or []
+    for region in regions:
+        box = region.get("bbox")
+        if (region.get("page") != block.page_idx or not box or not block.bbox
+                or box[0] < block.bbox[0] or box[1] < block.bbox[1]
+                or box[2] > block.bbox[2] or box[3] > block.bbox[3]):
+            return []
+    rows = [list(row) for row in block.metadata.get("table_native_grid") or [] if any(c.strip() for c in row)]
+    if not rows or len(rows[0]) < 2 or any(len(r) != len(rows[0]) for r in rows):
+        return []
+    if block.metadata.get("table_native_grid_strategy") == "text":
+        # Text-based extraction emits wrapped lines as separate rows. Fold only
+        # continuations of a unique printed first-column anchor, in source order.
+        folded = []
+        for row in rows:
+            if row[0].strip():
+                folded.append(row)
+            elif folded:
+                folded[-1] = [a + "\n" + b for a, b in zip(folded[-1], row)]
+            else:
+                return []
+        keys = [table_evidence_text(r[0]) for r in folded]
+        if len(keys) != len(set(keys)):
+            return []
+        rows = folded
+    return rows if len(rows) >= 2 else []
+
+
+def route_image_only_tables(blocks: list[ParsedBlock]) -> None:
+    """An image wrapped in an empty table still needs the normal visual reader.
+
+    This does not certify cell alignment. Keep the review status and source
+    location, and retain native text independently of the model's description.
+    """
+    for block in blocks:
+        if block.block_type != "table" or (block.metadata.get("table_review") or {}).get("status") == "accepted":
+            continue
+        if _pipe_grid(block.table_markdown or block.text):
+            continue  # A partially verified grid must not be replaced by a caption.
+        raw = str((block.metadata.get("source_item") or {}).get("table_body") or block.table_markdown or "")
+        if not re.search(r"<img\b", raw, re.I) or re.sub(r"<[^>]*>|\s", "", raw):
+            continue
+        image = Path(block.metadata.get("table_review_image") or block.visual_ref or "")
+        if not image.is_file():
+            continue
+        block.block_type = "image"
+        block.visual_ref = str(image)
+        block.table_markdown = None
+        outside = re.sub(r"<table\b[^>]*>.*?</table>", "", block.text, flags=re.I | re.S).strip()
+        native = "\n".join(str(block.metadata.get(k) or "") for k in
+                           ("table_source_text", "table_source_legend", "source_footnote")).strip()
+        block.text = "\n".join(x for x in (outside, native if native not in outside else "") if x)
+        block.metadata["visual_source_context"] = native
+        block.metadata["table_review"] = {"status": "unverified", "reason": "missing_table_body"}
+        block.metadata["image_only_table"] = True
+
+
+# Standard radical/ideograph equivalents not covered by NFKC. Unknown glyphs
+# stay literal; a radical must never act as a wildcard for another word.
+# https://www.unicode.org/Public/17.0.0/ucd/CJKRadicals.txt
+_SOURCE_RADICALS = str.maketrans("⺦⺰⻅⻈⻉⻋⻐⻓⻔⻙⻚⻛⻜⻠⻢⻥⻦⻧⻨⻩⻪⻬⻫⻮⻭⻰⻯⻳⻲",
+                               "丬纟见讠贝车钅长门韦页风飞饣马鱼鸟卤麦黄黾齐斉齿歯龙竜龟亀")
+
+
+def _matches_source_cells(source: list[list[str]], candidate: list[list[str]]) -> bool:
+    """Whole-cell equality: no moving values, dropping units or inventing rows."""
+    def cell(text):
+        text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).translate(_SOURCE_RADICALS)
+
+    if not source or len(source) != len(candidate):
+        return False
+    for left, right in zip(source, candidate):
+        if len(left) != len(right):
+            return False
+        for a, b in zip(left, right):
+            if cell(a) != cell(b):
+                return False
+    return True
+
+
+def _preserves_populated_cells(old: list[list[str]], new: list[list[str]]) -> bool:
+    # A blank in the PDF text layer is not evidence of a visually empty cell:
+    # it may contain a screenshot whose text was recovered only by OCR.
+    if not old:
+        return True
+    if len(old) != len(new) or any(len(a) != len(b) for a, b in zip(old, new)):
+        # Changed structure has no safe mapping from old cells to new blanks.
+        return all(cell.strip() for row in new for cell in row)
+    return all(not before.strip() or after.strip()
+               for a, b in zip(old, new) for before, after in zip(a, b))
+
+
 def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                       model_id: str, cache_dir: Path, vlm_options: dict | None = None) -> dict[str, int]:
     stats = {"requested": 0, "accepted": 0, "unverified": 0}
@@ -419,12 +517,13 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                   else "missing_table_body" if not old_grid else "ambiguous_row_keys" if not alignable
                   else "verification_incomplete")
         native_grid = block.metadata.get("table_native_grid") or []
+        source_cells = _source_cells(block)
         if (not identity_columns or len(native_grid) != len(old_grid)
                 or any(len(a) != len(b) for a, b in zip(old_grid, native_grid))
                 or any(_row_key(a, identity_columns) != _row_key(b, identity_columns)
                        for a,b in zip(old_grid,native_grid))):
             native_grid = []
-        if api_key and image.is_file() and alignable:
+        if api_key and image.is_file() and (alignable or source_cells):
             stats["requested"] += 1
             prompt = TABLE_EVIDENCE_PROMPT + "\n" + json.dumps({"text": native, "legend": legend}, ensure_ascii=False)
             cache = cache_dir / "table-review" / (file_hash(image) + "-" + hashlib.sha256(prompt.encode()).hexdigest()[:16] + ".json")
@@ -440,10 +539,15 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
             new_grid = data.get("rows") or []
             if not all(isinstance(row, list) and all(isinstance(c, str) for c in row) for row in new_grid):
                 new_grid = []
-            new_grid = _restore_review_empty_columns(old_grid, new_grid)
-            new_grid = _expand_review_spans(old_grid, new_grid, str((block.metadata.get("source_item") or {}).get("table_body") or ""))
+            source_verified = (not data.get("error") and _matches_source_cells(source_cells, new_grid)
+                               and _preserves_populated_cells(old_grid, new_grid))
+            if not source_verified:
+                new_grid = _restore_review_empty_columns(old_grid, new_grid)
+                new_grid = _expand_review_spans(old_grid, new_grid, str((block.metadata.get("source_item") or {}).get("table_body") or ""))
             verified = []
-            if (not data.get("error") and len(new_grid) == len(old_grid)
+            if source_verified:
+                verified = [True] * len(new_grid)
+            elif (alignable and not data.get("error") and len(new_grid) == len(old_grid)
                     and all(len(a) == len(b) for a, b in zip(old_grid, new_grid))):
                 spans = block.metadata.get("table_native_spans") or []
                 verified = [(
@@ -456,9 +560,11 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                                 for old,new,ok in zip(old_grid,new_grid,verified)):
                 block.metadata["table_cell_alignment_unverified"] = True
             if verified and any(verified):
-                new_grid = [b if ok else a for a, b, ok in zip(old_grid, new_grid, verified)]
+                if not source_verified:
+                    new_grid = [b if ok else a for a, b, ok in zip(old_grid, new_grid, verified)]
                 # Keep source caption/footnotes outside the actual grid.
-                notes = [s for s in original.splitlines() if s.strip() and not s.strip().startswith("|")]
+                outside = re.sub(r"<table\b[^>]*>.*?</table>", "", original, flags=re.I | re.S)
+                notes = [s for s in outside.splitlines() if s.strip() and not s.strip().startswith("|")]
                 body = grid_to_markdown(new_grid) or ""
                 raw_legend = data.get("legend")
                 facts = [f for f in raw_legend if isinstance(f, str)] if all(verified) and isinstance(raw_legend, list) else []
@@ -469,10 +575,12 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 # Passing unchanged rows does not prove that missing source text
                 # was recovered. Preserve the review flag and source supplement
                 # until every originally missing span is represented.
-                accepted = all(verified) and all(_span_present(s, table_evidence_text(block.text))
+                accepted = all(verified) and all(source_span_present(s, table_evidence_text(block.text), block.metadata.get("table_native_spans") or [])
                     for s in block.metadata.get("table_missing_spans") or [])
                 block.metadata["table_review"] = {"status": "accepted" if accepted else "partial", "model": model_id,
                                                    "rows_verified": sum(verified), "rows_total": len(verified)}
+                if source_verified:
+                    block.metadata["table_review"]["verification"] = "native_cells"
                 if not accepted:
                     block.metadata["table_review"]["reason"] = "source_text_missing" if all(verified) else "rows_unverified"
                 if accepted:

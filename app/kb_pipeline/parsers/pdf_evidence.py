@@ -51,6 +51,27 @@ def _span_present(span: str, body: str) -> bool:
     return False
 
 
+def source_span_present(span: str, body: str, spans: list[dict]) -> bool:
+    if _span_present(span, body):
+        return True
+    # A word split at the end of a printed line can be joined by OCR. Require
+    # an adjacent source line in the same column, not arbitrary dash removal.
+    if not re.search(r"[A-Za-z]{2,}-$", span.rstrip()):
+        return False
+    owners = [s for s in spans if s.get("text", "").strip() == span.strip() and s.get("bbox")]
+    if len(owners) != 1:
+        return False
+    box = owners[0]["bbox"]
+    height = max(box[3] - box[1], 1)
+    following = [s for s in spans if s.get("bbox")
+        and 0 < s["bbox"][1] - box[1] <= height * 1.8
+        and abs(s["bbox"][0] - box[0]) <= height
+        and re.match(r"^[A-Za-z]+", s.get("text", "").strip())]
+    if len(following) != 1:
+        return False
+    return _span_present(span.rstrip()[:-1] + following[0]["text"].strip(), body)
+
+
 def _rect(page, box):
     import pymupdf
     return pymupdf.Rect(box[0] * page.rect.width / 1000, box[1] * page.rect.height / 1000,
@@ -150,7 +171,7 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
             native_spans.sort(key=lambda s: (s.get("bbox", [0,0,0,0])[1], s.get("bbox", [0,0,0,0])[0]))
             spans = [s.get("text", "").strip() for s in native_spans]
             missing = list(dict.fromkeys(s for s in spans if len(_norm(s)) >= 2
-                and not re.fullmatch(r"[\s\-‐‑‒–—]+", s) and not _span_present(s, got)))
+                and not re.fullmatch(r"[\s\-‐‑‒–—]+", s) and not source_span_present(s, got, native_spans)))
             # Look only below this table, in its column, stopping before another
             # content region. A distant or adjacent-column legend is not adopted.
             bottom = min(page.rect.height, rect.y1 + page.rect.height * .12)
@@ -180,6 +201,18 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                         candidates.append([[cell or "" for cell in row] for row in table.extract()])
             except Exception:
                 pass
+            if not candidates and native:
+                # Borderless tables still have independently positioned native
+                # cells. Use only this region, never a page-wide text guess.
+                try:
+                    for table in page.find_tables(clip=rect, strategy="text").tables:
+                        area = pymupdf.Rect(table.bbox)
+                        if (area & rect).get_area() / max(area.get_area(), rect.get_area(), 1) >= .85:
+                            candidates.append([[cell or "" for cell in row] for row in table.extract()])
+                    if len(candidates) == 1:
+                        block.metadata["table_native_grid_strategy"] = "text"
+                except Exception:
+                    pass
             block.metadata["table_native_grid"] = candidates[0] if native and len(candidates) == 1 else []
             block.metadata["table_source_text"] = native
             block.metadata["table_native_spans"] = [{"text": s.get("text", ""), "bbox": list(s["bbox"]),
