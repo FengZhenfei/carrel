@@ -170,6 +170,20 @@ def chunk_diagnostics(
     stats["visual_outputs_truncated"] = truncated
     if truncated:
         flag("visual_output_truncated", f"{truncated} visual responses reached the output limit; only complete facts were retained", truncated)
+    degraded = sum(bool(b.metadata.get("vlm_degraded_retry")) for b in evidence_blocks)
+    runaway = sum(bool(b.metadata.get("vlm_runaway")) for b in evidence_blocks)
+    stats["visual_outputs_degraded"] = degraded
+    stats["visual_outputs_repetitive"] = runaway
+    # Report the final result separately from a successful, reduced retry.
+    # A retry can finish normally while intentionally omitting transcription.
+    recovered = sum(bool(b.metadata.get("vlm_degraded_retry"))
+                    and b.metadata.get("vlm_status") == "success"
+                    and not b.metadata.get("vlm_truncated") and not b.metadata.get("vlm_runaway")
+                    for b in evidence_blocks)
+    if recovered:
+        flag("visual_output_degraded", f"{recovered} visual responses used reduced retries; descriptions retained, transcription may be incomplete", recovered)
+    if runaway:
+        flag("visual_output_repetitive", f"{runaway} visual responses still repeated after retry; available results retained", runaway)
     return {"ok": not reasons, "reasons": reasons, "stats": stats}
 
 

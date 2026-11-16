@@ -31,6 +31,7 @@ def test_unfinished_repetition_uses_bounded_retry_and_keeps_complete_facts(tmp_p
                                   api_key="fixture", model_id="fixture", cache_json=tmp_path / "caption.json")
     assert [c.kwargs["max_tokens"] for c in call.call_args_list] == [4096, 4096]
     assert result["facts"] == ["Input: 17 V"] and result["vlm_degraded_retry"]
+    assert result["vlm_degraded_reason"] == "repetitive_output"
     assert not (tmp_path / "caption.json").exists()
 
 

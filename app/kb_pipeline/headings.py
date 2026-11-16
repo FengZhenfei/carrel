@@ -177,6 +177,48 @@ def detect_toc_pages(entries: Iterable[tuple[int | None, str]], *, min_short_lin
     return pages
 
 
+def explicit_toc_entries(entries: list[tuple[int | None, str]]) -> set[int]:
+    """Recognize short contents lists without making nearby prose a TOC.
+
+    Mixed pages require printed page-number leaders. Contents-only pages may
+    use numbered entries without page numbers. The explicit title and list
+    structure are both required; a short-line count alone is not sufficient.
+    """
+    pages: dict[int, list[tuple[int, str]]] = {}
+    for index, (page, text) in enumerate(entries):
+        if page is not None and text.strip():
+            pages.setdefault(page, []).append((index, text.strip()))
+    found: set[int] = set()
+
+    def title(text):
+        return re.sub(r"\s+", "", clean_heading_text(text)).lower() in {"目录", "contents", "tableofcontents"}
+
+    def lines(text):
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def numbered(line):
+        return len(line) <= HEADING_MAX_CHARS and bool(re.match(r"^\d+(?:[.\-]\d+)*[.、．]?\s+\S", line))
+
+    for items in pages.values():
+        for offset, (index, text) in enumerate(items):
+            if not title(text):
+                continue
+            rest = [(i, t) for i, t in items[offset + 1:] if not title(t)]
+            all_lines = [line for _, text in rest for line in lines(text)]
+            if len(all_lines) >= 2 and all(_LEADER_RE.search(line) or numbered(line) for line in all_lines):
+                found.update(i for i, _ in items[offset:])
+                break
+            run = []
+            for i, t in rest:
+                if not all(_LEADER_RE.search(line) for line in lines(t)):
+                    break
+                run.append((i, t))
+            if sum(len(lines(t)) for _, t in run) >= 2:
+                found.add(index)
+                found.update(i for i, _ in run)
+    return found
+
+
 def is_note_label(text: str) -> bool:
     """The whole block is just a label such as "Note:", with no body."""
     return bool(_NOTE_LABEL_RE.match(str(text or "").strip()))

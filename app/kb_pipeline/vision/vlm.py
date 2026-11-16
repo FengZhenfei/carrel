@@ -633,6 +633,7 @@ def caption_image(
         data = data or parse_jsonish(content)
         data["vlm_length_retry"] = True
 
+    degraded_reason = "repetitive_output" if data and data.get("runaway") else "invalid_output"
     if data is not None and data.get("runaway") and not length_retried:
         print(f"[vlm] caption ran away ({data.get('runaway_dropped')} repeated items); degraded retry", flush=True)
         data = None
@@ -673,6 +674,7 @@ def caption_image(
         if first_data and not any(data.get(k) for k in ("summary", "facts", "text_verbatim", "entities")):
             data, finish_reason = first_data, first_finish
         data["vlm_degraded_retry"] = True
+        data["vlm_degraded_reason"] = degraded_reason
         if data.get("runaway"):
             # Still repeating despite the stronger repetition penalty: the runaway items were already
             # collapsed in normalize_result, the remaining facts are kept (2026-09-10 user decision:

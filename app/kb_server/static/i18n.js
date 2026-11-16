@@ -1064,7 +1064,9 @@ const DIAGNOSTIC_LABELS = {
   table_review_request_failed: ["{0} 处表格复核请求失败，原文已保留", "{0} table review requests failed; source text retained"],
   table_review_partial: ["{0} 处表格仅部分内容通过复核，未确认内容的原文已保留", "{0} tables were partly verified; unverified source text retained"],
   table_review_unconfirmed: ["{0} 处表格复核结果未通过行列与内容校验，原文已保留", "{0} table review results did not pass alignment and content checks; source text retained"],
-  visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留可用结果", "{0} visual responses reached the output limit; available results were retained"]
+  visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留可用结果", "{0} visual responses reached the output limit; available results were retained"],
+  visual_output_degraded: ["{0} 处图片识别经简化重试恢复，描述已保留，逐字转录可能不完整", "{0} visual responses recovered with reduced retries; descriptions retained, transcription may be incomplete"],
+  visual_output_repetitive: ["{0} 处图片识别重试后仍有重复，已保留可用结果", "{0} visual responses still repeated after retry; available results retained"]
 };
 // Length statistics alone do not establish missing or broken meaning.
 function diagnosticTone(reason) {

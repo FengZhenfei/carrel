@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ParsedBlock
-from ..headings import detect_toc_pages
+from ..headings import detect_toc_pages, explicit_toc_entries
 from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, clean_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx, walk_dicts
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown, mineru_parser_profile
@@ -76,16 +76,21 @@ def mineru_pdf_blocks(
     # list items are not headings, and unnumbered headings hang under the nearest numbered one.
     # Ordinary body lines MinerU did not mark are recognised by inference (see headings.HeadingResolver)
     toc_pages = detect_toc_pages((page_idx(i), item_text(i)) for i in items if label_of(i) in ("text", "title"))
+    toc_items = explicit_toc_entries([(page_idx(i), "" if label_of(i) in
+        {"header", "footer", "page_header", "page_footer", "page_number"} else item_text(i) or "\ufffc") for i in items])
+    explicit_pages = {page_idx(items[i]) for i in toc_items}
     if toc_pages:       # page_idx() already returns 1-based page numbers
         print(f"[parser] pdf toc pages={sorted(toc_pages)} (headings there are not sections)", flush=True)
-    resolver = HeadingResolver(item_text(i) for i in items if heading_level(i) and label_of(i) in ("text", "title")
-                               and not i.get("_pdf_code_label_owned"))
+    resolver = HeadingResolver(item_text(item) for i, item in enumerate(items)
+                               if i not in toc_items and heading_level(item) and label_of(item) in ("text", "title")
+                               and not item.get("_pdf_code_label_owned"))
     count = 0
-    for item in items:
+    for item_index, item in enumerate(items):
         typ = label_of(item)
         text = item_text(item)
         level, inferred = (resolver.resolve(heading_level(item), text)
-                           if typ in ("text", "title") and page_idx(item) not in toc_pages
+                           if typ in ("text", "title") and item_index not in toc_items
+                           and page_idx(item) not in toc_pages - explicit_pages
                            and not item.get("_pdf_code_label_owned") else (None, False))
         sections.observe(level, text)
         footnote = footnote_of(item)
@@ -112,6 +117,9 @@ def mineru_pdf_blocks(
             # attached by caption_of below
             block_type = "code"
             latex = None
+        elif item_index in toc_items:
+            block_type = "text"
+            latex = None
         elif "title" in typ or level is not None:
             # Lines MinerU marked with text_level also become title blocks (previously only those
             # recognised by layout inference did): the chunker breaks before headings using the
@@ -131,10 +139,12 @@ def mineru_pdf_blocks(
         seen.add(key)
         count += 1
         metadata = {
-            "section_path": list(sections.path),
+            "section_path": [] if item_index in toc_items else list(sections.path),
             "source_type": typ,
             "source_item": {k: v for k, v in item.items() if k not in {"text", "content", "html", "latex"}},
         }
+        if item_index in toc_items:
+            metadata["is_toc"] = True
         if footnote:
             metadata["source_footnote"] = footnote
         if item.get("_pdf_table_note_sources"):

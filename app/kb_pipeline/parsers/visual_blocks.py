@@ -228,6 +228,9 @@ def enrich_blocks_with_vlm(
                 "vlm_status": "success" if got_content else "empty",
                 "vlm_model": model_id,
                 "vlm_truncated": bool(data.get("vlm_truncated")),
+                "vlm_degraded_retry": bool(data.get("vlm_degraded_retry")),
+                "vlm_degraded_reason": data.get("vlm_degraded_reason"),
+                "vlm_runaway": bool(data.get("vlm_runaway")),
             }
         )
         if data.get("error"):

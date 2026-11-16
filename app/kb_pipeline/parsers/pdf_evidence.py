@@ -83,6 +83,36 @@ def _box(page, rect) -> list[float]:
             rect.x1 * 1000 / page.rect.width, rect.y1 * 1000 / page.rect.height]
 
 
+def _native_line_spans(line: dict) -> list[dict]:
+    """Rejoin adjacent single-glyph spans, never separate lines or cells.
+
+    PDF styling can split a word or number into one span per glyph. Preserve
+    spaces, baseline changes and cell gaps; these are evidence boundaries.
+    """
+    result = []
+    previous = None
+    for source in line.get("spans", []):
+        span = {**source, "line_dir": line.get("dir")}
+        text = span.get("text", "")
+        box = span.get("bbox")
+        size = float(span.get("size") or 0)
+        single = len(text) == 1 and text.isalnum()
+        if (single and previous and len(previous.get("text", "")) == 1
+                and previous["text"].isalnum() and box and previous.get("bbox")
+                and tuple(line.get("dir") or ()) == (1, 0) and size > 0
+                and abs(size - float(previous.get("size") or 0)) < .1
+                and abs(box[1] - previous["bbox"][1]) < .1
+                and -.15 * size <= box[0] - previous["bbox"][2] <= .15 * size):
+            joined = result[-1]
+            joined["text"] += text
+            a = joined["bbox"]
+            joined["bbox"] = (min(a[0], box[0]), min(a[1], box[1]), max(a[2], box[2]), max(a[3], box[3]))
+        else:
+            result.append(span)
+        previous = source
+    return result
+
+
 def supplement_visible_forms(blocks: list[ParsedBlock], path: Path) -> list[ParsedBlock]:
     """Read visible field values without executing actions or flattening the PDF."""
     try:
@@ -164,8 +194,8 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                                     str(block.metadata.get("source_footnote") or "")]))
             # get_text(sort=True) inserts spaces between cells. Compare individual
             # spans, not whole rows joined across Markdown column separators.
-            native_spans = [{**s, "line_dir": line.get("dir")} for b in page.get_text("dict", clip=rect).get("blocks", [])
-                            for line in b.get("lines", []) for s in line.get("spans", [])]
+            native_spans = [s for b in page.get_text("dict", clip=rect).get("blocks", [])
+                            for line in b.get("lines", []) for s in _native_line_spans(line)]
             # PDF drawing order can write a wrapped line bottom-first. Evidence
             # supplements follow visible top-to-bottom, then left-to-right order.
             native_spans.sort(key=lambda s: (s.get("bbox", [0,0,0,0])[1], s.get("bbox", [0,0,0,0])[0]))

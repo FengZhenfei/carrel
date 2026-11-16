@@ -127,6 +127,7 @@ def test_reasoning_only_response_keeps_existing_degraded_retry(tmp_path):
         out=vlm.caption_image(image_path=tmp_path/'unused.png',base_url='http://fixture/v1',api_key='x',model_id='fixture')
     assert [x.kwargs['max_tokens'] for x in create.call_args_list]==[4096,4096]
     assert out['vlm_degraded_retry'] and out['facts']==['Output 17 V.']
+    assert out['vlm_degraded_reason']=='invalid_output'
 
 
 def test_runaway_uses_degraded_retry_without_larger_budget(tmp_path):

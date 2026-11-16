@@ -359,6 +359,7 @@ def merge_mineru_text_blocks(
             tokens < floor_tokens
             and previous is not None
             and previous.metadata.get("merged")
+            and bool(previous.metadata.get("is_toc")) == bool(run[0].metadata.get("is_toc"))
             and list(previous.metadata.get("section_path") or []) == list(run[0].metadata.get("section_path") or [])
         ):
             # Fold back into the previous merged block. One block fewer, and the block_id stays the
@@ -397,6 +398,7 @@ def merge_mineru_text_blocks(
                 page_idx=min(pages) if pages else template.page_idx,
                 title=template.title,
                 metadata={
+                    **({"is_toc": True} if template.metadata.get("is_toc") else {}),
                     "section_path": list(template.metadata.get("section_path") or []),
                     "section_spans": section_spans,
                     "merged": True,
@@ -502,6 +504,17 @@ def merge_mineru_text_blocks(
     for block in blocks:
         if is_noise_block(block):
             dropped_noise += 1
+            continue
+        if buf and buf[0].metadata.get("is_toc") and not block.metadata.get("is_toc"):
+            flush()
+        if block.metadata.get("is_toc"):
+            # Contents stay searchable, without becoming the next section's title.
+            tokens = count_tokens(rendered(block))
+            if buf and (not buf[0].metadata.get("is_toc") or buf[0].page_idx != block.page_idx
+                        or buf_tokens + tokens > target_tokens):
+                flush()
+            buf.append(block)
+            buf_tokens += tokens
             continue
         if is_inline_icon(block):
             # Small figures can be labels, symbols or status indicators. Keep
