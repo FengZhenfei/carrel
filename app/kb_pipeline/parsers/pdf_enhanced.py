@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 
 from ..chunking.chunker import text_for_block
+from ..chunking.packing import heading_body_flow, is_inline_icon, same_column_before, source_regions
+from ..chunking.sections import same_section
 from ..headings import infer_heading_level, is_note_label, is_page_footer, is_short_lead_in, starts_with_note
 from ..models import ParsedBlock
 from ..utils import count_tokens
@@ -35,17 +37,6 @@ NOISE_SOURCE_TYPES = {"header", "footer", "page_header", "page_footer", "page_nu
 # table / image / chart remain non-mergeable: they are large on their own, have their own
 # 2048-dimensional visual vector, and retrieving them individually is meaningful.
 MERGEABLE_TYPES = {"text", "title", "page", "equation"}
-
-
-def _same_column_before(a: ParsedBlock, b: ParsedBlock) -> bool:
-    if a.page_idx != b.page_idx:
-        return False
-    if not a.bbox or not b.bbox:
-        return True  # Native document parsers supply order but not geometry.
-    x0, y0, x1, y1 = a.bbox
-    bx0, by0, bx1, by1 = b.bbox
-    overlap = max(0, min(x1, bx1) - max(x0, bx0))
-    return y1 <= by0 + 5 and overlap >= min(x1 - x0, bx1 - bx0) * .5
 
 
 def parse_pdf_enhanced(
@@ -294,7 +285,8 @@ def merge_mineru_text_blocks(
       - Other short buffers fold back into the previous merged block (overflowed prose tails), in line
         with the min_merge_tokens description.
       - Short lines before a title (table-of-contents entries such as "Technical support....18",
-        parameter lines) do not follow the title into the TITLE; inline icons are not boundaries.
+        parameter lines) do not follow the title into the TITLE. Inline icons retain their own
+        position and do not adopt the preceding heading.
       - When the buffer is cut because it is full, the titles at its tail are left to the next buffer, so a
         title stays in the same block as the body below it.
     """
@@ -351,7 +343,8 @@ def merge_mineru_text_blocks(
             if not part:
                 continue
             section_spans.append({"start": offset, "end": offset + len(part),
-                                  "section_path": list(block.metadata.get("section_path") or [])})
+                                  "section_path": list(block.metadata.get("section_path") or []),
+                                  "source_regions": source_regions(block)})
             offset += len(part) + 2
 
         previous = merged[-1] if merged else None
@@ -441,7 +434,7 @@ def merge_mineru_text_blocks(
         target.metadata.setdefault("footnote_block_ids", []).extend(block.block_id for block in run)
         footnoted += 1
 
-    def hand_over(target: ParsedBlock) -> None:
+    def hand_over(target: ParsedBlock, *, body_follows: bool = False) -> None:
         """A non-mergeable block arrives: the title / lead-in at the tail of the buffer becomes its
         TITLE, a note becomes the FOOTNOTE of the previous figure/table, and the rest is emitted as
         usual (short runs fold back into the previous merged block)."""
@@ -466,9 +459,10 @@ def merge_mineru_text_blocks(
             prose_tail = not has_title and not buf and previous is not None and previous.metadata.get("merged")
             can_adopt = (
                 not prose_tail
+                and not body_follows
                 and not (target.title or "").strip()
                 and (has_title or not (target.caption or "").strip())
-                and all(_same_column_before(b, target) for b in tail)
+                and all(same_column_before(b, target) for b in tail)
             )
             if can_adopt:
                 text = "\n\n".join(part for part in (rendered(block) for block in tail) if part)
@@ -501,7 +495,7 @@ def merge_mineru_text_blocks(
         # 3) Everything else as usual
         flush()
 
-    for block in blocks:
+    for index, block in enumerate(blocks):
         if is_noise_block(block):
             dropped_noise += 1
             continue
@@ -524,7 +518,15 @@ def merge_mineru_text_blocks(
             preserved_icons += 1
             continue
         if not is_mergeable_text_block(block):
-            hand_over(block)
+            following = index
+            while following < len(blocks) and blocks[following].block_type in {"image", "vision", "chart"}:
+                following += 1
+            body = blocks[following] if following < len(blocks) else None
+            body_follows = bool(following > index and buf and buf[-1].block_type == "title"
+                                and body and body.block_type != "title" and is_mergeable_text_block(body)
+                                and same_section(buf[-1], body)
+                                and heading_body_flow(buf[-1], body, blocks[index:following]))
+            hand_over(block, body_follows=body_follows)
             merged.append(block)
             continue
         text = rendered(block)
@@ -571,23 +573,6 @@ def merge_mineru_text_blocks(
         flush=True,
     )
     return merged
-
-ICON_MAX_PERMILLE = 48
-
-
-def is_inline_icon(block: ParsedBlock) -> bool:
-    """An image whose width and height are both under ICON_MAX_PERMILLE of the page is an inline icon / bullet.
-    MinerU normalizes bboxes to 0-1000 of the page (per mille), not pt, so the threshold is relative to the
-    page: on a large slide exported in pixels an icon measures many pt, yet its share of the page is still
-    small."""
-    if block.block_type != "image" or not block.bbox or len(block.bbox) < 4:
-        return False
-    try:
-        x0, y0, x1, y1 = (float(v) for v in block.bbox[:4])
-    except (TypeError, ValueError):
-        return False
-    return (x1 - x0) < ICON_MAX_PERMILLE and (y1 - y0) < ICON_MAX_PERMILLE
-
 
 def source_type(block: ParsedBlock) -> str:
     value = block.metadata.get("source_type") or block.metadata.get("label") or ""

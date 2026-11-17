@@ -1,4 +1,4 @@
-"""Resolve section provenance after packing, without changing text boundaries."""
+"""Locate fragment provenance before packing and retain it through combination."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -17,6 +17,13 @@ def common_path(paths: list[list[str]]) -> list[str]:
         common = common[:next((i for i, (a, b) in enumerate(zip(common, path)) if a != b),
                               min(len(common), len(path)))]
     return common
+
+
+def same_section(a: ParsedBlock, b: ParsedBlock) -> bool:
+    def paths(block):
+        return block.metadata.get("_chunk_section_paths", block.metadata.get(
+            "section_paths", [list(block.metadata.get("section_path") or [])]))
+    return paths(a) == paths(b)
 
 
 class SectionSources:
@@ -74,7 +81,20 @@ class SectionSources:
             path = list(span.get("section_path") or [])
             if path not in paths:
                 paths.append(path)
-        metadata = {**block.metadata, "_chunk_section_paths": paths}
+        metadata = {**block.metadata, "_chunk_section_paths": paths, "section_path": common_path(paths)}
+        # A split fragment must not keep the whole premerged block's geometry.
+        # Old caches without per-span regions retain their existing provenance.
+        regions = []
+        if selected and all(s.get("source_regions") for s in selected):
+            for span in selected:
+                for region in span["source_regions"]:
+                    if region not in regions:
+                        regions.append(dict(region))
+            metadata["source_regions"] = regions
+            pages = [r["page"] for r in regions if r.get("page") is not None]
+            metadata.update(page_start=min(pages) if pages else None, page_end=max(pages) if pages else None)
+            block = replace(block, page_idx=min(pages) if pages else None,
+                            bbox=regions[0].get("bbox") if len(regions) == 1 else None)
         if ambiguous:
             metadata["section_match"] = "ambiguous"
         return replace(block, metadata=metadata)

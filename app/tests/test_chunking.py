@@ -494,7 +494,8 @@ class HeadingAwareChunkingTests(unittest.TestCase):
                 self.assertEqual("".join(c.text for c in chunks if c.block.block_type == "code"),
                                  fence.partition("\n")[2][:-3])
             else:
-                self.assertIn(f"{heading}\n{unit[:20]}", first)
+                self.assertTrue(any(f"{heading}\n{unit[:20]}" in c.text for c in chunks))
+                self.assertNotIn(heading, first)  # prior prose does not acquire the next section's title
 
     def test_heading_at_the_end_of_the_text_is_not_dropped(self) -> None:
         """The block text ends with a heading (a merged block filled up right after the heading): the final flush
@@ -509,7 +510,7 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         self.assertEqual(parts[-1], "功能描述")
         self.assertEqual(sum(p.count("功能描述") for p in parts), 1)
         # A stranded heading is left to the fragment fallback: right before a table block it becomes the table's
-        # TITLE, otherwise it merges back into the previous chunk of the same block
+        # TITLE; an unowned title stays separate rather than returning to earlier prose.
         body, grid = self._para(200), "| a | b |\n| --- | --- |\n| 1 | 2 |"
         tail = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text",
                            text=f"{body}\n\n第3章 部署说明", block_id="b1")
@@ -520,7 +521,7 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         chunks = lambda blocks: [c.text for c in blocks_to_chunks(
             kb_id="k", file_key=1, content_version="v", parser_profile="p", blocks=blocks, max_tokens=600, overlap_tokens=80)]
         self.assertEqual(chunks([tail, table]), [body, f"TITLE: 第3章 部署说明\n{grid}"])
-        self.assertEqual(chunks([tail, other]), [f"{body}\n第3章 部署说明", other.text])
+        self.assertEqual(chunks([tail, other]), [body, "第3章 部署说明", other.text])
 
 
 class HeadingRuleTests(unittest.TestCase):

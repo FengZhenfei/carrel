@@ -25,7 +25,7 @@ from ..vision.images import file_hash
 from .common import grid_to_markdown, html_table_to_grid, html_table_spans
 from .table_check import GLUED_KINDS, expand_glued_rows, high_confidence
 from .errors import JobCancelled
-from .pdf_evidence import normalize_ranges, _span_present, source_span_present, table_evidence_text
+from .pdf_evidence import normalize_ranges, normalize_table_presentation, _span_present, source_span_present, table_evidence_text
 
 TABLE_ROWS_PROMPT = """This image is a table cropped from a document. Some cells contain several lines stacked vertically (one line per test condition), and an OCR pass merged those lines into one string.
 The table has {width} columns; its header row reads: {header}.
@@ -112,6 +112,8 @@ def _review_preserves_rows(old: list[list[str]], new: list[list[str]], native: s
         previous = i
         used.add(i)
         for before, after in zip(row, replacement):
+            if normalize_table_presentation(table_evidence_text(before)) == normalize_table_presentation(table_evidence_text(after)):
+                continue  # Formatting alone does not require a second source.
             # Existing values remain in their original columns, not merely somewhere
             # in the new table. New numeric fields need support in native evidence.
             before, after = normalize_ranges(before), normalize_ranges(after)
@@ -199,15 +201,16 @@ def _identity_columns(rows: list[list[str]]) -> tuple[int, ...]:
     # A repeated first-column category is common. The shortest unique populated
     # prefix identifies a row without depending on a domain or a model response.
     # Ignore wholly empty columns when choosing keys, but keep their positions
-    # in the table and in all cell-level checks. Partly empty columns still
-    # prevent alignment: a value elsewhere is not a substitute for a missing key.
+    # in the table and in all cell-level checks. The first (header) row may have
+    # an empty corner; it stays at its original position and is still reviewed.
+    # Missing body keys still prevent alignment.
     if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
         return ()
     populated = tuple(i for i in range(len(rows[0])) if any(_norm(row[i]) for row in rows))
     for width in range(1, min(3, len(populated)) + 1):
         columns = populated[:width]
         keys = [_row_key(row, columns) for row in rows]
-        if all(all(k) for k in keys) and len(set(keys)) == len(keys):
+        if all(all(k) for k in keys[1:]) and len(set(keys)) == len(keys):
             return columns
     return ()
 
@@ -454,18 +457,11 @@ def route_image_only_tables(blocks: list[ParsedBlock]) -> None:
         block.metadata["image_only_table"] = True
 
 
-# Standard radical/ideograph equivalents not covered by NFKC. Unknown glyphs
-# stay literal; a radical must never act as a wildcard for another word.
-# https://www.unicode.org/Public/17.0.0/ucd/CJKRadicals.txt
-_SOURCE_RADICALS = str.maketrans("⺦⺰⻅⻈⻉⻋⻐⻓⻔⻙⻚⻛⻜⻠⻢⻥⻦⻧⻨⻩⻪⻬⻫⻮⻭⻰⻯⻳⻲",
-                               "丬纟见讠贝车钅长门韦页风飞饣马鱼鸟卤麦黄黾齐斉齿歯龙竜龟亀")
-
-
 def _matches_source_cells(source: list[list[str]], candidate: list[list[str]]) -> bool:
     """Whole-cell equality: no moving values, dropping units or inventing rows."""
     def cell(text):
         text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
-        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).translate(_SOURCE_RADICALS)
+        return re.sub(r"\s+", "", normalize_table_presentation(text).strip())
 
     if not source or len(source) != len(candidate):
         return False

@@ -8,6 +8,7 @@ from typing import Any
 from ..models import ParsedBlock
 from ..headings import infer_heading_level
 from ..utils import count_tokens
+from .sections import common_path, same_section
 
 PROSE = frozenset({"text", "title", "list", "page", "slide"})
 
@@ -35,6 +36,7 @@ def combined_owner(owner: ParsedBlock, members: list[ParsedBlock]) -> ParsedBloc
                 if path not in paths:
                     paths.append(path)
         metadata["_chunk_section_paths"] = paths
+        metadata["section_path"] = common_path(paths)
     pages = [p for b in members for p in (b.page_idx, b.metadata.get("page_end")) if p is not None]
     bbox = owner.bbox
     if pages:
@@ -56,9 +58,11 @@ def combined_owner(owner: ParsedBlock, members: list[ParsedBlock]) -> ParsedBloc
 def same_structure(a: ParsedBlock, b: ParsedBlock) -> bool:
     if (a.slide_idx, a.sheet_name, a.doc_type) != (b.slide_idx, b.sheet_name, b.doc_type):
         return False
-    for key in ("section_path", "source_field", "source_fields", "frontmatter", "degraded"):
+    if not same_section(a, b):
+        return False
+    for key in ("source_field", "source_fields", "frontmatter", "degraded"):
         left, right = a.metadata.get(key), b.metadata.get(key)
-        if key in {"section_path", "source_fields"}:
+        if key == "source_fields":
             left, right = left or [], right or []
         if left != right:
             return False
@@ -84,6 +88,62 @@ def _page_boxes(block: ParsedBlock) -> list[list[float]]:
             return []
         boxes.append(box)
     return boxes
+
+
+def same_column_before(a: ParsedBlock, b: ParsedBlock) -> bool:
+    if a.page_idx != b.page_idx:
+        return False
+    if a.page_idx is None:
+        return True  # Unpaginated native documents provide source order.
+    left, right = _page_boxes(a), _page_boxes(b)
+    if not left or not right:
+        return False
+    return all(p[3] <= min(q[1] for q in right) + 5 and
+               any(min(p[2], q[2]) - max(p[0], q[0]) >= min(p[2]-p[0], q[2]-q[0]) * .5
+                   for q in right) for p in left)
+
+
+def heading_body_flow(heading: ParsedBlock, body: ParsedBlock, images: list[ParsedBlock]) -> bool:
+    """Side elements sit beside the heading or its opening paragraph.
+
+    This describes layout, not image importance. The image stays independently
+    searchable; figures occupying the prose column still interrupt its flow.
+    """
+    if not same_column_before(heading, body):
+        return False
+    titles, prose = _page_boxes(heading), _page_boxes(body)
+    for image in images:
+        if heading.page_idx != image.page_idx or heading.slide_idx != image.slide_idx:
+            return False
+        boxes = _page_boxes(image)
+        if not boxes or not all(
+                any(box[3] <= boundary + 5
+                    and min(line[3], box[3]) > max(line[1], box[1])
+                    and (box[2] <= line[0] or box[0] >= line[2])
+                    for line, boundary in [(h, min(p[1] for p in prose)) for h in titles]
+                    + [(p, p[3]) for p in prose])
+                for box in boxes):
+            return False
+    return True
+
+
+def is_inline_icon(block: ParsedBlock) -> bool:
+    """Existing MinerU per-mille size hint; never permission to drop an image."""
+    if block.block_type != "image" or not block.bbox or len(block.bbox) < 4:
+        return False
+    try:
+        x0, y0, x1, y1 = map(float, block.bbox[:4])
+    except (TypeError, ValueError):
+        return False
+    return 0 < x1-x0 < 48 and 0 < y1-y0 < 48
+
+
+def starts_heading(piece: dict[str, Any]) -> bool:
+    block = piece["block"]
+    lines = [s.strip() for s in piece["text"].splitlines() if s.strip() and not s.startswith("TITLE:")]
+    return bool(lines and (block.block_type == "title"
+                           or lines[0] in (block.metadata.get("heading_lines") or [])
+                           or infer_heading_level(lines[0]) is not None))
 
 
 def owns_code_intro(prose: ParsedBlock, code: ParsedBlock) -> bool:
@@ -115,11 +175,6 @@ def pack_prose(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str, 
     def eligible(p):
         b = p["block"]
         return b.block_type in PROSE and not b.visual_ref and not b.metadata.get("symbol")
-
-    def starts_heading(p):
-        lines = [s.strip() for s in p["text"].splitlines() if s.strip() and not s.startswith("TITLE:")]
-        return bool(lines and (lines[0] in (p["block"].metadata.get("heading_lines") or [])
-                               or infer_heading_level(lines[0]) is not None))
 
     def pack(run):
         n = len(run)

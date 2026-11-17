@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import threading
-import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 
@@ -24,7 +23,7 @@ from .images import image_data_url as _image_data_url
 
 # Bump when the schema, the field semantics or the default prompts change, so
 # that cached captions from an earlier contract are not reused.
-CAPTION_CONTRACT_VERSION = 6  # Complete facts only; truncated responses are not reusable captions.
+CAPTION_CONTRACT_VERSION = 7  # Preserve distinct source details without secondary field-length caps.
 
 # text_verbatim is deliberately the LAST property: guided decoding emits
 # fields in schema order, and it is the only field that can run long. If a
@@ -200,209 +199,38 @@ def image_data_url(path: Path, max_pixels: int | None = DEFAULT_MAX_PIXELS) -> s
     return _image_data_url(path, max_pixels)
 
 
-VERBATIM_MAX_CHARS = 4000
-
-
-def _collapse_repeats(text: str) -> str:
-    """Fold runs of identical lines -- degenerate repetition loops must not
-    reach the index even when the JSON itself parsed fine."""
-    lines = text.splitlines()
-    out: list[str] = []
-    for line in lines:
-        if out and line.strip() and line.strip() == out[-1].strip():
-            continue
-        out.append(line)
-    collapsed = "\n".join(out)
-    return collapsed[:VERBATIM_MAX_CHARS]
-
-
-_ARRAY_FIELD_CAP = int(os.getenv("VLM_ARRAY_FIELD_CAP", "64"))
-_GROWING_MIN_CHAIN = 3          # this many consecutive items each extending the previous one by prefix count as a repetition chain ("pending folder", "folder inside pending folder", ...)
-_ITEM_MAX_CHARS = 200           # a single item longer than this and highly repetitive inside (one 4-char gram over half of it) counts as runaway
-# Caps for string fields: by contract title is one line and summary one or two sentences; anything
-# beyond is not a description but a runaway, or FACTS written into the wrong place
-_STRING_CAPS = {"title": 120, "summary": 600}
-# Numbering, punctuation, whitespace: in "1. task list; 2. task list; ..." they dilute the share of
-# the 4-char gram below half, so they are stripped before judging repetition
-_NOISE_RE = re.compile(r"[\s\d\W_]+")
-_GRAM = 4
-_COMPRESS_MIN_BYTES = 400       # check the compression ratio only on strings this long: a loop body longer than 4 chars (a whole sentence repeated) escapes the gram-share test
-_COMPRESS_MAX_RATIO = 0.15      # measured: repetition 0.01-0.14; legitimate repetition such as pinout / parameter tables / menu vocabularies >= 0.20
-_CYCLE_MAX_GAP = 60             # the same gram occurring three times in a row, each at most this many chars apart, marks where the loop begins
-
-
-def _compressible(text: str) -> bool:
-    raw = (text or "").encode("utf-8")
-    return len(raw) >= _COMPRESS_MIN_BYTES and len(zlib.compress(raw, 6)) < len(raw) * _COMPRESS_MAX_RATIO
-
-
-def _top_gram(t: str) -> tuple[str, int]:
-    grams: dict[str, int] = {}
-    for i in range(len(t) - _GRAM + 1):
-        g = t[i:i + _GRAM]
-        grams[g] = grams.get(g, 0) + 1
-    if not grams:
-        return "", 0
-    top = max(grams, key=grams.get)
-    return top, grams[top]
-
-
-def _repetitive(text: str) -> bool:
-    """One 4-char gram recurring within an item (over half of it) is repetition; long enough items
-    are also checked by compression ratio."""
-    t = text.replace(" ", "")
-    if len(t) < 40:
-        return False
-    _, n = _top_gram(t)
-    return n * _GRAM >= len(t) * 0.5 or _compressible(t)
-
-
-def _repetitive_prose(text: str) -> bool:
-    """Prose fields such as title / summary: strip numbering, punctuation and whitespace before judging
-    (2026-09-10 screenshot evaluation: "1. task list; 2. task list; ..."
-    516 times, and with only spaces removed the gram share was 45%, so it was missed)."""
-    t = _NOISE_RE.sub("", text or "")
-    if len(t) < 40:
-        return False
-    _, n = _top_gram(t)
-    return n * _GRAM >= len(t) * 0.5 or _compressible(t)
-
-
-def _cut_at_cycle(text: str) -> str:
-    """Cut a repetitive string at the start of the loop: find the most frequent 4-char gram, locate it
-    in the original text (numbering / punctuation may sit in between), and the first place where three
-    consecutive occurrences are all close together is the loop; keep up to the loop's first item. If
-    it cannot be located, return the text unchanged and leave it to the cap truncation."""
-    top, _ = _top_gram(_NOISE_RE.sub("", text))
-    if not top:
-        return text
-    pattern = re.compile(r"[\s\d\W_]*".join(re.escape(ch) for ch in top))
-    starts = [m.start() for m in pattern.finditer(text)]
-    for i in range(len(starts) - 2):
-        if starts[i + 1] - starts[i] <= _CYCLE_MAX_GAP and starts[i + 2] - starts[i + 1] <= _CYCLE_MAX_GAP:
-            return text[: starts[i + 1]].rstrip(" \t;；,，、.。:：0123456789")
-    return text
-
-
-def _tame_string(text: str, cap: int) -> tuple[str, bool]:
-    """title / summary: a repetitive one is cut at the start of the loop and reported as runaway; a
-    non-repetitive one is still truncated at the cap. Returns (text, runaway)."""
-    text = (text or "").strip()
-    if not text:
-        return text, False
-    if _repetitive_prose(text):
-        return _cut_at_cycle(text)[:cap].rstrip(), True
-    return text[:cap].rstrip(), False
-
-
-def _collapse_growing(items: list[str]) -> tuple[list[str], int]:
-    """Collapse a repetition chain that grows item by item: an item that merely extends the previous
-    one (same prefix, only ever longer) is dropped, keeping only the chain head; an over-long item that
-    repeats internally is dropped too. Returns (kept items, number dropped). Exact duplicate lines are
-    deduped separately in normalize_result."""
-    kept: list[str] = []
-    dropped = 0
-    chain = 0
-    for item in items:
-        prev = kept[-1] if kept else ""
-        head = prev[: max(12, len(prev) * 2 // 3)] if prev else ""
-        growing = bool(prev) and len(item) > len(prev) and bool(head) and item.startswith(head)
-        if growing:
-            chain += 1
-            if chain >= _GROWING_MIN_CHAIN - 1:
-                dropped += 1
-                continue
-        else:
-            chain = 0
-        if len(item) > _ITEM_MAX_CHARS and _repetitive(item):
-            dropped += 1
-            continue
-        kept.append(item)
-    # The first two items after the chain head are part of the chain too: only the head survives
-    if dropped:
-        pruned: list[str] = []
-        for item in kept:
-            prev = pruned[-1] if pruned else ""
-            head = prev[: max(12, len(prev) * 2 // 3)] if prev else ""
-            if prev and len(item) > len(prev) and item.startswith(head):
-                dropped += 1
-                continue
-            pruned.append(item)
-        kept = pruned
-    return kept, dropped
+# Match literal loops only in unfinished, output-limited responses. Complete
+# model fields, including repeated table rows, are preserved as returned.
+_LITERAL_LOOP = re.compile(r"(?P<unit>.{4,160}?)(?:[ \t\r\n]*(?P=unit)){7,}", re.DOTALL)
 
 
 def normalize_result(data: Any) -> dict[str, Any]:
-    """Coerce whatever came back into the documented shape."""
-    result = dict(EMPTY_RESULT)
+    """Normalize the schema without imposing a second content-length budget."""
+    result = copy.deepcopy(EMPTY_RESULT)
     if not isinstance(data, dict):
         return result
-    runaway_dropped = 0
     for key in ("kind", "title", "summary", "text_verbatim", "confidence"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             result[key] = value.strip()
-    # String fields run away too (2026-09-10 screenshot evaluation: the
-    # model wrote FACTS into summary as "1. task list; 2. task list; ..." 516 times, over 5,000 chars;
-    # title / summary used to have neither a repetition check nor a cap, so it went into the chunk
-    # verbatim (3,157 tokens) and into the cache). Repetitive ones are cut at the loop start and
-    # recorded as runaway; non-repetitive ones are capped as well.
-    for key, cap in _STRING_CAPS.items():
-        tamed, ran = _tame_string(result[key], cap)
-        result[key] = tamed
-        if ran:
-            runaway_dropped += 1
     for key in ("entities", "facts", "keywords"):
         value = data.get(key)
-        if isinstance(value, list):
-            items = [str(x).strip() for x in value if str(x).strip()]
-        elif isinstance(value, str) and value.strip():
-            items = [value.strip()]
-        else:
-            items = []
-        # A model stuck in a repetition loop fills the whole array with the same sentence
-        # (text_verbatim already gets collapsed; these three fields used to be kept verbatim and went
-        # straight into the payload and the keyword index).
-        seen: set[str] = set()
-        deduped: list[str] = []
+        items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+        kept = []
         for item in items:
-            if item in seen:
-                continue
-            seen.add(item)
-            deduped.append(item)
-            if len(deduped) >= _ARRAY_FIELD_CAP:
-                break
-        # Item-by-item growing repetition (each item wraps one more layer than the last) and
-        # repetition inside a single item: collapsed and recorded as runaway (2026-09-09 product
-        # material, one "cloud antivirus overview page" screenshot had FACTS of 3955 tokens). A
-        # runaway result is retried / degraded by the caller and never cached
-        collapsed, dropped = _collapse_growing(deduped)
-        if dropped:
-            runaway_dropped += dropped
-        result[key] = collapsed
+            text = str(item).strip()
+            if text:
+                kept.append(text)
+        result[key] = list(dict.fromkeys(kept))
     if result["confidence"] not in {"high", "medium", "low"}:
         result["confidence"] = "low"
     decorative = data.get("decorative")
     result["decorative"] = decorative if isinstance(decorative, bool) else str(decorative).strip().lower() == "true"
-    verbatim = _collapse_repeats(result["text_verbatim"])
-    if _compressible(verbatim):
-        # Line-wise collapsing cannot catch repetition written on a single line ("Home Password Home
-        # Password ..."): if the transcription is garbage, drop it entirely
-        verbatim = ""
-        runaway_dropped += 1
-    result["text_verbatim"] = verbatim
-    if runaway_dropped:
-        result["runaway"] = True
-        result["runaway_dropped"] = runaway_dropped
     return result
 
 
 def _raw_tail_runaway(raw: str, finish_reason: str) -> bool:
-    """Inspect an unfinished JSON string before prefix repair discards it.
-
-    Repeated JSON keys or complete table cells are not a runaway tail. Only a
-    long, highly repetitive unfinished string in a length-limited reply counts.
-    """
+    """Check a truncated string before prefix repair discards it."""
     if finish_reason != "length":
         return False
     start = None
@@ -414,7 +242,13 @@ def _raw_tail_runaway(raw: str, finish_reason: str) -> bool:
             escaped = True
         elif char == '"':
             start = i + 1 if start is None else None
-    return start is not None and _compressible(raw[start:])
+    if start is None:
+        return False
+    tail = raw[start:]
+    # Completed rows can legitimately repeat. Only a dominant literal loop in
+    # an unfinished string is grounds to avoid spending a larger output budget.
+    return any(len(match.group()) >= max(200, len(tail) * 0.8)
+               for match in _LITERAL_LOOP.finditer(tail))
 
 
 def complete_json_prefix(raw: str) -> str | None:
@@ -519,9 +353,9 @@ def parse_jsonish(text: str) -> dict[str, Any]:
     m = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
     if m:
         try:
-            result["summary"] = str(json.loads(f'"{m.group(1)}"')).strip()[:500]
+            result["summary"] = str(json.loads(f'"{m.group(1)}"')).strip()
         except Exception:
-            result["summary"] = m.group(1).strip()[:500]
+            result["summary"] = m.group(1).strip()
     return result
 
 
@@ -569,11 +403,8 @@ def caption_image(
         # thing that decides whether a cached caption can be reused.
         if isinstance(cached, dict) and reusable_in_run(cached) and cached.get("_cache") == cache_identity:
             result = normalize_result(cached)
-            if result.get("runaway"):
-                print(f"[vlm] cached caption looks like a repetition runaway ({result.get('runaway_dropped')} items dropped); re-captioning", flush=True)
-            else:
-                result["vlm_cache_hit"] = True
-                return result
+            result["vlm_cache_hit"] = True
+            return result
 
     client = _client_for(base_url, api_key)
     request.body["messages"] = [
@@ -635,7 +466,7 @@ def caption_image(
 
     degraded_reason = "repetitive_output" if data and data.get("runaway") else "invalid_output"
     if data is not None and data.get("runaway") and not length_retried:
-        print(f"[vlm] caption ran away ({data.get('runaway_dropped')} repeated items); degraded retry", flush=True)
+        print(f"[vlm] caption has an unfinished repeated field; degraded retry", flush=True)
         data = None
     if data is None and not length_retried:
         # Unrecoverable output -- usually a repetition loop that truncated
@@ -676,9 +507,8 @@ def caption_image(
         data["vlm_degraded_retry"] = True
         data["vlm_degraded_reason"] = degraded_reason
         if data.get("runaway"):
-            # Still repeating despite the stronger repetition penalty: the runaway items were already
-            # collapsed in normalize_result, the remaining facts are kept (2026-09-10 user decision:
-            # occasional noise is preferable to a vague description), confidence drops to low
+            # The unfinished repeated field was discarded by prefix repair.
+            # Keep complete fields, lower confidence and report incomplete recovery.
             print(f"[vlm] still running away after retry; kept {len(data.get('facts') or [])} facts, confidence low", flush=True)
             data["confidence"] = "low"
             data["vlm_runaway"] = True

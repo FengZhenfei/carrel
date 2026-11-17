@@ -27,6 +27,10 @@ following projects, which keep their own licenses.
   Qwen3-Reranker and Qwen3-VL-Reranker model cards, unmodified. The license
   text is in `THIRD_PARTY_LICENSES/Apache-2.0.txt`.
 
+- **Unicode character equivalences** (Unicode License V3). PDF evidence
+  comparisons use the Unicode 17.0 `Equivalent_Unified_Ideograph` data.
+  The license text is in `THIRD_PARTY_LICENSES/Unicode-3.0.txt`.
+
 ## Services run as separate containers
 
 These are not part of this repository. `deployment/compose` pulls or builds

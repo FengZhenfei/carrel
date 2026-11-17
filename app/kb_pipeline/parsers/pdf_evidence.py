@@ -11,12 +11,30 @@ from pathlib import Path
 
 from ..models import ParsedBlock
 
+# Unicode 17.0 Equivalent_Unified_Ideograph mappings for the CJK Radicals
+# Supplement block not already covered by NFKC. Unknown glyphs stay literal.
+# https://www.unicode.org/Public/17.0.0/ucd/EquivalentUnifiedIdeograph.txt
+# Unicode data license: THIRD_PARTY_LICENSES/Unicode-3.0.txt.
+SOURCE_RADICALS = str.maketrans(
+    '⺁⺂⺃⺄⺅⺆⺇⺈⺉⺊⺋⺌⺍⺎⺏⺐⺑⺒⺓⺔⺕⺖⺗⺘⺙⺛⺜⺝⺞⺠⺡⺢⺣⺤⺥⺦⺧⺨⺩⺪⺫⺬⺭⺮⺯⺰⺱⺲⺳⺴⺵⺶⺷⺸⺹⺺⺻⺼⺽⺾⺿⻀⻁⻂⻃⻄⻅⻆⻇⻈⻉⻊⻋⻌⻍⻎⻏⻐⻑⻒⻓⻔⻕⻖⻗⻘⻙⻚⻛⻜⻝⻞⻟⻠⻡⻢⻣⻤⻥⻦⻧⻨⻩⻪⻫⻬⻭⻮⻯⻰⻱⻲',
+    '厂乛乚乙亻冂𠘨刀刂卜㔾小小兀尣尢𡯂巳幺彑𫜹忄心扌攵旡日月歺民氵氺灬爫爫丬牛犭王𤴔目示礻𥫗糹纟罓罒㓁冗𦉫羊𦍌𦍋耂肀聿肉𦥑艹艹艹虎衤覀西见角𧢲讠贝𧾷车辶辶辶邑钅長镸长门𨸏阝雨青韦页风飞食𩙿飠饣𩠐马骨鬼鱼鸟卤麦黄黾斉齐歯齿竜龙龜亀')
+
 
 def _norm(text: str) -> str:
     text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or ""))
     # Typographic hyphens are spelling variants; mathematical minus is not.
     text = text.replace("‐", "-").replace("‑", "-")
-    return normalize_ranges(text)
+    return normalize_ranges(normalize_table_presentation(text, strip_sentence_end=False))
+
+
+def normalize_table_presentation(text: str, *, strip_sentence_end: bool = True) -> str:
+    """Compare typographic variants without changing stored text or fact symbols."""
+    text = unicodedata.normalize("NFKC", text.strip()).translate(SOURCE_RADICALS).translate(str.maketrans("【】", "[]"))
+    # Ellipsis glyphs and repeated dots are presentation, not decimal points.
+    text = re.sub(r"\.{3,}|[·…]{2,}", "…", text)
+    # Sentence punctuation is optional in prose cells; bare numbers and their
+    # decimal points, operators, brackets and ellipses remain distinct.
+    return text.rstrip(".。") if strip_sentence_end and any(c.isalpha() for c in text) else text
 
 
 def table_evidence_text(text: str) -> str:
@@ -33,7 +51,8 @@ def normalize_ranges(text: str) -> str:
 
 
 def _span_present(span: str, body: str) -> bool:
-    text = _norm(span)
+    text = normalize_table_presentation(_norm(span))
+    body = _norm(body)
     if text in body:
         return True
     # A list bullet or a printed HTML line break may survive native extraction
@@ -42,12 +61,6 @@ def _span_present(span: str, body: str) -> bool:
     item = re.sub(r"^(?:<br\s*/?>)?[•●◦▪]", "", text, flags=re.I)
     if item != text and item and item in body:
         return True
-    # Some PDF font maps use Unicode radical characters for their visually
-    # identical ideographs. Treat only those characters as a single glyph here;
-    # numbers, letters, operators and ordinary ideographs still match exactly.
-    if any("CJK RADICAL" in unicodedata.name(ch, "") for ch in text):
-        pattern = "".join("." if "CJK RADICAL" in unicodedata.name(ch, "") else re.escape(ch) for ch in text)
-        return re.search(pattern, body) is not None
     return False
 
 
@@ -113,6 +126,66 @@ def _native_line_spans(line: dict) -> list[dict]:
     return result
 
 
+def _unreadable_native_glyphs(page, fonts=None) -> list[tuple[float, float]]:
+    """Locate broken mappings, including visible glyphs encoded as spaces.
+
+    The PDF's Unicode map and its embedded font must agree on a space glyph.
+    Unknown or non-embedded fonts are left alone; glyph boxes are not proof
+    because some valid fonts report an ink box even for a real space.
+    """
+    import pymupdf
+    fonts = {} if fonts is None else fonts
+    # Structured extraction may apply /ActualText that repairs a bad font map.
+    # A raw trace must not invalidate that correctly decoded text.
+    spaces = {(tuple(c["origin"]), ord(c["c"]))
+              for b in page.get_text("rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES).get("blocks", [])
+              for line in b.get("lines", []) for span in line.get("spans", [])
+              for c in span.get("chars", []) if len(c["c"]) == 1 and c["c"].isspace() and not c.get("synthetic")}
+    name = lambda value: re.sub(r"[\s-]", "", value.split("+")[-1]).casefold()
+    by_name = {}
+    for item in page.get_fonts():
+        xref = item[0]
+        if xref not in fonts:
+            data = page.parent.extract_font(xref)[3]
+            try:
+                font = pymupdf.Font(fontbuffer=data) if data else None
+                fonts[xref] = {c: font.has_glyph(c) for c in font.valid_codepoints()
+                               if chr(c).isspace()} if font else {}
+            except RuntimeError:
+                fonts[xref] = {}
+        by_name.setdefault(name(item[3]), []).append(fonts[xref])
+    bad = []
+    for span in page.get_texttrace():
+        candidates = by_name.get(name(span["font"]), [])
+        for code, glyph, origin, _ in span["chars"]:
+            if (tuple(origin), code) in spaces and candidates:
+                # Space/NBSP/width variants may share a decoded Unicode space.
+                expected = {g for font in candidates for g in font.values()}
+                if all(font.get(code) for font in candidates) and glyph not in expected:
+                    bad.append(tuple(origin))
+    return bad
+
+
+def _native_region(page, rect, bad_glyphs):
+    """Keep intact native lines; a damaged line cannot supply independent facts."""
+    import pymupdf
+    lines, omitted = [], 0
+    for block in page.get_text("dict", clip=rect).get("blocks", []):
+        for line in block.get("lines", []):
+            box = pymupdf.Rect(line["bbox"])
+            if (any(point in box for point in bad_glyphs) or
+                    any("\ufffd" in s.get("text", "") or "\x00" in s.get("text", "") for s in line.get("spans", []))):
+                omitted += 1
+            else:
+                lines.append(line)
+    spans = [s for line in lines for s in _native_line_spans(line)]
+    spans.sort(key=lambda s: (s["bbox"][1], s["bbox"][0]))
+    native = ("\n".join("".join(s.get("text", "") for s in line.get("spans", []))
+                         for line in sorted(lines, key=lambda x: (x["bbox"][1], x["bbox"][0])))
+              if omitted else page.get_text("text", clip=rect, sort=True)).strip()
+    return native, spans, omitted
+
+
 def supplement_visible_forms(blocks: list[ParsedBlock], path: Path) -> list[ParsedBlock]:
     """Read visible field values without executing actions or flattening the PDF."""
     try:
@@ -172,6 +245,7 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
     except Exception:
         return
     with doc:
+        bad_by_page, fonts = {}, {}
         for block in blocks:
             if block.block_type not in {"image", "chart", "table"} or not block.bbox or not block.page_idx:
                 continue
@@ -181,10 +255,12 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
             rect = _rect(page, block.bbox)
             if rect.is_empty:
                 continue
-            native = page.get_text("text", clip=rect, sort=True).strip()
-            # A broken font map is not independent evidence.
-            if "\ufffd" in native or "\x00" in native:
-                native = ""
+            if block.page_idx not in bad_by_page:
+                bad_by_page[block.page_idx] = _unreadable_native_glyphs(page, fonts)
+            bad_glyphs = bad_by_page[block.page_idx]
+            native, native_spans, omitted = _native_region(page, rect, bad_glyphs)
+            if omitted:
+                block.metadata["pdf_native_lines_omitted"] = omitted
             if block.block_type != "table":
                 context = "\n".join(x for x in (native, block.metadata.get("source_footnote", "")) if x)
                 if context:
@@ -194,14 +270,10 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                                     str(block.metadata.get("source_footnote") or "")]))
             # get_text(sort=True) inserts spaces between cells. Compare individual
             # spans, not whole rows joined across Markdown column separators.
-            native_spans = [s for b in page.get_text("dict", clip=rect).get("blocks", [])
-                            for line in b.get("lines", []) for s in _native_line_spans(line)]
-            # PDF drawing order can write a wrapped line bottom-first. Evidence
-            # supplements follow visible top-to-bottom, then left-to-right order.
-            native_spans.sort(key=lambda s: (s.get("bbox", [0,0,0,0])[1], s.get("bbox", [0,0,0,0])[0]))
             spans = [s.get("text", "").strip() for s in native_spans]
             missing = list(dict.fromkeys(s for s in spans if len(_norm(s)) >= 2
-                and not re.fullmatch(r"[\s\-‐‑‒–—]+", s) and not source_span_present(s, got, native_spans)))
+                and not re.fullmatch(r"[\s\-‐‑‒–—]+", s) and _norm(s) != "…"
+                and not source_span_present(s, got, native_spans)))
             # Look only below this table, in its column, stopping before another
             # content region. A distant or adjacent-column legend is not adopted.
             bottom = min(page.rect.height, rect.y1 + page.rect.height * .12)
@@ -213,7 +285,7 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                 r = _rect(page, other.bbox)
                 if r.y0 >= rect.y1 and min(r.x1, rect.x1) > max(r.x0, rect.x0):
                     bottom = min(bottom, r.y0)
-            below = page.get_text("text", clip=pymupdf.Rect(rect.x0, rect.y1, rect.x1, bottom), sort=True).strip()
+            below, _, _ = _native_region(page, pymupdf.Rect(rect.x0, rect.y1, rect.x1, bottom), bad_glyphs)
             legend_terms = (r"(?:\blegend\b|\bsymbols?\b|图例|符号说明|"
                             r"[“\"‘'][^“”\"‘’'\n]{1,8}[”\"’']\s*(?:指的是|表示|代表|means|denotes|indicates))")
             footnote = str(block.metadata.get("source_footnote") or "")
@@ -243,7 +315,7 @@ def add_pdf_region_evidence(blocks: list[ParsedBlock], path: Path, cache_dir: Pa
                         block.metadata["table_native_grid_strategy"] = "text"
                 except Exception:
                     pass
-            block.metadata["table_native_grid"] = candidates[0] if native and len(candidates) == 1 else []
+            block.metadata["table_native_grid"] = candidates[0] if native and not omitted and len(candidates) == 1 else []
             block.metadata["table_source_text"] = native
             block.metadata["table_native_spans"] = [{"text": s.get("text", ""), "bbox": list(s["bbox"]),
                 "origin": list(s.get("origin", [])), "line_dir": list(s.get("line_dir") or [])}

@@ -1914,7 +1914,7 @@ class TableHeaderCandidateTests(unittest.TestCase):
 
 class VisualContractTests(unittest.TestCase):
     def test_current_contract_has_decorative_and_kind_specific_guidance(self) -> None:
-        self.assertEqual(vlm.CAPTION_CONTRACT_VERSION, 6)
+        self.assertEqual(vlm.CAPTION_CONTRACT_VERSION, 7)
         self.assertIn("decorative", vlm.RESULT_SCHEMA["properties"])
         self.assertIn("decorative", vlm.RESULT_SCHEMA["required"])
         self.assertIs(vlm.EMPTY_RESULT["decorative"], False)
@@ -2378,25 +2378,15 @@ class VisualEvidenceTests(unittest.TestCase):
         self.assertIn("facts, summary, value_conflicts = reconcile_visual_facts(", src)
         self.assertIn('"visual_value_conflicts": value_conflicts', src)
 
-    def test_runaway_captions_are_collapsed_retried_and_never_cached(self) -> None:
+    def test_distinct_growing_items_and_completed_rows_are_preserved(self) -> None:
         from kb_pipeline.vision.vlm import normalize_result
-
-        chain = ["待处理文件夹"] + ["待处理文件夹" + "内文件夹" * i for i in range(1, 30)]
-        data = normalize_result({"kind": "screenshot", "summary": "云杀毒概况页面", "facts": ["左侧导航栏显示安全管控"] + chain,
-                                 "entities": ["云盘", "安全管控"], "keywords": []})
-        self.assertEqual(data["facts"], ["左侧导航栏显示安全管控", "待处理文件夹"])
-        self.assertTrue(data["runaway"])
-        self.assertEqual(data["runaway_dropped"], 29)
-        normal = normalize_result({"kind": "chart", "summary": "s", "facts": ["A 1", "B 2", "C 3"], "entities": [], "keywords": []})
-        self.assertEqual(normal["facts"], ["A 1", "B 2", "C 3"])
-        self.assertNotIn("runaway", normal)
-        # repetition inside a single item counts too
-        loop = normalize_result({"kind": "screenshot", "summary": "s", "facts": ["首页 密码 " * 60], "entities": [], "keywords": []})
-        self.assertEqual((loop["facts"], loop.get("runaway")), ([], True))
-        src = _repo_file("app/kb_pipeline/vision/vlm.py")
-        self.assertIn('if result.get("runaway"):', src)                       # re-checked on cache read: a runaway old entry is recaptioned
-        self.assertIn('data["vlm_runaway"] = True', src)                       # still runaway after retry: keep the non-repetitive facts, confidence low, no caching
-        self.assertNotIn('data["facts"] = []', src)                            # 2026-09-10: facts are no longer wiped wholesale
+        paths = ["Root folder", "Root folder / Projects", "Root folder / Projects / Reports"]
+        data = normalize_result({"facts": paths})
+        self.assertEqual(data["facts"], paths)
+        self.assertNotIn("runaway", data)
+        loop = normalize_result({"facts": ["Home Password " * 60]})
+        self.assertEqual(loop["facts"], [("Home Password " * 60).strip()])
+        self.assertNotIn("runaway", loop)
 
 
 class VlmEndpointFallbackTests(unittest.TestCase):
@@ -2489,50 +2479,38 @@ class VlmEndpointFallbackTests(unittest.TestCase):
 
 
 class VlmRunawayStringFieldsTests(unittest.TestCase):
-    """Synthetic repetitive model output tests bounds and repetition detection for titles, summaries and facts. Tidying and chunking must retain useful content without reintroducing uncapped fields."""
+    """Complete model fields survive normalization; chunking owns the size budget."""
 
     _HEAD = "顶部导航栏包含:首页、日程、任务。;右侧有一个黑色按钮,文字为“新建任务”。;左侧边栏有多个项目列表,包括:"
 
-    def test_repetitive_summary_is_cut_at_the_cycle_and_marked_runaway(self) -> None:
+    def test_completed_and_numbered_content_survives(self) -> None:
         from kb_pipeline.vision import vlm
-
-        loop = self._HEAD + "".join(f"{i}. 任务列表;" for i in range(1, 400))
-        self.assertTrue(vlm._repetitive_prose(loop))
-        self.assertFalse(vlm._repetitive(loop[:2000]))                   # the old check that only strips spaces misses it, which is why it slipped through
-        data = vlm.normalize_result({"kind": "screenshot", "summary": loop, "facts": ["a"], "entities": [], "keywords": []})
-        self.assertTrue(data["runaway"])
-        self.assertIn("新建任务", data["summary"])                        # content before the loop is kept
-        self.assertNotIn("2. 任务列表", data["summary"])                  # only the first item of the loop is kept
-        self.assertLessEqual(len(data["summary"]), vlm._STRING_CAPS["summary"])
+        loop = self._HEAD + "任务列表;" * 400
+        data = vlm.normalize_result({"summary": loop, "facts": ["a"]})
+        self.assertNotIn("runaway", data)
+        self.assertEqual(data["summary"], loop)
+        self.assertIn("新建任务", data["summary"])
         self.assertEqual(data["facts"], ["a"])
-        # Whole-sentence repetition (a loop body longer than 4 characters) is caught by the compression ratio
-        sentences = "".join(f"第{i}段说明了界面上第{i}个区域的用途与状态。" for i in range(1, 80))
-        self.assertTrue(vlm.normalize_result({"summary": sentences}).get("runaway"))
-        # Long but not repetitive: capped but not runaway; a normal sentence or two stays as is
-        varied = "".join(chr(0x4E00 + (i * 7919) % 2000) for i in range(900))
-        long_ok = vlm.normalize_result({"kind": "screenshot", "summary": varied})
-        self.assertNotIn("runaway", long_ok)
-        self.assertEqual(len(long_ok["summary"]), vlm._STRING_CAPS["summary"])
-        short = "一个弹窗界面,用于将当前项目添加到指定团队,列出了多个可选团队。"
-        self.assertEqual(vlm.normalize_result({"summary": short})["summary"], short)
+        distinct = "".join(f"第{i}段说明了界面上第{i}个区域的用途与状态。" for i in range(1, 80))
+        result = vlm.normalize_result({"summary": distinct})
+        self.assertNotIn("runaway", result)
+        self.assertEqual(result["summary"], distinct)
         title = vlm.normalize_result({"title": "任务 " * 200})
-        self.assertTrue(title["runaway"])
-        self.assertLessEqual(len(title["title"]), vlm._STRING_CAPS["title"])
+        self.assertNotIn("runaway", title)
 
-    def test_verbatim_runaway_on_one_line_is_dropped_but_pin_tables_survive(self) -> None:
+    def test_completed_transcriptions_and_numbered_tables_survive(self) -> None:
         from kb_pipeline.vision import vlm
-
-        loop = vlm.normalize_result({"summary": "s", "text_verbatim": "首页 密码 " * 300})
-        self.assertEqual((loop["text_verbatim"], loop.get("runaway")), ("", True))
+        loop = vlm.normalize_result({"text_verbatim": "首页 密码 " * 300})
+        self.assertEqual(loop["text_verbatim"], ("首页 密码 " * 300).strip())
+        self.assertNotIn("runaway", loop)
         pins = "\n".join(f"A{i} VSS" if i % 2 else f"A{i} VDD" for i in range(1, 80))
         rows = "\n".join(f"| 参数 {i} | {i * 3} | {i * 7} mV | 典型值 |" for i in range(1, 60))
         for legit in (pins, rows):
-            ok = vlm.normalize_result({"summary": "s", "text_verbatim": legit})
-            self.assertEqual(ok["text_verbatim"], legit)
-            self.assertNotIn("runaway", ok)
-        # A single facts item: the old rule stands, and a long item repeating whole sentences counts too
+            out = vlm.normalize_result({"text_verbatim": legit})
+            self.assertEqual(out["text_verbatim"], legit)
+            self.assertNotIn("runaway", out)
         item = "".join(f"第{i}行显示了第{i}个配置项的当前取值与说明。" for i in range(1, 40))
-        self.assertEqual(vlm.normalize_result({"facts": [item]})["facts"], [])
+        self.assertEqual(vlm.normalize_result({"facts": [item]})["facts"], [item])
 
     def test_tidy_keeps_a_truncated_first_line_instead_of_emptying_the_block(self) -> None:
         from kb_pipeline.parsers.visual_blocks import tidy_visual_text
@@ -2854,11 +2832,11 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         # Complete JSON passes through unchanged
         self.assertEqual(vlm.complete_json_prefix(text), text)
 
-        # 3) Degenerate repeated lines are collapsed in the normalize stage; legitimate spaced repeats are kept
+        # 3) Complete transcriptions keep repeated source rows; repetition alone does not justify deletion
         loop = {"summary": "ok", "confidence": "high",
                 "text_verbatim": "\n".join(["High Impedance"] * 50) + "\nEND\nVSS\nA1\nVSS"}
         norm = vlm.normalize_result(loop)
-        self.assertEqual(norm["text_verbatim"], "High Impedance\nEND\nVSS\nA1\nVSS")
+        self.assertEqual(norm["text_verbatim"], loop["text_verbatim"])
 
         # 4) When nothing parses, never stuff the raw text into summary; salvage the summary field when possible
         junk_prefix = '{"kind": "diagram", "summary": "该图展示时序关系", "text_verbatim": "aaa'

@@ -131,7 +131,7 @@ def test_reasoning_only_response_keeps_existing_degraded_retry(tmp_path):
 
 
 def test_runaway_uses_degraded_retry_without_larger_budget(tmp_path):
-    first={'summary':'A menu','facts':['Home Password '*60]}
+    first='{"summary":"A menu","text_verbatim":"'+'Home Password '*300
     create=Mock(side_effect=[response(first,'length'),response({'summary':'A menu','facts':['Navigation menu.']})])
     client=NS(chat=NS(completions=NS(create=create)))
     cache=tmp_path/'caption.json'

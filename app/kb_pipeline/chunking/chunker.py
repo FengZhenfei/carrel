@@ -30,7 +30,9 @@ from ..models import ParsedBlock, UnifiedChunk
 from ..parsers.code_source import code_locator
 from ..utils import count_tokens, split_sentences
 from .context import evidence_text
-from .packing import combined_owner, owns_code_intro, pack_prose, source_regions
+from .packing import (combined_owner, heading_body_flow, is_inline_icon, owns_code_intro, pack_prose,
+                      same_column_before, same_structure, source_regions, starts_heading)
+from .sections import SectionSources, same_section
 
 VISUAL_TYPES = frozenset({"vision", "image", "chart"})
 TEXT_LIKE_TYPES = frozenset({"text", "title", "list", "equation", "page", "slide"})
@@ -418,7 +420,12 @@ def _chunk_prose(
 
     def flush(*, keep_overlap: bool = True) -> list[str]:
         nonlocal current, current_tokens
-        carry = [current.pop()] if len(current) > 1 and is_heading(current[-1]) else []
+        cut = len(current)
+        while cut and is_heading(current[cut - 1]):
+            cut -= 1
+        carry = current[cut:] if cut else []
+        if carry:
+            current = current[:cut]
         if current:
             chunks.append("\n".join(current).strip())
         tail: list[str] = []
@@ -439,7 +446,9 @@ def _chunk_prose(
         if t > max_tokens:
             # A heading moved off the end of the chunk cannot attach to a unit that is split on its own: it becomes
             # a chunk of its own, and the fragment fallback (_glue_pieces) merges it into a neighbouring chunk
-            chunks.extend(flush())
+            carry = flush()
+            if carry:
+                chunks.append("\n".join(carry))
             if atomic:
                 kind = "fence" if _FENCE_OPEN_RE.match(sentence.split("\n", 1)[0]) else "table"
                 chunks.extend(_split_fence(sentence, max_tokens) if kind == "fence" else split_table_text(sentence, max_tokens))
@@ -461,7 +470,9 @@ def _chunk_prose(
                 current_tokens = sum(cost(s) for s in carry)
         current.append(sentence)
         current_tokens += t
-    chunks.extend(flush())      # the text ends with a heading: no sentence follows to attach it to, so it stands alone too
+    carry = flush()
+    if carry:
+        chunks.append("\n".join(carry))  # Keep a trailing heading stack together, ahead of its next source block.
     return [c for c in chunks if c]
 
 
@@ -477,7 +488,15 @@ def chunk_text(
     units: list[tuple[str, bool]] = []
     for kind, seg in _segments(text):
         if kind == "prose":
-            units.extend((s, False) for s in split_sentences(seg))
+            prose = []
+            for line in seg.splitlines(keepends=True):
+                if line.strip() in headings or infer_heading_level(line.strip()) is not None:
+                    units.extend((s, False) for s in split_sentences("".join(prose)))
+                    prose = []
+                    units.append((line.strip(), False))
+                else:
+                    prose.append(line)
+            units.extend((s, False) for s in split_sentences("".join(prose)))
         else:
             seg = seg.strip()
             if seg:
@@ -586,7 +605,7 @@ def _heading_only(text: str) -> bool:
 
 
 def _same_section(a: ParsedBlock, b: ParsedBlock) -> bool:
-    return list(a.metadata.get("section_path") or []) == list(b.metadata.get("section_path") or [])
+    return same_section(a, b)
 
 
 def _same_slide(a: ParsedBlock, b: ParsedBlock) -> bool:
@@ -595,6 +614,91 @@ def _same_slide(a: ParsedBlock, b: ParsedBlock) -> bool:
     if a.slide_idx is None or b.slide_idx is None:
         return True
     return int(a.slide_idx) == int(b.slide_idx)
+
+
+def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_tokens: int,
+                         sources: SectionSources) -> list[dict[str, Any]]:
+    """A heading travels with its prose, even when a side image sits between them.
+
+    Bind by section and source layout before the short-fragment fallback. Repack
+    within the ordinary budget and retain every member's source regions. Side
+    images remain independent, in their original relative order. A short page
+    tail may likewise join the next page's opening in the same section; a later
+    heading in that next chunk must not hide the valid continuation.
+    """
+    out = []
+    i = 0
+    while i < len(pieces):
+        h = pieces[i]
+        j = i + 1
+        heading_lines = [line.strip() for line in h["text"].splitlines() if line.strip()]
+        known = h["block"].metadata.get("heading_lines") or []
+        heading_only = bool(heading_lines) and all(
+                line in known or h["block"].block_type == "title" or infer_heading_level(line) is not None
+                for line in heading_lines)
+        if h["block"].block_type in TEXT_LIKE_TYPES and (heading_only or h["tokens"] < tiny_threshold(max_tokens)):
+            while heading_only and j < len(pieces) and pieces[j]["block"].block_type in VISUAL_TYPES:
+                j += 1
+            b = pieces[j] if j < len(pieces) else None
+            remainder = None
+            if b and b["block"].block_type in {"text", "list", "page", "slide"} and not starts_heading(b):
+                # Only the body's opening section belongs to this heading. A
+                # size-based chunk may also contain a later section; retain it
+                # separately instead of rejecting the valid opening association.
+                lines = b["text"].splitlines(keepends=True)
+                cut = next((n for n, line in enumerate(lines) if line.strip() in
+                            (b["block"].metadata.get("heading_lines") or [])
+                            or infer_heading_level(line.strip()) is not None), len(lines))
+                if cut < len(lines):
+                    prefix, tail = "".join(lines[:cut]).strip(), "".join(lines[cut:]).strip()
+                    remainder = {"text": tail, "tokens": count_tokens(tail),
+                                 "block": sources.locate(b["block"], tail, advance=False)}
+                    b = {"text": prefix, "tokens": count_tokens(prefix),
+                         "block": sources.locate(b["block"], prefix, advance=False)}
+            paths = h["block"].metadata.get("_chunk_section_paths")
+            terminal = replace(h["block"], metadata={**h["block"].metadata,
+                "section_path": paths[-1], "_chunk_section_paths": [paths[-1]]}) if paths else h["block"]
+            if (b and b["block"].block_type in {"text", "list", "page", "slide"}
+                    and b["text"] and not starts_heading(b) and same_structure(terminal, b["block"])):
+                # A long body may continue on another page; ownership starts at
+                # its first source region, while the merged evidence keeps all.
+                first = source_regions(b["block"])[0]
+                entry = replace(b["block"], page_idx=first.get("page"), bbox=first.get("bbox"),
+                                metadata={"source_regions": [first], "page_end": first.get("page")})
+                within_budget = count_tokens(h["text"] + "\n" + b["text"]) <= max_tokens
+                last_page = source_regions(h["block"])[-1].get("page")
+                next_page = first.get("page")
+                continues_page = last_page is not None and next_page == last_page + 1
+                can_bind = heading_only or (continues_page and remainder and within_budget
+                                            and same_structure(h["block"], b["block"]))
+                if can_bind and (j == i + 1 or heading_body_flow(h["block"], entry, [p["block"] for p in pieces[i + 1:j]])):
+                    text = h["text"] + "\n" + b["text"]
+                    owner = combined_owner(b["block"], [h["block"], b["block"]])
+                    offset, spans = 0, []
+                    for p in (h, b):
+                        paths = p["block"].metadata.get("_chunk_section_paths", [
+                            list(p["block"].metadata.get("section_path") or [])])
+                        for path in paths:
+                            spans.append({"start": offset, "end": offset + len(p["text"]),
+                                          "section_path": path, "source_regions": source_regions(p["block"])})
+                        offset += len(p["text"]) + 1
+                    metadata = {k: v for k, v in owner.metadata.items() if k != "embedded_source"}
+                    headings = list(dict.fromkeys([*([h["text"]] if heading_only else known),
+                                                   *(metadata.get("heading_lines") or [])]))
+                    owner = replace(owner, text=text, title=None, caption=None,
+                                    metadata={**metadata, "section_spans": spans, "heading_lines": headings})
+                    bound_sources = SectionSources([owner])
+                    parts = chunk_text(text, max_tokens, overlap_tokens, headings=frozenset(headings))
+                    out.extend({"text": part, "block": bound_sources.locate(owner, part), "tokens": count_tokens(part)}
+                               for part in parts)
+                    out.extend(pieces[i + 1:j])
+                    if remainder:
+                        out.append(remainder)
+                    i = j + 1
+                    continue
+        out.append(h)
+        i += 1
+    return out
 
 
 def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str, Any]]:
@@ -607,21 +711,19 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
 
     def owned_heading(p, nxt) -> bool:
         a, b = p["block"], nxt["block"]
+        if is_inline_icon(b):
+            return False
         if a.slide_idx is not None:
             return _same_slide(a, b)
         explicit = (a.block_type == "title" or infer_heading_level(p["text"]) is not None
                     or p["text"] in (a.metadata.get("heading_lines") or []))
-        if not explicit or a.page_idx != b.page_idx:
-            return False
-        if a.bbox and b.bbox:
-            return (a.bbox[3] <= b.bbox[1] + 5 and min(a.bbox[2], b.bbox[2]) > max(a.bbox[0], b.bbox[0]))
-        return True
+        return explicit and same_column_before(a, b)
 
     def owned_lead_in(p, cand, prepend) -> bool:
         a, b = p["block"], cand["block"]
         if a.slide_idx is not None:
             return _same_slide(a, b)
-        if not prepend or a.page_idx != b.page_idx:
+        if not prepend or is_inline_icon(b) or not same_column_before(a, b):
             return False
         # An explicit forward reference supplies evidence of ownership; brevity
         # alone does not. This applies equally to PDF, DOCX and other documents.
@@ -656,6 +758,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             # slide_idx as the source page (Codex review F09); PDF pages are continuous, so _same_slide
             # lets them through
             if (nxt is not None and text_like(nxt) and _same_section(p["block"], nxt["block"])
+                    and not starts_heading(nxt)
                     and _same_slide(p["block"], nxt["block"]) and p["tokens"] + nxt["tokens"] <= limit):
                 nxt["block"] = combined_owner(nxt["block"], [p["block"], nxt["block"]])
                 nxt["text"] = f"{p['text']}\n{nxt['text']}"
@@ -664,6 +767,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
                 changed = True
                 continue
             if (prev is not None and text_like(prev) and _same_section(prev["block"], p["block"])
+                    and not starts_heading(p)
                     and _same_slide(prev["block"], p["block"]) and prev["tokens"] + p["tokens"] <= limit):
                 prev["block"] = combined_owner(prev["block"], [prev["block"], p["block"]])
                 prev["text"] = f"{prev['text']}\n{p['text']}"
@@ -791,7 +895,7 @@ def blocks_to_chunks(
     max_tokens: int,
     overlap_tokens: int,
 ) -> list[UnifiedChunk]:
-    from .sections import SectionSources, resolve_sections
+    from .sections import resolve_sections
     sections = SectionSources(blocks)
     pieces: list[dict[str, Any]] = []
     for block, text in _group_code_blocks(_embedded_code_blocks(blocks), max_tokens):
@@ -833,8 +937,11 @@ def blocks_to_chunks(
             # Merged slides use the ordinary text splitter.
             parts = split_visual_text(text, max_tokens)
         else:
+            headings = frozenset(block.metadata.get("heading_lines") or ())
+            if block.block_type == "title":
+                headings = headings | {block.text.strip()}
             parts = chunk_text(text, max_tokens, overlap_tokens,
-                               headings=frozenset(block.metadata.get("heading_lines") or ()))
+                               headings=headings)
         offset = 0
         for part_index, part in enumerate(parts):
             owner = block
@@ -858,7 +965,8 @@ def blocks_to_chunks(
             owner = sections.locate(owner, part)
             pieces.append({"text": part, "block": owner, "tokens": count_tokens(evidence_text(part, owner.metadata))})
 
-    pieces = pack_prose(_glue_pieces(pieces, max_tokens), max_tokens)
+    pieces = pack_prose(_glue_pieces(_bind_heading_bodies(
+        pieces, max_tokens, overlap_tokens, SectionSources(blocks)), max_tokens), max_tokens)
 
     result: list[UnifiedChunk] = []
     per_block: dict[str, int] = {}
