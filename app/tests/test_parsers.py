@@ -1209,7 +1209,10 @@ class MergedCellFillTests(unittest.TestCase):
         code = "\n".join(line[12:] if line.startswith(" " * 12) else line
                          for line in code.splitlines())
         ns = {"ws": ws, "merged_values": {}, "used_rows": ws.max_row,
-              "used_cols": ws.max_column, "normalize_cell": native_table.normalize_cell}
+              "used_cols": ws.max_column, "normalize_cell": native_table.normalize_cell,
+              # the lifted loop reads the anchor through this helper since the built-in CJK date formats are
+              # recognised; the stand-in cells carry no number format, so the workbook epoch is never used
+              "_xlsx_shown_value": native_table._xlsx_shown_value, "wb": SimpleNamespace(epoch=None)}
         exec(compile(code, "fill.py", "exec"), ns)
         return ns["merged_values"]
 

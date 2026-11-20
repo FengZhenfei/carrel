@@ -109,11 +109,21 @@ def stitch_short_hit(row: dict[str, Any], neighbors: list[dict[str, Any]], *, mi
             order.append(nxt[i])
         if i < len(prev):
             order.append(prev[i])
+    closed: set[bool] = set()       # sides (after the hit / before it) on which a neighbour did not fit
     for p in order:
         if total >= min_chars:
             break
+        after = int(p["chunk_index"]) > idx
+        if after in closed:
+            continue
         t = str(p.get("text") or "")
-        if not t or total + len(t) + 1 > max_chars:
+        if not t:
+            continue
+        if total + len(t) + 1 > max_chars:
+            # A neighbour that does not fit ends the stitching on its side. Skipping it and taking a farther
+            # chunk instead produced a text with a piece missing in the middle that read as continuous, and
+            # chunk_from / chunk_to spanned the piece that was left out.
+            closed.add(after)
             continue
         pieces[int(p["chunk_index"])] = {"text": t, "point_id": p.get("point_id"), "chunk_index": int(p["chunk_index"]),
                                          "page_idx": p.get("page_idx"), "page_end": p.get("page_end"),

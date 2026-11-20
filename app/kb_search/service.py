@@ -644,17 +644,21 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
         c["_image_order"] = c["score_rerank_visual"] * factor
     image_rows.sort(key=lambda c: (-c["_image_order"], str(c["point_id"])))
     recall_rows.sort(key=lambda c: (-float(c["scores"]["score_visual"]), str(c["point_id"])))
-    # Rejected/unknown evidence never gets promoted merely by a high list rank.
+    # Rejected evidence never gets promoted merely by a high list rank. Evidence without a verdict is not
+    # rejected evidence: when the text branch has no scores (reranker down, timed out or switched off) its
+    # candidates are "unknown" (accepted is None) and stay in recall order next to the accepted pictures.
+    # Dropping them together with the rejected ones returned nothing but pictures as soon as one picture
+    # passed its threshold, while the same request without that picture returned the text in recall order.
     accepted = any(c.get("accepted") is True for c in cands)
     lists = [text_rows, image_rows, recall_rows]
     k = max(0, ss.rrf_k)
     for rows in lists:
-        retained = [c for c in rows if c.get("accepted") is True] if accepted else rows
+        retained = [c for c in rows if c.get("accepted") is not False] if accepted else rows
         for rank, c in enumerate(retained, 1):
             c["ranking"]["rank"] = rank
             c["score_fusion"] = 1.0 / (k + rank)
             weight = 1.0
-            if accepted:
+            if accepted and c.get("accepted") is True:
                 branch = c["ranking"]["branch"]
                 if branch == "visual_recall":
                     score, threshold = float(c["scores"]["score_visual"]), 0.5
@@ -665,13 +669,16 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
                 weight = relevance_weight(score, threshold)
             c["ranking"]["margin_weight"] = weight
             c["score_final"] = round((k + 1) * c["score_fusion"] * weight, 6)
-    ordered = [c for c in cands if not accepted or c.get("accepted") is True]
+    ordered = [c for c in cands if not accepted or c.get("accepted") is not False]
     # Equal ranks carry no cross-model relevance comparison. Retain the original
     # recall order; only a request with pixels explicitly prefers the image lane.
-    ordered.sort(key=lambda c: (-float(c.get("score_final") or 0),
+    # At an equal score an accepted candidate comes before one without a verdict.
+    ordered.sort(key=lambda c: (-float(c.get("score_final") or 0), c.get("accepted") is not True,
                                bool(image_query and c["ranking"]["branch"] not in ("visual", "visual_recall")),
                                c.get("_recall_order", 0), str(c["point_id"])))
-    status = "ok" if accepted else ("skipped" if any(c.get("accepted") is None for c in cands) else "below_threshold")
+    # Candidates without a verdict mean the text ranking did not happen: report that, also when a picture was
+    # accepted (this used to say "ok" although no text had been scored).
+    status = "skipped" if any(c.get("accepted") is None for c in cands) else ("ok" if accepted else "below_threshold")
     audit["fusion"] = {"status": "ok", "constant": k, "accepted": sum(c.get("accepted") is True for c in cands),
                        "method": "rank_margin"}
     return {"cands": cands, "ordered": ordered, "status": status, "error": text_out["error"], "floor": floor,
@@ -756,6 +763,31 @@ def _mark_accepted(ordered: list[dict[str, Any]], status: str, floor: float | No
     for c in ordered:
         c["accepted"] = None
     return "unranked"
+
+
+def _recheck_source_status(settings: Settings, rows: list[dict[str, Any]], meta: dict[str, dict[str, Any]],
+                           scope: dict[str, Any]) -> None:
+    """Document status of the sources of derived rows (facts, entities, relations); marks the rows to drop.
+
+    A row stays when at least one of its source points is confirmed allowed, and then cites only those; it is
+    excluded when none is (a point whose metadata did not come back is not confirmed). This is the rule of the
+    build's current view (graph/current_view.py) and of the two later checks in search() (document scope,
+    deactivated points). The row used to be dropped as soon as one source was not allowed: an entity named in
+    ten documents disappeared from the current scope once one of the ten was archived. A fact row is one
+    occurrence with a document of its own, so that document has to be allowed as before."""
+    for row in rows:
+        source = settings.sources[row["kb_id"]]
+        pids = list(row.get("point_ids") or [])
+        if not pids:
+            continue
+        confirmed = [pid for pid in pids if docstatus.allowed(settings, source, meta.get(str(pid), {}).get("rel_path"), scope)]
+        own = row.get("rel_path")
+        if not confirmed or (own and not docstatus.allowed(settings, source, own, scope)):
+            row["_status_excluded"] = True
+        elif len(confirmed) < len(pids):
+            row["point_ids"] = confirmed
+            if row.get("docs"):
+                row["docs"] = [d for d in row["docs"] if docstatus.allowed(settings, source, d, scope)]
 
 
 def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = None, hints: dict[str, Any] | None = None,
@@ -1016,11 +1048,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     point_active = {pid: bool(m.get("active")) for pid, m in meta.items()}
     pages = [pg for pg in pages if docstatus.page_allowed(settings, settings.sources[pg["kb_id"]], pg, scope)]
     # Source status is rechecked after hydration too, independently of prefilter limits.
-    for row in specs + entities + relations:
-        source = settings.sources[row["kb_id"]]
-        pids = list(row.get("point_ids") or [])
-        if pids and any(not docstatus.allowed(settings, source, meta.get(str(pid), {}).get("rel_path"), scope) for pid in pids):
-            row["_status_excluded"] = True
+    _recheck_source_status(settings, specs + entities + relations, meta, scope)
     specs = [r for r in specs if not r.get("_status_excluded")]
     entities = [r for r in entities if not r.get("_status_excluded")]
     relations = [r for r in relations if not r.get("_status_excluded")]

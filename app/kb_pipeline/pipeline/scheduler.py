@@ -10,6 +10,7 @@ from pathlib import Path
 from .. import db
 from ..models import SourceFile
 from ..localfs.scanner import inside_boundary
+from ..parsers.errors import FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE, FAILURE_VERDICT_KEY
 from ..parsers.source_guard import is_source_placeholder
 from .detect_changes import detect_change, parser_profile_for
 
@@ -401,14 +402,34 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
 FAILED_RETRY_COOLDOWN_SECONDS = int(os.getenv("KB_FAILED_RETRY_COOLDOWN_SECONDS", str(24 * 3600)))
 
 
+def _stored_failure_verdict(job_row) -> str | None:
+    """The failure verdict the worker stored in the job payload (worker._record_failure_verdict). None when
+    there is none: jobs that failed before verdicts were recorded, and jobs reclaimed as failed after their
+    process died."""
+    try:
+        payload = json.loads(job_row["payload_json"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    verdict = payload.get(FAILURE_VERDICT_KEY) if isinstance(payload, dict) else None
+    return verdict if verdict in (FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE) else None
+
+
 def _failed_parse_blocks_auto_requeue(job_row, change_type: str = "needs_parse") -> bool:
     """Whether this scan should still hold back a file whose last parse failed instead of re-queueing it.
     True = hold it back (the file stays in the failed state)."""
-    error_raw = str(job_row["error"] or "")
-    error = error_raw.lower()
-    if "physical file not found" in error:
+    verdict = _stored_failure_verdict(job_row)
+    if verdict is None:
+        # No verdict on the job: read it from the error text as before, so these jobs are treated as they were
+        error_raw = str(job_row["error"] or "")
+        if "physical file not found" in error_raw.lower():
+            verdict = FAILURE_FILE_MISSING
+        elif any(marker in error_raw for marker in ("NonRetryableParseError", "MissingSourceContent", "非重试")):
+            verdict = FAILURE_DETERMINISTIC
+        else:
+            verdict = FAILURE_RETRYABLE
+    if verdict == FAILURE_FILE_MISSING:
         return False   # the file reappeared: re-queue
-    if any(marker in error_raw for marker in ("NonRetryableParseError", "MissingSourceContent", "非重试")):
+    if verdict == FAILURE_DETERMINISTIC:
         # Deterministic failure (no parser route, broken format): re-queueing is pointless, so hold it back
         # until the parser / router changes or the user retries by hand. This used to return False (let
         # through), re-enqueueing the same unchanged input on every scan (Codex review F07).

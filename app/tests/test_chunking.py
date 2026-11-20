@@ -612,25 +612,27 @@ class HeadingRuleTests(unittest.TestCase):
         self.assertEqual([lv for lv, _ in got], [2, None, 3, 1])
 
     def test_docx_headings_are_not_demoted_below_inferred_ones(self) -> None:
-        """docx levels come from Word styles: once an unstyled "2.3 xxx" body paragraph had been recovered as a
-        level-2 heading, every level-1 heading after it used to be demoted to level 3."""
+        """docx levels come from Word styles. An unstyled "2.3 xxx" body paragraph is body text: inference sets
+        the level of marked headings only (audit B2), so it neither enters the section path nor pushes the
+        headings after it down."""
         seq = [("概述", 1), ("2.3 没有标题样式的正文段", None), ("安装", 1), ("配置", 2), ("1.2.1 细节", 2),
                ("- 加粗的列表项", 1), ("升级", 1)]
         got = self._walk(seq, trust_parser_levels=True)
-        self.assertEqual([lv for lv, _ in got], [1, 2, 1, 2, 3, None, 1])
+        self.assertEqual([lv for lv, _ in got], [1, None, 1, 2, 3, None, 1])
+        self.assertEqual(got[1][1], ["概述"])
         self.assertEqual(got[4][1], ["安装", "配置", "1.2.1 细节"])
         self.assertEqual(got[6][1], ["升级"])
-        self.assertEqual([lv for lv, _ in self._walk(seq)], [1, 2, 3, 3, 3, None, 4])       # unchanged for PDF
-        # Only the document title carries a style and the chapters are typed by hand: the chapters are still
-        # recovered from the layout; when every style is level 1, the depth of the numbering still counts
+        self.assertEqual([lv for lv, _ in self._walk(seq)], [1, None, 1, 2, 3, None, 4])    # PDF: unnumbered headings hang under the numbered one
+        # Chapters typed by hand without a heading style are not marked by the parser and stay body text;
+        # when every style is level 1, the depth of the numbering still counts
         got = self._walk([("XX 系统设计说明书", 1), ("第一章 总则", None), ("1.1 范围", None)], trust_parser_levels=True)
-        self.assertEqual([lv for lv, _ in got], [1, 1, 2])
+        self.assertEqual([lv for lv, _ in got], [1, None, None])
         got = self._walk([("1 概述", 1), ("1.1 背景", 1), ("1.1.1 细节", 1)], trust_parser_levels=True)
         self.assertEqual([lv for lv, _ in got], [1, 2, 3])
 
     def test_section_paths_in_parsed_blocks(self) -> None:
-        """Blocks from the two parsers: PDF integer chapter numbers are not demoted; docx style headings are not
-        pushed down by numbered headings recovered by inference."""
+        """Blocks from the two parsers: PDF integer chapter numbers are not demoted; a docx paragraph without a
+        heading style stays body text even when it reads like a numbered heading (audit B2)."""
         from kb_pipeline.parsers import mineru_docx, mineru_pdf
 
         def item(text, level=None):
@@ -647,9 +649,9 @@ class HeadingRuleTests(unittest.TestCase):
             self.assertEqual({b.parser_profile for b in blocks}, {"mineru-3.4.4-pdf-v3"})     # the provenance tag no longer claims the pipeline backend
             with patch.object(mineru_docx, "call_mineru_sync", return_value=docx):
                 blocks = mineru_docx.mineru_docx_blocks(mineru_url="http://x", path=Path(tmp) / "a.docx", cache_dir=Path(tmp) / "d")
-            self.assertEqual([b.metadata.get("heading_level") for b in blocks], [1, 2, 1, None])
-            self.assertEqual([b.metadata["section_path"] for b in blocks],
-                             [["概述"], ["概述", "2.3 没有标题样式的一段"], ["安装"], ["安装"]])
+            self.assertEqual([b.block_type for b in blocks], ["title", "text", "title", "text"])
+            self.assertEqual([b.metadata.get("heading_level") for b in blocks], [1, None, 1, None])
+            self.assertEqual([b.metadata["section_path"] for b in blocks], [["概述"], ["概述"], ["安装"], ["安装"]])
 
 
 class ChunkStructureTests(unittest.TestCase):

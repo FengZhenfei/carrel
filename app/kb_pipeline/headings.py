@@ -14,6 +14,9 @@ from typing import Iterable
 # not a heading -- values like "1.5 V typical", numbered list items like "1. Typical values are for
 # reference only, ..." -- must be kept out, otherwise section_path gets polluted and the chunker's
 # structural cut points land in the wrong places.
+# The parser uses these rules only to set the level of a block it has already marked as a heading (see
+# HeadingResolver); it does not promote an ordinary paragraph to a heading with them. The chunker uses them to
+# find structural cut points inside body text.
 _CJK_NUM = r"[一二三四五六七八九十百千零〇0-9]+"
 _HEADING_TAIL = r"(?=\s|[:：.．、—\-]|$)"
 # Chinese typesetting often glues the number to the title (e.g. "1.2" fused with the title text, or
@@ -251,6 +254,11 @@ class HeadingResolver:
     trust_parser_levels (docx): the levels come from Word styles, so the third rule is skipped -- otherwise,
     once an unstyled body paragraph shaped like "2.3 xxx" is recovered as a heading, every level-1 heading
     after it would be demoted.
+
+    Layout inference only sets the level of a block the parser has already marked as a heading; it does not
+    promote an ordinary paragraph. Numbered steps and values ("1. Switch the device on", "2.4 GHz band")
+    read like headings: once promoted to level 1 they wiped the section path before them, and every chunk
+    after them was filed under the wrong section.
     """
 
     def __init__(self, title_texts: Iterable[str] = (), *, repeat_limit: int = 3,
@@ -274,6 +282,8 @@ class HeadingResolver:
         return number <= 1 and self.numbered_level is None
 
     def resolve(self, parser_level: int | None, text: str) -> tuple[int | None, bool]:
+        if parser_level is None:
+            return None, False           # the parser did not mark it as a heading: body text, no promotion by wording
         clean = clean_heading_text(text)
         if parser_level is not None and (
             not clean or clean in self.labels or looks_like_list_item(text) or looks_like_step_label(text)

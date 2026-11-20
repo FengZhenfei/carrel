@@ -13,6 +13,7 @@
 !deployment/compose/
 !deployment/compose/app/
 !deployment/compose/app/Dockerfile
+!deployment/compose/app/code-parsers/**
 **/__pycache__
 **/*.pyc
 

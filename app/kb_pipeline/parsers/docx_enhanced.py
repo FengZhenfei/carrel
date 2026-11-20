@@ -150,7 +150,7 @@ def extract_docx_chart_blocks(path: Path) -> list[ParsedBlock]:
                         text=table,
                         table_markdown=table,
                         title=title or f"{path.name} chart {idx}",
-                        caption="Chart data" + (f"; axes: {' / '.join(axes)}" if axes else ""),
+                        caption="图表数据" + (f";坐标轴: {' / '.join(axes)}" if axes else ""),
                         block_id=f"docx-chart-{idx:04d}",
                         metadata={"ooxml_path": name, "anchor_text": anchors.get(name, "")},
                     )
@@ -231,7 +231,7 @@ def chart_xml_table(raw: bytes) -> tuple[str, list[str], str]:
     rows: list[list[str]] = []
     sized = False
     for number, ser in enumerate(chart.iter(f"{_CHART_NS}ser"), start=1):
-        name = _chart_text(ser.find(f"{_CHART_NS}tx")) or f"Series {number}"
+        name = _chart_text(ser.find(f"{_CHART_NS}tx")) or f"系列{number}"
         cats = _chart_points(ser.find(f"{_CHART_NS}cat")) or _chart_points(ser.find(f"{_CHART_NS}xVal"))
         vals = _chart_points(ser.find(f"{_CHART_NS}val")) or _chart_points(ser.find(f"{_CHART_NS}yVal"))
         sizes = _chart_points(ser.find(f"{_CHART_NS}bubbleSize"))
@@ -241,7 +241,7 @@ def chart_xml_table(raw: bytes) -> tuple[str, list[str], str]:
     if not rows:
         return title, axes, ""
     width = 4 if sized else 3
-    lines = [["Series", "Category", "Value", "Size"][:width], ["---"] * width] + [row[:width] for row in rows]
+    lines = [["系列", "类别", "值", "大小"][:width], ["---"] * width] + [row[:width] for row in rows]
     return title, axes, "\n".join("| " + " | ".join(cell.replace("|", "\\|") for cell in line) + " |" for line in lines)
 
 

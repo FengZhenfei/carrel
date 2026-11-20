@@ -415,12 +415,12 @@ def normalize_fact(raw: dict[str, Any]) -> dict[str, Any] | None:
         out["ranges"] = ranges
     if cmps:
         out["cmps"] = cmps
-    if raw.get("subject_origin") in {"explicit", "context", "unresolved"}:
-        out["subject_origin"] = raw["subject_origin"]
-    if raw.get("fact_kind") in {"observation", "state", "reference"}:
-        out["fact_kind"] = raw["fact_kind"]
-    else:
-        out["fact_kind"] = "observation"
+    # 模型偶尔把这两个字段写成列表 / 对象。不可哈希的值直接做集合成员判断会抛 TypeError,整个单元算失败;而这条回复是
+    # 合法 JSON、已经进了响应缓存,重试读到的还是它,事实阶段永远过不去。按「不认识的值」处理,与写了别的字符串时相同。
+    origin, kind = raw.get("subject_origin"), raw.get("fact_kind")
+    if isinstance(origin, str) and origin in {"explicit", "context", "unresolved"}:
+        out["subject_origin"] = origin
+    out["fact_kind"] = kind if isinstance(kind, str) and kind in {"observation", "state", "reference"} else "observation"
     if raw.get("evidence"):
         out["evidence"] = _clean_value(raw["evidence"], 800)
     if out.get("subject_origin") == "unresolved":

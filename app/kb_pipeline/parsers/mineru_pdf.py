@@ -74,7 +74,8 @@ def mineru_pdf_blocks(
     # Heading levels: MinerU's text_level is combined with layout inference (CJK chapter numbering /
     # 1.2.3 / Chapter N), then corrected at document level -- recurring labels (KEYWORD / Note:) and
     # list items are not headings, and unnumbered headings hang under the nearest numbered one.
-    # Ordinary body lines MinerU did not mark are recognised by inference (see headings.HeadingResolver)
+    # Body lines MinerU did not mark stay body text: inference only sets the level of a block that is
+    # already marked as a heading (see headings.HeadingResolver)
     toc_pages = detect_toc_pages((page_idx(i), item_text(i)) for i in items if label_of(i) in ("text", "title"))
     toc_items = explicit_toc_entries([(page_idx(i), "" if label_of(i) in
         {"header", "footer", "page_header", "page_footer", "page_number"} else item_text(i) or "\ufffc") for i in items])

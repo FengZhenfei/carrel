@@ -18,6 +18,11 @@ from .common import clean_text
 from .source_guard import require_source_content
 from .openpyxl_compat import load_workbook_compat
 
+# The csv module caps a field at 131,072 characters by default, so one long text cell made the whole file
+# unreadable. The size of a file is limited separately (KB_MAX_FILE_BYTES), so no second cap is set here: the
+# limit is raised to the largest value every platform accepts (a C long has at least 32 bits).
+csv.field_size_limit(2**31 - 1)
+
 
 def parse_native_table(
     path: Path,
@@ -50,19 +55,22 @@ def parse_native_table(
 def read_csv_rows_numbered(path: Path) -> list[tuple[int, list[str]]]:
     """(source-file row number, cells). Blank rows are filtered out but row numbers follow the source
     file, so provenance lines up (final review S01)."""
-    last_error: Exception | None = None
     with path.open("rb") as handle:
         prefix = handle.read(4)
     bom = "utf-32" if prefix in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff") else "utf-16" if prefix[:2] in (b"\xff\xfe", b"\xfe\xff") else None
-    for encoding in ((bom,) if bom else ("utf-8-sig", "utf-8", "gb18030", "gbk")):
-        try:
-            return _read_csv_rows_with_encoding(path, encoding=encoding, errors="strict")
-        except Exception as exc:
-            last_error = exc
     try:
+        for encoding in ((bom,) if bom else ("utf-8-sig", "utf-8", "gb18030", "gbk")):
+            try:
+                return _read_csv_rows_with_encoding(path, encoding=encoding, errors="strict")
+            except UnicodeError:
+                # Only a decoding failure means the encoding guess was wrong: try the next one. An error of the
+                # csv module itself (field size, quoting) or of reading the file is the same under any encoding
+                # and is reported as it is. Every error used to move on to the next encoding, and the message
+                # named the last decoding error instead of the cause.
+                continue
         return _read_csv_rows_with_encoding(path, encoding="utf-8", errors="ignore")
     except Exception as exc:
-        raise RuntimeError(f"cannot read csv {path}: {last_error or exc!r}") from exc
+        raise RuntimeError(f"cannot read csv {path}: {exc!r}") from exc
 
 
 def _read_csv_rows_with_encoding(path: Path, *, encoding: str, errors: str) -> list[tuple[int, list[str]]]:
@@ -118,6 +126,31 @@ def _xlsx_content_extent(ws: Any) -> tuple[int, int]:
     return last_row, last_col
 
 
+# Excel's built-in number formats 27-36 and 50-58 are reserved for CJK locale dates and times (ECMA-376 part 1,
+# 18.8.30). Their format codes depend on the locale, are not written into the file, and openpyxl's built-in
+# table does not have them: a cell using one was read as General and a date came out as its serial (45123).
+_CJK_DATE_FORMAT_IDS = frozenset((*range(27, 37), *range(50, 59)))
+_CJK_DATE_FORMAT = "yyyy-mm-dd"     # only makes these ids count as dates; indexed dates are written in ISO form anyway
+
+
+def _xlsx_shown_value(cell: Any, epoch: datetime.datetime) -> Any:
+    """The value of a cell as read by openpyxl. A number in one of the built-in CJK date formats
+    (_CJK_DATE_FORMAT_IDS) is a date serial and is turned into a date; one that cannot be (outside the date
+    range, shown as #### by Excel itself) keeps its value. The format id is only in the cell's style record
+    (_style): cell.number_format answers General for every id missing from the built-in table."""
+    value = cell.value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if getattr(getattr(cell, "_style", None), "numFmtId", None) not in _CJK_DATE_FORMAT_IDS:
+        return value
+    from openpyxl.utils.datetime import from_excel
+
+    try:
+        return from_excel(value, epoch=epoch)
+    except (OverflowError, ValueError):
+        return value
+
+
 def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], dict[int, int]]]:
     try:
         wb = load_workbook_compat(str(path), data_only=True, read_only=False)
@@ -138,7 +171,7 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
             for merged in ws.merged_cells.ranges:
                 min_col, min_row, max_col, max_row = merged.bounds
                 anchor = ws.cell(min_row, min_col)
-                value = normalize_cell(anchor.value, getattr(anchor, "number_format", None))
+                value = normalize_cell(_xlsx_shown_value(anchor, wb.epoch), getattr(anchor, "number_format", None))
                 if not value:
                     continue
                 # Fill vertically, not horizontally. Every **row** covered by the merged range gets
@@ -164,7 +197,8 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                     continue
                 values: list[str] = []
                 for cell in row:
-                    values.append(normalize_cell(cell.value, cell.number_format) or merged_values.get((cell.row, cell.column), ""))
+                    values.append(normalize_cell(_xlsx_shown_value(cell, wb.epoch), cell.number_format)
+                                  or merged_values.get((cell.row, cell.column), ""))
                 if any(values):
                     empty_run = 0
                     rows.append((row[0].row if row else len(rows) + 1, values))
@@ -281,8 +315,9 @@ def _xlsx_parse_sheet_rows(
         styles = ET.fromstring(archive.read("xl/styles.xml"))
         sns = _xml_namespace(styles)
         custom = {int(x.attrib["numFmtId"]): x.attrib["formatCode"] for x in _xml_findall(styles, ".//numFmt", sns)}
-        formats = [custom.get(int(x.attrib.get("numFmtId", 0)), BUILTIN_FORMATS.get(int(x.attrib.get("numFmtId", 0))))
-                   for x in _xml_findall(styles, "cellXfs/xf", sns)] or ["General"]
+        format_ids = [int(x.attrib.get("numFmtId", 0)) for x in _xml_findall(styles, "cellXfs/xf", sns)]
+        formats = [custom.get(i, BUILTIN_FORMATS.get(i, _CJK_DATE_FORMAT if i in _CJK_DATE_FORMAT_IDS else None))
+                   for i in format_ids] or ["General"]
     wb = ET.fromstring(archive.read("xl/workbook.xml"))
     props = _xml_find(wb, "workbookPr", _xml_namespace(wb))
     epoch = CALENDAR_MAC_1904 if props is not None and props.attrib.get("date1904") in ("1", "true") else CALENDAR_WINDOWS_1900
@@ -426,7 +461,13 @@ def chunk_rows_to_blocks(
         return []
     header_rows = detect_header_rows(rows, spans=header_spans)
     header_row_nos = {row_no for row_no, _ in header_rows}
-    header = merge_header_rows([row for _, row in header_rows])
+    # Same-named columns are told apart here, while the column positions are still known: the HEADER line, the
+    # Columns line of the summary chunk and rows expanded by column name all use these names. An expanded row
+    # skips empty cells, so with two columns both called "Price" and the first one empty all that is left is
+    # one "Price: 30"; a reader, and the graph's table route numbering by order of appearance, can only take
+    # it for the first column (2026-11-20 Codex review: the same row went to the second column at a budget of
+    # 400 and to the first at 300)
+    header = distinct_names([flat_cell(name) for name in merge_header_rows([row for _, row in header_rows])])
     header_line = header_text(header)
     # Title / description rows before the header: not emitted as data rows, written into the summary chunk
     first_header_no = min(header_row_nos) if header_row_nos else None
@@ -607,7 +648,7 @@ def normalize_cell(value: Any, number_format: str | None = None) -> str:
     if value is None:
         return ""
     if isinstance(value, str) and _DISPIMG_RE.match(value.strip()):
-        return "(image)"                       # WPS embedded-image formula; storing it verbatim is only noise
+        return "(图片)"                       # WPS embedded-image formula; storing it verbatim is only noise
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"   # the same form as the xls path
     if isinstance(value, datetime.datetime):
@@ -731,11 +772,33 @@ def merge_header_rows(rows: list[list[str]]) -> list[str]:
     return merged
 
 
+def distinct_names(names: list[str]) -> list[str]:
+    """Tell same-named columns apart: from the second one on they are written "name (2)", "name (3)",
+    positions unchanged; empty names stay empty, and a number already used by a real column name is
+    skipped. The side that writes a table (chunk_rows_to_blocks) and the side that reads it
+    (graph.tables) use this one rule: names that are already distinct come out unchanged."""
+    taken = set(names)
+    count: dict[str, int] = {}
+    out: list[str] = []
+    for name in names:
+        n = count[name] = count.get(name, 0) + 1
+        if not name or n == 1:
+            out.append(name)
+            continue
+        while f"{name} ({n})" in taken:
+            n += 1
+        count[name] = n
+        taken.add(f"{name} ({n})")
+        out.append(f"{name} ({n})")
+    return out
+
+
 def split_long_row(row: list[str], budget: int, header: list[str] | None = None) -> list[str]:
     """A row over budget: split it into several pieces by cell, each cell carrying its column name
     (the column letter when the header has none), and later pieces start by repeating the row
     identifier (the first non-empty cell); empty cells are skipped, but the column names make the
-    positions clear. Previously the non-empty cells were simply packed by budget and empty columns
+    positions clear (same-named columns were told apart on the header, see distinct_names).
+    Previously the non-empty cells were simply packed by budget and empty columns
     vanished, so a continuation piece no longer lined up with the full-row header (2026-09-13 Codex
     F01: a 40-column questionnaire sheet whose continuation held only the W-AE stretch under the
     complete header). No piece exceeds budget: a single cell that is still over budget has its value

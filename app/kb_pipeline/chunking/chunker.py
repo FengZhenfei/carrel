@@ -30,7 +30,7 @@ from ..models import ParsedBlock, UnifiedChunk
 from ..parsers.code_source import code_locator
 from ..utils import count_tokens, split_sentences
 from .context import evidence_text
-from .packing import (combined_owner, heading_body_flow, is_inline_icon, owns_code_intro, pack_prose,
+from .packing import (combined_owner, heading_body_flow, is_inline_icon, join_pieces, owns_code_intro, pack_prose,
                       same_column_before, same_structure, source_regions, starts_heading)
 from .sections import SectionSources, same_section
 
@@ -75,6 +75,34 @@ def _split_long_sentence(sentence: str, max_tokens: int) -> list[str]:
         if piece:
             parts.append(piece)
         start += best
+    return parts
+
+
+def _split_long_prose(text: str, max_tokens: int) -> list[str]:
+    """Split a stretch of prose that is over the budget and has no sentence boundary inside (a log, a list,
+    any text with one record per line): pack whole lines within the budget, and split by token only a line
+    that alone exceeds it. Splitting the whole stretch by token used to cut in the middle of the lines, so
+    a record ended up with its two halves in different chunks."""
+    parts: list[str] = []
+    cur: list[str] = []
+    cur_tokens = 0
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        t = count_tokens(line) + 1              # +1: the newline when joining back
+        if t > max_tokens:
+            if cur:
+                parts.append("\n".join(cur).strip())
+                cur, cur_tokens = [], 0
+            parts.extend(_split_long_sentence(line, max_tokens))
+            continue
+        if cur and cur_tokens + t > max_tokens:
+            parts.append("\n".join(cur).strip())
+            cur, cur_tokens = [], 0
+        cur.append(line)
+        cur_tokens += t
+    if cur:
+        parts.append("\n".join(cur).strip())
     return parts
 
 
@@ -261,7 +289,7 @@ def _labelled_cells(line: str, header_cells: list[str] | None, native: bool) -> 
     for idx, text in enumerate(raw):
         if not text:
             continue
-        name = (header_cells[idx] if header_cells and idx < len(header_cells) and header_cells[idx].strip() else f"column {idx + 1}")
+        name = (header_cells[idx] if header_cells and idx < len(header_cells) and header_cells[idx].strip() else f"列{idx + 1}")
         items.append(f"{name}: {text}")
     return items
 
@@ -387,6 +415,7 @@ def _chunk_prose(
     overlap_tokens: int,
     *,
     headings: frozenset[str] = frozenset(),
+    overlaps: list[str] | None = None,
 ) -> list[str]:
     """Greedy sentence packing with whole-sentence overlap; heading lines are structural cut points.
     units = [(text, is_atomic)].
@@ -402,10 +431,16 @@ def _chunk_prose(
         it to (the text ends there, or the following unit is split on its own), it becomes a chunk of its own
     An atomic unit (fence / table) is packed like a sentence when it fits; only when it does not is it
     split by line on its own.
+
+    overlaps, when given, receives one entry per returned chunk: the text at the start of that chunk that
+    repeats the end of the chunk before it (the overlap), "" when the chunk starts with new text. Whoever
+    joins two neighbouring chunks back together needs it to avoid saying those sentences twice.
     """
     chunks: list[str] = []
+    leads: list[str] = []           # per chunk: the overlap it starts with
     current: list[str] = []
     current_tokens = 0
+    lead = 0                        # how many sentences at the start of current are the overlap tail
 
     def is_heading(sentence: str) -> bool:
         return sentence in headings or infer_heading_level(sentence) is not None
@@ -419,7 +454,7 @@ def _chunk_prose(
         return count_tokens(sentence) + 1
 
     def flush(*, keep_overlap: bool = True) -> list[str]:
-        nonlocal current, current_tokens
+        nonlocal current, current_tokens, lead
         cut = len(current)
         while cut and is_heading(current[cut - 1]):
             cut -= 1
@@ -428,6 +463,7 @@ def _chunk_prose(
             current = current[:cut]
         if current:
             chunks.append("\n".join(current).strip())
+            leads.append("\n".join(current[:lead]))
         tail: list[str] = []
         tail_tokens = 0
         if overlap_tokens > 0 and keep_overlap:
@@ -438,6 +474,7 @@ def _chunk_prose(
                 tail.insert(0, sentence)
                 tail_tokens += t
         current = tail + carry
+        lead = len(tail)
         current_tokens = tail_tokens + sum(cost(s) for s in carry)
         return carry
 
@@ -449,13 +486,17 @@ def _chunk_prose(
             carry = flush()
             if carry:
                 chunks.append("\n".join(carry))
+                leads.append("")
             if atomic:
                 kind = "fence" if _FENCE_OPEN_RE.match(sentence.split("\n", 1)[0]) else "table"
-                chunks.extend(_split_fence(sentence, max_tokens) if kind == "fence" else split_table_text(sentence, max_tokens))
+                parts = _split_fence(sentence, max_tokens) if kind == "fence" else split_table_text(sentence, max_tokens)
             else:
-                chunks.extend(_split_long_sentence(sentence, max_tokens))
+                parts = _split_long_prose(sentence, max_tokens)
+            chunks.extend(parts)
+            leads.extend("" for _ in parts)
             current = []
             current_tokens = 0
+            lead = 0
             continue
         if current and current_tokens >= max_tokens // 2 and is_heading(sentence):
             flush(keep_overlap=False)
@@ -468,12 +509,17 @@ def _chunk_prose(
             if current and current_tokens + t > max_tokens:
                 current = list(carry)
                 current_tokens = sum(cost(s) for s in carry)
+                lead = 0
         current.append(sentence)
         current_tokens += t
     carry = flush()
     if carry:
         chunks.append("\n".join(carry))  # Keep a trailing heading stack together, ahead of its next source block.
-    return [c for c in chunks if c]
+        leads.append("")
+    kept = [(c, head) for c, head in zip(chunks, leads) if c]
+    if overlaps is not None:
+        overlaps.extend(head for _, head in kept)
+    return [c for c, _ in kept]
 
 
 def chunk_text(
@@ -482,9 +528,10 @@ def chunk_text(
     overlap_tokens: int,
     *,
     headings: frozenset[str] = frozenset(),
+    overlaps: list[str] | None = None,
 ) -> list[str]:
     """Chunk prose: fences and pipe tables are atomic segments (see _segments), the rest is packed by sentence
-    (see _chunk_prose)."""
+    (see _chunk_prose, also for overlaps)."""
     units: list[tuple[str, bool]] = []
     for kind, seg in _segments(text):
         if kind == "prose":
@@ -503,7 +550,7 @@ def chunk_text(
                 units.append((seg, True))
     if not units:
         return []
-    return _chunk_prose(units, max_tokens, overlap_tokens, headings=headings)
+    return _chunk_prose(units, max_tokens, overlap_tokens, headings=headings, overlaps=overlaps)
 
 
 def text_for_block(block: ParsedBlock) -> str:
@@ -621,7 +668,9 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
     """A heading travels with its prose, even when a side image sits between them.
 
     Bind by section and source layout before the short-fragment fallback. Repack
-    within the ordinary budget and retain every member's source regions. Side
+    within the ordinary budget and retain every member's source regions; a body
+    chunk already packed to the budget is not split again for its heading, the
+    heading may take it over the budget by its own size, up to GLUE_SLACK. Side
     images remain independent, in their original relative order. A short page
     tail may likewise join the next page's opening in the same section; a later
     heading in that next chunk must not hide the valid continuation.
@@ -665,7 +714,8 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
                 first = source_regions(b["block"])[0]
                 entry = replace(b["block"], page_idx=first.get("page"), bbox=first.get("bbox"),
                                 metadata={"source_regions": [first], "page_end": first.get("page")})
-                within_budget = count_tokens(h["text"] + "\n" + b["text"]) <= max_tokens
+                bound_tokens = count_tokens(h["text"] + "\n" + b["text"])
+                within_budget = bound_tokens <= max_tokens
                 last_page = source_regions(h["block"])[-1].get("page")
                 next_page = first.get("page")
                 continues_page = last_page is not None and next_page == last_page + 1
@@ -683,14 +733,27 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
                                           "section_path": path, "source_regions": source_regions(p["block"])})
                         offset += len(p["text"]) + 1
                     metadata = {k: v for k, v in owner.metadata.items() if k != "embedded_source"}
-                    headings = list(dict.fromkeys([*([h["text"]] if heading_only else known),
+                    # One entry per heading line: every reader of heading_lines compares single lines, so a
+                    # two-line heading stored as one string was not recognised as a heading afterwards
+                    headings = list(dict.fromkeys([*(heading_lines if heading_only else known),
                                                    *(metadata.get("heading_lines") or [])]))
                     owner = replace(owner, text=text, title=None, caption=None,
                                     metadata={**metadata, "section_spans": spans, "heading_lines": headings})
                     bound_sources = SectionSources([owner])
-                    parts = chunk_text(text, max_tokens, overlap_tokens, headings=frozenset(headings))
-                    out.extend({"text": part, "block": bound_sources.locate(owner, part), "tokens": count_tokens(part)}
-                               for part in parts)
+                    # A heading-only piece joins its body under the same limit as any fragment glued into a
+                    # neighbour (GLUE_SLACK), and stays one chunk when it fits. Re-chunking regardless of the
+                    # size used to split a body chunk that was already packed to the budget: one heading line
+                    # more pushed its last sentences into an extra piece made of overlap plus those sentences,
+                    # all of which the neighbouring chunks hold as well
+                    if bound_tokens <= (int(max_tokens * GLUE_SLACK) if heading_only else max_tokens):
+                        parts, leads = [text], [""]
+                    else:
+                        leads = []
+                        parts = chunk_text(text, max_tokens, overlap_tokens, headings=frozenset(headings), overlaps=leads)
+                    if leads:
+                        leads[0] = h.get("overlap") or ""       # the first part starts where the heading piece started
+                    out.extend({"text": part, "block": bound_sources.locate(owner, part), "tokens": count_tokens(part),
+                                **({"overlap": lead} if lead else {})} for part, lead in zip(parts, leads))
                     out.extend(pieces[i + 1:j])
                     if remainder:
                         out.append(remainder)
@@ -761,7 +824,8 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
                     and not starts_heading(nxt)
                     and _same_slide(p["block"], nxt["block"]) and p["tokens"] + nxt["tokens"] <= limit):
                 nxt["block"] = combined_owner(nxt["block"], [p["block"], nxt["block"]])
-                nxt["text"] = f"{p['text']}\n{nxt['text']}"
+                nxt["text"] = join_pieces(p["text"], nxt)
+                nxt["overlap"] = p.get("overlap") or ""     # the merged chunk now starts where the fragment started
                 nxt["tokens"] = count_tokens(nxt["text"])
                 pieces.pop(i)
                 changed = True
@@ -770,7 +834,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
                     and not starts_heading(p)
                     and _same_slide(prev["block"], p["block"]) and prev["tokens"] + p["tokens"] <= limit):
                 prev["block"] = combined_owner(prev["block"], [prev["block"], p["block"]])
-                prev["text"] = f"{prev['text']}\n{p['text']}"
+                prev["text"] = join_pieces(prev["text"], p)
                 prev["tokens"] = count_tokens(prev["text"])
                 pieces.pop(i)
                 changed = True
@@ -901,6 +965,7 @@ def blocks_to_chunks(
     for block, text in _group_code_blocks(_embedded_code_blocks(blocks), max_tokens):
         if not text:
             continue
+        overlaps: list[str] = []           # filled for prose only: what each part repeats from the part before it
         if block.block_type == "code":
             context = []
             if block.title and not _symbol(block):
@@ -921,8 +986,11 @@ def blocks_to_chunks(
                 # inserting prose into the copied code or assigning it source-code columns.
                 metadata = {k: v for k, v in block.metadata.items() if k not in ("source_spans", "source_locator", "code_fragment")}
                 caption = replace(block, block_type="text", block_id=block.block_id + "-caption", metadata=metadata)
-                for part in chunk_text(attached, max_tokens, overlap_tokens):
-                    pieces.append({"text": part, "block": caption, "tokens": count_tokens(part)})
+                leads: list[str] = []
+                caption_parts = chunk_text(attached, max_tokens, overlap_tokens, overlaps=leads)
+                for part, lead in zip(caption_parts, leads):
+                    pieces.append({"text": part, "block": caption, "tokens": count_tokens(part),
+                                   **({"overlap": lead} if lead else {})})
                 attached = ""
             if attached:
                 block = replace(block, metadata={**block.metadata, "code_context": attached,
@@ -941,7 +1009,7 @@ def blocks_to_chunks(
             if block.block_type == "title":
                 headings = headings | {block.text.strip()}
             parts = chunk_text(text, max_tokens, overlap_tokens,
-                               headings=headings)
+                               headings=headings, overlaps=overlaps)
         offset = 0
         for part_index, part in enumerate(parts):
             owner = block
@@ -963,7 +1031,8 @@ def blocks_to_chunks(
                                                 "code_fragment": {"start": offset, "end": offset + len(part)}})
                 offset += len(part)
             owner = sections.locate(owner, part)
-            pieces.append({"text": part, "block": owner, "tokens": count_tokens(evidence_text(part, owner.metadata))})
+            pieces.append({"text": part, "block": owner, "tokens": count_tokens(evidence_text(part, owner.metadata)),
+                           **({"overlap": overlaps[part_index]} if overlaps and overlaps[part_index] else {})})
 
     pieces = pack_prose(_glue_pieces(_bind_heading_bodies(
         pieces, max_tokens, overlap_tokens, SectionSources(blocks)), max_tokens), max_tokens)

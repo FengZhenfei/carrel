@@ -336,7 +336,9 @@ def greedy_cover(seeds: list[dict[str, Any]], question: str, *, limit: int) -> l
 
 def fact_content_key(row: dict[str, Any]) -> tuple:
     """一条事实说的内容:主体、属性(有概念键用概念键)、取值、时间,加上真正起区分作用的条件 ——
-    条件值已经写在主体或属性名里的(「位点名称: rs0000111」配属性「GENE_A rs0000111 …」)不算区别。"""
+    条件值已经写在主体或属性名里的(「位点名称: rs0000111」配属性「GENE_A rs0000111 …」)不算区别。
+    时间与建图侧同一个口径(reconcile.fact_axis):生效日期,没有就用观测日期,再没有才是文档的日期 ——
+    两次检查读数相同、观测日期不同的,是两条事实。"""
     subject = str(row.get("subject_id") or row.get("subject") or "").casefold()
     concept = str(row.get("concept_key") or row.get("property") or "").casefold()
     named = f"{row.get('subject') or ''} {row.get('property') or ''} {row.get('symbol') or ''}".casefold()
@@ -348,10 +350,10 @@ def fact_content_key(row: dict[str, Any]) -> tuple:
             conditions = {"_": conditions}
     kept = tuple(sorted((str(k).casefold(), str(v).casefold()) for k, v in dict(conditions).items()
                         if str(v).strip() and str(v).casefold() not in named))
-    from .reconcile import unit_of
+    from .reconcile import fact_axis, unit_of
     from .quality import fact_quality
     values = tuple(str(row.get(k) or "").strip().casefold() for k in ("value", "min", "typ", "max")) + (unit_of(row),)
-    return (subject, concept, values, str(row.get("valid_from") or row.get("axis") or ""), kept,
+    return (subject, concept, values, fact_axis(row), kept,
             str(row.get("fact_kind") or "observation"), fact_quality(row))
 
 
@@ -381,6 +383,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
     from qdrant_client.http import models as qm
 
     from .currency import in_scope, query_scope
+    from .reconcile import fact_axis
     from .temporal import in_window
 
     scope = scope or query_scope()
@@ -436,7 +439,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
         # The question has a time window ("these two years", 2024 to 2026): facts inside get a small boost, those
         # outside a small penalty, no filtering
         if window:
-            when = str(r.get("valid_from") or r.get("axis") or "")
+            when = fact_axis(r)          # 生效日期 → 观测日期 → 文档的日期,与去重用的是同一个
             r["_score"] = float(r["_score"]) * (WINDOW_IN_BOOST if in_window(when, window) else WINDOW_OUT_PENALTY)
     ranked = collapse_duplicate_facts(sorted(seeds.values(), key=lambda r: -float(r["_score"])))
     return greedy_cover(ranked[: limit * 2], question, limit=limit)

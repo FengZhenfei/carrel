@@ -12,7 +12,8 @@ import traceback
 from .. import db
 from ..storage import get_storage
 from ..config import Settings
-from ..parsers.errors import JobPaused, service_unreachable
+from ..parsers.errors import (FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE, FAILURE_VERDICT_KEY,
+                              JobPaused, service_unreachable)
 from ..parsers.source_guard import MissingSourceContent
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
@@ -236,8 +237,10 @@ def run_once(
             error_type=type(exc).__name__,
             error_message=f"{exc}\n{traceback.format_exc()}",
         )
-        db.mark_job_failed(con, job["job_id"], repr(exc), retry=should_retry, retry_delay_seconds=retry_delay,
-                           worker_id=current_worker_id)
+        failed = db.mark_job_failed(con, job["job_id"], repr(exc), retry=should_retry, retry_delay_seconds=retry_delay,
+                                    worker_id=current_worker_id)
+        if failed and not should_retry and job_type == "parse":
+            _record_failure_verdict(con, str(job["job_id"]), _failure_verdict(exc))
         if should_retry:
             return f"retry:{job['job_id']}:delay={retry_delay}s:{exc!r}"
         return f"failed:{job['job_id']}:{exc!r}"
@@ -269,25 +272,46 @@ def _rerun_if_asked(con: sqlite3.Connection, job: sqlite3.Row) -> None:
     print(f"[worker] re-parse requested while job={job['job_id']} was running; queued={queued}", flush=True)
 
 
-def _should_retry(job: sqlite3.Row, settings: Settings | None, exc: Exception) -> bool:
+def _failure_verdict(exc: Exception) -> str:
+    """The verdict on this failure (the three values in parsers.errors). A deterministic failure (unsupported
+    format, over the size limit, vector dimension mismatch) comes out the same no matter how often it is
+    retried; it is recognised by exception type, not by the error string. Only "the file is not on disk" still
+    goes by the string, because old paths raise a generic exception for it."""
     from .parse_job import NonRetryableParseError
-
-    if settings is None or settings.job_max_retries <= 0:
-        return False
-    # Decide by exception type, not by error string: deterministic failures (unsupported format, missing
-    # file, over the size limit, vector dimension mismatch) come out the same no matter how often retried.
-    if isinstance(exc, NonRetryableParseError):
-        return False
-    if getattr(exc, "deterministic", False):   # MinerU 4xx: the document itself is broken
-        return False
     from ..embedding.client import EmbeddingDimensionError
 
-    if isinstance(exc, EmbeddingDimensionError):
+    if "physical file not found" in str(exc).lower():   # missing file; also the generic exception raised by old paths
+        return FAILURE_FILE_MISSING
+    if isinstance(exc, (NonRetryableParseError, EmbeddingDimensionError)):
+        return FAILURE_DETERMINISTIC
+    if getattr(exc, "deterministic", False):   # MinerU 4xx: the document itself is broken
+        return FAILURE_DETERMINISTIC
+    return FAILURE_RETRYABLE
+
+
+def _should_retry(job: sqlite3.Row, settings: Settings | None, exc: Exception) -> bool:
+    if settings is None or settings.job_max_retries <= 0:
         return False
-    message = str(exc).lower()
-    if "physical file not found" in message:   # compatibility with the generic exception raised by old paths
+    if _failure_verdict(exc) != FAILURE_RETRYABLE:
         return False
     return int(job["retry_count"] or 0) < settings.job_max_retries
+
+
+def _record_failure_verdict(con: sqlite3.Connection, job_id: str, verdict: str) -> None:
+    """A parse job that failed for good: store the verdict in the job payload; the scan uses it to decide
+    whether the file is queued again (scheduler._failed_parse_blocks_auto_requeue)."""
+    row = con.execute("SELECT payload_json FROM jobs WHERE job_id = ? AND status = 'failed'", (job_id,)).fetchone()
+    if row is None:
+        return
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload[FAILURE_VERDICT_KEY] = verdict
+    con.execute("UPDATE jobs SET payload_json = ? WHERE job_id = ? AND status = 'failed'",
+                (json.dumps(payload, ensure_ascii=False), job_id))
 
 
 def _retry_delay_seconds(job: sqlite3.Row, settings: Settings | None) -> int:

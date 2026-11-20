@@ -409,14 +409,20 @@ def parse_period(value: str) -> tuple[str, str] | None:
     return None
 
 
+# 提示词要的关系强度是 1 到 10 的分数(prompts.GRAPH_EXTRACTION_PROMPT 的 relationship_strength)
+STRENGTH_MIN, STRENGTH_MAX = 1.0, 10.0
+
+
 def _strength(value: str) -> float:
+    """强度一段 → 落在合法区间里的数;没有数按最低的 1。读错了段(年份、编号)也不会带着几千的强度进图:下游按全图
+    最大的 strength_sum 归一,一条 2021 会把其余关系的强度分量都压成零。"""
     m = _STRENGTH_RE.search(str(value or ""))
     if not m:
-        return 1.0
+        return STRENGTH_MIN
     try:
-        return float(m.group(0))
+        return max(STRENGTH_MIN, min(STRENGTH_MAX, float(m.group(0))))
     except ValueError:
-        return 1.0
+        return STRENGTH_MIN
 
 
 _EXTRACTION_NUDGE = ("Your previous reply was not in the required record format. Reply again using ONLY the record format "
@@ -497,9 +503,13 @@ def parse_records(text: str, schema: ExtractionSchema | None = None) -> tuple[li
                     stats["malformed_metadata"] = stats.get("malformed_metadata", 0) + 1
                 fields = fields[:-1]
             period = None
+            new_format = False
             if len(fields) >= 7 and _STRENGTH_RE.fullmatch(fields[-2].strip() or "x"):
                 period = parse_period(fields[-1])
-            if period is not None:
+                # 起止一段解析不出来(2021..present;把 <|> 写成 |>、和后面的元数据粘成了一段)仍然是新格式,强度还在
+                # 倒数第二段。只有最后一段本身是个数的才可能是旧格式:描述里带分隔符、强度在最后
+                new_format = period is not None or not _STRENGTH_RE.fullmatch(fields[-1].strip() or "x")
+            if new_format:
                 # 新格式:… 描述 <|> 强度 <|> 起止
                 predicate_raw, description, strength = fields[3], " ".join(fields[4:-2]).strip(), fields[-2]
             elif len(fields) >= 6:

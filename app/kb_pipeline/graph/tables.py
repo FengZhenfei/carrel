@@ -16,11 +16,12 @@ import json
 import re
 from typing import Any, Iterable
 
+from ..parsers.native_table import distinct_names
 from . import prompts
 from .extract import ExtractionResult, ExtractionSchema, entity_name_ok, normalize_name, normalize_predicate, predicate_menu, type_menu
 from .units import Unit
 
-VERSION = "tables-v5"
+VERSION = "tables-v6"
 TABLE_SUFFIXES = (".xlsx", ".xls", ".csv", ".tsv")
 PROFILE_SAMPLE_ROWS = 8
 MIN_DATA_ROWS = 3
@@ -42,15 +43,25 @@ def _cells(line: str) -> list[str]:
     return [c.strip() for c in s.split(" | ")]
 
 
+# 同名的列互相区分(第二个起是「列名 (2)」):规则在写表的一侧,读表用同一条。两列都叫「单价」的表,按列名取值时后一列
+# 会盖掉前一列(按位置排的行),或者两个值粘成一个(按列名展开的行)。解析器现在写出来的表头列名已经互不相同,这里再过
+# 一遍不变;还会被改名的是旧版解析器写的切片
+_distinct = distinct_names
+
+
 def _labelled(cells: list[str]) -> dict[str, str] | None:
-    """「列名: 值 | 列名: 值」展开的一行 → {列名: 值};不是这种写法返回 None。"""
-    out: dict[str, str] = {}
+    """「列名: 值 | 列名: 值」展开的一行 → {列名: 值};不是这种写法返回 None。一行里还有重复列名的,是旧版解析器写的
+    切片(现在同名的列在表头上就区分了),或者没有列名的列用的列字母恰好与另一列的名字相同:只能按出现顺序区分,
+    前面同名的格子为空时会归到前一列。前一种重新解析后消除。"""
+    names: list[str] = []
+    values: list[str] = []
     for c in cells:
         name, sep, value = c.partition(": ")
         if not sep or not name.strip():
             return None
-        out[name.strip()] = (out.get(name.strip(), "") + " " + value.strip()).strip() if name.strip() in out else value.strip()
-    return out
+        names.append(name.strip())
+        values.append(value.strip())
+    return dict(zip(_distinct(names), values))
 
 
 def parse_table_text(text: str) -> list[dict[str, Any]]:
@@ -64,6 +75,10 @@ def parse_table_text(text: str) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         m = _PREFIX_RE.match(line.strip())
+        if m and m.group(1) in ("Title", "Columns") and not summary:
+            # 摘要片以 Sheet: / Rows: 开头,Title: 与 Columns: 只跟在它们后面(native_table.summary_block)。不在摘要片里的
+            # 「Title: … | Author: …」是按列名展开的一行数据,第一列恰好叫 Title:当成摘要会把这一行和它后面的行都吞掉
+            m = None
         if m:
             tag, value = m.group(1), m.group(2)
             if tag in ("Sheet", "Rows", "Columns", "Title"):
@@ -119,7 +134,7 @@ def _row_values(section: dict[str, Any], row: dict[str, Any]) -> dict[str, str] 
     if not header or len(cells) > len(header) or len(cells) < 2:
         return None
     cells += [""] * (len(header) - len(cells))      # 解析器去掉了行尾的空格子(native_table._joined_cells)
-    return {h: c for h, c in zip(header, cells) if h}
+    return {h: c for h, c in zip(_distinct(header), cells) if h}
 
 
 def table_key(rel_path: str, section: dict[str, Any]) -> str:
@@ -142,7 +157,7 @@ def _unique_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _columns(section: dict[str, Any]) -> list[str]:
     if section.get("header"):
-        return [h for h in section["header"] if h]
+        return [h for h in _distinct(section["header"]) if h]
     cols: list[str] = []
     for r in section["rows"]:
         for k in (r.get("labelled") or {}):
@@ -312,7 +327,8 @@ class TableExtractor:
             for r in section["rows"]:
                 total += 1
                 cells = r.get("cells") or []
-                if header and cells and cells[0].casefold() == header[0] and len(cells) >= 2:
+                # 表头第一格是空的(表从 B 列起、第一列是没有列名的序号)时不做这个判断:第一格为空的数据行都会「等于表头」
+                if header and header[0] and cells and cells[0].casefold() == header[0] and len(cells) >= 2:
                     subtable = True          # 又一行表头(同一个工作表里的下一张子表):后面的行不是这张表的
                 values = None if subtable else _row_values(section, r)
                 if not prof.get("row_type") or values is None:

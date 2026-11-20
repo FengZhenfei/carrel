@@ -244,7 +244,12 @@ def test_text_failure_still_returns_verified_image_results(env, monkeypatch):
         c.pop("score_rerank")
     result = run(env, rows)
     assert result["evidence_state"] == "accepted"
-    assert [c["point_id"] for c in result["ordered"]] == ["image"]
+    # The text candidate has no verdict because its ranker failed. That is unknown, not rejected: it stays behind
+    # the verified picture, as it would have been returned had no picture passed. (Until 2026-11-20 this asserted
+    # ["image"]: the unranked text was dropped as soon as one picture was accepted.)
+    assert [c["point_id"] for c in result["ordered"]] == ["image", "text"]
+    assert [c["accepted"] for c in result["ordered"]] == [True, None]
+    assert result["status"] == "skipped"
     assert result["error"] == "rerank: ConnectionError"
 
 

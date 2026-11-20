@@ -27,7 +27,11 @@ RUN pip install --no-deps ./app
 COPY LICENSE NOTICE.md ./
 COPY THIRD_PARTY_LICENSES ./THIRD_PARTY_LICENSES
 COPY scripts ./scripts
-RUN python scripts/prepare-code-parsers.py
+RUN --mount=type=bind,source=deployment/compose/app,target=/build-input \
+    if [ -d /build-input/code-parsers ]; then \
+        mkdir -p "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR" && \
+        cp -a /build-input/code-parsers/. "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR/"; \
+    fi && python scripts/prepare-code-parsers.py
 COPY config/knowledge-base.env.example ./config/knowledge-base.env.example
 RUN mkdir -p /data
 EXPOSE 9800 9810

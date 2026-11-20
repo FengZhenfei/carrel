@@ -340,6 +340,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
                         continue
                     gone = discovery.build_source(settings.mirror_root, str(row["source_root"]), {},
                                                   kb_id=str(row["kb_id"]), collection=str(row["collection"]))
+                # 来源列表是开工时读的,列文件可能要几分钟。在册、开着、配置读得出来、目录也在盘上,却不在本轮列表里的库,
+                # 只能是这期间才在控制台开启的(或者目录刚回来):它不是「目录消失」,不标失活、不排删除,下一轮扫描
+                # 会把它列进来。过去按消失处理:刚开启的库当场被标成 directory_missing,要到控制台再开一次
+                if str(row["status"]) == "active" and discovery.directory_admitted(settings.mirror_root, str(row["source_root"]))[0]:
+                    print(f"[scan] kb deferred: {gone.kb_id} ({gone.source_root}) is enabled and its directory is present, "
+                          "but it was not in this round's source list; the next scan picks it up")
+                    continue
                 if str(row["status"]) == "active":
                     print(f"[scan] kb vanished: {gone.kb_id} ({gone.source_root}); marking inactive, queueing deletes dry_run={args.dry_run}")
                     if not args.dry_run:

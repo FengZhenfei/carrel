@@ -306,21 +306,29 @@ def clean_domain(value: Any, *, limit: int = 80) -> str:
 
 
 def parse_entity_types(value: Any, *, limit: int = MAX_ENTITY_TYPES) -> list[str]:
-    """归纳出的类型名单;与上层类同名的不要(ontology.UPPER_NAMES)。"""
-    from ..ontology import is_upper_name
+    """归纳出的类型名单;与上层类同名的不要(ontology.UPPER_NAMES)。
+
+    名单只从 JSON 对象的 entity_types、JSON 数组或一对方括号里取。没有方括号的整段文字不是名单,返回空:以前会把它
+    按逗号和换行切开当类型名,一段说明文字就这样通过了校验、进了响应缓存,切出来的片段成了类型;其中一段超过类型名
+    上限时 ontology.normalize_model 报错,整次归纳失败,而回复已缓存,重跑结果相同。
+    单个名称超过上限(与 normalize_model 同一个标准)只丢这一个,不截断:截断的句子也不是类型名。"""
+    import unicodedata
+
+    from ..ontology import TYPE_NAME_MAX_LEN, is_upper_name
 
     if isinstance(value, dict):
         value = value.get("entity_types") or value.get("entities")
     if isinstance(value, (list, tuple)):
         items = [str(v) for v in value]
     else:
-        text = str(value or "")
-        m = re.search(r"\[(.*?)\]", text, re.S)
-        items = re.split(r"[,\n]", m.group(1) if m else text)
+        m = re.search(r"\[(.*?)\]", str(value or ""), re.S)
+        items = re.split(r"[,\n]", m.group(1)) if m else []
     out: list[str] = []
     for item in items:
         name = entity_type_name(item)
-        if name and not is_upper_name(name) and name.casefold() not in {o.casefold() for o in out}:
+        if not name or len(unicodedata.normalize("NFKC", name).strip()) > TYPE_NAME_MAX_LEN:
+            continue
+        if not is_upper_name(name) and name.casefold() not in {o.casefold() for o in out}:
             out.append(name)
     return out[:limit]
 

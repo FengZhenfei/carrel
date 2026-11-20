@@ -56,44 +56,41 @@ RESULT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_FIELD_GUIDE = """Field guide (output in this order):
-- kind: screenshot (UI screenshot) / diagram (architecture, flow or topology diagram) / chart (statistical chart) /
-  table / photo / formula / illustration / slide (a whole slide) / other
-- title: the title text in the image or on the page. Empty string when there is none.
-- summary: one or two sentences on what it conveys. Empty string when there is no substance.
-- entities: product, system, module, organization and person names that appear explicitly in the image
-- facts: facts that can be read directly off the image, one self-contained sentence each, including values,
-  states, hierarchy or process order. Do not write meta descriptions such as "the figure shows…" or
-  "this page introduces…".
-- keywords: keywords useful for search
-- confidence: high (clearly legible) / medium (partly blurred or occluded) / low (hard to make out)
-- decorative: true = purely decorative (no text, data or chart, and no photo of a recognizable product /
-  person / organization: background images, dividers, watermarks); otherwise false
-- text_verbatim: the text in the image, transcribed as-is in reading order. Keep the original case,
-  numbering, units and symbols; do not translate, rephrase or complete elided content. Transcribe a
-  repeated passage once. Empty string when there is no text.
+_FIELD_GUIDE = """字段说明(按此顺序输出):
+- kind: screenshot(界面截图)/ diagram(架构图、流程图、拓扑图)/ chart(统计图表)/
+  table(表格)/ photo(照片)/ formula(公式)/ illustration(插图)/ slide(整页幻灯片)/ other
+- title: 图中或页面上的标题文字。没有标题时留空字符串。
+- summary: 一到两句话说明它在表达什么。没有实质内容时留空字符串。
+- entities: 图中明确出现的产品名、系统名、模块名、组织名、人名
+- facts: 能从图上直接读出的事实,每条独立成句,包含数值、状态、层级关系或流程顺序。
+  不要写"该图展示了…""本页介绍了…"这类元描述。
+- keywords: 便于检索的关键词
+- confidence: high(清晰可辨)/ medium(部分模糊或遮挡)/ low(难以辨认)
+- decorative: true = 纯装饰(没有文字、数据、图表,也没有可辨认的产品 / 人物 / 机构的照片、
+  背景图、分隔图、水印);否则 false
+- text_verbatim: 图中出现的文字,按阅读顺序原样转录。保持原始大小写、编号、
+  单位和符号,不要翻译、不要改写、不要补全省略的内容。同一段文字重复出现时
+  只转录一次。没有文字时留空字符串。
 
-Extra requirements by image type:
-- UI screenshot (screenshot): facts lists the key visible text item by item -- menu entries, field names,
-  buttons, table headers, status values, hints -- in reading order; do not describe layout or colours,
-  do not draw flows.
-- Architecture / flow diagram (diagram): facts records nodes and their links as "A → B: note"; never
-  output mermaid, code blocks or any markup language.
-- Several logos, name lists, participant or customer walls: entities lists every name that appears,
-  never summarized as "several hospitals" or "some companies".
-- Photo (photo): summary states the subject in one sentence; with no text or data, leave facts empty
-  and set decorative as appropriate.
+按图片类型的额外要求:
+- 界面截图(screenshot):facts 逐条写出界面上可见的关键文字 —— 菜单项、字段名、按钮、
+  表头、状态值、提示语,按阅读顺序;不要描述布局和颜色,不要画流程。
+- 架构图 / 流程图(diagram):facts 写节点与连线关系,形如「A → B:说明」,不要输出 mermaid、
+  代码块或任何标记语言。
+- 多个 logo、名单、参会单位、客户墙:entities 逐个列出图中出现的每个名称,不要概括成
+  「多家医院」「若干企业」。
+- 照片(photo):summary 一句话说明主体;没有文字和数据时 facts 留空,并按情况填 decorative。
 
-Output only what is really visible in the image. Use ? for illegible characters.
-Return an empty string for string fields with no content and an empty array for array fields with no
-matching items; never fill them with placeholders, field names or "none". Leaving a field empty beats guessing."""
+只输出图上真实可见的内容。看不清的字用 ? 占位。
+字符串字段无内容时返回空字符串,数组字段无符合条目时返回空数组,
+不要用占位词、字段名或"无"来填充。留空优于猜测。"""
 
 DEFAULT_PROMPT = (
-    "This is an image from a knowledge-base document; examine it carefully and output a structured result.\n"
-    "Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, "
-    "formulas, whole slides; decide the kind first, then extract the information item by item.\n"
-    "Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, "
-    "watermarks and purely decorative elements, and extract only content that carries information."
+    "这是知识库文档中的一张图片,请仔细识别并输出结构化结果。\n"
+    "常见类型:界面截图、架构图、流程图、拓扑图、数据图表、表格、照片、公式、整页幻灯片;"
+    "先判断图片类型,再逐项提取图中信息。\n"
+    "文字、数值、单位与编号一律按原样精确转录;忽略页眉页脚、页码、水印和纯装饰性元素,"
+    "只提取承载信息的真实内容。"
 )
 # The console's prompt textarea placeholder (app/kb_server/static/index.html)
 # shows this default text; keep the two in sync.
@@ -110,7 +107,7 @@ def compose_prompt(route: str, custom: str | None = None, *, filename: str | Non
         raise ValueError("image_file route requires a filename")
     parts = [(custom or "").strip() or DEFAULT_PROMPT]
     if filename:
-        parts.append(f"(File name: “{filename}”, usable as a hint for the topic; title still follows the actual text in the image.)")
+        parts.append(f"(文件名:「{filename}」,可作主题参考;title 仍以图中实际文字为准。)")
     parts.append(_FIELD_GUIDE)
     return "\n\n".join(parts)
 

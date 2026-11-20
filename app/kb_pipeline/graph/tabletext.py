@@ -39,7 +39,7 @@ RENDER_TAG_REALIGNED = "wide-table-v2" + _FACTS_SUFFIX
 
 _MD_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 # columns the header leaves unnamed: native tables use the column letter, the chunker "column N"
-_AUTO_NAME_RE = re.compile(r"^(?:[A-Z]{1,3}|column \d+)$")
+_AUTO_NAME_RE = re.compile(r"^(?:[A-Z]{1,3}|column \d+|列\d+)$")
 
 
 def contains_table(text: str) -> bool:

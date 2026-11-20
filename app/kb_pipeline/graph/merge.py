@@ -702,9 +702,20 @@ _VALUE_TOKEN_RE = re.compile(r"^[+\-±~≥≤<>]?\d[\d.,]*(?:[A-Za-zµμ°℃Ω%
 _UNIT_TOKEN_RE = re.compile(r"^[A-Za-zµμ°℃Ω%]{1,3}$")
 _CJK_SHORT_RE = re.compile(r"^[\u4e00-\u9fff]{1,2}$")
 _CONNECTOR_RE = re.compile(r"^(?:to|至|到|and|或|或者|x|×|/|-|–|—|~|～|\+|±)$", re.IGNORECASE)
+# A reference is a keyword followed by its number. A label that starts with a digit may follow the keyword directly
+# (Figure 5, Table 3.2, 图5); a letter label is one letter plus an optional number (Appendix A, 附录A, Table A1) and,
+# after a Latin keyword, needs a dot or whitespace in between; a revision letter needs a dot, whitespace or "*".
+# Without these limits the keyword alone matched the start of ordinary names: p+ython, note+s, fig+ma, tab+leau,
+# sec+urity, rev+iew, "P. Smith", "table tennis".
+_REF_NUMBER = r"\d[\dA-Za-z.\-]*"
+_REF_LETTER = r"[A-Za-z](?:[.\-]?\d[\d.\-]*)?"
 _REFERENCE_RE = re.compile(
-    r"^(?:(?:fig(?:ure)?|table|tab|图|表|附录|appendix|chapter|section|sec|章|节|page|p|note|注|footnote|equation|eq|公式)\.?\s*"
-    r"[\dA-Za-z][\dA-Za-z.\-]*|\d{2,4}-\d{3,6}(?:\s*\*?[A-Za-z]{1,2})?|rev(?:ision)?\.?\s*\*?[A-Za-z0-9]{1,3}|\*[A-Za-z]{1,2})$",
+    r"^(?:(?:fig(?:ure)?|table|tab|appendix|chapter|section|sec|page|p|note|footnote|equation|eq)"
+    rf"(?:\.?\s*{_REF_NUMBER}|(?:\.\s*|\s+){_REF_LETTER})"
+    rf"|(?:图|表|附录|章|节|注|公式)\.?\s*(?:{_REF_NUMBER}|{_REF_LETTER})"
+    r"|\d{2,4}-\d{3,6}(?:\s*\*?[A-Za-z]{1,2})?"
+    r"|rev(?:ision)?(?:\.?\s*\*?\d[A-Za-z0-9]{0,2}|(?:\.?\s*\*|\.\s*|\s+)[A-Za-z][A-Za-z0-9]{0,2})"
+    r"|\*[A-Za-z]{1,2})$",
     re.IGNORECASE)
 
 

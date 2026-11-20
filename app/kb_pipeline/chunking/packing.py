@@ -166,6 +166,23 @@ def owns_code_intro(prose: ParsedBlock, code: ParsedBlock) -> bool:
     return False
 
 
+def join_pieces(first_text: str, piece: dict[str, Any]) -> str:
+    """first_text followed by the text of the piece that comes after it.
+
+    A piece cut from the same text as the one before it starts with the last sentences of that one (the
+    overlap; chunk_text reports it and the chunker keeps it in piece["overlap"]). When the two are joined
+    into one chunk again those sentences would stand there twice, so the piece's overlap is left out. It is
+    left out only when first_text really ends where the overlap ends; everything dropped is a repeat.
+    """
+    text = piece["text"]
+    head = piece.get("overlap") or ""
+    if head and text.startswith(head):
+        last = head.rsplit("\n", 1)[-1]
+        if first_text == last or first_text.endswith("\n" + last):
+            text = text[len(head):].lstrip("\n")
+    return f"{first_text}\n{text}" if text else first_text
+
+
 def pack_prose(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str, Any]]:
     """Minimize chunk count, then balance slack; never reorder or drop source text.
 
@@ -201,7 +218,9 @@ def pack_prose(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str, 
             if len(group) == 1:
                 out.append(group[0])
             else:
-                text = "\n".join(p["text"] for p in group)
+                text = group[0]["text"]
+                for p in group[1:]:
+                    text = join_pieces(text, p)     # which pieces go together was decided above, as before
                 owner = next((p["block"] for p in group if p["block"].block_type != "title"), group[0]["block"])
                 out.append({"text": text, "tokens": count_tokens(text),
                             "block": combined_owner(owner, [p["block"] for p in group])})

@@ -27,6 +27,19 @@ class JobPaused(JobCancelled):
     """Yield at a safe parse checkpoint, retaining this job and its completed caches."""
 
 
+# The verdict on a failed parse job. The worker gives it from the exception (pipeline.worker._failure_verdict)
+# and stores it in the job payload under FAILURE_VERDICT_KEY when the job fails for good; the scan uses it to
+# decide whether the file is queued again (pipeline.scheduler._failed_parse_blocks_auto_requeue) instead of
+# looking for words in the error text. The two used to judge separately: failures the worker knew a retry
+# could not change (MinerU 4xx, an embedding dimension mismatch) were not recognised by the scan from the text
+# and were queued again after every cooldown; and a file whose path happened to contain a marker word was
+# never queued again after one transient failure.
+FAILURE_VERDICT_KEY = "failure_verdict"
+FAILURE_DETERMINISTIC = "deterministic"    # the same input fails the same way: queued again only when the parser / router changes
+FAILURE_FILE_MISSING = "file_missing"      # the file was not on disk: queued as soon as a scan sees it again
+FAILURE_RETRYABLE = "retryable"            # everything else: once the retries are used up, queued again after the cooldown
+
+
 def service_unreachable(exc: BaseException | None) -> bool:
     """Whether this failure means "the service cannot be reached": it is not up yet, or it is restarting. Walks
     the exception chain looking for connection-level errors (connection refused, connection reset by the peer,
