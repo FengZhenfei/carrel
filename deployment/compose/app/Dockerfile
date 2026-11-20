@@ -27,11 +27,14 @@ RUN pip install --no-deps ./app
 COPY LICENSE NOTICE.md ./
 COPY THIRD_PARTY_LICENSES ./THIRD_PARTY_LICENSES
 COPY scripts ./scripts
+# tree-sitter validates cache ownership against the runtime UID.
+ARG PARSER_CACHE_UID=0
 RUN --mount=type=bind,source=deployment/compose/app,target=/build-input \
     if [ -d /build-input/code-parsers ]; then \
         mkdir -p "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR" && \
         cp -a /build-input/code-parsers/. "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR/"; \
-    fi && python scripts/prepare-code-parsers.py
+    fi && python scripts/prepare-code-parsers.py \
+    && chown -R "$PARSER_CACHE_UID" "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"
 COPY config/knowledge-base.env.example ./config/knowledge-base.env.example
 RUN mkdir -p /data
 EXPOSE 9800 9810
