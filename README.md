@@ -23,7 +23,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-[0.4.3 changes and upgrade steps](docs/releases/0.4.3.md) — Consistent document publication, version-bound evidence, document and section time context, table parsing repairs, and bundled code grammars.
+Carrel 0.4.4 improves PDF and table chunking, image descriptions and index recovery, and ships MinerU 3.4.5 with CJK font checks. [Changes and upgrade steps](docs/releases/0.4.4.md)
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
