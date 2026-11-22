@@ -42,6 +42,13 @@ RUN set -eux; \
         python3 -m pip uninstall -y lmcache || true; \
     fi
 
+# Use Noto for unembedded CJK fonts. Other fallbacks can shadow Noto even when they lack the glyph.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+COPY check_fonts.py /usr/local/share/carrel/check_fonts.py
+RUN python3 /usr/local/share/carrel/check_fonts.py
+
 COPY entrypoint.sh /usr/local/bin/carrel-mineru-entrypoint
 COPY detect.py /usr/local/bin/carrel-mineru-detect.py
 RUN chmod +x /usr/local/bin/carrel-mineru-entrypoint

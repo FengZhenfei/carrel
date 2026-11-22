@@ -67,6 +67,16 @@ upgrade the parser. Keep the existing model and output mounts: an upgrade does n
 schedule reparsing or graph rebuilding. Cached results retain their producer version;
 new results record the version returned by MinerU.
 
+Light and Standard use the same MinerU service. Both CPU and GPU parser images
+add only `fonts-noto-cjk` for CJK fallback. It supplies four font files covering
+Noto Sans CJK and Noto Serif CJK in regular and bold. No host font mount is required.
+The build renders unembedded Japanese and Korean Gothic text to catch missing
+glyphs even when serif text renders correctly. If you previously mounted additional fonts, remove
+that font mount so it cannot override Noto. To update an existing 3.4.5
+installation, update the checkout and run
+`docker compose up -d --no-deps --build mineru` in `deployment/compose`.
+Previously cached parses are unchanged.
+
 For a registry mirror, set `CARREL_PYTHON_IMAGE`, `MINERU_BASE_IMAGE` and the database
 image variables. `PIP_INDEX_URL` controls the Python package index used during build.
 GPU parsing uses `COMPOSE_FILE=docker-compose.yml:compose.gpu.yml` with

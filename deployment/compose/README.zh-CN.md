@@ -60,6 +60,13 @@ MinerU 由 Compose 单独构建，默认版本为 **3.4.5**。已有部署需将
 仅拉取应用镜像不会升级解析服务。保留原有模型和输出挂载目录，升级不会主动触发
 重新解析或建图。缓存结果保留原解析版本，新结果记录 MinerU 实际返回的版本。
 
+Light 和 Standard 共用 MinerU 服务。CPU 和 GPU 解析镜像都只额外安装 `fonts-noto-cjk`
+作为中日韩回退字体。Noto Sans CJK 和 Noto Serif CJK 各有常规体和粗体，共四个文件。
+无需挂载宿主机字体。构建时会实际渲染未内嵌字体的日文和韩文黑体，避免只测明朝体或宋体时漏掉缺字。
+如果曾额外挂载其他字体，请先移除该字体挂载，以免它们优先于 Noto 被选用。
+已有 3.4.5 部署更新仓库后，在 `deployment/compose` 下运行
+`docker compose up -d --no-deps --build mineru` 即可。已有解析缓存不变。
+
 需要镜像加速时，可配置 `CARREL_PYTHON_IMAGE`、`MINERU_BASE_IMAGE` 和数据库镜像地址。
 `PIP_INDEX_URL` 设置构建时的 Python 包索引。GPU 解析使用
 `COMPOSE_FILE=docker-compose.yml:compose.gpu.yml`、`MINERU_FLAVOR=gpu`
