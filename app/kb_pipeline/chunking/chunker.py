@@ -25,9 +25,10 @@ import hashlib
 from dataclasses import replace
 from typing import Any
 
-from ..headings import clean_heading_text, infer_heading_level, is_short_lead_in
+from ..headings import clean_heading_text, is_short_lead_in
 from ..models import ParsedBlock, UnifiedChunk
 from ..parsers.code_source import code_locator
+from ..parsers.common import matched_colspan_prefix
 from ..utils import count_tokens, split_sentences
 from .context import evidence_text
 from .packing import (combined_owner, heading_body_flow, is_inline_icon, join_pieces, owns_code_intro, pack_prose,
@@ -39,6 +40,20 @@ TEXT_LIKE_TYPES = frozenset({"text", "title", "list", "equation", "page", "slide
 # How far a merged chunk may exceed the budget after chunking: used when gluing fragments into a neighbour
 GLUE_SLACK = 1.25
 _FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})([^\n]*)$")
+_BACKTICK_FENCE_RE = re.compile(r"^[ \t]*(`{3,})([^\n]*)$")
+# Document types written in Markdown (a notebook's text cells are Markdown too). Only there is a row of tildes a
+# code fence. Anywhere else it underlines a title or separates two passages (reStructuredText, plain text, text
+# recognised from a PDF or a Word file), and taking it for a fence turned everything up to the next such row into
+# "code". The backtick fence has no second meaning and is recognised in every text, as before.
+MARKDOWN_DOC_TYPES = frozenset({"md", "markdown", "qmd", "rmd", "ipynb"})
+
+
+def _fence_open(line: str, tilde: bool = True) -> re.Match | None:
+    return (_FENCE_OPEN_RE if tilde else _BACKTICK_FENCE_RE).match(line)
+
+
+def _tilde_fences(block: ParsedBlock) -> bool:
+    return str(block.doc_type or "").lower() in MARKDOWN_DOC_TYPES
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}")
 _CELL_BAR_RE = re.compile(r"(?<!\\)\|")          # the bars separating the cells of a pipe table; a bar inside a cell is written \|
@@ -147,9 +162,10 @@ def _closes_fence(line: str, marker: str) -> bool:
     return bool(match and match[1][0] == marker[0] and len(match[1]) >= len(marker) and not match[2].strip())
 
 
-def _segments(text: str) -> list[tuple[str, str]]:
+def _segments(text: str, tilde: bool = True) -> list[tuple[str, str]]:
     """Split text into a sequence of ('prose' | 'fence' | 'table', segment text). Fences and runs of
-    consecutive pipe-table lines are kept whole."""
+    consecutive pipe-table lines are kept whole. tilde: whether a row of tildes opens a fence (see
+    MARKDOWN_DOC_TYPES)."""
     out: list[tuple[str, str]] = []
     prose: list[str] = []
     lines = text.split("\n")
@@ -162,8 +178,8 @@ def _segments(text: str) -> list[tuple[str, str]]:
 
     while i < len(lines):
         line = lines[i]
-        if _FENCE_OPEN_RE.match(line):
-            fence = _FENCE_OPEN_RE.match(line).group(1)
+        if _fence_open(line, tilde):
+            fence = _fence_open(line, tilde).group(1)
             j = i + 1
             while j < len(lines) and not _closes_fence(lines[j], fence):
                 j += 1
@@ -281,7 +297,10 @@ def _labelled_cells(line: str, header_cells: list[str] | None, native: bool) -> 
     """Split a row by position and write each cell as "name: value": a column without a name in the header is
     called "column N", and empty cells are skipped. In a native table block without a HEADER line the rows
     were already expanded with column names by native_table (empty cells skipped, positions unrelated to
-    the header): those cells are used as they are, without pairing column names a second time."""
+    the header): those cells are used as they are, without pairing column names a second time.
+
+    When a pipe-table cell carries a '[COLS: h1 / h2 ...] ' horizontal-span prefix whose covered columns
+    match header_cells, emit 'h1 / h2 ...: value' once instead of repeating the anchor column name."""
     raw = _native_cells(line) if native else _framed_cells(line)
     if native and not header_cells:
         return [c for c in raw if c]
@@ -289,7 +308,15 @@ def _labelled_cells(line: str, header_cells: list[str] | None, native: bool) -> 
     for idx, text in enumerate(raw):
         if not text:
             continue
-        name = (header_cells[idx] if header_cells and idx < len(header_cells) and header_cells[idx].strip() else f"列{idx + 1}")
+        if not native and header_cells and text.startswith("[COLS: "):
+            prefix, width = matched_colspan_prefix(raw, header_cells, idx, range(len(raw) - idx, 1, -1))
+            if prefix:
+                label = prefix[len("[COLS: "):-2]
+                if label == f"{idx + 1}-{idx + width}":
+                    label = f"COLS {label}"
+                items.append(f"{label}: {text[len(prefix):]}")
+                continue
+        name = header_cells[idx] if header_cells and idx < len(header_cells) and header_cells[idx].strip() else f"列{idx + 1}"
         items.append(f"{name}: {text}")
     return items
 
@@ -339,6 +366,20 @@ def split_table_text(text: str, max_tokens: int) -> list[str]:
         body = extra_body + body[len(extra_body) + 2:]
     header_cells = _table_header_cells(columns)
     native = any(l.lstrip().startswith(_NATIVE_TABLE_PREFIXES) for l in lead)
+    if not native and header_cells and any("[COLS: " in line for line in body):
+        # A verified positional span marks a grid without column names. Keep its first
+        # printed row as data, including when every following row is split by cell.
+        unnamed = [""] * len(header_cells)
+        for line in body:
+            if "[COLS: " not in line:
+                continue
+            cells = _framed_cells(line)
+            if any(matched_colspan_prefix(cells, unnamed, i, range(len(cells) - i, 1, -1))[0]
+                   for i, cell in enumerate(cells) if cell.startswith(f"[COLS: {i + 1}-")):
+                body.insert(len(extra_body), columns[0])
+                columns = []
+                header_cells = unnamed
+                break
     # Every line of a native table block is a data row; in other tables a line without a bar is a table note, a
     # footnote or original text that was not turned into a table: not split by cell, no column names
     entries = [(l, native or "|" in l) for l in body if l.strip()]
@@ -443,7 +484,7 @@ def _chunk_prose(
     lead = 0                        # how many sentences at the start of current are the overlap tail
 
     def is_heading(sentence: str) -> bool:
-        return sentence in headings or infer_heading_level(sentence) is not None
+        return sentence in headings
 
     def cost(sentence: str) -> int:
         # Sentences are joined with newlines, and that newline is a token too: a prose chunk has only a few
@@ -529,15 +570,16 @@ def chunk_text(
     *,
     headings: frozenset[str] = frozenset(),
     overlaps: list[str] | None = None,
+    tilde_fences: bool = True,
 ) -> list[str]:
     """Chunk prose: fences and pipe tables are atomic segments (see _segments), the rest is packed by sentence
     (see _chunk_prose, also for overlaps)."""
     units: list[tuple[str, bool]] = []
-    for kind, seg in _segments(text):
+    for kind, seg in _segments(text, tilde_fences):
         if kind == "prose":
             prose = []
             for line in seg.splitlines(keepends=True):
-                if line.strip() in headings or infer_heading_level(line.strip()) is not None:
+                if line.strip() in headings:
                     units.extend((s, False) for s in split_sentences("".join(prose)))
                     prose = []
                     units.append((line.strip(), False))
@@ -641,14 +683,16 @@ def _group_code_blocks(blocks: list[ParsedBlock], max_tokens: int) -> list[tuple
     return out
 
 
-def _heading_only(text: str) -> bool:
+def _heading_only(text: str, block: ParsedBlock | None = None) -> bool:
     """The whole chunk is a single heading / lead-in (only one short line remains after dropping the
     TITLE: lines)."""
     lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("TITLE:")]
     if len(lines) != 1:
         return False
     line = lines[0]
-    return infer_heading_level(line) is not None or is_short_lead_in(line)
+    if block is not None and (block.block_type == "title" or line in (block.metadata.get("heading_lines") or [])):
+        return True
+    return is_short_lead_in(line)
 
 
 def _same_section(a: ParsedBlock, b: ParsedBlock) -> bool:
@@ -683,7 +727,7 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
         heading_lines = [line.strip() for line in h["text"].splitlines() if line.strip()]
         known = h["block"].metadata.get("heading_lines") or []
         heading_only = bool(heading_lines) and all(
-                line in known or h["block"].block_type == "title" or infer_heading_level(line) is not None
+                line in known or h["block"].block_type == "title"
                 for line in heading_lines)
         if h["block"].block_type in TEXT_LIKE_TYPES and (heading_only or h["tokens"] < tiny_threshold(max_tokens)):
             while heading_only and j < len(pieces) and pieces[j]["block"].block_type in VISUAL_TYPES:
@@ -696,8 +740,7 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
                 # separately instead of rejecting the valid opening association.
                 lines = b["text"].splitlines(keepends=True)
                 cut = next((n for n, line in enumerate(lines) if line.strip() in
-                            (b["block"].metadata.get("heading_lines") or [])
-                            or infer_heading_level(line.strip()) is not None), len(lines))
+                            (b["block"].metadata.get("heading_lines") or [])), len(lines))
                 if cut < len(lines):
                     prefix, tail = "".join(lines[:cut]).strip(), "".join(lines[cut:]).strip()
                     remainder = {"text": tail, "tokens": count_tokens(tail),
@@ -749,7 +792,8 @@ def _bind_heading_bodies(pieces: list[dict[str, Any]], max_tokens: int, overlap_
                         parts, leads = [text], [""]
                     else:
                         leads = []
-                        parts = chunk_text(text, max_tokens, overlap_tokens, headings=frozenset(headings), overlaps=leads)
+                        parts = chunk_text(text, max_tokens, overlap_tokens, headings=frozenset(headings), overlaps=leads,
+                                           tilde_fences=_tilde_fences(owner))
                     if leads:
                         leads[0] = h.get("overlap") or ""       # the first part starts where the heading piece started
                     out.extend({"text": part, "block": bound_sources.locate(owner, part), "tokens": count_tokens(part),
@@ -778,7 +822,7 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             return False
         if a.slide_idx is not None:
             return _same_slide(a, b)
-        explicit = (a.block_type == "title" or infer_heading_level(p["text"]) is not None
+        explicit = (a.block_type == "title"
                     or p["text"] in (a.metadata.get("heading_lines") or []))
         return explicit and same_column_before(a, b)
 
@@ -804,7 +848,8 @@ def _glue_pieces(pieces: list[dict[str, Any]], max_tokens: int) -> list[dict[str
             nxt = pieces[i + 1] if i + 1 < len(pieces) else None
             prev = pieces[i - 1] if i > 0 else None
             # A heading-only fragment right before a figure / table: becomes the TITLE of that block
-            if (nxt is not None and nxt["block"].block_type in VISUAL_TYPES | {"table"} and _heading_only(p["text"])
+            if (nxt is not None and nxt["block"].block_type in VISUAL_TYPES | {"table"}
+                    and _heading_only(p["text"], p["block"])
                     and _same_slide(p["block"], nxt["block"])
                     and owned_heading(p, nxt)):
                 title = " ".join(clean_heading_text(l) for l in p["text"].splitlines()
@@ -874,11 +919,12 @@ def _embedded_code_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
     """
     out = []
     for block in blocks:
-        if block.block_type not in TEXT_LIKE_TYPES or not any(_FENCE_OPEN_RE.match(line) for line in block.text.split("\n")):
+        tilde = _tilde_fences(block)
+        if block.block_type not in TEXT_LIKE_TYPES or not any(_fence_open(line, tilde) for line in block.text.split("\n")):
             out.append(block)
             continue
         cursor = 0
-        for i, (kind, text) in enumerate(_segments(block.text)):
+        for i, (kind, text) in enumerate(_segments(block.text, tilde)):
             start = block.text.find(text, cursor)
             cursor = start + len(text)
             if kind != "fence":
@@ -1009,7 +1055,7 @@ def blocks_to_chunks(
             if block.block_type == "title":
                 headings = headings | {block.text.strip()}
             parts = chunk_text(text, max_tokens, overlap_tokens,
-                               headings=headings, overlaps=overlaps)
+                               headings=headings, overlaps=overlaps, tilde_fences=_tilde_fences(block))
         offset = 0
         for part_index, part in enumerate(parts):
             owner = block
@@ -1075,8 +1121,27 @@ def _compact_code_label(caption: str) -> bool:
 
 def embedding_context_for(chunk: UnifiedChunk, *, doc_name: str) -> str:
     """Embedding prefix: "document name > section path". Titles and captions are already written into the text
-    by text_for_block and are not repeated here."""
-    parts = [str(doc_name or "").strip()] + [str(x).strip() for x in (chunk.block.metadata.get("section_path") or []) if str(x).strip()]
+    by text_for_block and are not repeated here. When a chunk spans sibling chapters so its strict common
+    section_path is empty, fall back to the non-empty section_paths it covers so retrieval still sees the
+    chapter context."""
+    section_parts = [str(x).strip() for x in (chunk.block.metadata.get("section_path") or []) if str(x).strip()]
+    if not section_parts:
+        seen_paths: list[list[str]] = []
+        for raw_path in (chunk.block.metadata.get("section_paths") or []):
+            cleaned = [str(x).strip() for x in (raw_path or []) if str(x).strip()]
+            if cleaned and cleaned not in seen_paths:
+                seen_paths.append(cleaned)
+        # Drop paths that are a strict prefix of a deeper path already in the same chunk
+        # (e.g. ["Ch1"] alongside ["Ch1", "1.1"]) to avoid repeating parent names within the 200-char cap.
+        maximal = [
+            p for p in seen_paths
+            if not any(len(q) > len(p) and q[:len(p)] == p for q in seen_paths)
+        ]
+        if len(maximal) == 1:
+            section_parts = maximal[0]
+        elif len(maximal) >= 2:
+            section_parts = [" / ".join(" > ".join(p) for p in maximal)]
+    parts = [str(doc_name or "").strip()] + section_parts
     if chunk.block.block_type == "code" and _compact_code_label(chunk.block.caption or ""):
         # Keep the label searchable without modifying literal code or creating a
         # tiny extra chunk. It also remains in the original caption payload.

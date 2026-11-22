@@ -154,19 +154,77 @@ def _escape_bare_lt(html: str) -> str:
             pos = i + 1
 
 
-class _TableReader(HTMLParser):
-    """<table> -> list of rows. Only cell text is kept; every attribute except colspan/rowspan is dropped.
+_NUMERIC_RE = re.compile(r"^[\d.,%￥$€\-+/:\s]+$")
+# date / version / id shaped values are data even when short (20260122, v7.0.2412a, SP2B09-x86)
+# date-like runs, dotted versions, and CODE-123 / AB1234 style ids. Plain
+# arch/platform words with a short number (arm64, x86_64, IPv6) stay headers.
+_DATAISH_RE = re.compile(r"\d{6,}|\bv?\d+\.\d+(\.\d+)?[a-z]?\b|[A-Z]{2,}-\d{2,}|[A-Z]{2,}\d{3,}", re.I)
 
-    A cell spanning several rows or columns has its value **repeated** into every position it covers
-    instead of leaving them empty: markdown tables have no notion of spans, and empty positions would
-    shift all the following columns, and a misaligned table is harder to read than a repetitive one.
+
+def looks_like_header_cell(cell: str) -> bool:
+    cell = (cell or "").strip()
+    if not cell:
+        return True  # blank cells are fine in a header (merged spans)
+    if len(cell) > 40:
+        return False
+    if _NUMERIC_RE.match(cell) or _DATAISH_RE.search(cell):
+        return False
+    return True
+
+
+def first_row_header(row: list[str], spans: list[tuple[int, int, int]], roles: set[bool | None]) -> bool:
+    """Honor source markup, then use the spreadsheet label check for unmarked OCR tables."""
+    if False in roles:
+        declared = False
+    elif roles == {True}:
+        declared = True
+    else:
+        # Alternating field names and values form a record even when every value is short text.
+        keys = row[::2]
+        field_pairs = len(row) >= 4 and len(row) % 2 == 0 and all(key.rstrip().endswith((":", "：")) for key in keys)
+        declared = all(looks_like_header_cell(cell) for cell in row) and not field_pairs
+    if not declared:
+        for col, _, width in spans:
+            row[col + 1:col + width] = [""] * (width - 1)
+    return declared
+
+
+def _column_header_role(tag: str, scope: str | None, in_thead: bool) -> bool | None:
+    if scope in ("row", "rowgroup"):
+        return False
+    return True if in_thead or tag == "th" else None
+
+
+class _TableReader(HTMLParser):
+    """<table> -> list of rows + declared spans. Only cell text is kept; every attribute except colspan/rowspan is dropped.
+
+    Merged cells follow their physical merge direction:
+      - Vertical (rowspan > 1): repeated down into every covered row so each row and any split table chunk
+        retains the shared value independently.
+      - Header row (row 0) horizontal (colspan > 1): repeated across the covered header columns so every column
+        carries its column/group header name.
+      - Body row (row >= 1) horizontal (colspan > 1): placed once in the anchor column (covered sibling columns
+        stay empty so column alignment holds without duplicating the value across columns); grid_to_markdown
+        annotates multi-column horizontal spans with their covered distinct column headers.
+      - Cells with both rowspan > 1 and colspan > 1 apply both rules: repeated once per spanned row, never
+        duplicated across columns on body rows.
+
+    A line break or a new paragraph inside a cell becomes a space. The lines used to be joined with nothing
+    between them: a cell listing 75 / 75 / 57 on three lines came out as 757557 and its unit column as mAmAmA.
     """
 
-    def __init__(self) -> None:
+    _LINE_TAGS = frozenset({"br", "p", "div", "li"})
+
+    def __init__(self, *, header_row: bool = True) -> None:
         super().__init__(convert_charrefs=True)
+        self._header_row = header_row
+        self.column_headers = False
+        self._in_thead = False
+        self._first_row_roles: set[bool | None] = set()
         self.rows: list[list[str]] = []
         self.spans: list[tuple[int, int, int, int]] = []
         self._row: list[str] | None = None
+        self._row_spans: list[tuple[int, int, int]] = []
         self._cell: list[str] | None = None
         self._span = (1, 1)
         self._col = 0
@@ -181,15 +239,22 @@ class _TableReader(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs) -> None:
         tag = tag.lower()
+        if tag in self._LINE_TAGS and self._cell is not None:
+            self._cell.append(" ")
+        if tag == "thead":
+            self._in_thead = True
         if tag == "tr":
             self._flush_row()
-            self._row, self._col = [], 0
+            self._first_row_roles.clear()
+            self._row, self._row_spans, self._col = [], [], 0
         elif tag in {"td", "th"}:
             if self._row is None:          # some tables lack <tr>; open a row for them
-                self._row, self._col = [], 0
+                self._row, self._row_spans, self._col = [], [], 0
             self._drain()
             self._cell = []
             a = {k.lower(): v for k, v in attrs}
+            if not self.rows:
+                self._first_row_roles.add(_column_header_role(tag, a.get("scope"), self._in_thead))
             self._span = (_span_of(a.get("colspan")), _span_of(a.get("rowspan")))
 
     def handle_data(self, data: str) -> None:
@@ -201,21 +266,29 @@ class _TableReader(HTMLParser):
             return
         value = re.sub(r"\s+", " ", "".join(self._cell)).strip().replace("|", "\\|")
         cols, rows = self._span
+        row_idx = len(self.rows)
         if cols > 1 or rows > 1:
-            self.spans.append((len(self.rows), self._col, rows, cols))
-        for _ in range(cols):
-            self._row.append(value)
+            self._row_spans.append((self._col, rows, cols))
+        for offset in range(cols):
+            cell_val = value if (offset == 0 or (self._header_row and row_idx == 0)) else ""
+            self._row.append(cell_val)
             if rows > 1:
-                self._carry[self._col] = [rows - 1, value]
+                # Carried rows are always body rows (row >= 1): carry value vertically in the anchor
+                # column only, reserving covered sibling columns with empty strings.
+                self._carry[self._col] = [rows - 1, value if offset == 0 else ""]
             self._col += 1
         self._cell = None
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in self._LINE_TAGS and self._cell is not None:
+            self._cell.append(" ")
         if tag in {"td", "th"}:
             self._flush_cell()
         elif tag == "tr":
             self._flush_row()
+        elif tag == "thead":
+            self._in_thead = False
 
     def _flush_row(self) -> None:
         self._flush_cell()
@@ -223,8 +296,16 @@ class _TableReader(HTMLParser):
             return
         self._drain()
         if any(cell for cell in self._row):
+            row_idx = len(self.rows)
+            if row_idx == 0:
+                self.column_headers = first_row_header(
+                    self._row, self._row_spans, self._first_row_roles if self._header_row else {False}
+                )
             self.rows.append(self._row)
+            for col, rs, cs in self._row_spans:
+                self.spans.append((row_idx, col, rs, cs))
         self._row = None
+        self._row_spans = []
 
     def close(self) -> None:
         # Truncated HTML must still hand over whatever was read -- losing the tail of one table
@@ -233,28 +314,12 @@ class _TableReader(HTMLParser):
         self._flush_row()
 
 
-def html_table_to_markdown(html: str) -> str | None:
-    """MinerU table HTML -> markdown pipe table. Returns None when it cannot be recognised, and the
-    caller keeps the original.
-
-    MinerU gives tables a single table_body key whose content is <table><tr><td>..., with no markdown
-    alternative. That markup would go into chunk text verbatim: measured, markup makes up a median of
-    57%~61% of the body characters, and kb_005 alone has 312,105 tags. The tokenizer compresses the
-    repeated </td><td> fairly well, so the real waste in tokens is 33% -- 3,374 real tables went from
-    1,391,102 to 928,911 tokens. The waste is not only budget: a 399-token chunk can consist entirely
-    of <td></td>, and its vector then represents "this is a table" rather than what the table holds.
-    """
-    rows = html_table_to_grid(html)
-    return grid_to_markdown(rows) if rows else None
-
-
-def html_table_to_grid(html: str) -> list[list[str]] | None:
-    """MinerU table HTML -> cell grid (rows x columns, padded to equal width). Returns None when it
-    cannot be recognised. Table ambiguity detection (table_check) and screenshot verification repair
-    (table_repair) both operate on this grid."""
+def _parse_html_table(
+    html: str, *, header_row: bool = True
+) -> _TableReader | None:
     if not html or not _TABLE_TAG_RE.search(html):
         return None
-    reader = _TableReader()
+    reader = _TableReader(header_row=header_row)
     try:
         reader.feed(_escape_bare_lt(html))
         reader.close()
@@ -266,23 +331,136 @@ def html_table_to_grid(html: str) -> list[list[str]] | None:
     width = max(len(row) for row in rows)
     if width <= 0:
         return None
-    return [row + [""] * (width - len(row)) for row in rows]
+    reader.rows = [row + [""] * (width - len(row)) for row in rows]
+    return reader
 
 
-def html_table_spans(html: str) -> list[tuple[int, int, int, int]]:
+def colspan_header_prefix(header: list[str], col: int, width: int, *, column_headers: bool = True) -> str:
+    """Label a partial-row span by its column names, or use its one-based range on a headerless grid."""
+    if width <= 1 or not header or col < 0 or (col == 0 and width >= len(header)):
+        return ""
+    if not column_headers:
+        return f"[COLS: {col + 1}-{col + width}] "
+    distinct = list(dict.fromkeys(str(h).strip() for h in header[col : col + width] if str(h).strip()))
+    if len(distinct) < 2:
+        return ""
+    return f"[COLS: {' / '.join(distinct)}] "
+
+
+def matched_colspan_prefix(row: list[str], header: list[str], col: int, widths: Iterable[int]) -> tuple[str, int]:
+    """Recognize a rendered span at its anchor, with empty covered cells, before stripping or splitting it."""
+    if col >= len(row) or not row[col].startswith("[COLS: "):
+        return "", 0
+    for width in widths:
+        if width <= 1 or col + width > min(len(header), len(row)) or any(row[col + 1:col + width]):
+            continue
+        for named in (True, False):
+            prefix = colspan_header_prefix(header, col, width, column_headers=named)
+            if prefix and row[col].startswith(prefix):
+                return prefix, width
+    return "", 0
+
+
+def strip_colspan_prefixes(
+    grid: list[list[str]],
+    spans: list[tuple[int, int, int, int]] | None = None,
+) -> list[list[str]]:
+    """Remove only verified span annotations so the review compares original cell text."""
+    if not grid:
+        return []
+    out = [list(row) for row in grid]
+    if spans:
+        for r, c, rs, cs in spans:
+            for row in out[max(1, r):r + rs]:
+                prefix, _ = matched_colspan_prefix(row, out[0], c, (cs,))
+                if prefix:
+                    row[c] = row[c][len(prefix):]
+    else:
+        for row in out[1:]:
+            for c in range(len(row)):
+                prefix, _ = matched_colspan_prefix(row, out[0], c, range(len(row) - c, 1, -1))
+                if prefix:
+                    row[c] = row[c][len(prefix):]
+    return out
+
+
+def rerender_continuation_rows(
+    header: list[str],
+    body_rows: list[list[str]],
+    raw_html: str = "",
+) -> tuple[list[list[str]], list[tuple[int, int, int, int]]]:
+    """Re-normalize a header-less continuation table's rows against the parent table's real header.
+
+    Because html_table_to_markdown parsed the continuation table standalone, its first data row was
+    treated as row 0 (expanding any row-0 horizontal colspan and supplying fake '[COLS: ...]' names
+    for later rows). Strip those stale prefixes, collapse row-0 horizontal duplicates when raw_html
+    declares a row-0 colspan, and return (clean_rows, shifted_spans) aligned to [header] + clean_rows.
+    """
+    if not body_rows:
+        return [], []
+    clean = [list(row) for row in body_rows]
+    inferred_spans: list[tuple[int, int, int, int]] = []
+    # Strip any [COLS: ...] generated from clean[0] (the false header) and remember their column widths.
+    fake_header = clean[0]
+    ncols = len(header)
+    for rr in range(1, len(clean)):
+        row = clean[rr]
+        for c, val in enumerate(row):
+            prefix, width = matched_colspan_prefix(row, fake_header, c, range(len(row) - c, 1, -1))
+            if prefix:
+                row[c] = val[len(prefix):]
+                inferred_spans.append((rr + 1, c, 1, width))
+    parsed = _parse_html_table(raw_html, header_row=False) if raw_html else None
+    if parsed:
+        raw_body, raw_spans = parsed.rows, parsed.spans
+        if len(raw_body) == len(clean) and raw_body and len(raw_body[0]) == ncols:
+            # Collapse any row-0 horizontal colspan that was expanded when parsed standalone with header_row=True.
+            for r, c, rs, cs in raw_spans:
+                if r == 0 and cs > 1 and c + cs <= len(clean[0]):
+                    anchor = clean[0][c]
+                    if anchor and all(clean[0][cc] == anchor for cc in range(c + 1, c + cs)):
+                        for cc in range(c + 1, c + cs):
+                            clean[0][cc] = ""
+            return clean, [(r + 1, c, rs, cs) for r, c, rs, cs in raw_spans]
+    return clean, inferred_spans
+
+
+def html_table_to_markdown(html: str, *, header_row: bool = True) -> str | None:
+    """MinerU table HTML -> markdown pipe table. Returns None when it cannot be recognised, and the
+    caller keeps the original.
+
+    MinerU gives tables a single table_body key whose content is <table><tr><td>..., with no markdown
+    alternative. That markup would go into chunk text verbatim: measured, markup makes up a median of
+    57%~61% of the body characters, and kb_005 alone has 312,105 tags. The tokenizer compresses the
+    repeated </td><td> fairly well, so the real waste in tokens is 33% -- 3,374 real tables went from
+    1,391,102 to 928,911 tokens. The waste is not only budget: a 399-token chunk can consist entirely
+    of <td></td>, and its vector then represents "this is a table" rather than what the table holds.
+    """
+    parsed = _parse_html_table(html, header_row=header_row)
+    if not parsed:
+        return None
+    return grid_to_markdown(parsed.rows, spans=parsed.spans, column_headers=parsed.column_headers)
+
+
+def html_table_to_grid(html: str, *, header_row: bool = True) -> list[list[str]] | None:
+    """MinerU table HTML -> cell grid (rows x columns, padded to equal width). Returns None when it
+    cannot be recognised."""
+    parsed = _parse_html_table(html, header_row=header_row)
+    return parsed.rows if parsed else None
+
+
+def html_table_spans(html: str, *, header_row: bool = True) -> list[tuple[int, int, int, int]]:
     """Source-declared (row, column, row span, column span), without changing the grid."""
-    if not html or not _TABLE_TAG_RE.search(html):
-        return []
-    reader = _TableReader()
-    try:
-        reader.feed(_escape_bare_lt(html))
-        reader.close()
-    except Exception:
-        return []
-    return reader.spans
+    parsed = _parse_html_table(html, header_row=header_row)
+    return parsed.spans if parsed else []
 
 
-def grid_to_markdown(rows: list[list[str]] | None) -> str | None:
+def grid_to_markdown(
+    rows: list[list[str]] | None,
+    *,
+    spans: list[tuple[int, int, int, int]] | None = None,
+    column_headers: bool = False,
+) -> str | None:
     if not rows:
         return None
     width = max(len(row) for row in rows)
@@ -292,6 +470,21 @@ def grid_to_markdown(rows: list[list[str]] | None) -> str | None:
     # Keep repeated serialization stable and keep one physical line per row.
     padded = [[re.sub(r"(?<!\\)\|", r"\\|", str(c)).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
                for c in row] + [""] * (width - len(row)) for row in rows]
+    if spans and len(padded) > 1:
+        header = padded[0]
+        for r, c, rs, cs in spans:
+            if cs <= 1 or c < 0 or c + cs > width:
+                continue
+            prefix = colspan_header_prefix(header, c, cs, column_headers=column_headers)
+            if not prefix:
+                continue
+            for rr in range(max(1, r), min(len(padded), r + rs)):
+                if (
+                    padded[rr][c].strip()
+                    and not padded[rr][c].startswith(prefix)
+                    and all(not padded[rr][cc].strip() for cc in range(c + 1, c + cs))
+                ):
+                    padded[rr][c] = prefix + padded[rr][c]
     lines = ["| " + " | ".join(padded[0]) + " |",
              "| " + " | ".join(["---"] * width) + " |"]
     lines.extend("| " + " | ".join(row) + " |" for row in padded[1:])
@@ -572,7 +765,9 @@ def markdown_to_blocks(
             metadata={"section_path": [], "frontmatter": frontmatter},
         ))
     tracker = SectionTracker()
-    sections: list[tuple[str | None, list[str], list[str]]] = []
+    # (title, body lines, section path, listed). "listed" marks the sections that have always been in this list:
+    # their position numbers the block ids, which are part of every chunk id and must not move.
+    sections: list[tuple[str | None, list[str], list[str], bool]] = []
     current_title: str | None = None
     current_lines: list[str] = []
     # Character and length of the opening fence: it is closed only by a line of the same character,
@@ -608,7 +803,9 @@ def markdown_to_blocks(
                 i += 1      # consume the underline too; it must not end up in the body
         if heading is not None:
             if current_lines:
-                sections.append((current_title, current_lines, tracker.path))
+                sections.append((current_title, current_lines, tracker.path, True))
+            elif current_title is not None:
+                sections.append((current_title, [], tracker.path, False))      # a heading followed directly by the next heading
             current_title = clean_heading_text(heading) or heading
             tracker.observe(level, current_title)
             # The heading is carried by title + section_path; keeping it in the
@@ -623,12 +820,26 @@ def markdown_to_blocks(
         else:
             current_lines.append(line)
     if current_lines or current_title:
-        sections.append((current_title, current_lines, tracker.path))
+        sections.append((current_title, current_lines, tracker.path, True))
 
-    for idx, (title, lines, section_path) in enumerate(sections, start=1):
+    number = extra = 0
+    for pos, (title, lines, section_path, listed) in enumerate(sections):
+        if listed:
+            number, extra = number + 1, 0
         text = clean_markdown("\n".join(lines))
-        if not text and (not title or idx != len(sections)):
-            continue
+        if not text:
+            # A heading without body text is content too (an outline, a conclusion written as a heading). When the
+            # next section is one of its subsections the section path carries it; otherwise it gets a block of its
+            # own. Only the last heading of a file used to be kept, every other one vanished.
+            following = list(sections[pos + 1][2]) if pos + 1 < len(sections) else None
+            carried = following is not None and len(following) > len(section_path) and following[:len(section_path)] == list(section_path)
+            if not title or carried:
+                continue
+        if listed:
+            block_id = f"md-{number:04d}"
+        else:
+            extra += 1
+            block_id = f"md-{number:04d}-h{extra}"
         blocks.append(
             ParsedBlock(
                 parser=parser,
@@ -637,7 +848,7 @@ def markdown_to_blocks(
                 block_type="text" if text else "title",
                 text=text,
                 title=title,
-                block_id=f"md-{idx:04d}",
+                block_id=block_id,
                 metadata={"section_path": list(section_path)},
             )
         )
@@ -703,8 +914,11 @@ class SectionTracker:
         title = clean_heading_text(clean_text(title))
         if not level or not title:
             return
-        self._stack = [(lv, tt) for lv, tt in self._stack if lv < level]
+        self.end_at(level)
         self._stack.append((level, title))
+
+    def end_at(self, level: int) -> None:
+        self._stack = [(lv, tt) for lv, tt in self._stack if lv < level]
 
     @property
     def path(self) -> list[str]:

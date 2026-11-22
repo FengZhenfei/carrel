@@ -7,15 +7,15 @@ from pathlib import Path
 from ..chunking.chunker import text_for_block
 from ..chunking.packing import heading_body_flow, is_inline_icon, same_column_before, source_regions
 from ..chunking.sections import same_section
-from ..headings import infer_heading_level, is_note_label, is_page_footer, is_short_lead_in, starts_with_note
+from ..headings import is_note_label, is_page_footer, is_short_lead_in, starts_with_note
 from ..models import ParsedBlock
 from ..utils import count_tokens
+from .common import _parse_html_table, grid_to_markdown, rerender_continuation_rows
+from .errors import NonRetryableParseError
 from .mineru_pdf import MinerUServiceError, mineru_pdf_blocks
-from .pdf_textlayer import mark_degraded_pages, repair_lost_text_layer
+from .pdf_textlayer import lost_text_pages
 from .pdf_longpage import prepare_long_pages, restore_page_coordinates
 from ..vision.vlm import compose_prompt
-from .table_check import high_confidence
-from .table_repair import repair_ambiguous_tables
 from .table_repair import review_pdf_tables, route_image_only_tables
 from .pdf_evidence import add_pdf_region_evidence, supplement_visible_forms
 from .pdf_code import recover_native_code
@@ -54,12 +54,7 @@ def parse_pdf_enhanced(
     caption_cache_root: Path | None = None,
     vlm_prompt: str | None = None,
     progress_cb=None,
-    text_layer_repair: str = "retry",
 ) -> list[ParsedBlock]:
-    """text_layer_repair: what to do when the second MinerU request of the text-layer repair fails. "retry": a
-    transient failure is raised and the job retries; "final" (the job's last attempt): degrade in place, so a
-    document is not kept out of the index for good; "cached" (chunk preview): use only a resend result already
-    in the parse cache, never call MinerU."""
     print(f"[parser] pdf mineru start file={path.name}", flush=True)
     try:
         parse_path, segments = prepare_long_pages(path, cache_dir)
@@ -73,33 +68,22 @@ def parse_pdf_enhanced(
         print(f"[parser] pdf mineru failed file={path.name} error={exc!r}", flush=True)
         raise
 
-    # Text-layer cross-check: when MinerU cannot render non-embedded Chinese fonts whole pages lose their CJK text;
-    # render those pages with PyMuPDF and send them through MinerU once more (pdf_textlayer)
-    rendered_dir = cache_dir / "rendered"
-    cached_only = text_layer_repair == "cached"
-
-    def parse_rendered(rendered: Path) -> list[ParsedBlock]:
-        return mineru_pdf_blocks(mineru_url=mineru_url, path=rendered, cache_dir=rendered_dir, timeout=timeout,
-                                 cached_only=cached_only)
-
-    # Cache only, and the cache holds no resend result: pages that lost their text are only marked, neither
-    # rendered nor parsed
-    skip_repair = cached_only and not (rendered_dir / "mineru" / "result.json").exists()
-    blocks, layer_info = repair_lost_text_layer(
-        blocks, path=path, rendered_path=rendered_dir / f"{path.stem}.lost-pages.pdf",
-        parse_rendered=None if skip_repair else parse_rendered, raise_transient=text_layer_repair == "retry")
-    if layer_info.get("lost_before"):
-        print(f"[parser] pdf text-layer cjk lost pages={layer_info['lost_before']} rendered={layer_info['rendered']} "
-              f"recovered={layer_info['recovered']} still_lost={layer_info['lost']}"
-              + (f" error={layer_info['error']}" if layer_info.get("error") else "") + f" file={path.name}", flush=True)
+    # Text-layer cross-check (pdf_textlayer): a page whose Chinese text is in the PDF's text layer but not in the
+    # recognition result. The document is not indexed without that text, and the result is not kept: a later parse
+    # asks the recogniser again instead of meeting the same result in the cache.
+    lost = lost_text_pages(blocks, path)
+    if lost:
+        print(f"[parser] pdf text-layer cjk lost pages={lost} file={path.name}", flush=True)
+        for name in ("result.json", "result.md"):
+            (parse_cache / "mineru" / name).unlink(missing_ok=True)
+        raise NonRetryableParseError(
+            "text layer lost: the recognition result lacks the Chinese text of pages "
+            + ", ".join(map(str, lost[:20])) + (" and more" if len(lost) > 20 else "")
+            + " (present in the text layer of the PDF); check the CJK fonts of the recognition service and parse the file again")
 
     recover_native_code(blocks, path)
     blocks = supplement_visible_forms(blocks, path)
     restore_pdf_images(blocks, path, cache_dir, (vlm_options or {}).get("max_pixels"))
-    table_blocks = [b for b in blocks if b.block_type == "table" and b.metadata.get("table_flags")]
-    if table_blocks:
-        repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
-                               cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
     restore_ruled_continuation_columns(blocks, path)
     add_pdf_region_evidence(blocks, path, cache_dir)
     # Review original per-page tables before cross-page merging changes ownership.
@@ -108,9 +92,6 @@ def parse_pdf_enhanced(
     route_image_only_tables(blocks)
     blocks = merge_mineru_text_blocks(blocks, target_tokens=merge_target_tokens)
     blocks = merge_split_tables(blocks)
-    if layer_info.get("lost"):
-        marked = mark_degraded_pages(blocks, layer_info["lost"])
-        print(f"[parser] pdf degraded blocks={marked} pages={layer_info['lost']} file={path.name}", flush=True)
 
     image_blocks = [block for block in blocks if block.block_type in {"image", "chart"} and block.visual_ref]
     print(f"[parser] pdf vlm candidates={len(image_blocks)} file={path.name}", flush=True)
@@ -145,8 +126,6 @@ def parse_pdf_enhanced(
 # (2026-09-07 evaluation: 5 header-less table fragments in one document). Two adjacent table blocks with the same column
 # count, on the same or consecutive pages, where the second has no title of its own and its first row
 # either equals the first table's header or looks like a data row, are merged back into the first.
-# Tables flagged for merged cells are not merged (screenshot verification aligns rows on the original
-# grid).
 
 def _table_lines(md: str) -> tuple[list[str], list[str], list[str]]:
     """Table text -> (lines before, table rows, lines after). Before is TITLE / CAPTION, after is FOOTNOTE."""
@@ -177,8 +156,7 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         prev = out[-1] if out else None
         if (prev is None or block.block_type != "table" or prev.block_type != "table"
                 or not prev.table_markdown or not block.table_markdown
-                or block.caption or block.title
-                or high_confidence(prev.metadata.get("table_flags")) or high_confidence(block.metadata.get("table_flags"))):
+                or block.caption or block.title):
             out.append(block)
             continue
         prev_end = prev.metadata.get("page_end", prev.page_idx)      # a table that already absorbed continuations is compared from its last page
@@ -186,8 +164,11 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
             out.append(block)
             continue
         # Matching column counts alone do not establish table identity. On one
-        # page separate tables remain separate unless they are long-page tiles.
-        tiled = bool(prev.metadata.get("source_tile") and block.metadata.get("source_tile"))
+        # page separate tables remain separate unless they are tiles of the same
+        # long page. Every block of a PDF that has a long page carries source_tile,
+        # ordinary pages included, so its presence alone says nothing.
+        tile_a, tile_b = prev.metadata.get("source_tile") or {}, block.metadata.get("source_tile") or {}
+        tiled = bool(tile_a.get("tiled") and tile_b.get("tiled") and tile_a.get("page") == tile_b.get("page"))
         if block.page_idx == prev_end and not tiled:
             out.append(block)
             continue
@@ -218,13 +199,28 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         elif (not _is_separator(rows_b[0]) and (_looks_like_data(first_b)
               or (len(rows_a) == 2 and block.metadata.get("native_continuation_columns")))
               and prev.bbox and block.bbox):
-            body_b = [r for r in rows_b if not _is_separator(r)]           # header-less continuation
+            raw_body_lines = [r for r in rows_b if not _is_separator(r)]           # header-less continuation
+            raw_html_b = (
+                ""
+                if block.metadata.get("restored_empty_columns") or block.metadata.get("inherited_table_header")
+                else str((block.metadata.get("source_item") or {}).get("table_body") or "")
+            )
+            clean_body, shifted_spans = rerender_continuation_rows(
+                header, [_cells(r) for r in raw_body_lines], raw_html_b
+            )
+            parent_html = (prev.metadata.get("source_item") or {}).get("table_body")
+            parent = _parse_html_table(parent_html) if parent_html and shifted_spans else None
+            rendered = grid_to_markdown([header] + clean_body, spans=shifted_spans,
+                                        column_headers=bool(parent and parent.column_headers)) or ""
+            body_b = rendered.splitlines()[2:] if rendered else raw_body_lines
         else:
             out.append(block)
             continue
         if not body_b:
             continue
-        extra_post = [l for l in post_b if l.strip() and l not in post_a]  # a page footer taken as a table note is identical in both parts; do not repeat it
+        # A continuation has no title or caption of its own (checked above), so whatever stands before its grid is
+        # a note: the table review writes the notes of a table there. They used to be dropped by the merge.
+        extra_post = [l for l in pre_b + post_b if l.strip() and l not in pre_a + post_a]  # a page footer taken as a table note is identical in both parts; do not repeat it
         merged = "\n".join(pre_a + rows_a + body_b + post_a + extra_post)
         prev.table_markdown = merged
         prev.text = merged
@@ -235,8 +231,7 @@ def merge_split_tables(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         prev.metadata["table_source_regions"] = regions
         if prev.metadata.get("source_regions"):
             prev.metadata["source_regions"] = regions
-        if (prev.metadata.get("source_tile") and block.metadata.get("source_tile")
-                and prev.page_idx == block.page_idx and prev.bbox and block.bbox):
+        if tiled and prev.page_idx == block.page_idx and prev.bbox and block.bbox:
             # Two tiles can be portions of one physical page. The merged table
             # must point to both regions, not only the first tile's rectangle.
             prev.bbox = [min(prev.bbox[0], block.bbox[0]), min(prev.bbox[1], block.bbox[1]),
@@ -432,6 +427,9 @@ def merge_mineru_text_blocks(
             # table a second time
             target.table_markdown = target.text
         target.metadata.setdefault("footnote_block_ids", []).extend(block.block_id for block in run)
+        if target.block_type in {"image", "chart"}:
+            # Source text, kept apart from whatever a model read in the picture (see visual_blocks)
+            target.metadata.setdefault("attached_footnotes", []).append(text)
         footnoted += 1
 
     def hand_over(target: ParsedBlock, *, body_follows: bool = False) -> None:
@@ -538,7 +536,7 @@ def merge_mineru_text_blocks(
         previous = merged[-1] if merged else None
         labels_only = bool(buf) and all(is_note_label(rendered(b)) for b in buf)
         if previous is not None and previous.block_type in {"table", "image", "chart"} and (not buf or labels_only):
-            if labels_only and (block.block_type == "title" or infer_heading_level(text) is not None):
+            if labels_only and block.block_type == "title":
                 dropped_labels += 1
                 buf = []
                 buf_tokens = 0

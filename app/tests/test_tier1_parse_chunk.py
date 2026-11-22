@@ -66,10 +66,11 @@ def test_marked_headings_still_take_their_level_from_the_numbering():
     assert resolver.resolve(1, "5.4.3 函数的凹凸性") == (3, False)       # deeper than the parser's flat level 1
     assert resolver.resolve(1, "1. 打开设备电源") == (1, False)         # the parser says heading: it stays one
     assert resolver.resolve(2, "试验条件")[0] is not None
-    # a marked heading that recurs three times is a label, unless its numbering says otherwise: unchanged
+    # a marked heading that recurs three times is placed by its numbering when it has one (unchanged), and
+    # below the nearest heading that does not recur when it has none (it used to become body text)
     labels = HeadingResolver(["1. 概述"] * 3 + ["KEYWORD"] * 3)
     assert labels.resolve(1, "1. 概述") == (1, True)
-    assert labels.resolve(1, "KEYWORD") == (None, False)
+    assert labels.resolve(1, "KEYWORD") == (2, False)
 
 
 def test_pdf_blocks_keep_numbered_steps_as_body_text():

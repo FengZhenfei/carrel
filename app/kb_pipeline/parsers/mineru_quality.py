@@ -43,6 +43,21 @@ def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
             item["type"] = "title" if cover or (page_idx(item) == first_page and height >= 25) else "text"
             if item["type"] == "title":
                 item["text_level"] = 1
+    # The same for footers: a line the layout model called a footer and that stands on one page only is a
+    # figure caption, a note or a credit, not page furniture (trial: 37 such blocks in 15 PDFs, among them
+    # captions and a 222-character note). Footers carry page numbers in many forms, so texts that differ only
+    # in their digits count as one footer; a line without a single letter is not content.
+    footers = defaultdict(list)
+    for item in items:
+        if label_of(item) in {"footer", "page_footer"}:
+            footers[re.sub(r"\d+", "0", "".join(item_text(item).casefold().split()))].append(item)
+    for group in footers.values():
+        item, text = group[0], item_text(group[0]).strip()
+        if (len({page_idx(i) for i in group}) != 1 or not text or is_page_footer(text)
+                or not re.search(r"[^\W\d_]", text) or "".join(text.casefold().split()) in body_texts):
+            continue
+        item["original_source_type"] = label_of(item)
+        item["type"] = "text"
     continuations = {}
     ends = _merged_table_ends(payload, continuations=continuations)
     for item in items:
@@ -55,7 +70,7 @@ def recover_pdf_items(items: list[dict], payload: dict) -> list[dict]:
                 # just a similarly named or partially recovered entry.
                 if _table_rows(item.get("table_body") or item.get("html") or "") == merged:
                     item["_merged_table_continuations"] = regions
-    # MinerU can append discarded headers after the page body. Restore only the
+    # MinerU can append discarded headers and footers after the page body. Restore only the
     # recovered items to their geometric neighbours; keep the other reading order.
     for item in list(items):
         box = bbox(item)

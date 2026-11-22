@@ -80,7 +80,6 @@ def call_mineru_sync(
     table_enable: bool = False,
     return_middle_json: bool = True,
     timeout: int = 43200,
-    cached_only: bool = False,
 ) -> dict[str, Any]:
     output_json.parent.mkdir(parents=True, exist_ok=True)
     # Result cache: cache_dir is already split by kb/file/content_version, so MinerU output for the
@@ -94,8 +93,6 @@ def call_mineru_sync(
         if cached is not None:
             print(f"[mineru] reusing cached result for {input_path.name}", flush=True)
             return cached
-    if cached_only:       # the caller must not send the file off for parsing (the console's chunk preview runs in the web process)
-        raise RuntimeError(f"no cached MinerU result for {input_path.name}")
     request_data = [
         ("lang_list", os.getenv("MINERU_LANG", "ch")),
         ("backend", backend),

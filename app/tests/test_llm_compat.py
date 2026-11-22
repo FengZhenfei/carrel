@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from kb_pipeline import llm_compat as compat
 from kb_pipeline.graph.llm import ChatClient, LLMCache, LLMSpec, chat_once
+from kb_pipeline.parsers import table_repair
 from kb_pipeline.vision import vlm
 from kb_server import service
 
@@ -29,6 +30,8 @@ class CompatibilityTests(unittest.TestCase):
     def setUp(self):
         compat._ACCEPTED.clear()
         self.addCleanup(compat._ACCEPTED.clear)
+        compat._FUTILE.clear()
+        self.addCleanup(compat._FUTILE.clear)
         env = patch.dict(os.environ, {"KB_LLM_COMPAT_OVERRIDES": ""})
         env.start()
         self.addCleanup(env.stop)
@@ -86,6 +89,98 @@ class CompatibilityTests(unittest.TestCase):
         self.assertIn("thinking", request.body)
         self.assertEqual(request.body["max_tokens"], 1024)
         self.assertEqual(compat._ACCEPTED, {})
+
+    def test_a_thinking_control_is_given_up_when_a_refusal_names_it_in_any_words(self):
+        def make(**extra):
+            return compat.CompatibleRequest("https://a.example/v1", "alias", "openai", {"max_tokens": 1024, "temperature": 0, **extra})
+        # a refused value, not an unknown field: outside the explicit wording, and still only that control goes
+        request = make(enable_thinking=False, thinking={"type": "disabled"})
+        self.assertTrue(request.adapt(400, "thinking.type: Input should be 'enabled'"))
+        self.assertEqual(request.parameters(), {"max_tokens": 1024, "temperature": 0, "enable_thinking": False})
+        request = make(enable_thinking=False, thinking={"type": "disabled"})
+        self.assertTrue(request.adapt(400, 'Invalid JSON payload received. Unknown name "enable_thinking": Cannot find field.'))
+        self.assertEqual(request.parameters(), {"max_tokens": 1024, "temperature": 0, "thinking": {"type": "disabled"}})
+        request = make(reasoning_effort="none")
+        self.assertTrue(request.adapt(422, "reasoning_effort must be one of low, medium, high"))
+        self.assertNotIn("reasoning_effort", request.body)
+        request = make(chat_template_kwargs={"enable_thinking": False})
+        self.assertTrue(request.adapt(400, "chat_template_kwargs: this model has no chat template arguments"))
+        self.assertNotIn("chat_template_kwargs", request.body)
+        # every other parameter keeps the explicit rule: a wrong value is not a refusal of the parameter
+        request = make(thinking={"type": "disabled"})
+        self.assertFalse(request.adapt(400, "temperature must be between 0 and 2"))
+        # nothing is given up on a refusal that names nothing, nor on one that is not about the request
+        self.assertFalse(request.adapt(400, "invalid request"))
+        self.assertFalse(request.adapt(429, "rate limit reached while thinking"))
+        self.assertFalse(request.adapt(400, "thinking: quota exceeded"))
+        self.assertEqual(request.parameters(), {"max_tokens": 1024, "temperature": 0, "thinking": {"type": "disabled"}})
+
+    def test_output_format_steps_down_on_a_refusal_in_any_words(self):
+        schema = {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}
+        refusal = "This response_format type is unavailable now"       # no "unsupported" in it
+        request = compat.CompatibleRequest("https://a.example/v1", "alias", "openai",
+                                           {"max_tokens": 1024, "temperature": 0, "response_format": schema})
+        self.assertTrue(request.adapt(400, refusal))
+        self.assertEqual(request.body["response_format"], {"type": "json_object"})
+        self.assertEqual(compat._ACCEPTED, {})                          # not remembered before an answer arrived
+        request.accept()
+        again = compat.CompatibleRequest("https://a.example/v1", "alias", "openai",
+                                         {"max_tokens": 1024, "temperature": 0, "response_format": schema})
+        self.assertEqual(again.body["response_format"], {"type": "json_object"})
+        self.assertTrue(again.adapt(400, refusal))                      # JSON mode refused too: nothing is asked for
+        self.assertNotIn("response_format", again.body)
+        self.assertFalse(again.adapt(400, refusal))
+        self.assertEqual(again.body, {"max_tokens": 1024, "temperature": 0})
+
+    def test_only_the_output_format_is_given_up_without_an_explicit_refusal(self):
+        body = {"max_tokens": 1024, "temperature": 3,
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}}
+        def make(base="https://a.example/v1"):
+            return compat.CompatibleRequest(base, "alias", "openai", body)
+        for error in ("temperature must be between 0 and 2; response_format is invalid",    # names it, in other words
+                      "请求错误 - 参数无效"):                                                  # names nothing
+            request = make()
+            with self.subTest(error=error):
+                # a wrong value elsewhere is not a refusal: only the output format moves, one step at a time
+                self.assertTrue(request.adapt(400, error))
+                self.assertEqual(request.body, {**body, "response_format": {"type": "json_object"}})
+                self.assertTrue(request.adapt(400, error))
+                self.assertEqual(request.body, {"max_tokens": 1024, "temperature": 3})
+                self.assertFalse(request.adapt(400, error))
+        for status, error in ((400, "context_length_exceeded with this response_format"),
+                              (401, "response_format unavailable"), (500, "response_format unavailable")):
+            request = make()
+            with self.subTest(status=status, error=error):
+                self.assertFalse(request.adapt(status, error))
+                self.assertEqual(request.body, body)
+        # an explicit refusal of another parameter is answered by removing that parameter alone
+        request = make()
+        self.assertTrue(request.adapt(400, "Unsupported parameter: temperature"))
+        self.assertEqual(request.body, {k: v for k, v in body.items() if k != "temperature"})
+
+    def test_guessing_stops_where_it_keeps_failing_and_resumes_where_it_helped(self):
+        body = {"max_tokens": 1024, "response_format": {"type": "json_object"}}
+        def make(base="https://a.example/v1"):
+            return compat.CompatibleRequest(base, "alias", "openai", body)
+        for _ in range(compat.MAX_FUTILE_GUESSES):
+            request = make()
+            self.assertTrue(request.adapt(400, "invalid request"))
+            self.assertFalse(request.adapt(400, "invalid request"))
+            request.fail()
+        self.assertFalse(make().adapt(400, "invalid request"))                 # this endpoint's refusals have another cause
+        self.assertTrue(make(base="https://b.example/v1").adapt(400, "invalid request"))      # counted per endpoint
+        self.assertTrue(make().adapt(400, "response_format is unavailable"))     # a named refusal is not a guess
+        compat._FUTILE.clear()
+        request = make()
+        self.assertTrue(request.adapt(400, "invalid request"))
+        request.fail()
+        helped = make()
+        self.assertTrue(helped.adapt(400, "invalid request"))
+        helped.accept()                                                           # a guess that led to an answer
+        self.assertEqual(compat._FUTILE, {})
+        request = make(base="https://c.example/v1")
+        request.fail()                                                            # a failure with no guess behind it
+        self.assertEqual(compat._FUTILE, {})
 
     def test_thinking_override_only_applies_when_the_caller_requests_it(self):
         override = [{"model_id": "qwen-custom", "base_url": "https://models.example/v1",
@@ -172,6 +267,47 @@ class CompatibilityTests(unittest.TestCase):
             self.assertNotIn("enable_thinking", body)
         self.assertNotIn("extra_body", image)
         self.assertIn("response_format", image)
+
+    def test_table_calls_share_the_model_rules_and_ask_for_thinking_off(self):
+        """The table review used to build its own request: no rule for the model family, no way out of a
+        refused parameter, and a thinking model spent the output limit before it copied a row."""
+        answer = json.dumps({"rows": [["A", "10"], ["B", "20"]]})
+
+        def run(model, refuse=None):
+            calls = []
+
+            def create(**kwargs):
+                calls.append(kwargs)
+                sent = {**kwargs, **kwargs.get("extra_body", {})}
+                if refuse and refuse in sent:
+                    error = Exception(f"{refuse}: Input should be 'enabled'")
+                    error.status_code = 400
+                    raise error
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=answer), finish_reason="stop")])
+
+            client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+            with tempfile.TemporaryDirectory() as tmp, patch.object(table_repair, "_client_for", return_value=client), \
+                    patch.object(table_repair, "image_data_url", return_value="data:,"):
+                image = Path(tmp) / "table.png"
+                image.write_bytes(b"synthetic")
+                args = dict(base_url="https://tables.example/v1", api_key="k", model_id=model)
+                reviewed = table_repair.transcribe_table(image, prompt="Transcribe the table.", cache=Path(tmp) / "review.json", options={}, **args)
+            self.assertEqual(reviewed["rows"], [["A", "10"], ["B", "20"]])
+            return calls
+
+        review, = run("deepseek-flash")
+        self.assertEqual(review["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertEqual((review["max_tokens"], review["temperature"], review["top_p"]), (4096, 0.1, 0.8))
+        self.assertNotIn("response_format", review)
+        # the prompt goes out as written: the picture-description output contract is not appended to it
+        self.assertEqual(review["messages"][0]["content"][0]["text"], "Transcribe the table.")
+        review, = run("gpt-5-nano")
+        self.assertIn("max_completion_tokens", review)
+        self.assertEqual(review["reasoning_effort"], "minimal")
+        self.assertTrue({"max_tokens", "temperature", "top_p", "extra_body"}.isdisjoint(review))
+        # a refused switch costs one more request, then the table is read at the service's default
+        calls = run("deepseek-flash", refuse="thinking")
+        self.assertEqual(["extra_body" in call for call in calls], [True, False])
 
     def test_probe_requires_a_completed_real_response(self):
         for reply in (response(400, error={"message": "invalid request"}), response(content=""),

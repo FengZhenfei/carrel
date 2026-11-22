@@ -1634,8 +1634,8 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
 
     def test_f02_unverified_glued_values_never_become_trusted_numbers(self) -> None:
         """An unverified glued value reaching fact extraction: that fact's number is cleared, the field kind becomes
-        ambiguous, quality=ambiguous_source; the payload and the chunk list carry the mark and the front end shows a
-        badge; the parser route version was bumped so that historical files get re-parsed."""
+        ambiguous, quality=ambiguous_source. The parser no longer marks such values; chunks indexed before still carry
+        the mark, and the graph keeps reading it from them."""
         from kb_pipeline.graph.facts import FactExtractor, mark_ambiguous_source
         from kb_pipeline.graph.llm import ChatClient, LLMCache, LLMSpec
         from kb_pipeline.graph.units import ChunkRef, Unit, build_units
@@ -1664,22 +1664,11 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         by_symbol = {f.get("symbol") or f["property"]: f for f in res.facts}
         self.assertEqual((by_symbol["I_CC1"]["max_num"], by_symbol["I_CC1"]["quality"]), (None, "ambiguous_source"))
         self.assertEqual((by_symbol["电源"]["typ_num"], by_symbol["电源"].get("quality")), (3.0, None))
-        # Payload, console, parser version
-        self.assertIn('"table_flags": block.metadata.get("table_flags") or None', _repo_file("app/kb_pipeline/pipeline/parse_job.py"))
-        self.assertIn('"table_flags": pl.get("table_flags") or None', _repo_file("app/kb_server/service.py"))
-        js = _repo_file("app/kb_server/static/app.js")
-        self.assertIn("function tableBadge(c)", js)
-        self.assertIn('⚠ ${t("表格粘连")}', js)
-        self.assertIn('chip("ambiguous", t("表格粘连"), ambiguous)', js)
+        # Console script version, parser version
         html = _repo_file("app/kb_server/static/index.html")
-        self.assertIn(".pv-badge.warn", html)
         self.assertRegex(html, r"app\.js\?v=\d{8}-\d+")
         self.assertEqual(parser_profile_for_path(Path("x.pdf")), "pdf-mineru-table-vlm-v15+source-v1")
         self.assertEqual(parser_profile_for_path(Path("x.docx")), "docx-mineru-ooxml-vlm-v10+source-v1")
-        for name in ("mineru_pdf.py", "mineru_docx.py"):
-            self.assertIn("table_ambiguity_flags(", _repo_file(f"app/kb_pipeline/parsers/{name}"), name)
-        for name in ("pdf_enhanced.py", "docx_enhanced.py"):
-            self.assertIn("repair_ambiguous_tables(", _repo_file(f"app/kb_pipeline/parsers/{name}"), name)
 
     def test_f03_truncated_fact_json_is_salvaged_and_retried_with_a_bigger_budget(self) -> None:
         """Real box: the fact JSON of a large table was cut off midway by max_tokens. A truncation is a valid prefix,
@@ -1753,13 +1742,11 @@ class FactsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsS
         from kb_pipeline.graph.concepts import _unit_family
         from kb_pipeline.graph.reconcile import unit_of
         from kb_pipeline.measure_units import unit_key
-        from kb_pipeline.parsers.visual_blocks import reconcile_visual_facts
 
         self.assertNotEqual(unit_key("MW"), unit_key("mW"))
         self.assertEqual(unit_key("MMOL/L"), unit_key("mmol/L"))
         self.assertEqual(unit_of({"unit": "MW"}), "MW")
         self.assertNotEqual(_unit_family("MHz"), _unit_family("mHz"))
-        self.assertEqual(reconcile_visual_facts(["功率 1000000000 mW"], "功率 1 MW")[::2], (["功率 1000000000 mW"], []))
         L = labels_for("Chinese")
         rows = [{"concept": "功率", "value": "2", "unit": "mW", "valid_from": "2024"},
                 {"concept": "功率", "value": "1", "unit": "MW", "valid_from": "2025"}]

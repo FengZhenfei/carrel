@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 
 from ..models import ParsedBlock
 from ..vision.images import IMAGE_SUFFIXES
-from .native_table import _xlsx_parse_shared_strings, col_name
+from .native_table import VERY_HIDDEN, _xlsx_parse_shared_strings, col_name
 
 S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -51,10 +51,12 @@ def _cell(marker) -> tuple[str, int]:
 
 
 def extract_xlsx_images(path: Path, cache_dir: Path) -> list[ParsedBlock]:
-    """Only referenced, internal pictures on visible sheets are read.
+    """Only referenced, internal pictures are read, on sheets in view and on hidden ones.
 
     Supports DrawingML anchors and WPS DISPIMG cells. External links and
     formulas are never fetched or evaluated; unreferenced media are not data.
+    A very hidden sheet is not read: WPS keeps a copy of every picture placed
+    in a cell there, and each would be extracted twice (native_table.VERY_HIDDEN).
     """
     blocks = []
     with zipfile.ZipFile(path) as z:
@@ -71,24 +73,24 @@ def extract_xlsx_images(path: Path, cache_dir: Path) -> list[ParsedBlock]:
                 blip = pic.find(".//a:blip", NS)
                 if prop is not None and blip is not None:
                     target = cell_rels.get(blip.get(f"{{{R}}}embed", ""))
-                    if target and prop.get("hidden") not in {"1", "true"}:
+                    if target:
                         named[prop.get("name", "")] = target
         shared = _xlsx_parse_shared_strings(z)
         for sheet in workbook.findall("s:sheets/s:sheet", NS):
-            if sheet.get("state", "visible") != "visible":
+            if sheet.get("state") == VERY_HIDDEN:
                 continue
+            # pictures on hidden sheets, in hidden rows and columns and pictures set to "not shown" are read
+            # like the others: hidden content is indexed, see native_table.read_xlsx_rows
             sheet_part = book_rels.get(sheet.get(f"{{{R}}}id", ""))
             root = _xml(z, sheet_part) if sheet_part else None
             if root is None:
                 continue
             sheet_name = sheet.get("name", "Sheet")
             refs = []
-            hidden_rows = {int(row.get("r", "0")) for row in root.findall("s:sheetData/s:row", NS)
-                           if row.get("hidden") in {"1", "true"}}
             for cell in root.findall("s:sheetData/s:row/s:c", NS):
                 address = cell.get("r", "")
                 m = re.fullmatch(r"([A-Z]+)([1-9][0-9]*)", address)
-                if not m or int(m[2]) in hidden_rows:
+                if not m:
                     continue
                 value = cell.findtext("s:f", "", NS) or cell.findtext("s:v", "", NS)
                 if cell.get("t") == "s" and value.isdigit() and int(value) < len(shared):
@@ -111,9 +113,6 @@ def extract_xlsx_images(path: Path, cache_dir: Path) -> list[ParsedBlock]:
                     first, row_start = _cell(start) if start is not None else ("", 0)
                     last, row_end = _cell(end) if end is not None else (first, row_start)
                     for picture_index, pic in enumerate(anchor.findall(".//xdr:pic", NS)):
-                        prop = pic.find("xdr:nvPicPr/xdr:cNvPr", NS)
-                        if prop is not None and prop.get("hidden") in {"1", "true"}:
-                            continue
                         blip = pic.find(".//a:blip", NS)
                         target = rels.get(blip.get(f"{{{R}}}embed", "")) if blip is not None else None
                         if target:

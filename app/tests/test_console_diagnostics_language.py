@@ -26,11 +26,14 @@ def test_every_diagnostic_current_and_saved(lang):
       'table_review_missing_model':'3 tables could not be reviewed: model credentials are missing',
       'table_review_missing_image':'4 tables could not be reviewed: source images are missing',
       'table_review_request_failed':'5 table review requests failed; source text retained',
+      'table_review_no_answer':'8 table reviews got no usable answer from the model; source text retained',
       'table_review_partial':'6 tables were partly verified; unverified source text retained',
       'table_review_unconfirmed':'7 table review results could not be verified; source text retained',
       'visual_output_degraded':'2 visual responses recovered with reduced retries; descriptions retained, transcription may be incomplete',
       'visual_output_repetitive':'3 visual responses still repeated after retry; available results retained',
-      'visual_output_truncated':'1 visual responses reached the output limit; only complete facts were retained'}
+      'visual_output_truncated':'1 visual responses reached the output limit; only complete facts were retained',
+      'visual_output_empty':'4 images were left without a description: the model returned no content for them',
+      'outputs_omitted':'2 saved outputs were left out: unsupported type or unreadable image'}
     script=r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const [root,lang,raw]=process.argv.slice(1);

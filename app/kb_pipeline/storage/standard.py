@@ -95,8 +95,8 @@ class StandardChunks:
     def reactivate(self, row, *, point_ids=None):
         return qdrant.reactivate_file_metadata(self._q, row, point_ids=point_ids)
 
-    def version_count(self, row):
-        return qdrant.file_version_point_count(self._q, row)
+    def version_count(self, row, *, point_ids=None):
+        return qdrant.file_version_point_count(self._q, row, point_ids=point_ids)
 
     def deactivate(self, row):
         return qdrant.mark_file_inactive(self._q, row)

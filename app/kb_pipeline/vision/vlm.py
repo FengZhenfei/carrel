@@ -172,21 +172,48 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     return client
 
 
-def _compatible_completion(client: OpenAI, request: CompatibleRequest, *, api_key: str | None = None):
+# The prompt always states the output contract, whatever output format the request also carries. Services that
+# enforce a schema advise it all the same, services with JSON mode require the word "JSON" (some refuse the request
+# without it, others emit whitespace up to the token limit), and a service or gateway that takes response_format
+# and ignores it has nothing else to go by.
+_JSON_ONLY = "\n\nOutput exactly one JSON object and nothing else."
+# Without an enforced schema the prompt also carries the shape: JSON mode guarantees syntax only.
+_JSON_SHAPE = _JSON_ONLY + " Fill in this shape:\n" + json.dumps({
+    key: [] if spec["type"] == "array" else False if spec["type"] == "boolean" else ""
+    for key, spec in RESULT_SCHEMA["properties"].items()
+})
+
+
+def _schema_constrained(body: dict[str, Any]) -> bool:
+    """Whether the answer was decoded against the schema. Only then is an object with every field empty a
+    deliberate answer; JSON mode guarantees syntax alone (a service may even blank out what it cannot read as
+    JSON), so its answers are read as leniently, and retried as readily, as those of a plain prompt."""
+    return (body.get("response_format") or {}).get("type") == "json_schema"
+
+
+def _compatible_completion(client: OpenAI, request: CompatibleRequest, *, api_key: str | None = None,
+                           caption_contract: bool = True):
+    """Send the request, giving up what the service refuses (see llm_compat). caption_contract appends the
+    image-description output contract to the prompt; a caller whose prompt states its own (table transcription)
+    passes False."""
+    first: Exception | None = None
     while True:
         body = copy.deepcopy(request.body)
-        if "response_format" not in body:
-            body["messages"][0]["content"][0]["text"] += "\n\nOutput exactly one JSON object and nothing else."
+        if caption_contract:
+            body["messages"][0]["content"][0]["text"] += _JSON_ONLY if _schema_constrained(body) else _JSON_SHAPE
         try:
             return client.chat.completions.create(**sdk_arguments(body),
                 **({"extra_headers": {"Authorization": omit}} if api_key == "" else {}))
         except Exception as exc:
+            first = first or exc
             status = getattr(exc, "status_code", None)
             # SDK errors expose the server's JSON body separately from their display text.
             detail = getattr(exc, "body", None)
             error = json.dumps(detail) if isinstance(detail, (dict, list)) else str(exc)
             if not request.adapt(status, error):
-                raise
+                request.fail()
+                # the refusal of the request as it was first sent: later ones answer requests cut down on the way
+                raise first
 
 
 def image_data_url(path: Path, max_pixels: int | None = DEFAULT_MAX_PIXELS) -> str:
@@ -312,8 +339,32 @@ def parse_structured(content: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
+def answer_is_readable(text: str) -> bool:
+    """Whether the answer holds a JSON object at all, whole or cut off and repairable. An answer that is not
+    readable says nothing about the picture; an object with every field empty is the model's answer."""
+    return _json_object(text)[0] is not None
+
+
 def parse_jsonish(text: str) -> dict[str, Any]:
     """Fallback for servers that cannot constrain decoding to the schema."""
+    parsed, raw = _json_object(text)
+    if parsed is not None:
+        return normalize_result(parsed)
+    # Unparseable and unrepairable: salvage the summary field if its text
+    # survived. NEVER embed the raw model output as a summary -- a broken
+    # JSON blob in the chunk text poisons the vector and the keyword index.
+    result = dict(EMPTY_RESULT)
+    m = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if m:
+        try:
+            result["summary"] = str(json.loads(f'"{m.group(1)}"')).strip()
+        except Exception:
+            result["summary"] = m.group(1).strip()
+    return result
+
+
+def _json_object(text: str) -> tuple[dict[str, Any] | None, str]:
+    """The JSON object in an answer, with the answer stripped of its code fence."""
     raw = text.strip()
     if raw.startswith("```"):
         lines = raw.splitlines()
@@ -341,19 +392,7 @@ def parse_jsonish(text: str) -> dict[str, Any]:
                     parsed = json.loads(fixed)
                 except Exception:
                     parsed = None
-    if isinstance(parsed, dict):
-        return normalize_result(parsed)
-    # Unparseable and unrepairable: salvage the summary field if its text
-    # survived. NEVER embed the raw model output as a summary -- a broken
-    # JSON blob in the chunk text poisons the vector and the keyword index.
-    result = dict(EMPTY_RESULT)
-    m = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-    if m:
-        try:
-            result["summary"] = str(json.loads(f'"{m.group(1)}"')).strip()
-        except Exception:
-            result["summary"] = m.group(1).strip()
-    return result
+    return (parsed if isinstance(parsed, dict) else None), raw
 
 
 def caption_image(
@@ -374,8 +413,10 @@ def caption_image(
     effective_prompt = prompt or compose_prompt("figure")
     body: dict[str, Any] = {
         "model": model_id,
-        **generation_parameters(model_id, base_url=base_url, max_tokens=max_tokens,
-                                temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty),
+        # Thinking off: describing a picture is reading. A model that thinks first shares this output limit with
+        # its thoughts and can spend all of it before it answers, which leaves the picture without a description.
+        **generation_parameters(model_id, base_url=base_url, max_tokens=max_tokens, temperature=temperature,
+                                top_p=top_p, repetition_penalty=repetition_penalty, disable_thinking=True),
     }
     if structured:
         body["response_format"] = {
@@ -414,15 +455,19 @@ def caption_image(
         }
     ]
     resp = _compatible_completion(client, request, api_key=api_key)
-    constrained = "response_format" in request.body
+    constrained = _schema_constrained(request.body)
 
     content = resp.choices[0].message.content or ""
     finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
     data: dict[str, Any] | None
-    if constrained:
-        obj = parse_structured(content)
-        data = normalize_result(obj) if obj is not None else None
+    obj = parse_structured(content) if constrained else None
+    if obj is not None:
+        data = normalize_result(obj)
+    elif constrained and content.lstrip().startswith("{"):
+        data = None      # schema-constrained output that cannot be repaired: the degraded retry below
     else:
+        # No schema was enforced, or the service took the schema and did not apply it (an enforced answer
+        # starts with "{"; prose or a fenced block came back). Read leniently, and take nothing for no answer.
         data = parse_jsonish(content)
         if not (data["summary"] or data["title"] or data["facts"] or data["entities"]
                 or (data.get("decorative") is True and data.get("confidence") == "high")):
@@ -431,6 +476,7 @@ def caption_image(
     if data is not None and _raw_tail_runaway(content, finish_reason):
         data["runaway"] = True
     first_data = data if data and any(data.get(k) for k in ("summary", "title", "facts", "text_verbatim", "entities")) else None
+    readable = True     # whether the answer finally kept could be read; only the degraded retry below can end otherwise
     first_finish = finish_reason
     length_retried = False
     _log_caption_usage(resp, max_tokens)
@@ -492,11 +538,12 @@ def caption_image(
             if not first_data:
                 raise
             resp = None
-        constrained = "response_format" in degraded_request.body
+        constrained = _schema_constrained(degraded_request.body)
         content = (resp.choices[0].message.content or "") if resp else ""
         finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "") if resp else first_finish
         obj = parse_structured(content) if constrained else None
         data = normalize_result(obj) if obj is not None else parse_jsonish(content)
+        readable = obj is not None or answer_is_readable(content)
         if _raw_tail_runaway(content, finish_reason):
             data["runaway"] = True
         if first_data and not any(data.get(k) for k in ("summary", "facts", "text_verbatim", "entities")):
@@ -511,6 +558,14 @@ def caption_image(
             data["vlm_runaway"] = True
     data["vlm_truncated"] = finish_reason == "length"
     data["vlm_cache_hit"] = False
+    if not (any(str(data.get(k) or "").strip() for k in ("summary", "text_verbatim")) or data.get("facts") or data.get("entities")) \
+            and (data["vlm_truncated"] or not readable):
+        # No description, and not because the model had nothing to say: its last answer was cut off at the
+        # output limit or could not be read. That is a missing description, the same as a failed request,
+        # and the document is held back and retried like one (parse_job). A complete answer with every field
+        # empty is different: the model looked and said nothing; it stays, and the chunk check reports it.
+        data["error"] = "no description: the answer " + ("was cut off at the output limit" if data["vlm_truncated"] else "could not be read")
+        print(f"[vlm] caption failed image={image_path} {data['error']}", flush=True)
     # An explicit, confident decoration classification is a complete result, even without text.
     # Empty unknown images and degraded transcriptions still need a future full attempt.
     degraded = bool(data.get("vlm_degraded_retry"))
@@ -531,10 +586,12 @@ def caption_image(
     return data
 
 
-def _log_caption_usage(response, budget: int) -> None:
+def _log_caption_usage(response, budget: int, task: str | None = None) -> None:
+    """One line per answer. reasoning_tokens above zero means the model thought although it was asked not to."""
     usage = getattr(response, "usage", None)
     details = getattr(usage, "completion_tokens_details", None)
-    print("[vlm] " + json.dumps({"finish_reason": getattr(response.choices[0], "finish_reason", None),
+    print("[vlm] " + json.dumps({**({"task": task} if task else {}),
+        "finish_reason": getattr(response.choices[0], "finish_reason", None),
         "output_budget": budget, "completion_tokens": getattr(usage, "completion_tokens", None),
         "reasoning_tokens": getattr(details, "reasoning_tokens", None)}), flush=True)
 

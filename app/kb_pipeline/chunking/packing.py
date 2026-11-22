@@ -6,7 +6,6 @@ import math
 from typing import Any
 
 from ..models import ParsedBlock
-from ..headings import infer_heading_level
 from ..utils import count_tokens
 from .sections import common_path, same_section
 
@@ -50,6 +49,11 @@ def combined_owner(owner: ParsedBlock, members: list[ParsedBlock]) -> ParsedBloc
     if all(l.get("kind") == "lines" for l in locators):
         metadata["source_locator"] = {"kind": "lines", "start": min(l["start"] for l in locators),
                                       "end": max(l["end"] for l in locators)}
+    elif locators[0] and all(l == locators[0] for l in locators):
+        # Pieces of one record, one notebook cell or one schema definition, put together again: the place is
+        # the same for all of them. It used to be dropped like the locators of different records, which cannot
+        # be merged into one (those stay in source_regions).
+        metadata["source_locator"] = dict(locators[0])
     else:
         metadata.pop("source_locator", None)
     return replace(owner, metadata=metadata, bbox=bbox, page_idx=min(pages) if pages else owner.page_idx)
@@ -142,8 +146,7 @@ def starts_heading(piece: dict[str, Any]) -> bool:
     block = piece["block"]
     lines = [s.strip() for s in piece["text"].splitlines() if s.strip() and not s.startswith("TITLE:")]
     return bool(lines and (block.block_type == "title"
-                           or lines[0] in (block.metadata.get("heading_lines") or [])
-                           or infer_heading_level(lines[0]) is not None))
+                           or lines[0] in (block.metadata.get("heading_lines") or [])))
 
 
 def owns_code_intro(prose: ParsedBlock, code: ParsedBlock) -> bool:

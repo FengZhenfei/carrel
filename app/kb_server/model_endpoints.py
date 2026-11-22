@@ -11,6 +11,13 @@ import requests
 from kb_pipeline import db
 from kb_pipeline.config import load_settings
 from kb_pipeline.model_endpoints import CONFIG_KEY, ROLES, endpoint_values, read_overrides
+from kb_pipeline.parsers.errors import FAILURE_SCOPE_EMBEDDING, FAILURE_SCOPE_VISUAL_EMBEDDING
+
+# Only ingestion-affecting endpoint roles may wake FAILURE_CONFIG parse jobs; search-only rerankers never do.
+_PARSE_ENDPOINT_SCOPES = {
+    "embedding": frozenset({FAILURE_SCOPE_EMBEDDING}),
+    "visual_embedding": frozenset({FAILURE_SCOPE_VISUAL_EMBEDDING}),
+}
 
 
 def _revision(row: dict) -> str:
@@ -247,4 +254,14 @@ def save_endpoint(role: str, payload: dict) -> dict:
             raise ValueError("Model settings changed; refresh and try again")
         _check_embedding_change(con, cfg, role, current[role], candidate)
         db.set_app_config(con, CONFIG_KEY, {**saved, role: candidate})
+        requeued_cfg = 0
+        scopes = _PARSE_ENDPOINT_SCOPES.get(role)
+        if scopes is not None:
+            from kb_pipeline.pipeline.scheduler import requeue_config_failed_files
+            requeued_cfg = requeue_config_failed_files(
+                con, kb_id=None, scopes=scopes, reason=f"endpoint {role} updated"
+            )
+    if requeued_cfg:
+        from .service import kick_worker
+        kick_worker()
     return _public(role, candidate)

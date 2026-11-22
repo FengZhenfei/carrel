@@ -7,10 +7,20 @@ from __future__ import annotations
 
 class NonRetryableParseError(RuntimeError):
     """Deterministic failure: the result is the same however many times it is retried (unsupported
-    format, missing file, dimension mismatch, single file over the limit). Previously the only rule
+    format, missing file, single file over the limit). Previously the only rule
     was the string "physical file not found"; every other deterministic failure needlessly went
     through all 5 rounds of exponential backoff (over 2.5 hours in total), recomputing the embedding
     each time."""
+
+
+class ConfigParseError(NonRetryableParseError):
+    """Configuration/auth/model error (missing/unregistered VLM, wrong protocol, unreadable KB config).
+    Skips immediate exponential backoff like NonRetryableParseError, but is recoverable via cooldown
+    auto-heal or immediately when the matching model/KB settings are updated in the console."""
+
+    def __init__(self, message: str, *, scope: str | None = None) -> None:
+        super().__init__(message)
+        self.config_scope = scope
 
 
 class JobCancelled(RuntimeError):
@@ -35,9 +45,19 @@ class JobPaused(JobCancelled):
 # and were queued again after every cooldown; and a file whose path happened to contain a marker word was
 # never queued again after one transient failure.
 FAILURE_VERDICT_KEY = "failure_verdict"
+FAILURE_SCOPE_KEY = "failure_scope"
+FAILURE_CONFIG = "config"                  # auth/model/KB config error: no immediate backoff; auto-heals after cooldown or config save
 FAILURE_DETERMINISTIC = "deterministic"    # the same input fails the same way: queued again only when the parser / router changes
 FAILURE_FILE_MISSING = "file_missing"      # the file was not on disk: queued as soon as a scan sees it again
 FAILURE_RETRYABLE = "retryable"            # everything else: once the retries are used up, queued again after the cooldown
+
+# Subsystem scopes for FAILURE_CONFIG jobs so saving an unrelated endpoint (e.g. a search-only reranker)
+# never wakes jobs waiting on a different service's credentials or config.
+FAILURE_SCOPE_MINERU = "mineru"
+FAILURE_SCOPE_EMBEDDING = "embedding"
+FAILURE_SCOPE_VISUAL_EMBEDDING = "visual_embedding"
+FAILURE_SCOPE_VLM = "vlm"
+FAILURE_SCOPE_KB_CONFIG = "kb_config"
 
 
 def service_unreachable(exc: BaseException | None) -> bool:

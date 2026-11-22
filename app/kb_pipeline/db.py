@@ -1181,6 +1181,17 @@ _PRUNABLE_JOBS_SQL = """
                OR (COALESCE(later.finished_at, 0) = COALESCE(jobs.finished_at, 0) AND later.rowid > jobs.rowid))
       )
     )
+    AND NOT (
+      job_type = 'parse' AND status = 'cancelled'
+      AND json_valid(payload_json) AND COALESCE(json_extract(payload_json, '$.cancelled_by'), '') = 'user'
+      AND EXISTS (SELECT 1 FROM files f WHERE f.file_id = jobs.file_id AND f.status != 'deleted')
+      AND NOT EXISTS (
+        SELECT 1 FROM jobs later
+        WHERE later.dedupe_key = jobs.dedupe_key
+          AND (COALESCE(later.created_at, 0) > COALESCE(jobs.created_at, 0)
+               OR (COALESCE(later.created_at, 0) = COALESCE(jobs.created_at, 0) AND later.rowid > jobs.rowid))
+      )
+    )
 """
 
 
@@ -1958,10 +1969,13 @@ def cancel_job_if_owned(con: sqlite3.Connection, job_id: str, worker_id: str, re
 
 
 def request_kb_job_cancel(con: sqlite3.Connection, kb_id: str, reason: str) -> dict[str, int]:
-    """Stop the parse queue of a knowledge base. Queued / retry jobs are voided outright; running jobs only
-    get the cancel flag -- they belong to the worker, and parse_job exits on its own once it sees the
-    flag at the next phase boundary. Returns {"cancelled": number voided, "signalled": number of running
-    jobs asked to stop}."""
+    """Stop the parse queue of a knowledge base. Queued / retry jobs are voided outright (and any
+    unresolved failure records belonging to cancelled jobs of this KB are marked resolved); running
+    jobs only get the cancel flag -- they belong to the worker, and parse_job exits on its own once
+    it sees the flag at the next phase boundary. Returns {"cancelled": number voided, "signalled":
+    number of running jobs asked to stop}."""
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
     ts = now_ts()
     cancelled = con.execute(
         """
@@ -1972,6 +1986,14 @@ def request_kb_job_cancel(con: sqlite3.Connection, kb_id: str, reason: str) -> d
         """,
         (reason[:4000], ts, ts, kb_id),
     ).rowcount
+    con.execute(
+        """
+        UPDATE failures SET resolved_at = COALESCE(resolved_at, ?)
+        WHERE resolved_at IS NULL
+          AND job_id IN (SELECT job_id FROM jobs WHERE kb_id = ? AND status = 'cancelled')
+        """,
+        (ts, kb_id),
+    )
     signalled = con.execute(
         "UPDATE jobs SET cancel_requested = 1, updated_at = ? "
         "WHERE kb_id = ? AND status = 'running'",
@@ -1981,22 +2003,86 @@ def request_kb_job_cancel(con: sqlite3.Connection, kb_id: str, reason: str) -> d
     return {"cancelled": int(cancelled or 0), "signalled": int(signalled or 0)}
 
 
-def request_job_cancel(con: sqlite3.Connection, job_id: str, reason: str) -> str:
+def _payload_with_cancelled_by(payload_json: str | None, cancelled_by: str) -> str:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["cancelled_by"] = cancelled_by
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def request_job_cancel(
+    con: sqlite3.Connection,
+    job_id: str,
+    reason: str,
+    *,
+    cancelled_by: str | None = None,
+) -> str:
     """Cancel a single job, same semantics as request_kb_job_cancel: queued / retry jobs are voided
-    outright, running jobs get the flag and the worker exits at the next phase boundary. Returns
-    cancelled / signalled / noop."""
-    row = con.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    outright, running jobs get the flag and the worker exits at the next phase boundary. When
+    cancelled_by="user" (console single-job cancel), the marker is persisted in payload_json so the
+    1-minute scan holds the file back until content/profile changes or the user manually retries.
+    Runs inside BEGIN IMMEDIATE so status transitions cannot race with a worker claim or completion.
+    Returns cancelled / signalled / noop."""
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
+    row = con.execute("SELECT status, payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
     if row is None:
+        con.rollback()
         raise KeyError(job_id)
     status = str(row["status"])
+    ts = now_ts()
     if status in ("queued", "retry"):
-        cancel_job(con, job_id, reason)
+        if cancelled_by:
+            cur = con.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?,
+                    locked_by = NULL, locked_until = NULL, payload_json = ?
+                WHERE job_id = ? AND status IN ('queued', 'retry')
+                """,
+                (reason[:4000], ts, ts, _payload_with_cancelled_by(row["payload_json"], cancelled_by), job_id),
+            )
+        else:
+            cur = con.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?,
+                    locked_by = NULL, locked_until = NULL
+                WHERE job_id = ? AND status IN ('queued', 'retry')
+                """,
+                (reason[:4000], ts, ts, job_id),
+            )
+        if cur.rowcount:
+            con.execute("INSERT INTO job_events(job_id, ts, kind, text) VALUES (?, ?, 'cancelled', ?)",
+                        (job_id, ts, reason[:1000]))
+            con.execute(
+                "UPDATE failures SET resolved_at = COALESCE(resolved_at, ?) WHERE job_id = ?",
+                (ts, job_id),
+            )
+            con.commit()
+            return "cancelled"
         con.commit()
-        return "cancelled"
+        return "noop"
     if status == "running":
-        con.execute("UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE job_id = ?", (now_ts(), job_id))
+        if cancelled_by:
+            cur = con.execute(
+                "UPDATE jobs SET cancel_requested = 1, payload_json = ?, updated_at = ? "
+                "WHERE job_id = ? AND status = 'running'",
+                (_payload_with_cancelled_by(row["payload_json"], cancelled_by), ts, job_id),
+            )
+        else:
+            cur = con.execute(
+                "UPDATE jobs SET cancel_requested = 1, updated_at = ? "
+                "WHERE job_id = ? AND status = 'running'",
+                (ts, job_id),
+            )
         con.commit()
-        return "signalled"
+        return "signalled" if cur.rowcount else "noop"
+    con.commit()
     return "noop"
 
 
@@ -2257,7 +2343,15 @@ def kb_parse_busy(con: sqlite3.Connection, kb_id: str) -> int:
     graph while the corpus is still growing yields half a graph, while another KB being parsed has
     nothing to do with this one -- the embedding concurrency budget is partitioned (pipeline 20 + graph
     build 10 + 2 reserved for retrieval = max_num_seqs 32), so there is no need to yield to each other.
+    When parsing is paused for this KB, queued/retry jobs cannot be claimed and do not count as busy;
+    only jobs still actively running count until they yield or finish (B10).
     """
+    if parse_is_paused(con, kb_id):
+        row = con.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kb_id = ? AND job_type = 'parse' AND status = 'running'",
+            (kb_id,),
+        ).fetchone()
+        return int(row[0] if row else 0)
     row = con.execute(
         f"SELECT COUNT(*) FROM jobs WHERE kb_id = ? AND job_type = 'parse' AND {CLAIMABLE_JOB_SQL}",
         (kb_id, now_ts()),
@@ -2316,6 +2410,7 @@ def chunk_point_ids_to_restore(con: sqlite3.Connection, file_id: str, content_ve
     then and is marked deleted now."""
     return [str(r["point_id"]) for r in con.execute(
         "SELECT point_id FROM chunks WHERE file_id = ? AND content_version = ? AND status = 'deleted' "
+        "AND point_id IS NOT NULL AND point_id != '' "
         "ORDER BY chunk_index, chunk_uid",
         (file_id, content_version),
     )]

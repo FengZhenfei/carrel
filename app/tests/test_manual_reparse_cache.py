@@ -42,8 +42,6 @@ def test_mineru_refresh_overwrites_one_cache_and_retries_reuse_it(mineru):
     mineru.call()
     mineru.cache.with_suffix(".md").write_text("previous markdown")
     with parse_cache.refresh_scope("manual-1"):
-        with pytest.raises(RuntimeError, match="no cached MinerU result"):
-            mineru.call(cached_only=True)
         mineru.call()
         mineru.call()
     assert len(mineru.posts) == 2
@@ -91,20 +89,10 @@ def test_caption_refresh_reaches_parallel_workers_without_leaking(model, tmp_pat
     assert parse_cache.reusable_in_run({})  # task-local policy was reset
 
 
-@pytest.mark.parametrize("kind", ["table", "rows"])
-def test_table_review_refreshes_both_cache_paths(model, tmp_path, kind):
+def test_table_review_refreshes_its_cache(model, tmp_path):
     cache = tmp_path / "table.json"
     def call():
-        if kind == "table":
-            return table_repair.transcribe_table(model.image, prompt="Transcribe", cache=cache, options={}, **model.args)
-        # Row-key transcription has a different output contract.
-        return table_repair.transcribe_rows(model.image, row_keys=["A", "B"], width=2, cache_json=cache, **model.args)
-    if kind == "rows":
-        def create(**kwargs):
-            model.calls.append(kwargs)
-            content = json.dumps({"rows": [{"key": "A", "cells": ["A", "10"]}, {"key": "B", "cells": ["B", "20"]}]})
-            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
-        table_repair._client_for(*[model.args[k] for k in ("base_url", "api_key")]).chat.completions.create = create
+        return table_repair.transcribe_table(model.image, prompt="Transcribe", cache=cache, options={}, **model.args)
     assert call()
     with parse_cache.refresh_scope("manual-1"):
         assert call()

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import json
 import re
 from pathlib import Path
@@ -63,6 +62,14 @@ def parse_notebook(path: Path, cache_dir: Path) -> list[ParsedBlock]:
             block.metadata["source_locator"].update(output=oi, mime=mime)
         return block
 
+    def omitted(ci: int, oi: int, reason: str, what: str) -> ParsedBlock:
+        """Stands where a saved output was left out, so that readers and the chunk check both see it."""
+        block = make(f"[Saved output not indexed: {'unsupported type' if reason == 'unsupported_type' else 'unreadable image'} {what}]",
+                     ci, oi, mime=what)
+        block.block_id += "-omitted"
+        block.metadata["output_omitted"] = reason
+        return block
+
     for ci, cell in enumerate(cells, 1):
         if not isinstance(cell, dict):
             raise NonRetryableParseError(f"Invalid notebook cell {ci}")
@@ -104,9 +111,13 @@ def parse_notebook(path: Path, cache_dir: Path) -> list[ParsedBlock]:
                 raise NonRetryableParseError(f"Invalid MIME bundle at cell {ci}, output {oi}")
             supported = {"text/html", "text/plain", "text/markdown", "text/latex", "application/json", "image/png", "image/jpeg"}
             if data and not (supported & data.keys()):
-                raise NonRetryableParseError(f"Unsupported saved output MIME at cell {ci}, output {oi}: {', '.join(data)}")
+                # One output in a form this parser cannot read (an interactive figure, a widget) used to reject
+                # the whole notebook. It is left out, said so in its place, and counted by the chunk check.
+                blocks.append(omitted(ci, oi, "unsupported_type", ", ".join(sorted(map(str, data)))))
+                continue
             # MIME alternatives describe the same output; choose one text representation.
             text, text_mime = "", "text/plain"
+            sections = []
             if "text/html" in data:
                 html_path = assets / f"cell-{ci}-output-{oi}.html"
                 html_path.write_text(_text(data["text/html"]), encoding="utf-8")
@@ -118,22 +129,22 @@ def parse_notebook(path: Path, cache_dir: Path) -> list[ParsedBlock]:
                     section.page_idx = None
                     section.metadata.update(source_locator={"kind": "notebook", "cell": ci, "output": oi, "mime": "text/html"}, section_path=[f"Cell {ci}", f"Output {oi}"])
                     blocks.append(section)
-                if not sections:
-                    text = _text(data.get("text/plain"))
-            elif "text/plain" in data:
-                text = _text(data["text/plain"])
-            elif "text/markdown" in data:
-                text = _text(data["text/markdown"])
-                text_mime = "text/markdown"
-            elif "application/json" in data:
-                text = json.dumps(data["application/json"], ensure_ascii=False, indent=2)
-                text_mime = "application/json"
-            elif "text/latex" in data:
-                text = _text(data["text/latex"])
-                text_mime = "text/latex"
+            # The forms that hold the content come before text/plain: beside Markdown, LaTeX or JSON the plain form
+            # is often only the name of the display object ("<IPython.core.display.Markdown object>"), and it used
+            # to be the one that was kept.
+            if not sections:
+                if "text/markdown" in data:
+                    text, text_mime = _text(data["text/markdown"]), "text/markdown"
+                elif "text/latex" in data:
+                    text, text_mime = _text(data["text/latex"]), "text/latex"
+                elif "application/json" in data:
+                    text, text_mime = json.dumps(data["application/json"], ensure_ascii=False, indent=2), "application/json"
+                elif "text/plain" in data:
+                    text = _text(data["text/plain"])
             if text.strip():
                 blocks.append(make(text, ci, oi, mime=text_mime))
             # Keep saved raster plots as visual evidence, beside their textual alternative.
+            damaged = None
             for mime, suffix in (("image/png", ".png"), ("image/jpeg", ".jpg")):
                 if mime not in data:
                     continue
@@ -144,11 +155,17 @@ def parse_notebook(path: Path, cache_dir: Path) -> list[ParsedBlock]:
                     from PIL import Image
                     with Image.open(asset) as im:
                         im.verify()
-                except (ValueError, binascii.Error, OSError) as exc:
-                    raise NonRetryableParseError(f"Invalid saved image at cell {ci}, output {oi}: {exc}") from exc
+                except Exception:     # noqa: BLE001 - the image library reports damage with several unrelated error types
+                    damaged = damaged or mime       # the other saved form of the same picture may still be good
+                    continue
                 block = make("", ci, oi, kind="image", mime=mime)
                 block.block_id += "-image"
                 block.visual_ref = str(asset)
                 blocks.append(block)
+                damaged = None
                 break
+            if damaged:
+                # A picture that cannot be decoded is lost whatever is done here; the rest of the notebook is not.
+                # It used to fail the whole file, and with an error type that was retried every day.
+                blocks.append(omitted(ci, oi, "unreadable_image", damaged))
     return blocks

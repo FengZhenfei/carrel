@@ -5,7 +5,17 @@ from collections import Counter
 import re
 import unicodedata
 
-from .common import bbox, footnote_of, item_text, label_of, page_idx, grid_to_markdown
+from .common import (
+    _parse_html_table,
+    bbox,
+    footnote_of,
+    grid_to_markdown,
+    item_text,
+    label_of,
+    page_idx,
+    rerender_continuation_rows,
+    strip_colspan_prefixes,
+)
 
 
 def attach_table_notes(items: list[dict], path=None) -> list[dict]:
@@ -125,6 +135,7 @@ def restore_ruled_continuation_columns(blocks, path):
             a, old = _pipe_grid(prev.table_markdown or prev.text), _pipe_grid(block.table_markdown or block.text)
             if not a or not old:
                 continue
+            raw_html = str((block.metadata.get("source_item") or {}).get("table_body") or "")
             if len(a) == 1 and len(a[0]) == len(old[0]) and prev.bbox[3] >= 850 and block.bbox[1] <= 150:
                 # A header stranded at the page bottom may continue with textual
                 # rows. Require matching internal ruled columns on both pages.
@@ -150,7 +161,10 @@ def restore_ruled_continuation_columns(blocks, path):
                     block.metadata["native_continuation_columns"] = True
                     text = block.table_markdown or block.text
                     notes = [l for l in text.splitlines() if l.strip() and not l.strip().startswith("|")]
-                    block.text = block.table_markdown = "\n".join([grid_to_markdown([a[0]] + old)] + notes)
+                    clean_old, shifted_spans = rerender_continuation_rows(a[0], old, raw_html)
+                    block.text = block.table_markdown = "\n".join(
+                        [grid_to_markdown([a[0]] + clean_old, spans=shifted_spans, column_headers=True) or ""] + notes
+                    )
                     from ..chunking.packing import source_regions
                     block.metadata["source_regions"] = source_regions(block) + [{
                         "page": prev.page_idx, "bbox": prev.bbox, "kind": "table_header", "text": " | ".join(a[0])}]
@@ -164,28 +178,43 @@ def restore_ruled_continuation_columns(blocks, path):
                 candidates = page.find_tables().tables
             except Exception:
                 continue
+            clean_old_for_match = strip_colspan_prefixes(old)
+            raw_parsed = _parse_html_table(raw_html) if raw_html else None
+            raw_spans_ok = (
+                raw_parsed.spans
+                if raw_parsed and len(raw_parsed.rows) == len(old) and len(raw_parsed.rows[0]) == len(old[0])
+                else []
+            )
             for table in candidates:
                 region = pymupdf.Rect(table.bbox)
                 if (region & rect).get_area() / max(region.get_area(), rect.get_area(), 1) < .85:
                     continue
                 native = table.extract()
-                if len(native) != len(old) or table.col_count != len(a[0]):
+                if len(native) != len(clean_old_for_match) or table.col_count != len(a[0]):
                     continue
                 empty = [j for j in range(table.col_count) if all(not canon(row[j]) for row in native)]
                 from itertools import combinations
                 matches = []
-                for omitted in combinations(empty, table.col_count-len(old[0])):
+                for omitted in combinations(empty, table.col_count-len(clean_old_for_match[0])):
                     if all([canon(c) for c in row] == [canon(c) for j,c in enumerate(nr) if j not in omitted]
-                           for row,nr in zip(old,native)):
+                           for row,nr in zip(clean_old_for_match,native)):
                         matches.append(omitted)
                 if len(matches) != 1:
                     continue
                 omitted = matches[0]
                 rows = []
-                for row in old:
+                for row in clean_old_for_match:
                     source = iter(row)
                     rows.append(["" if j in omitted else next(source) for j in range(table.col_count)])
+                col_map = [j for j in range(table.col_count) if j not in omitted]
+                remapped_spans = [
+                    (r, col_map[c], rs, col_map[c + cs - 1] - col_map[c] + 1)
+                    for r, c, rs, cs in raw_spans_ok
+                    if 0 <= c and c + cs - 1 < len(col_map)
+                ]
                 notes = [l for l in (block.table_markdown or block.text).splitlines() if l.strip() and not l.strip().startswith("|")]
-                block.text = block.table_markdown = "\n".join([grid_to_markdown(rows)] + notes)
+                block.text = block.table_markdown = "\n".join(
+                    [grid_to_markdown(rows, spans=remapped_spans, column_headers=bool(raw_parsed and raw_parsed.column_headers)) or ""] + notes
+                )
                 block.metadata["restored_empty_columns"] = list(omitted)
                 break

@@ -502,7 +502,18 @@ class ImageFileParserTests(unittest.TestCase):
             self.assertEqual(failure(bad)[0], False)
             retry, message = failure(strip)
             self.assertEqual((retry, message), (False, "VLM caption skipped for image file divider.png: degenerate_aspect"))
-            self.assertEqual(failure(good, api_key=""), (True, "VLM caption skipped for image file fig.png: missing_api_key"))
+            # A model registered without a key is asked like any other; the picture is no longer skipped
+            from kb_pipeline.parsers import visual_blocks
+            asked = []
+
+            def described(jobs, **kwargs):
+                asked.append(kwargs["api_key"])
+                return {jobs[0][0]: {"summary": "a diagram", "kind": "diagram", "confidence": "high"}}
+
+            with patch.object(visual_blocks, "caption_images_parallel", described):
+                keyless = image_file.parse_image_file(path=good, cache_dir=Path(tmp) / "cache", vlm_base_url="u",
+                                                     vlm_api_key="", vlm_model_id="m", vlm_concurrency=1)
+            self.assertEqual((asked, keyless[0].metadata["vlm_status"]), ([""], "success"))
             with patch.object(image_file, "enrich_blocks_with_vlm", failing_enrich):
                 self.assertEqual(failure(good)[0], True)
             # A file that cannot be opened is an environment problem (permissions, disk), not a broken image: retried as usual
@@ -1212,7 +1223,9 @@ class MergedCellFillTests(unittest.TestCase):
               "used_cols": ws.max_column, "normalize_cell": native_table.normalize_cell,
               # the lifted loop reads the anchor through this helper since the built-in CJK date formats are
               # recognised; the stand-in cells carry no number format, so the workbook epoch is never used
-              "_xlsx_shown_value": native_table._xlsx_shown_value, "wb": SimpleNamespace(epoch=None)}
+              "_xlsx_shown_value": native_table._xlsx_shown_value, "wb": SimpleNamespace(epoch=None),
+              # ... and asks where a merged label shows when some of its columns are hidden; none are here
+              "_shown_column": native_table._shown_column, "hidden_cols": set()}
         exec(compile(code, "fill.py", "exec"), ns)
         return ns["merged_values"]
 
@@ -2112,8 +2125,8 @@ class ParserDetailTests(unittest.TestCase):
         self.assertTrue(all(b.parser_profile == "html-dom-v2" for b in blocks))
         self.assertEqual(parser_profile_for_path(Path("a.html")), "html-dom-v2+source-v1")
 
-    def test_hidden_sheets_and_rows_are_skipped(self) -> None:
-        """R8: hidden sheets / hidden rows are not indexed."""
+    def test_hidden_sheets_and_rows_are_read(self) -> None:
+        """Hidden sheets and hidden rows are indexed like the ones in view (they used to be left out)."""
         from openpyxl import Workbook
 
         from kb_pipeline.parsers.native_table import read_xlsx_rows
@@ -2131,8 +2144,9 @@ class ParserDetailTests(unittest.TestCase):
             backup.sheet_state = "hidden"
             ew.save(path)
             sheets = read_xlsx_rows(path)
-        self.assertEqual([name for name, *_ in sheets], ["Data"])
-        self.assertEqual([values[0] for _, values in sheets[0][1]], ["name", "a", "b"])
+        self.assertEqual([name for name, *_ in sheets], ["Data", "Backup"])
+        self.assertEqual([values[0] for _, values in sheets[0][1]], ["name", "a", "old", "b"])
+        self.assertEqual(sheets[1][1], [(1, ["x", "y"])])
 
     def test_xlsx_read_is_bounded_by_the_cells_that_hold_content(self) -> None:
         """2026-09-29 audit: a sheet with a whole row formatted has max_column 16384; building cells row by row up
@@ -2284,11 +2298,7 @@ class PdfReportParseTests(unittest.TestCase):
         self.assertTrue(a.table_markdown.endswith("| 总溶质 | TP | 71.8 | 65.0—85.0 | g/L |\nFOOTNOTE: 注 1"))
         self.assertEqual(a.text, a.table_markdown)
         self.assertEqual((a.metadata["merged_tables"], a.metadata["page_end"]), (["t2", "t3"], 11))
-        # A table carrying merged-cell flags is not merged (screenshot verification maps rows against the
-        # original grid); neither is one two pages away
-        f = table("t6", head + "\n| a | b | 1 | 2 | c |", 12, metadata={"table_flags": [{"row": 2, "confidence": "high"}]})
-        g = table("t7", "| d | e | 3 | 4 | f |\n| --- | --- | --- | --- | --- |", 12)
-        self.assertEqual(len(merge_split_tables([f, g])), 2)
+        # A table two pages away is not merged
         h = table("t8", head + "\n| a | b | 1 | 2 | c |", 1)
         i = table("t9", "| d | e | 3 | 4 | f |\n| --- | --- | --- | --- | --- |", 5)
         self.assertEqual(len(merge_split_tables([h, i])), 2)
@@ -2348,38 +2358,8 @@ class PdfReportParseTests(unittest.TestCase):
 
 
 class VisualEvidenceTests(unittest.TestCase):
-    """Text in the image (caption / transcription / chart reading) is evidence, the model's FACTS are
-    interpretation: when the caption says 28 and the model says 25, the text wins and a trace is kept.
-    Another kind of runaway: a screenshot's FACTS swelling item by item to thousands of tokens: collapse,
-    flag as runaway, retry, never cache."""
-
-    def test_model_estimates_yield_to_on_image_text(self) -> None:
-        from kb_pipeline.parsers.visual_blocks import reconcile_visual_facts
-
-        facts = ["综合风险指数 25,中低等级", "供电可靠性指数 27", "过热风险指数 0", "EMC 测试结果 一般"]
-        trusted = "综合风险指数 28 中低等级\n供电可靠性指数 27\n过热风险指数:2\nEMC 测试结果 正常"
-        out, _, conflicts = reconcile_visual_facts(facts, trusted)
-        self.assertEqual(out[0], "综合风险指数 28,中低等级")
-        self.assertEqual(out[1], "供电可靠性指数 27")                 # consistent ones untouched
-        self.assertEqual(out[2], "过热风险指数 2")
-        self.assertEqual(out[3], "EMC 测试结果 一般")                        # non-numeric category conflicts are not on this path
-        self.assertEqual([(c["label"], c["text_value"], c["model_value"]) for c in conflicts],
-                         [("综合风险指数", "28", "25"), ("过热风险指数", "2", "0")])
-        # Synthetic fixture: the caption names the metric while the model summary and FACTS say "current risk
-        # value is 25" -- a generic label is matched against the single value in the image
-        summary = "一个风险水平的进度条,显示当前风险值为25,并与同类产品平均值30比较"
-        out2, sum2, conf2 = reconcile_visual_facts(["当前风险值为25", "同类产品平均值为30"], "综合风险指数 28 中低等级", summary)
-        self.assertEqual((out2, sum2), (["当前风险值为28", "同类产品平均值为30"], "一个风险水平的进度条,显示当前风险值为28,并与同类产品平均值30比较"))
-        self.assertEqual([(c["label"], c["text_value"], c["model_value"], c["model_label"]) for c in conf2],
-                         [("综合风险指数", "28", "25", "当前风险值为"), ("综合风险指数", "28", "25", "显示当前风险值为")])
-        # No collateral damage: reference ranges / normal values are not readings; metrics whose content words
-        # differ (power stability index vs overall risk index) are not the same; unmatched labels stay as is
-        keep = ["输出电压参考范围 3.1-5.2", "输出电压正常值 5.2", "供电稳定指数 24", "转速 3.3"]
-        self.assertEqual(reconcile_visual_facts(keep, "输出电压 6.0\n综合风险指数 28\n电流 5")[0], keep)
-        self.assertEqual(reconcile_visual_facts(["转速 3.3"], ""), (["转速 3.3"], "", []))
-        src = _repo_file("app/kb_pipeline/parsers/visual_blocks.py")
-        self.assertIn("facts, summary, value_conflicts = reconcile_visual_facts(", src)
-        self.assertIn('"visual_value_conflicts": value_conflicts', src)
+    """A screenshot's FACTS swelling item by item to thousands of tokens: collapse, flag as runaway, retry, never
+    cache."""
 
     def test_distinct_growing_items_and_completed_rows_are_preserved(self) -> None:
         from kb_pipeline.vision.vlm import normalize_result
@@ -2407,9 +2387,12 @@ class VlmEndpointFallbackTests(unittest.TestCase):
         from kb_pipeline import llm_compat
         llm_compat._ACCEPTED.clear()
         self.addCleanup(llm_compat._ACCEPTED.clear)
+        llm_compat._FUTILE.clear()
+        self.addCleanup(llm_compat._FUTILE.clear)
         self.calls: list[dict] = []
 
-    def _caption(self, url: str, verdict, *, structured: bool = True, images: int = 1, replies=()) -> list[tuple[bool, bool]]:
+    def _caption(self, url: str, verdict, *, structured: bool = True, images: int = 1, replies=(),
+                 model: str = "m") -> list[tuple[bool, bool]]:
         """Caption pictures against a fake endpoint (one base URL per test: clients are cached per endpoint).
         verdict(request) returns None to accept or (status, message) to reject. Returns, per request sent,
         whether it carried the penalty and whether it carried the schema."""
@@ -2434,40 +2417,161 @@ class VlmEndpointFallbackTests(unittest.TestCase):
                 for i in range(images):
                     image = Path(tmp) / f"image{i}.png"
                     image.write_bytes(b"not-a-real-image")
-                    result = vlm.caption_image(image_path=image, base_url=url, api_key="k", model_id="m", structured=structured)
+                    result = vlm.caption_image(image_path=image, base_url=url, api_key="k", model_id=model, structured=structured)
                     self.assertEqual(result["summary"], "ok")
         finally:
-            shape = [("extra_body" in kw, "response_format" in kw) for kw in calls]
+            shape = [(self._penalty(kw), "response_format" in kw) for kw in calls]
         return shape
 
+    @staticmethod
+    def _penalty(kw: dict) -> bool:
+        # extra_body also carries the thinking switch, so its presence alone says nothing about the penalty
+        return "repetition_penalty" in kw.get("extra_body", {})
+
+    @staticmethod
+    def _thinking(kw: dict) -> dict:
+        """The thinking controls a request carried, wherever the SDK puts them."""
+        sent = {**kw, **kw.get("extra_body", {})}
+        return {k: sent[k] for k in ("enable_thinking", "thinking", "reasoning_effort", "chat_template_kwargs") if k in sent}
+
     def test_a_strict_endpoint_loses_only_the_penalty_and_is_remembered(self) -> None:
-        strict = lambda kw: (400, "Unrecognized request argument supplied: repetition_penalty") if "extra_body" in kw else None
+        strict = lambda kw: (400, "Unrecognized request argument supplied: repetition_penalty") if self._penalty(kw) else None
         shape = self._caption("http://strict.test/v1", strict, images=2)
         # rejected once, the schema stays; the second picture is asked for once, without the parameter
         self.assertEqual(shape, [(True, True), (False, True), (False, True)])
         self.assertEqual(self._caption("http://strict-plain.test/v1", strict, structured=False)[3:], [(True, False), (False, False)])
 
-    def test_an_endpoint_without_json_schema_keeps_the_penalty(self) -> None:
-        no_schema = lambda kw: (400, "response_format of type json_schema is not supported") if "response_format" in kw else None
-        shape = self._caption("http://noschema.test/v1", no_schema, images=2)
-        self.assertEqual(shape, [(True, True), (True, False), (True, False)])
-        self.assertIn("Output exactly one JSON object", self.calls[1]["messages"][0]["content"][0]["text"])
+    @staticmethod
+    def _formats(calls: list[dict]) -> list[str | None]:
+        return [(kw.get("response_format") or {}).get("type") for kw in calls]
 
-    def test_a_rejection_that_names_nothing_is_raised_without_guessing(self) -> None:
-        bare = lambda kw: (422, "invalid request") if ("extra_body" in kw or "response_format" in kw) else None
-        with self.assertRaises(self._Http):
+    @staticmethod
+    def _only_schema(status: int, message: str):
+        """An endpoint that has JSON mode but no schema-constrained output."""
+        return lambda kw: (status, message) if (kw.get("response_format") or {}).get("type") == "json_schema" else None
+
+    def test_an_endpoint_without_json_schema_steps_down_to_json_mode_and_keeps_the_penalty(self) -> None:
+        no_schema = self._only_schema(400, "response_format of type json_schema is not supported")
+        shape = self._caption("http://noschema.test/v1", no_schema, images=2)
+        # refused once; JSON mode is kept and remembered, so the second picture is asked for once
+        self.assertEqual(self._formats(self.calls), ["json_schema", "json_object", "json_object"])
+        self.assertEqual([penalty for penalty, _ in shape], [True, True, True])
+        prompts = [kw["messages"][0]["content"][0]["text"] for kw in self.calls]
+        for prompt in prompts:                         # every request says what to output, whatever format it carries
+            self.assertIn("Output exactly one JSON object", prompt)
+        self.assertNotIn("Fill in this shape", prompts[0])                    # the schema carries the shape there
+        for prompt in prompts[1:]:                                            # JSON mode guarantees syntax only
+            for key in vlm.RESULT_SCHEMA["properties"]:
+                self.assertIn(f'"{key}"', prompt)
+
+    def test_a_refusal_in_any_words_steps_down(self) -> None:
+        # what services answer to json_schema when they only have JSON mode; neither says "unsupported"
+        for n, (status, message) in enumerate((
+                (400, "This response_format type is unavailable now"),
+                (422, "1 validation error for ChatCompletionRequest\nresponse_format.type\n  Input should be 'text' or 'json_object'"))):
+            self.calls.clear()
+            self._caption(f"http://worded{n}.test/v1", self._only_schema(status, message))
+            self.assertEqual(self._formats(self.calls), ["json_schema", "json_object"])
+
+    def test_an_endpoint_without_any_output_format_ends_on_the_plain_prompt(self) -> None:
+        none_at_all = lambda kw: (400, "Unknown parameter: 'response_format'") if "response_format" in kw else None
+        shape = self._caption("http://noformat.test/v1", none_at_all, images=2)
+        self.assertEqual(self._formats(self.calls), ["json_schema", "json_object", None, None])
+        self.assertEqual([penalty for penalty, _ in shape], [True] * 4)
+        last = self.calls[-1]["messages"][0]["content"][0]["text"]
+        self.assertIn("Output exactly one JSON object", last)
+        self.assertIn("Fill in this shape", last)                             # nothing but the prompt carries the shape now
+
+    def test_a_json_mode_answer_with_nothing_in_it_is_asked_for_again(self) -> None:
+        # JSON mode guarantees syntax only: a service may blank out what it cannot read as JSON, and a model may
+        # hand the shape back unfilled. Neither is taken as "this picture says nothing"
+        unfilled = json.dumps({"kind": "", "title": "", "summary": "", "entities": [], "facts": [], "keywords": [],
+                               "confidence": "", "decorative": False, "text_verbatim": ""})
+        for n, reply in enumerate(("      ", unfilled)):
+            self.calls.clear()
+            self._caption(f"http://blank{n}.test/v1", self._only_schema(400, "This response_format type is unavailable now"), replies=[reply])
+            self.assertEqual(self._formats(self.calls), ["json_schema", "json_object", "json_object"])
+
+    def test_a_rejection_that_names_nothing_costs_only_the_output_format(self) -> None:
+        # "invalid parameter" and nothing more is what some services answer. The output format is tried one step
+        # lower each time, because the answer is parsed and checked whichever way it was asked for
+        unnamed = self._only_schema(400, "请求错误 - 参数无效")
+        self._caption("http://unnamed.test/v1", unnamed, images=2)
+        self.assertEqual(self._formats(self.calls), ["json_schema", "json_object", "json_object"])
+        # nothing else is guessed at: the penalty stays in every request, and the refusal raised is the first one
+        self.calls.clear()
+        replies = iter(("first refusal", "second refusal", "third refusal"))
+        bare = lambda kw: (422, next(replies))
+        with self.assertRaises(self._Http) as raised:
             self._caption("http://bare.test/v1", bare)
-        self.assertEqual(len(self.calls), 1)
-        self.assertIn("response_format", self.calls[0])
-        self.assertIn("extra_body", self.calls[0])
+        self.assertEqual(str(raised.exception), "first refusal")
+        self.assertEqual(self._formats(self.calls), ["json_schema", "json_object", None])
+        self.assertTrue(all(self._penalty(kw) for kw in self.calls))
+        # nor is the thinking switch given up on a refusal that does not name it
+        self.assertTrue(all(self._thinking(kw) == {"enable_thinking": False, "thinking": {"type": "disabled"}} for kw in self.calls))
+
+    def test_guesses_stop_at_an_endpoint_where_they_never_help(self) -> None:
+        from kb_pipeline import llm_compat
+        named = self._only_schema(400, "This response_format type is unavailable now")
+        mood = {"names_the_format": False}                  # one endpoint, hence one cached client and one verdict
+        verdict = lambda kw: named(kw) if mood["names_the_format"] else (400, "invalid request")
+        per_picture = []
+        for _ in range(llm_compat.MAX_FUTILE_GUESSES + 2):
+            self.calls.clear()
+            with self.assertRaises(self._Http):
+                self._caption("http://hopeless.test/v1", verdict)
+            per_picture.append(len(self.calls))
+        # the refusals have another cause: after a few pictures each one is asked for once, as before
+        self.assertEqual(per_picture, [3] * llm_compat.MAX_FUTILE_GUESSES + [1, 1])
+        # a refusal that names the output format is not a guess and still steps down there
+        self.calls.clear()
+        mood["names_the_format"] = True
+        self._caption("http://hopeless.test/v1", verdict)
+        self.assertEqual(self._formats(self.calls), ["json_schema", "json_object"])
+
+    def test_an_endpoint_that_takes_the_schema_and_ignores_it_is_read_leniently(self) -> None:
+        good = json.dumps({"summary": "ok", "entities": [], "facts": [], "keywords": [], "confidence": "high"})
+        for n, reply in enumerate(("```json\n" + good + "\n```", "Here is the description:\n" + good)):
+            self.calls.clear()
+            self._caption(f"http://ignoring{n}.test/v1", lambda kw: None, replies=[reply])
+            self.assertEqual(self._formats(self.calls), ["json_schema"])      # no second request for a readable answer
 
     def test_the_degraded_retry_does_not_bring_a_rejected_penalty_back(self) -> None:
-        strict = lambda kw: (400, "Unknown parameter: 'repetition_penalty'") if "extra_body" in kw else None
+        strict = lambda kw: (400, "Unknown parameter: 'repetition_penalty'") if self._penalty(kw) else None
         shape = self._caption("http://strict-retry.test/v1", strict, replies=["not json at all"])
         self.assertEqual([penalty for penalty, _ in shape], [True, False, False])
         self.calls.clear()
         self._caption("http://vllm.test/v1", lambda kw: None, replies=["not json at all"])
         self.assertEqual([kw["extra_body"]["repetition_penalty"] for kw in self.calls], [1.05, 1.15])     # unchanged where it is accepted
+        # the retry is still asked not to think
+        self.assertEqual([self._thinking(kw) for kw in self.calls], [{"enable_thinking": False, "thinking": {"type": "disabled"}}] * 2)
+
+    def test_pictures_are_described_with_thinking_off(self) -> None:
+        """A model that thinks first shares the output limit with its thoughts: in a trial most of the output was
+        reasoning and some pictures got no answer. The request says so in the spelling the model family takes."""
+        expected = {
+            "deepseek-flash": {"thinking": {"type": "disabled"}},
+            "Qwen/Qwen3.8-VL-Flash": {"enable_thinking": False},
+            "gpt-5.4-mini": {"reasoning_effort": "none"},
+            "some-unknown-vision-model": {"enable_thinking": False, "thinking": {"type": "disabled"}},
+            "gpt-4o": {},                    # these do not think unless asked to
+            "claude-sonnet-4-5": {},
+        }
+        for n, (model, controls) in enumerate(expected.items()):
+            self.calls.clear()
+            self._caption(f"http://family{n}.test/v1", lambda kw: None, model=model)
+            self.assertEqual([self._thinking(kw) for kw in self.calls], [controls], model)
+
+    def test_a_refused_thinking_switch_falls_back_to_the_service_default(self) -> None:
+        """Refused in words the explicit rule does not know, one field at a time: each named field is given up, the
+        picture is still described, and the rest of the request is as it was."""
+        def strict(kw):
+            carried = self._thinking(kw)
+            return (400, f'Invalid JSON payload received. Unknown name "{next(iter(carried))}": Cannot find field.') if carried else None
+        shape = self._caption("http://no-thinking-switch.test/v1", strict, images=2)
+        self.assertEqual([self._thinking(kw) for kw in self.calls],
+                         [{"enable_thinking": False, "thinking": {"type": "disabled"}}, {"thinking": {"type": "disabled"}}, {}, {}])
+        self.assertEqual(shape, [(True, True)] * 4)          # penalty and schema untouched; the second picture is asked once
 
     def test_failures_that_are_not_a_rejected_request_are_raised_as_before(self) -> None:
         for n, status in enumerate((500, 503)):
@@ -2898,188 +3002,6 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
         self.assertNotIn("---", blocks[1].text)          # --- after a paragraph is still a rule, not a heading
         self.assertNotIn("=====", blocks[0].text)
 
-    def test_f02_glued_table_rows_are_flagged_and_only_verified_splits_are_applied(self) -> None:
-        """F02: MinerU glued the stacked 62/62/48 mA into 626248 / mAmAmA. Detection flags per row (unit
-        repeated n=3 + a long digit string = high confidence); the repair is applied only when the VLM's split
-        reassembles into the original string; if it does not, or the call fails, the original text and the
-        flag are kept."""
-        from kb_pipeline.parsers import table_repair
-        from kb_pipeline.parsers.common import grid_to_markdown, html_table_to_grid, html_table_to_markdown
-        from kb_pipeline.parsers.table_check import (detect_table_ambiguity, expand_glued_rows, table_ambiguity_flags,
-                                                    table_ambiguity_summary, unit_repeat, unrepaired_glued_values)
-
-        self.assertEqual((unit_repeat("mAmAmA"), unit_repeat("°C°C"), unit_repeat("mA"), unit_repeat("Vpp")), (3, 2, 1, 1))
-        self.assertEqual((unit_repeat("mm"), unit_repeat("**"), unit_repeat("输出数据" * 6), unit_repeat("pFpF")), (1, 1, 1, 2))
-        # Capacitance table: three test conditions in one row is normal; with no glued values / units nothing
-        # is flagged (a first-round false positive on the real box)
-        cap = ("<table><tr><td>参数</td><td>说明</td><td>测试条件</td><td>最大值</td><td>单位</td></tr>"
-               "<tr><td>$C_{IN}$</td><td>输入电容</td><td>$T_A = 25°C$ 、f=1 MHz、 $V_{CC} = V_{CC(typ)}$</td><td>10</td><td>pF</td></tr></table>")
-        self.assertEqual(table_ambiguity_flags(cap), [])
-        rev = ("<table><tr><td>版本</td><td>ECN</td><td>日期</td></tr><tr><td>**</td><td>5148011</td><td>02/23/2016</td></tr>"
-               "<tr><td>*A</td><td>5290011</td><td>03/01/2017</td></tr></table>")
-        self.assertEqual(table_ambiguity_flags(rev), [])
-        flags = table_ambiguity_flags(self.NVSTORE_ROW_HTML)
-        kinds = {(f["row"], f["col"], f["kind"], f["n"], f["confidence"]) for f in flags}
-        self.assertEqual(kinds, {(2, 2, "multi_condition", 4, "high"), (2, 5, "glued_values", 3, "high"), (2, 6, "glued_units", 3, "high")})
-        self.assertTrue(all(f["key"].startswith("$I_{CC1}$") for f in flags))
-        self.assertEqual(unrepaired_glued_values(flags, None), ["626248"])
-        self.assertEqual(unrepaired_glued_values(flags, {"status": "verified", "rows": [2]}), [])
-        # A normal table is not flagged; nor is a column of 5-digit order codes; only a digit string clearly
-        # longer than the rest of its column gets low confidence
-        self.assertEqual(table_ambiguity_flags("<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2.5</td></tr></table>"), [])
-        codes = "<table><tr><td>码</td><td>值</td></tr><tr><td>A</td><td>12345</td></tr><tr><td>B</td><td>23456</td></tr><tr><td>C</td><td>34567</td></tr></table>"
-        self.assertEqual(table_ambiguity_flags(codes), [])
-        odd = "<table><tr><td>参数</td><td>最大值</td></tr><tr><td>a</td><td>62</td></tr><tr><td>b</td><td>48</td></tr><tr><td>c</td><td>626248</td></tr></table>"
-        self.assertEqual([(f["kind"], f["confidence"]) for f in table_ambiguity_flags(odd)], [("glued_values", "low")])
-        grid = html_table_to_grid(self.NVSTORE_ROW_HTML)
-        self.assertEqual(html_table_to_markdown(self.NVSTORE_ROW_HTML), grid_to_markdown(grid))
-        expanded = expand_glued_rows(grid, {2: {5: ["62", "62", "48"], 6: ["mA", "mA", "mA"], 2: ["t_RC = 20 ns", "t_RC = 25 ns", "t_RC = 45 ns"]}})
-        self.assertEqual(len(expanded), len(grid) + 2)
-        self.assertEqual([r[5] for r in expanded[2:5]], ["62", "62", "48"])
-        self.assertEqual([r[2] for r in expanded[2:5]], ["t_RC = 20 ns", "t_RC = 25 ns", "t_RC = 45 ns"])
-        self.assertEqual(expanded[2][0], expanded[4][0])                            # unsplit columns are copied as is
-        self.assertEqual(expand_glued_rows(grid, {2: {5: ["62", "62"], 6: ["mA"] * 3}}), grid)   # inconsistent piece counts: no expansion
-        self.assertTrue(table_repair.verify_split("626248", ["62", "62", "48"]))
-        self.assertTrue(table_repair.verify_split("mAmAmA", ["mA", "mA", "mA"]))
-        self.assertFalse(table_repair.verify_split("626248", ["62", "62", "62"]))
-        self.assertFalse(table_repair.verify_split("626248", ["626248"]))
-
-        def block(tmp):
-            crop = Path(tmp) / "t.jpg"; crop.write_bytes(b"jpg")
-            return ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type="table", block_id="t1",
-                               text=html_table_to_markdown(self.NVSTORE_ROW_HTML) + "\nFOOTNOTE: 注 8",
-                               table_markdown=html_table_to_markdown(self.NVSTORE_ROW_HTML), visual_ref=str(crop),
-                               metadata={"table_flags": flags, "source_item": {"table_body": self.NVSTORE_ROW_HTML}})
-
-        good = [{"key": "$I_{CC1}$", "cells": [["I_CC1"], ["平均电流 V_CC"], ["t_RC = 20 ns", "t_RC = 25 ns", "t_RC = 45 ns"],
-                                                ["-"], ["-"], ["62", "62", "48"], ["mA", "mA", "mA"]]}]
-        with tempfile.TemporaryDirectory() as tmp:
-            b = block(tmp)
-            calls: list[dict] = []
-
-            def fake(image, **kw):
-                calls.append(kw); return good
-            stats = table_repair.repair_ambiguous_tables([b], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp), transcribe=fake)
-            self.assertEqual((stats["flagged"], stats["verified"]), (1, 1))
-            self.assertEqual(calls[0]["row_keys"], ["$I_{CC1}$"])
-            self.assertEqual(b.metadata["table_repair"]["status"], "verified")
-            self.assertEqual((b.metadata["table_repair"]["rows"], b.metadata["table_repair"]["n"]), ([2], 3))
-            self.assertNotIn("626248", b.text)
-            self.assertIn("| t_RC = 45 ns | - | - | 48 | mA |", b.text)
-            self.assertTrue(b.text.endswith("FOOTNOTE: 注 8"))                     # the note after the table is kept
-            self.assertEqual(b.table_markdown, b.text)
-            self.assertTrue(all(f.get("repaired") for f in b.metadata["table_flags"]))
-            self.assertEqual(table_ambiguity_summary([b]), {"flagged": 1, "verified": 1, "unverified": 0})
-            # Does not reassemble into the original string: no rewrite, flag kept
-            b2 = block(tmp)
-            bad = [{"key": "$I_{CC1}$", "cells": [["I_CC1"], ["x"], ["c"], ["-"], ["-"], ["62", "62", "62"], ["mA", "mA", "mA"]]}]
-            stats = table_repair.repair_ambiguous_tables([b2], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp), transcribe=lambda *a, **k: bad)
-            self.assertEqual((stats["verified"], stats["unverified"]), (0, 1))
-            self.assertEqual(b2.metadata["table_repair"]["status"], "unverified")
-            self.assertIn("626248", b2.text)
-            # VLM call failed: parsing is unaffected, recorded as failed
-            b3 = block(tmp)
-
-            def boom(*a, **k):
-                raise RuntimeError("vlm down")
-            stats = table_repair.repair_ambiguous_tables([b3], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp), transcribe=boom)
-            self.assertEqual((stats["failed"], b3.metadata["table_repair"]["status"]), (1, "failed"))
-            self.assertIn("626248", b3.text)
-        self.assertEqual(table_repair._parse_rows('```json\n{"rows": [{"key": "k", "cells": [["a", "b"], "c", []]}]}\n```'),
-                         [{"key": "k", "cells": [["a", "b"], ["c"], []]}])
-        # The synthetic VLM shape: first cell missing, the dash merged into the value column, conditions in <sub>;
-        # matching by content still verifies n=3
-        real = [{"key": "I_{CC1}", "cells": [["平均电流 V<sub>CC</sub>", "t<sub>RC</sub> = 20 ns", "t<sub>RC</sub> = 25 ns", "t<sub>RC</sub> = 45 ns",
-                                               "无输出负载下取得的值（I<sub>OUT</sub> = 0 mA）"], ["—", "—", "62", "62", "48"], ["mA", "mA", "mA", "mA", "mA"]]}]
-        repairs, reasons = table_repair.plan_repairs(grid, flags, real)
-        self.assertEqual(reasons, [])
-        self.assertEqual(repairs[2][5], ["62", "62", "48"])
-        self.assertEqual(repairs[2][6], ["mA", "mA", "mA"])
-        self.assertEqual(repairs[2][2], ["t_RC = 20 ns", "t_RC = 25 ns", "t_RC = 45 ns"])       # <sub> converted to the manual's own underscore notation
-        self.assertEqual(table_repair.clean_part("V<sub>CC</sub> + 0.5 V<sup>2</sup> <b>x</b>"), "V_CC + 0.5 V^2 x")
-        self.assertNotIn(0, repairs[2])                                            # the symbol cell is not split
-        with tempfile.TemporaryDirectory() as tmp:
-            b4 = block(tmp)
-            seen: list[dict] = []
-            table_repair.repair_ambiguous_tables([b4], base_url="u", api_key="k", model_id="m", cache_dir=Path(tmp),
-                                                 transcribe=lambda image, **kw: (seen.append(kw), real)[1])
-            self.assertEqual(b4.metadata["table_repair"]["status"], "verified")
-            self.assertEqual((seen[0]["width"], seen[0]["header"][:3]), (7, ["参数", "说明", "测试条件"]))
-            self.assertIn("| t_RC = 45 ns | - | - | 48 | mA |", b4.text)
-            self.assertNotIn("<sub>", b4.text)
-
-    def test_visual_correction_only_touches_the_matched_span(self) -> None:
-        from kb_pipeline.parsers.visual_blocks import reconcile_visual_facts
-
-        # Two identical numbers in one item: only the voltage one is wrong. The old code replaced the first 10
-        # in the whole sentence, corrupting the correct current
-        out, _, conflicts = reconcile_visual_facts(["电流 10,电压 10"], "电流 10\n电压 20")
-        self.assertEqual(out, ["电流 10,电压 20"])
-        self.assertEqual([(c["label"], c["text_value"], c["model_value"]) for c in conflicts], [("电压", "20", "10")])
-        # "current" is a substring of "leakage current": exact equality wins and the label listed first no
-        # longer grabs it
-        self.assertEqual(reconcile_visual_facts(["漏电流 0.2"], "电流 10\n漏电流 0.2")[::2], (["漏电流 0.2"], []))
-        out3, _, conf3 = reconcile_visual_facts(["漏电流 0.5"], "电流 10\n漏电流 0.2")
-        self.assertEqual((out3, [(c["label"], c["text_value"]) for c in conf3]), (["漏电流 0.2"], [("漏电流", "0.2")]))
-        # Containment matches several candidates (input current / output current): ambiguous, left alone
-        self.assertEqual(reconcile_visual_facts(["电流 7"], "输入电流 10\n输出电流 5")[::2], (["电流 7"], []))
-        # Numbers with different units cannot be compared: 0.1 V and 100 mV are two spellings of one value,
-        # so the number is left and no conflict is recorded; with the same unit it is corrected as usual
-        self.assertEqual(reconcile_visual_facts(["电压 100 mV"], "电压 0.1 V")[::2], (["电压 100 mV"], []))
-        out6, _, conf6 = reconcile_visual_facts(["电压 3.0 V"], "电压 3.3 V")
-        self.assertEqual((out6, [c["text_value"] for c in conf6]), (["电压 3.3 V"], ["3.3"]))
-        # The same number appears twice in the summary; only the occurrence belonging to that metric changes
-        _, summary, _ = reconcile_visual_facts([], "综合风险指数 34", "同批平均 31;显示当前风险值为31")
-        self.assertEqual(summary, "同批平均 31;显示当前风险值为34")
-
-    def test_a_runaway_transcription_does_not_stall_the_parse(self) -> None:
-        """Long repetitive synthetic text must not stall numeric matching. Oversized segments are skipped while short numeric readings remain comparable."""
-        import time
-
-        from kb_pipeline.parsers.visual_blocks import SEGMENT_MAX_CHARS, _label_num_spans, reconcile_visual_facts
-
-        runaway = "用户管理 " * 4000
-        started = time.monotonic()
-        self.assertEqual(_label_num_spans(runaway, max_numbers=3), [])
-        self.assertEqual(_label_num_spans(runaway + "设备 12", single_only=True), [])
-        self.assertEqual(_label_num_spans(runaway), [])
-        out, _, conflicts = reconcile_visual_facts(["总分 95"], runaway + "\n总分 98", runaway)
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertEqual((out, conflicts[0]["text_value"]), (["总分 98"], "98"))      # the runaway segment is skipped, the real reading next to it still applies
-        long_label = "甲" * (SEGMENT_MAX_CHARS - 4) + " 12"
-        self.assertEqual(len(_label_num_spans(long_label)), 1)
-        self.assertEqual(_label_num_spans("甲" * SEGMENT_MAX_CHARS + " 12"), [])
-
-    def test_same_label_with_several_values_is_left_alone(self) -> None:
-        from kb_pipeline.parsers.visual_blocks import reconcile_visual_facts
-
-        self.assertEqual(reconcile_visual_facts(["电压 5 V"], "电压 3.3 V\n电压 5 V")[::2], (["电压 5 V"], []))
-        # 2026-09-13 Codex F06: a flat table's full header row + the first id is not a "label - value" pair; a
-        # number the model read correctly must not be changed to 1
-        table = ("商品编号 商品名称 商品种类 销售单价 进货单价 登记日期 0001 T恤衫 衣服 1000 500 2009-09-20 "
-                 "0002 打孔器 办公用品 500 320 2009-09-11")
-        keep = ["商品编号0002对应的商品名称是打孔器,销售单价500,进货单价320。"]
-        self.assertEqual(reconcile_visual_facts(keep, table), (keep, "", []))
-        self.assertEqual(reconcile_visual_facts(["销售单价 500"], "商品编号 销售单价 进货单价 1")[::2], (["销售单价 500"], []))   # a label of three Chinese words is a header
-        self.assertEqual(reconcile_visual_facts(["编号 5"], "编号 0007")[::2], (["编号 5"], []))                             # a leading zero marks an id, not a reading
-        self.assertEqual(reconcile_visual_facts(["频率 72"], "频率 66 压力 118 76 质量 62")[::2], (["频率 72"], []))          # four numbers in one segment: a table row, not readings
-        out7, _, conf7 = reconcile_visual_facts(["频率 72"], "频率 66 压力 118")                                            # every number has its own label: trusted
-        self.assertEqual((out7, conf7[0]["text_value"]), (["频率 66"], "66"))
-        # 2026-09-14 Codex R01: citation numbers / numbers inside names / incompletely split table rows are
-        # not readings
-        keep2 = ["五年生存率 90.1%", "I 期五年生存率为 90.1%"]
-        self.assertEqual(reconcile_visual_facts(keep2, "管癌五年生存率[1-2]\n90.1% 72.6% 53.8% 10.4%")[::2], (keep2, []))
-        self.assertEqual(reconcile_visual_facts(["五年生存率 90.1%"], "管癌五年生存率[1]")[::2], (["五年生存率 90.1%"], []))
-        self.assertEqual(reconcile_visual_facts(["Price 20"], "Product Price Stock 1 20 50")[::2], (["Price 20"], []))
-        self.assertEqual(reconcile_visual_facts(["MACD 12"], "缩量 MACD(8,17,9)")[::2], (["MACD 12"], []))
-        self.assertEqual(reconcile_visual_facts(["安装量 12"], "安装量 Top 8")[::2], (["安装量 12"], []))
-        self.assertEqual(reconcile_visual_facts(["总分 95"], "总分(满分100)")[::2], (["总分 95"], []))
-        out8, _, conf8 = reconcile_visual_facts(["总分 95"], "总分 98\n注[1]")                                              # a citation line in its own segment does not affect the real reading
-        self.assertEqual((out8, conf8[0]["text_value"]), (["总分 98"], "98"))
-        self.assertEqual(reconcile_visual_facts(["电压 4 V"], "电压 3.3 V\n电压 5 V")[::2], (["电压 4 V"], []))
-        out, _, conf = reconcile_visual_facts(["电压 4 V"], "电压 5 V\n电压 5 V")            # a repeated identical value is safe to use
-        self.assertEqual((out, [c["text_value"] for c in conf]), (["电压 5 V"], ["5"]))
-
     def test_csv_row_numbers_survive_blank_lines(self) -> None:
         from kb_pipeline.parsers.native_table import parse_native_table, read_csv_rows_numbered
 
@@ -3107,8 +3029,8 @@ class ParserFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTests
 
 class PdfTextLayerTests(unittest.TestCase):
     """Whole pages lose their CJK text when MinerU cannot render non-embedded Chinese fonts (spot check: an waveform report
-    kept only digits on 6 pages): compare against the text layer page by page, confirm through the fonts, render and
-    resend only the lost pages, splice them back, mark pages still lost as degraded."""
+    kept only digits on 6 pages): compare against the text layer page by page and confirm through the fonts. What
+    happens to a page found this way is in test_removed_parse_rules.py."""
 
     @staticmethod
     def _block(page, text, block_type="text", bbox=None, **meta):
@@ -3116,9 +3038,9 @@ class PdfTextLayerTests(unittest.TestCase):
         return ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type=block_type, text=text,
                            block_id=f"b-{page}-{abs(hash(text)) % 1000}", page_idx=page, bbox=bbox, metadata=dict(meta))
 
-    def test_text_layer_and_rendering_run_on_a_real_pdf(self) -> None:
-        """Text-layer counts, font checks and page rendering run on the real PyMuPDF: the other tests stub it, so a
-        broken import would be swallowed by "skip when not installed"."""
+    def test_text_layer_counts_and_font_checks_run_on_a_real_pdf(self) -> None:
+        """Text-layer counts and font checks run on the real PyMuPDF: the other tests stub it, so a broken import
+        would be swallowed by "skip when not installed"."""
         try:
             import pymupdf
         except ImportError:
@@ -3135,11 +3057,6 @@ class PdfTextLayerTests(unittest.TestCase):
             self.assertEqual(tl.text_layer_cjk_by_page(source), {1: 27, 2: 0})
             self.assertEqual(tl.page_details(source, [1, 2, 9], {}), {1: (27, 27), 2: (0, 0)})      # out-of-range page numbers are ignored
             self.assertEqual(tl.page_details(source, [1], {1: [[0, 0, 1000, 1000]]}), {1: (0, 0)})   # text inside figure regions does not count
-            rendered = tl.render_pages(source, [1], Path(tmp) / "rendered" / "a.pdf")
-            with pymupdf.open(str(rendered)) as doc:
-                self.assertEqual(doc.page_count, 1)
-                self.assertEqual((doc[0].rect.width, doc[0].rect.height), (300.0, 200.0))
-                self.assertEqual(len(doc[0].get_images()), 1)
             self.assertIsNone(tl.text_layer_cjk_by_page(Path(tmp) / "missing.pdf"))
 
     def test_candidate_pages_compare_layer_with_blocks_and_skip_figures(self) -> None:
@@ -3152,162 +3069,22 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(candidate_pages({0: 9, 1: 40, 2: 30, 3: 3, 4: 0}, got), [1, 2])   # page 3 has too little Chinese to count
         self.assertEqual(figure_boxes_by_page(blocks), {2: [[100.0, 100.0, 900.0, 600.0]]})
 
-    def test_repair_renders_only_confirmed_pages_and_splices_them_back(self) -> None:
-        from kb_pipeline.parsers import pdf_textlayer as tl
-
-        original = [self._block(0, "第一章 总则", section_path=["第一章"]), self._block(1, "1 2 3", section_path=["第一章"]),
-                    self._block(2, "4 5 6"), self._block(3, "第二章 正文照旧", section_path=["第二章"])]
-        layer = {0: 5, 1: 40, 2: 40, 3: 8}
-        rendered_pages = []
-        rendered_blocks = [self._block(1, "第一页救回来了 周期平稳 未见明显异常 建议定期复查"), self._block(2, "7 8 9")]   # small-PDF pages are 1-based
-        with patch.object(tl, "render_pages", side_effect=lambda src, pages, out, **kw: rendered_pages.append(list(pages)) or out):
-            merged, info = tl.repair_lost_text_layer(
-                original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none/x.pdf"), layer=layer,
-                detail=lambda pages, boxes: {1: (40, 40), 2: (40, 40)},     # both pages: CJK drawn with non-embedded fonts
-                parse_rendered=lambda p: rendered_blocks)
-        self.assertEqual(rendered_pages, [[1, 2]])                               # only the two confirmed pages are rendered
-        self.assertEqual((info["candidates"], info["lost_before"], info["recovered"], info["lost"]), ([1, 2], [1, 2], [1], [2]))
-        self.assertEqual([b.page_idx for b in merged], [0, 1, 2, 3])
-        page1 = merged[1]
-        self.assertTrue(page1.block_id.startswith("rendered-") and page1.metadata["rendered_page"])
-        self.assertEqual(page1.metadata["section_path"], ["第一章"])              # inherits the preceding block's section
-        self.assertIs(merged[2], original[2])                                    # a page that did not recover keeps its original blocks
-        self.assertIs(merged[3], original[3])
-
-    def test_repair_skips_pages_whose_chinese_is_embedded_or_inside_figures(self) -> None:
-        from kb_pipeline.parsers import pdf_textlayer as tl
-
-        original = [self._block(0, "封面"), self._block(1, "1 2 3")]
-        with patch.object(tl, "render_pages") as render:
-            blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"),
-                                                     layer={0: 2, 1: 40}, detail=lambda pages, boxes: {1: (40, 0)},   # all embedded fonts
-                                                     parse_rendered=lambda p: [])
-            self.assertIs(blocks, original)
-            self.assertEqual((info["candidates"], info["lost"]), ([1], []))
-            render.assert_not_called()
-            # the second parse blows up: the main flow is unaffected, the original result is used, the page stays lost
-            def boom(p):
-                raise RuntimeError("mineru down")
-            blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"),
-                                                     layer={0: 2, 1: 40}, detail=lambda pages, boxes: {1: (40, 40)}, parse_rendered=boom)
-            self.assertIs(blocks, original)
-            self.assertEqual(info["lost"], [1])
-            self.assertIn("mineru down", info["error"])
-        # no text-layer information (PyMuPDF missing / unreadable): the whole check is skipped
-        blocks, info = tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"), layer={},
-                                                 parse_rendered=lambda p: [])
-        self.assertIs(blocks, original)
-        self.assertFalse(info["checked"])
-
     def test_degraded_mark_reaches_the_chunk_payload_and_search_row(self) -> None:
+        """The mark a parser puts on a block it could only keep in part (an embedded picture of a kind that cannot
+        be read) travels with the chunk."""
         from kb_pipeline.models import UnifiedChunk
-        from kb_pipeline.parsers.pdf_textlayer import mark_degraded_pages
         from kb_pipeline.pipeline.parse_job import _payload_for_chunk
         from kb_search.evidence import source_row
 
-        merged = self._block(2, "跨页正文", page_start=2, page_end=3)
         single = self._block(5, "别页")
-        table = self._block(3, "1 | 2", "table")
-        self.assertEqual(mark_degraded_pages([merged, single, table], [3]), 2)      # merged blocks match by page range; page 5 untouched
-        self.assertEqual(merged.metadata["degraded"], "text_layer_cjk_lost")
-        self.assertNotIn("degraded", single.metadata)
+        table = self._block(3, "1 | 2", "table", degraded="unsupported_embedded_image")
         settings = SimpleNamespace(cache_dir=Path("/cache"), embedding_model_id="m")
         row = {"kb_id": "k", "file_key": 1, "source_path": "r/a.pdf", "rel_path": "a.pdf", "filename": "a.pdf",
                "dir": "", "content_version": "v", "size": 1, "mtime": 1, "mime_type": "application/pdf"}
         payload = _payload_for_chunk(settings, row, UnifiedChunk("u", 0, "t", table, 1), 1)
-        self.assertEqual(payload["degraded"], "text_layer_cjk_lost")
+        self.assertEqual(payload["degraded"], "unsupported_embedded_image")
         self.assertIsNone(_payload_for_chunk(settings, row, UnifiedChunk("u2", 1, "t", single, 1), 2).get("degraded"))
-        self.assertEqual(source_row(1, {"point_id": "p"}, {"text": "t", **payload})["degraded"], "text_layer_cjk_lost")
-
-    def test_second_pass_failures_are_told_apart(self) -> None:
-        """Resending the rendered pages to MinerU fails: every such failure used to be swallowed, the lost pages were
-        marked degraded and indexed as usual, the scan then judged the file unchanged and it was never retried.
-        Transient failures (unreachable, 5xx) must be able to propagate; an explicit rejection by MinerU (4xx) and
-        a rendering failure would fail the same way on retry, so they degrade in place."""
-        from kb_pipeline.parsers import pdf_textlayer as tl
-        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
-
-        original = [self._block(0, "封面"), self._block(1, "1 2 3")]
-
-        def repair(parse_rendered, **kw):
-            return tl.repair_lost_text_layer(original, path=Path("/x.pdf"), rendered_path=Path("/tmp/none"), layer={0: 2, 1: 40},
-                                             detail=lambda pages, boxes: {1: (40, 40)}, parse_rendered=parse_rendered, **kw)
-
-        def failing(exc):
-            def parse(_path):
-                raise exc
-            return parse
-
-        with patch.object(tl, "render_pages") as render:
-            for exc in (MinerUServiceError("500 Server Error", status_code=500), MinerUServiceError("connection reset"),
-                        RuntimeError("boom")):
-                with self.assertRaises(type(exc)):
-                    repair(failing(exc), raise_transient=True)
-                blocks, info = repair(failing(exc))                                  # last attempt: degrade in place
-                self.assertEqual((blocks, info["lost"]), (original, [1]))
-            blocks, info = repair(failing(MinerUServiceError("422 Unprocessable", status_code=422)), raise_transient=True)
-            self.assertEqual((blocks, info["lost"], info["rendered"]), (original, [1], False))
-            self.assertIn("422", info["error"])
-            render.side_effect = OSError("disk full")                                # rendering failed: a retry would fail the same way
-            blocks, info = repair(lambda p: [], raise_transient=True)
-            self.assertEqual((info["lost"], info["error"]), ([1], "OSError: disk full"))
-            render.reset_mock(side_effect=True)
-            blocks, info = repair(None, raise_transient=True)                        # check only, no repair
-            self.assertEqual((blocks, info["lost_before"], info["lost"]), (original, [1], [1]))
-            render.assert_not_called()
-
-    def _parse_pdf(self, tmp, fake_mineru, **kw):
-        """Run parse_pdf_enhanced once: the main parse yields two pages, and page 1 is confirmed to have lost its
-        text; fake_mineru stands in for MinerU, rendering is stubbed."""
-        from kb_pipeline.parsers import pdf_enhanced, pdf_textlayer as tl
-
-        with patch.object(pdf_enhanced, "mineru_pdf_blocks", fake_mineru), \
-                patch.object(tl, "text_layer_cjk_by_page", return_value={1: 40, 2: 7}), \
-                patch.object(tl, "page_details", return_value={1: (40, 40)}), \
-                patch.object(tl, "render_pages", side_effect=lambda src, pages, out, **_: out) as render:
-            blocks = pdf_enhanced.parse_pdf_enhanced(
-                mineru_url="http://x", vlm_base_url="u", vlm_api_key="", vlm_model_id="m", vlm_concurrency=1,
-                path=Path(tmp) / "a.pdf", cache_dir=Path(tmp) / "cache", **kw)
-        return blocks, render
-
-    def test_transient_second_pass_failure_retries_the_job_and_degrades_on_the_last_attempt(self) -> None:
-        from kb_pipeline.parsers.mineru_pdf import MinerUServiceError
-
-        def fake_mineru(*, path, **kw):
-            if path.name.endswith(".lost-pages.pdf"):
-                raise MinerUServiceError("500 Server Error", status_code=500)
-            return [self._block(1, "1 2 3"), self._block(2, "第二页正文照旧")]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(MinerUServiceError):
-                self._parse_pdf(tmp, fake_mineru)                                    # retries left: the job fails and runs again
-            blocks, _ = self._parse_pdf(tmp, fake_mineru, text_layer_repair="final")
-        self.assertEqual([b.metadata.get("degraded") for b in blocks], ["text_layer_cjk_lost"])
-        self.assertIn("第二页正文照旧", blocks[0].text)
-
-    def test_preview_mode_never_sends_the_rendered_pages_to_mineru(self) -> None:
-        """The chunk preview runs in the web process: without a resend result in the parse cache the pages are only
-        marked; with one, only the cache is read."""
-        seen = []
-
-        def fake_mineru(*, path, cached_only=False, **kw):
-            seen.append((path.name, cached_only))
-            if path.name.endswith(".lost-pages.pdf"):
-                return [self._block(1, "第一页救回来了 周期平稳 未见明显异常 建议定期复查 波形图报告结论正常")]
-            return [self._block(1, "1 2 3"), self._block(2, "第二页正文照旧")]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            blocks, render = self._parse_pdf(tmp, fake_mineru, text_layer_repair="cached")
-            self.assertEqual(seen, [("a.pdf", False)])
-            render.assert_not_called()
-            self.assertEqual([b.metadata.get("degraded") for b in blocks], ["text_layer_cjk_lost"])
-            cached = Path(tmp) / "cache" / "rendered" / "mineru" / "result.json"
-            cached.parent.mkdir(parents=True)
-            cached.write_text("{}", encoding="utf-8")
-            blocks, _ = self._parse_pdf(tmp, fake_mineru, text_layer_repair="cached")
-            self.assertEqual(seen[1:], [("a.pdf", False), ("a.lost-pages.pdf", True)])
-            self.assertIn("周期平稳", blocks[0].text)
-            self.assertNotIn("degraded", blocks[0].metadata)
+        self.assertEqual(source_row(1, {"point_id": "p"}, {"text": "t", **payload})["degraded"], "unsupported_embedded_image")
 
     @staticmethod
     def _fake_mineru_service(payload, posts):
@@ -3339,12 +3116,8 @@ class PdfTextLayerTests(unittest.TestCase):
             src.write_bytes(b"%PDF-1.4 demo")
             out = Path(tmp) / "mineru" / "result.json"
             call = lambda **kw: service_clients.call_mineru_sync("http://x", src, out, out.with_suffix(".md"), **kw)
-            with self.assertRaisesRegex(RuntimeError, "no cached MinerU result"):
-                call(cached_only=True)                                        # a cache-only caller: no cache means an error, no request
-            self.assertEqual(posts, [])
             call()
-            call()                                                            # same file, same backend: reused
-            self.assertEqual(call(cached_only=True)["_kb_source"], {"name": "a.pdf", "size": 13, "backend": "vlm-engine"})
+            self.assertEqual(call()["_kb_source"], {"name": "a.pdf", "size": 13, "backend": "vlm-engine"})   # same file, same backend: reused
             self.assertEqual([p["backend"] for p in posts], ["vlm-engine"])
             with patch.dict(os.environ, {"MINERU_BACKEND": "pipeline"}):
                 call()                                                        # backend changed: requested again
@@ -3357,54 +3130,3 @@ class PdfTextLayerTests(unittest.TestCase):
             out.write_text(json.dumps({"content_list": [{"type":"text", "text":"real body"}], "_kb_source": {"name": "a.pdf", "size": src.stat().st_size}}), encoding="utf-8")
             call()                                                            # 标记里没记后端:无从比较,照旧认
             self.assertEqual(len(posts), 3)
-
-    def test_parse_job_picks_the_mode_from_the_attempts_left(self) -> None:
-        """With retries left a transient failure makes the job retry, and the last attempt degrades in place;
-        callers outside a job (the chunk preview) read only the cache by default."""
-        from kb_pipeline import db
-        from kb_pipeline.pipeline import parse_job
-
-        seen = []
-
-        class Stop(Exception):
-            pass
-
-        def fake_parse_blocks(*args, **kw):
-            seen.append(kw.get("text_layer_repair"))
-            raise Stop()
-
-        def fake_pdf(**kw):
-            self.assertEqual((kw['vlm_base_url'], kw['vlm_api_key'], kw['vlm_model_id']),
-                             ('http://vision.invalid/v1', '', 'synthetic-vision'))
-            seen.append(kw["text_layer_repair"])
-            return []
-
-        with tempfile.TemporaryDirectory() as tmp:
-            pdf = Path(tmp) / "a.pdf"
-            pdf.write_bytes(b"%PDF-1.4 demo")
-            state_db = Path(tmp) / "state.db"
-            db.init_db(state_db)
-            with db.connect(state_db) as con:
-                db.upsert_llm(con, name="vision-a", base_url="http://vision.invalid/v1",
-                              api_key="", model_id="synthetic-vision", multimodal=True)
-            settings = SimpleNamespace(max_file_bytes=0, job_max_retries=5, cache_dir=Path(tmp) / "cache", mineru_url="http://x",
-                                       state_db=state_db, vlm_concurrency=1, vlm_temperature=0.1,
-                                       vlm_top_p=0.8, vlm_max_tokens=64, vlm_structured_output=True, image_max_pixels=1,
-                                       mineru_timeout_seconds=5)
-            source = SimpleNamespace(vlm_model="vision-a", vlm_prompt=None, graph_language=None,
-                                     block_merge_tokens=800, max_tokens=400, overlap_tokens=0)
-            row = {"physical_path": str(pdf), "size": 13, "mtime": int(pdf.stat().st_mtime), "kb_id": "kb_x", "file_key": 1,
-                   "content_version": "v", "source_path": "r/a.pdf"}
-            with patch.object(parse_job.db, "get_file_by_id", return_value=row), \
-                    patch.object(parse_job, "_source_for_file", return_value=source), \
-                    patch.object(parse_job, "verify_source_file"), \
-                    patch.object(parse_job, "_parse_blocks", fake_parse_blocks):
-                for retry_count in (0, 4, 5):
-                    job = {"job_id": "j", "file_id": "f", "parser_profile": "p", "retry_count": retry_count, "locked_by": None}
-                    with self.assertRaises(Stop):
-                        parse_job.process_parse_job(None, settings, job)
-            self.assertEqual(seen, ["retry", "retry", "final"])
-            with patch.object(parse_job, "parse_pdf_enhanced", fake_pdf):
-                parse_job._parse_blocks(settings, source, pdf, Path(tmp) / "cache", "p", row)
-                parse_job._parse_blocks(settings, source, pdf, Path(tmp) / "cache", "p", row, text_layer_repair="final")
-            self.assertEqual(seen[3:], ["cached", "final"])

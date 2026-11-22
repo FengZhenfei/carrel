@@ -12,7 +12,6 @@ from .mineru_docx import mineru_docx_blocks
 from .native_table import normalize_cell
 from .pdf_enhanced import merge_mineru_text_blocks, merge_split_tables
 from ..vision.vlm import compose_prompt
-from .table_repair import repair_ambiguous_tables
 from .visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text, tidy_visual_blocks
 
 
@@ -70,12 +69,8 @@ def parse_docx_enhanced(
     )
     tidy_visual_blocks(media_blocks)
     ensure_visual_blocks_have_text(media_blocks, doc_name=path.name)
-    table_blocks = [b for b in blocks if b.block_type == "table" and b.metadata.get("table_flags")]
-    if table_blocks:
-        stats = repair_ambiguous_tables(table_blocks, base_url=vlm_base_url, api_key=vlm_api_key, model_id=vlm_model_id,
-                                        cache_dir=cache_dir, vlm_options=vlm_options, caption_cache_root=caption_cache_root)
-        print(f"[parser] docx table-repair {stats} file={path.name}", flush=True)
-    return place_chart_blocks(blocks, extract_docx_chart_blocks(path))
+    blocks = place_chart_blocks(blocks, extract_docx_chart_blocks(path))
+    return attach_note_blocks(blocks, extract_docx_note_blocks(path, blocks))
 
 
 def extract_docx_media_blocks(*, path: Path, cache_dir: Path) -> list[ParsedBlock]:
@@ -160,11 +155,203 @@ def extract_docx_chart_blocks(path: Path) -> list[ParsedBlock]:
     return blocks
 
 
+_NOTE_PARTS = (("footnote", "word/footnotes.xml", "footnoteReference", "FOOTNOTE"),
+               ("endnote", "word/endnotes.xml", "endnoteReference", "ENDNOTE"))
+
+
+def _iter_ooxml_paragraphs(root: ET.Element):
+    """Yield <w:p> elements while skipping <mc:Fallback> duplicates inside <mc:AlternateContent>."""
+    stack = [root]
+    while stack:
+        elem = stack.pop()
+        tag = elem.tag
+        if tag.endswith("}Fallback") or tag == "Fallback":
+            continue
+        if tag == f"{_WORD_NS}p":
+            yield elem
+        # Push children in reverse so traversal stays in document order
+        children = list(elem)
+        for child in reversed(children):
+            stack.append(child)
+
+
+def _direct_paragraph_parts(para: ET.Element, marks: dict[str, tuple[str, str, str]]) -> tuple[str, list[tuple[str, str, str, str | None, str]]]:
+    """Return (paragraph_text, [(kind, part, label, note_id, text_before_mark)]) for this <w:p> without
+    descending into nested textbox paragraphs (<w:txbxContent>), avoiding double-counting nested <w:p>."""
+    chunks: list[str] = []
+    refs: list[tuple[str, str, str, str | None, str]] = []
+    before = ""
+
+    def walk(node: ET.Element) -> None:
+        nonlocal before
+        for child in node:
+            tag = child.tag
+            if tag.endswith("}Fallback") or tag == "Fallback" or tag == f"{_WORD_NS}txbxContent":
+                continue
+            if tag == f"{_WORD_NS}t":
+                t = child.text or ""
+                chunks.append(t)
+                before += t
+            elif tag in marks:
+                kind, part, label = marks[tag]
+                refs.append((kind, part, label, child.get(f"{_WORD_NS}id"), before))
+            else:
+                walk(child)
+
+    walk(para)
+    return clean_text("".join(chunks)), refs
+
+
+def extract_docx_note_blocks(path: Path, blocks: list[ParsedBlock] = ()) -> list[ParsedBlock]:
+    """One block for each footnote and endnote, in the order their reference marks appear in the body. The
+    recogniser's answer for a Word file holds no notes at all, so without this they are not in the index.
+    metadata.anchor_text is the paragraph that carries the mark, anchor_tail the last few characters before the
+    mark and anchor_paragraph the number of that paragraph; attach_note_blocks uses them to write the note where
+    it belongs. A note that the recogniser already delivered (in an explicit note block/line, attached to its
+    anchored paragraph unit, or in an unmatched standalone text block) is left out without letting unrelated
+    body phrasing, merged table repetitions, charts, or image captions suppress a real footnote."""
+    found: list[ParsedBlock] = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            notes: dict[tuple[str, str | None], str] = {}
+            for kind, part, _mark, _label in _NOTE_PARTS:
+                if part not in names:
+                    continue
+                for note in ET.fromstring(zf.read(part)).iter(f"{_WORD_NS}{kind}"):
+                    text = "\n".join(line for line in (_paragraph_text(para) for para in note.iter(f"{_WORD_NS}p")) if line)
+                    if text:
+                        notes[(kind, note.get(f"{_WORD_NS}id"))] = text
+            if not notes:
+                return []
+
+            def plain(text: str) -> str:
+                return _MARKUP_RE.sub("", _LINK_RE.sub(r"\1", text))
+
+            # 1. Explicit note texts already recognised (dedicated note blocks or FOOTNOTE:/ENDNOTE: lines only).
+            explicit_note_texts: list[str] = []
+            for block in blocks:
+                if block.metadata.get("source_type") in {"footnote", "endnote"}:
+                    p = plain(block.text or "")
+                    if p:
+                        explicit_note_texts.append(p)
+                else:
+                    for line in (block.text or "").splitlines():
+                        stripped = line.lstrip()
+                        if stripped.startswith(("FOOTNOTE:", "ENDNOTE:")):
+                            body = plain(stripped.split(":", 1)[1])
+                            if body:
+                                explicit_note_texts.append(body)
+            explicit_used: list[bool] = [False] * len(explicit_note_texts)
+
+            # 2. Decompose eligible body blocks into paragraph units (same granularity as attach_note_blocks)
+            #    so merged 800-token blocks are checked per paragraph unit, and exclude VLM/chart/media blocks.
+            doc_root = ET.fromstring(zf.read("word/document.xml"))
+            marks = {f"{_WORD_NS}{mark}": (kind, part, label) for kind, part, mark, label in _NOTE_PARTS}
+            doc_entries: list[tuple[str, str, list[tuple[str, str, str, str | None, str]]]] = []
+            for para in _iter_ooxml_paragraphs(doc_root):
+                ptxt, prefs = _direct_paragraph_parts(para, marks)
+                doc_entries.append((ptxt, plain(ptxt), prefs))
+            ooxml_body_plains = [p for _, p, _ in doc_entries if p]
+
+            unit_entries: list[tuple[str, bool, bool]] = []  # (plain_text, is_plain_text_block, is_body_para)
+            for block in blocks:
+                if block.parser in {"docx-ooxml-chart", "docx-ooxml-media"} or block.visual_ref:
+                    continue
+                bu = _paragraph_units(block)
+                if not bu:
+                    continue
+                is_text_block = block.block_type in {"text", "list"}
+                for start, end, _span in bu:
+                    up = plain((block.text or "")[start:end])
+                    is_body = bool(up) and any(up == bp or (len(up) >= 6 and up in bp) for bp in ooxml_body_plains)
+                    unit_entries.append((up, is_text_block, is_body))
+
+            # Unmatched standalone text units (candidate recogniser-emitted note blocks, e.g. endnotes at tail)
+            unmatched_text_units: list[tuple[int, str]] = [
+                (idx, up) for idx, (up, is_text_block, is_body) in enumerate(unit_entries)
+                if is_text_block and up and not is_body
+            ]
+            unmatched_used: set[int] = set()
+
+            cursor = -1
+            last_para = None
+            for number, (para_text, para_plain, refs) in enumerate(doc_entries):
+                for kind, part, label, note_id, before in refs:
+                    text = notes.pop((kind, note_id), "")
+                    needle = _MARKUP_RE.sub("", text)
+                    if not text or not needle:
+                        continue
+                    # Check 1: explicit note block / FOOTNOTE: line (consume once per match)
+                    already = False
+                    for ei, etxt in enumerate(explicit_note_texts):
+                        if not explicit_used[ei] and needle in etxt:
+                            explicit_used[ei] = True
+                            already = True
+                            break
+                    # Check 2: anchored paragraph unit & its immediate next non-body unit
+                    if not already and unit_entries:
+                        short = _MARKUP_RE.sub("", before)[-16:]
+                        short = short if len(short) >= 6 else ""
+                        if cursor >= 0 and number == last_para:
+                            places = [cursor]
+                        else:
+                            places = [*range(cursor + 1, len(unit_entries)), *([cursor] if cursor >= 0 else [])]
+                        anchored = next(
+                            (n for k in (para_plain, short) if k for n in places if k in unit_entries[n][0]),
+                            None,
+                        )
+                        if anchored is not None:
+                            cursor, last_para = anchored, number
+                            up = unit_entries[anchored][0]
+                            if up.count(needle) > para_plain.count(needle):
+                                already = True
+                            elif anchored + 1 < len(unit_entries):
+                                nxt_up, nxt_is_text, nxt_is_body = unit_entries[anchored + 1]
+                                if nxt_is_text and not nxt_is_body and (anchored + 1) not in unmatched_used:
+                                    # Also join one more consecutive unmatched text unit for split multi-para notes
+                                    combined = nxt_up
+                                    span_ids = [anchored + 1]
+                                    if anchored + 2 < len(unit_entries):
+                                        n2_up, n2_text, n2_body = unit_entries[anchored + 2]
+                                        if n2_text and not n2_body and (anchored + 2) not in unmatched_used:
+                                            combined += n2_up
+                                            span_ids.append(anchored + 2)
+                                    if needle in nxt_up:
+                                        unmatched_used.add(anchored + 1)
+                                        already = True
+                                    elif needle in combined:
+                                        unmatched_used.update(span_ids)
+                                        already = True
+                    # Check 3: unmatched standalone text unit elsewhere (e.g. endnote emitted at end of doc)
+                    if not already and unmatched_text_units:
+                        for ui, uplain in unmatched_text_units:
+                            if ui not in unmatched_used and needle in uplain:
+                                unmatched_used.add(ui)
+                                already = True
+                                break
+                    if already:
+                        continue
+                    found.append(ParsedBlock(
+                        parser="docx-ooxml-note", parser_profile="docx-ooxml-note-v1", doc_type="docx",
+                        block_type="text", text=f"{label}: {text}", block_id=f"docx-{kind}-{len(found) + 1:04d}",
+                        metadata={"ooxml_path": part, "source_type": kind, "anchor_text": para_text,
+                                  "anchor_tail": _MARKUP_RE.sub("", before)[-16:], "anchor_paragraph": number}))
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        return []
+    return found
+
+
+def _paragraph_text(para: ET.Element) -> str:
+    return clean_text("".join(node.text or "" for node in para.iter(f"{_WORD_NS}t")))
+
+
 _CHART_NS = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 _AXIS_TAGS = frozenset(f"{_CHART_NS}{kind}" for kind in ("catAx", "dateAx", "valAx", "serAx"))
 _MARKUP_RE = re.compile(r"[\s*_`\\#]+")          # whitespace and markdown marks are ignored when comparing text
+_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 
 
 def chart_anchors(zf: zipfile.ZipFile) -> dict[str, str]:
@@ -212,6 +399,90 @@ def place_chart_blocks(blocks: list[ParsedBlock], charts: list[ParsedBlock]) -> 
         plain.insert(at + 1, "")
         last_key, last_at = key, at + 1
     return out + tail
+
+
+def _paragraph_units(block: ParsedBlock) -> list[tuple[int, int, dict | None]] | None:
+    """The stretches of a block's text that came from one paragraph of the source each: (start, end, span record).
+    A merged text block lists them in metadata.section_spans; any other text or table block is one stretch.
+    None for a block that takes no note (a picture, a formula) or whose span list does not fit its text."""
+    if block.block_type not in {"text", "list", "table"} or block.visual_ref:
+        return None
+    text = block.text or ""
+    spans = block.metadata.get("section_spans")
+    if not spans:
+        return [(0, len(text), None)]
+    units, at = [], 0
+    for span in spans:
+        start, end = span.get("start"), span.get("end")
+        if not isinstance(start, int) or not isinstance(end, int) or not at <= start <= end <= len(text):
+            return None
+        units.append((start, end, span))
+        at = end
+    return units
+
+
+def attach_note_blocks(blocks: list[ParsedBlock], notes: list[ParsedBlock]) -> list[ParsedBlock]:
+    """Write every footnote and endnote into the block that holds its paragraph, on a line of its own right after
+    that paragraph (after the table when the mark is in a table cell, where the note lines of a table already go).
+    A reader of the chunk then finds the note under the sentence it explains, as on the printed page, and the note
+    shares that paragraph's section. Only a note whose paragraph is not found becomes a block of its own, at the
+    end of the document.
+
+    The paragraph is looked for as it stands and, failing that (the recogniser may leave out a field or a
+    cross-reference), by the last characters before the mark. A link the recogniser wrote as [text](address) is
+    compared by its text. Notes come in the order of their marks, so the search goes on from the last place
+    found: a note from another paragraph looks further down first and only then in that same place (two cells
+    of one table, two paragraphs the recogniser delivered as one)."""
+    if not notes:
+        return blocks
+    units = [_paragraph_units(block) for block in blocks]
+    order = [(i, j) for i, block_units in enumerate(units) for j in range(len(block_units or ()))]
+    seen: dict[tuple[int, int], str] = {}
+
+    def plain(text: str) -> str:
+        return _MARKUP_RE.sub("", _LINK_RE.sub(r"\1", text))
+
+    def holds(place: tuple[int, int], needle: str) -> bool:
+        if place not in seen:
+            start, end, _span = units[place[0]][place[1]]
+            seen[place] = plain((blocks[place[0]].text or "")[start:end])
+        return needle in seen[place]
+
+    tail: list[ParsedBlock] = []
+    at = -1                                               # position in order of the last place found
+    last_paragraph = None
+    for note in notes:
+        key = plain(str(note.metadata.get("anchor_text") or ""))
+        short = plain(str(note.metadata.get("anchor_tail") or ""))
+        short = short if len(short) >= 6 else ""          # a handful of characters would match anywhere
+        paragraph = note.metadata.get("anchor_paragraph")
+        if at >= 0 and paragraph is not None and paragraph == last_paragraph:
+            places = [at]                                 # another mark in the same paragraph: one note after the other
+        else:
+            places = [*range(at + 1, len(order)), *([at] if at >= 0 else [])]
+        found = next((n for needle in (key, short) if needle for n in places if holds(order[n], needle)), None)
+        if found is None:
+            tail.append(note)
+            continue
+        at, last_paragraph = found, paragraph
+        i, j = order[found]
+        block = blocks[i]
+        end = units[i][j][1]
+        line = "\n" + note.text
+        block.text = block.text[:end] + line + block.text[end:]
+        if block.block_type == "table" and block.table_markdown is not None:
+            block.table_markdown = block.text             # a table's text and table_markdown must stay the same (as in the PDF route)
+        # That stretch grows by the note, the ones after it move down
+        for n, (a, b, record) in enumerate(units[i]):
+            if n < j:
+                continue
+            a, b = (a, b + len(line)) if n == j else (a + len(line), b + len(line))
+            if record is not None:
+                record["start"], record["end"] = a, b
+            units[i][n] = (a, b, record)
+        seen.pop((i, j), None)
+        block.metadata.setdefault("footnote_block_ids", []).append(note.block_id)
+    return blocks + tail
 
 
 def chart_xml_table(raw: bytes) -> tuple[str, list[str], str]:

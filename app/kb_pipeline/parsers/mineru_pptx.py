@@ -48,11 +48,14 @@ def mineru_pptx_blocks(
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     slide_by_index = normalize_pptx_slide_indexes(content)
     blocks: list[ParsedBlock] = []
-    count = 0
+    count = notes = 0
     for idx, item in enumerate(content):
         raw_type = label_of(item)
-        if raw_type in {"page_footnote", "footer", "header"}:
+        if raw_type in {"footer", "header"}:
             continue
+        # For a presentation the recogniser reports the speaker notes of a slide as page_footnote items, after
+        # the slide's own items. They used to be skipped together with the slide footers.
+        speaker_note = raw_type == "page_footnote"
         image_path = resolve_image_path(item, image_map, allowed_root=cache_dir / "mineru")
         text = item_text(item)
         footnote = footnote_of(item)
@@ -71,7 +74,12 @@ def mineru_pptx_blocks(
         # No de-duplication by content: short labels repeated on one slide (four cards all saying "Supported")
         # are part of the layout, see mineru_docx
         slide_idx = slide_by_index.get(idx)
-        count += 1
+        if speaker_note:
+            notes += 1
+            block_id = f"mineru-pptx-note-{notes:05d}"       # numbered apart: block ids are part of chunk ids
+        else:
+            count += 1
+            block_id = f"mineru-pptx-{block_type}-{count:05d}"
         blocks.append(
             ParsedBlock(
                 parser="mineru",
@@ -80,7 +88,7 @@ def mineru_pptx_blocks(
                 block_type=block_type,
                 text=text,
                 table_markdown=text if block_type == "table" else None,
-                block_id=f"mineru-pptx-{block_type}-{count:05d}",
+                block_id=block_id,
                 page_idx=slide_idx,
                 slide_idx=slide_idx,
                 bbox=bbox(item),
@@ -90,6 +98,7 @@ def mineru_pptx_blocks(
                     "source_type": raw_type,
                     "raw_page": raw_page(item),
                     "source_item": {k: v for k, v in item.items() if k not in {"text", "content", "html"}},
+                    **({"speaker_note": True} if speaker_note else {}),
                 },
             )
         )
@@ -122,15 +131,18 @@ def aggregate_mineru_slide_blocks(blocks: list[ParsedBlock], path: Path) -> list
     slide_titles: dict[int, str] = {}
     for slide in sorted(text_by_slide):
         slide_blocks = text_by_slide[slide]
-        text = clean_text("\n\n".join(block.text or "" for block in slide_blocks))
-        if not text:
-            continue
+        notes = clean_text("\n".join(block.text or "" for block in slide_blocks if block.metadata.get("speaker_note")))
+        text = clean_text("\n\n".join(block.text or "" for block in slide_blocks if not block.metadata.get("speaker_note")))
         # The slide's first line (usually the slide title) serves as the section: both the retrieval
-        # prefix and the section path used in graph recall depend on it
+        # prefix and the section path used in graph recall depend on it. A line of the notes never does.
         first_line = next((l.strip() for l in text.splitlines() if l.strip()), "")
         heading = clean_heading_text(first_line) if len(first_line) <= 80 else ""
         if heading:
             slide_titles[slide] = heading
+        if notes:
+            text = (text + "\n\n" if text else "") + "SPEAKER NOTES:\n" + notes
+        if not text:
+            continue
         merged.append(
             ParsedBlock(
                 parser="mineru",

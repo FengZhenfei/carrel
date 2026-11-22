@@ -9,7 +9,6 @@ from kb_pipeline.models import ParsedBlock
 from kb_pipeline.parsers.mineru_pdf import mineru_pdf_blocks
 from kb_pipeline.parsers.mineru_quality import merge_table_placeholders, recover_pdf_items
 from kb_pipeline.parsers.pdf_longpage import restore_page_coordinates
-from kb_pipeline.parsers.pdf_textlayer import splice_rendered
 
 
 def html(rows):
@@ -149,16 +148,6 @@ def test_region_coordinates_follow_long_page_tiles_without_mutating_shared_notes
     assert b.metadata['table_note_sources'][0] == b.metadata['source_regions'][1]
     assert note['page'] == 2 and note['bbox'] == [100, 100, 900, 400]
     assert b.metadata['page_end'] == 1
-
-
-def test_rendered_subset_regions_use_original_page_numbers():
-    b = ParsedBlock(parser='p', parser_profile='p', doc_type='pdf', block_type='table', text='表格内容',
-        block_id='a', page_idx=1, metadata={'page_end': 2, 'source_regions': [{'page': 1}, {'page': 2}],
-                                         'table_note_sources': [{'page': 2}]})
-    out, _, _ = splice_rendered([], [b], [4, 9], {4: 1, 9: 1})
-    assert out[0].page_idx == 4 and out[0].metadata['page_end'] == 9
-    assert [r['page'] for r in out[0].metadata['source_regions']] == [4, 9]
-    assert out[0].metadata['table_note_sources'] == [{'page': 9}]
 
 
 @pytest.mark.parametrize('native_value,expected', [('34', 1), ('35', 2)])

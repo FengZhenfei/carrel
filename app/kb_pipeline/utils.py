@@ -69,14 +69,52 @@ def infer_doc_type(filename: str, mime_type: str = "") -> str:
     return "unknown"
 
 
+_SENTENCE_BREAK_RE = re.compile(r"((?<=[。！？；])\s*|(?<=[.!?])\s+|\n{2,})")
+# The number or letter of a list item at the start of a line ("1. ", "2.3. ", "a. "), multi-letter Roman
+# numerals ("II. ", "IV. ", "VI. ", "vii. "), or a structural item/caption label ("Step 1. ", "Figure 2.1. ",
+# "Option A. ", "步骤 1. ", "图2.1. "), also right after the TITLE: label that the chunker writes in front of a
+# heading, and behind a few marks that are not words: emphasis, a quote mark, a bullet ("**1. Scope**", "> 2. ",
+# "- 3. ", "*J. Name*"). Its period ends no sentence.
+_ROMAN_MARKER_RE = r"(?:X{1,3}(?:IX|IV|V?I{0,3})|VI{1,3}|I{2,3}|IV|IX|V|x{1,3}(?:ix|iv|v?i{0,3})|vi{1,3}|i{2,3}|iv|ix|v)"
+_ENG_LABEL_WORDS = (
+    r"Step|Steps|Stage|Phase|Part|Item|Task|Rule|Note|Tip|Case|Option|Choice|Method|Mode|"
+    r"Fig|Figure|Table|Tab|Chart|Box|Listing|Example|Ex|Algorithm|Theorem|Lemma|Definition|"
+    r"Eq|Equation|Section|Sec|Chapter|Ch|Appendix|App|Clause|Article|Art|Question|Answer"
+)
+_CJK_LABEL_WORDS = r"步骤|阶段|环节|条款|附图|附表|附录|示例|方案|选项|问题|方法|任务|规则|公式|算法|定理|定义|图|表|例"
+_WORD_LABEL_MARKER_RE = (
+    rf"(?:(?:{_ENG_LABEL_WORDS})[ \t]+|(?:{_CJK_LABEL_WORDS})[ \t]*)"
+    r"(?:\d{1,3}(?:\.\d{1,3}){0,2}|[A-Z])"
+)
+_LIST_MARKER_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:TITLE:[ \t]*)?(?:[^\w\n]|_){0,10}"
+    rf"(?:\d{{1,3}}(?:\.\d{{1,3}}){{0,3}}|[A-Za-z]|{_ROMAN_MARKER_RE}|{_WORD_LABEL_MARKER_RE})\.\Z"
+)
+
+
 def split_sentences(text: str) -> list[str]:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # CJK sentence enders are never followed by a space, so requiring \s+
     # after them meant long Chinese paragraphs never split at all and fell
     # through to arbitrary character cuts. ASCII .!? keep the whitespace
     # requirement -- "3.14" and file names must not split.
-    parts = re.split(r"(?<=[。！？；])\s*|(?<=[.!?])\s+|\n{2,}", text)
-    return [p.strip() for p in parts if p.strip()]
+    pieces = _SENTENCE_BREAK_RE.split(text)          # text, break, text, break, ..., text
+    parts: list[str] = []
+    current = ""
+    for i in range(0, len(pieces), 2):
+        current += pieces[i]
+        gap = pieces[i + 1] if i + 1 < len(pieces) else ""
+        if gap and "\n" not in gap and _LIST_MARKER_RE.search(current):
+            # "1. Disconnect the power" used to come out as "1." and "Disconnect the power", each on a line of
+            # its own in the chunk. A marker that stands alone on its line in the source is left alone.
+            current += gap
+            continue
+        if current.strip():
+            parts.append(current.strip())
+        current = ""
+    if current.strip():
+        parts.append(current.strip())
+    return parts
 
 
 def approx_tokens(text: str) -> int:

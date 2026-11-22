@@ -55,7 +55,8 @@ class LongPageTests(unittest.TestCase):
 
     def test_missing_tile_provenance_fails_instead_of_inventing_page(self):
         b=ParsedBlock('mineru','pdf','pdf','text','x','b')
-        with self.assertRaises(ValueError):restore_page_coordinates([b],[dict(page=1,tiled=True,y0=0,y1=1000,width=600,height=4000)])
+        from kb_pipeline.parsers.errors import NonRetryableParseError
+        with self.assertRaises(NonRetryableParseError):restore_page_coordinates([b],[dict(page=1,tiled=True,y0=0,y1=1000,width=600,height=4000)])
 
     def test_continuation_table_covers_both_original_regions(self):
         from kb_pipeline.parsers.pdf_enhanced import merge_split_tables
@@ -63,7 +64,7 @@ class LongPageTests(unittest.TestCase):
         for i, (text, box) in enumerate([('| Item | Value |\n| --- | --- |\n| A | 12 |',[100,100,800,200]),
                                        ('| B | 34 |\n| --- | --- |',[100,220,800,300])]):
             rows.append(ParsedBlock('mineru','pdf','pdf','table',text,str(i),page_idx=1,bbox=box,
-                                    table_markdown=text,metadata={'source_tile':{'tile':i+1,'page':1}}))
+                                    table_markdown=text,metadata={'source_tile':{'tile':i+1,'page':1,'tiled':True}}))
         merged=merge_split_tables(rows)
         self.assertEqual(len(merged),1)
         self.assertEqual(merged[0].bbox,[100,100,800,300])

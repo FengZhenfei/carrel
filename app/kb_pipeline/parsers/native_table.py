@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from ..chunking.chunker import pack_labelled_cells
 from ..models import ParsedBlock
 from ..utils import count_tokens
-from .common import clean_text
+from .common import clean_text, looks_like_header_cell
 from .source_guard import require_source_content
 from .openpyxl_compat import load_workbook_compat
 
@@ -85,6 +85,52 @@ def _read_csv_rows_with_encoding(path: Path, *, encoding: str, errors: str) -> l
 
 
 _XLSX_EMPTY_RUN_LIMIT = 5000
+# A sheet can be hidden in two ways. "hidden" is what the author chooses from the menu; such a sheet is read like any
+# other (see read_xlsx_rows). "veryHidden" cannot be set or undone from the menus, only by a program, and programs
+# use it for records of their own: WPS keeps a copy of every picture placed in a cell on a very hidden sheet
+# (WpsReserved_CellImgList), add-ins keep their caches on one. That is not content of the document, and reading it
+# put each of those pictures into the index a second time. Such sheets are not read (.xls: visibility 2).
+VERY_HIDDEN = "veryHidden"
+
+
+class SheetRows(list):
+    """The rows of one sheet, [(row number, cells)], with what the workbook hides in it: the hidden rows and the hidden
+    columns (numbered from 1). All of it is read. in_view() gives the rows as the sheet shows them, and that is where
+    the header of the sheet is looked for (chunk_rows_to_blocks)."""
+
+    hidden: frozenset[int] = frozenset()
+    hidden_columns: frozenset[int] = frozenset()
+
+    @classmethod
+    def of(cls, rows: Iterable[tuple[int, list[str]]], hidden: Iterable[int] = (), hidden_columns: Iterable[int] = ()) -> "SheetRows":
+        out = cls(rows)
+        out.hidden = frozenset(int(n) for n in hidden)
+        out.hidden_columns = frozenset(int(n) for n in hidden_columns)
+        return out
+
+    def in_view(self) -> list[tuple[int, list[str]]]:
+        """What was read of the sheet while hidden content was left out: no hidden rows, the cells of hidden columns
+        empty, and no row that shows nothing."""
+        if not (self.hidden or self.hidden_columns):
+            return list(self)
+        out = []
+        for number, row in self:
+            if number in self.hidden:
+                continue
+            cells = ["" if column in self.hidden_columns else cell for column, cell in enumerate(row, 1)]
+            if any(cells):
+                out.append((number, cells))
+        return out
+
+
+def _shown_column(first: int, last: int, hidden: Iterable[int]) -> int:
+    """The column the label of a merged range first..last is read into: where the sheet shows it, which is the first
+    column of the range that is not hidden (the label is drawn across what is left of the range), and the first column
+    of the range when all of it is hidden. A merged cell holds one value and it is read once: in the place where it
+    was read while hidden columns were left out, so that a group label above a hidden and a shown column still names
+    the shown one ("备注组/对外备注") and a title merged across a sheet whose first column is hidden is not written
+    twice."""
+    return next((col for col in range(first, last + 1) if col not in hidden), first)
 
 
 HEADER_SPAN_MAX_ROWS = 3     # a vertical merge starting on a row counts as evidence of a header tier only if it spans at most this many rows (category labels spanning dozens of rows do not)
@@ -151,18 +197,33 @@ def _xlsx_shown_value(cell: Any, epoch: datetime.datetime) -> Any:
         return value
 
 
+def _xlsx_hidden_columns(ws: Any) -> set[int]:
+    """The numbers of the columns a sheet hides. One column record can stand for a run of columns (min..max)."""
+    from openpyxl.utils import column_index_from_string
+
+    hidden: set[int] = set()
+    for key, dim in ws.column_dimensions.items():
+        if not getattr(dim, "hidden", False):
+            continue
+        first = int(getattr(dim, "min", None) or column_index_from_string(key))
+        hidden.update(range(first, int(getattr(dim, "max", None) or first) + 1))
+    return hidden
+
+
 def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], dict[int, int]]]:
     try:
         wb = load_workbook_compat(str(path), data_only=True, read_only=False)
         output: list[tuple[str, list[tuple[int, list[str]]], dict[int, int]]] = []
         for ws in wb.worksheets:
-            if str(getattr(ws, "sheet_state", "visible") or "visible") != "visible":
-                # Hidden sheets are mostly archived old data / helper calculation sheets: not indexed
-                # (health check R8)
-                print(f"[XLSX] skip hidden sheet {path.name}:{ws.title}", flush=True)
+            if getattr(ws, "sheet_state", None) == VERY_HIDDEN:
+                print(f"[XLSX] skip very hidden sheet {path.name}:{ws.title}", flush=True)
                 continue
-            hidden_rows = {int(r) for r, dim in ws.row_dimensions.items() if getattr(dim, "hidden", False)}
+            # Hidden sheets, rows and columns are read like the ones in view: what a workbook hides is still part
+            # of the document, the same as a hidden slide of a presentation. (Hidden sheets and rows used to be
+            # left out, and hidden columns for a while as well.)
             merged_values: dict[tuple[int, int], str] = {}
+            moved: set[tuple[int, int]] = set()
+            hidden_cols = _xlsx_hidden_columns(ws)
             # Clamp fills to the used range: an accidental whole-column merge
             # (A1:A1048576 is one Excel/WPS click away) would otherwise build
             # a ~1M-entry dict per merge before a single row is read.
@@ -184,24 +245,31 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                 # repeated over 7 rows, which chunked into dozens of verbatim-identical chunks -- the
                 # same vector stored dozens of times, surfacing in clusters at retrieval. 9.2% of all
                 # table-native-v1 chunks came from this.
+                shown_col = _shown_column(min_col, max_col, hidden_cols)
                 for row_no in range(min_row, min(max_row, used_rows) + 1):
-                    merged_values[(row_no, min_col)] = value
+                    merged_values[(row_no, shown_col)] = value
+                if shown_col != min_col:
+                    moved.add((min_row, min_col))        # its own cell is hidden: the value is read where it shows
             rows: list[tuple[int, list[str]]] = []
             empty_run = 0
+            hidden_rows = {int(r) for r, dim in ws.row_dimensions.items() if getattr(dim, "hidden", False)}
             # Read only up to the last row / column with content (rows a merged range is filled down to count
             # as content): no cells are built for formatted but empty areas
             last_row = max([content_rows] + [row_no for row_no, _col in merged_values])
             last_col = max([content_cols] + [col_no for _row, col_no in merged_values])
             for row in (ws.iter_rows(max_row=last_row, max_col=last_col) if last_row > 0 and last_col > 0 else ()):
-                if row and row[0].row in hidden_rows:
-                    continue
                 values: list[str] = []
                 for cell in row:
-                    values.append(normalize_cell(_xlsx_shown_value(cell, wb.epoch), cell.number_format)
-                                  or merged_values.get((cell.row, cell.column), ""))
+                    own = "" if (cell.row, cell.column) in moved else normalize_cell(_xlsx_shown_value(cell, wb.epoch), cell.number_format)
+                    values.append(own or merged_values.get((cell.row, cell.column), ""))
                 if any(values):
                     empty_run = 0
                     rows.append((row[0].row if row else len(rows) + 1, values))
+                    continue
+                if row and row[0].row in hidden_rows:
+                    # An empty hidden row does not count towards the run of empty rows that ends the sheet. It
+                    # never did while hidden rows were left out, and the part of a sheet that is read must not
+                    # get shorter because its hidden rows are read now.
                     continue
                 # ws.max_row is affected by formatting: a sheet with a whole column formatted "uses"
                 # row 1048576, with nothing but empty rows after the data. Several thousand consecutive
@@ -210,7 +278,8 @@ def read_xlsx_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], d
                 if empty_run >= _XLSX_EMPTY_RUN_LIMIT:
                     break
             if rows:
-                output.append((ws.title or "Sheet", rows, vertical_spans(m.bounds for m in ws.merged_cells.ranges)))
+                output.append((ws.title or "Sheet", SheetRows.of(rows, hidden_rows, hidden_cols),
+                               vertical_spans(m.bounds for m in ws.merged_cells.ranges)))
         return output
     except Exception as exc:
         print(f"[XLSX WARN] openpyxl failed, fallback XML: {path} -> {exc!r}", flush=True)
@@ -225,9 +294,12 @@ def read_xlsx_rows_via_xml(path: Path) -> list[tuple[str, list[tuple[int, list[s
             rows = _xlsx_parse_sheet_rows(archive, sheet_path, shared)
             root = ET.fromstring(archive.read(sheet_path))
             from openpyxl.utils.cell import range_boundaries
-            spans = vertical_spans(range_boundaries(x.attrib["ref"]) for x in _xml_findall(root, ".//mergeCell", _xml_namespace(root)))
+            ns = _xml_namespace(root)
+            spans = vertical_spans(range_boundaries(x.attrib["ref"]) for x in _xml_findall(root, ".//mergeCell", ns))
             if rows:
-                output.append((sheet_name or "Sheet", rows, spans))
+                hidden = (int(x.attrib.get("r") or 0) for x in _xml_findall(root, ".//sheetData/row", ns)
+                          if x.attrib.get("hidden") in ("1", "true"))
+                output.append((sheet_name or "Sheet", SheetRows.of(rows, hidden, _xml_hidden_columns(root, ns)), spans))
     return output
 
 
@@ -273,8 +345,8 @@ def _xlsx_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
         if rel_id and target:
             rel_targets[rel_id] = target
 
-    for sheet in _xml_findall(workbook, ".//sheets/sheet", workbook_ns):
-        if sheet.attrib.get("state", "visible") != "visible":
+    for sheet in _xml_findall(workbook, ".//sheets/sheet", workbook_ns):       # hidden sheets too, see read_xlsx_rows
+        if sheet.attrib.get("state") == VERY_HIDDEN:
             continue
         name = sheet.attrib.get("name") or "Sheet"
         rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") or sheet.attrib.get("r:id")
@@ -322,13 +394,10 @@ def _xlsx_parse_sheet_rows(
     props = _xml_find(wb, "workbookPr", _xml_namespace(wb))
     epoch = CALENDAR_MAC_1904 if props is not None and props.attrib.get("date1904") in ("1", "true") else CALENDAR_WINDOWS_1900
     values = {}
-    hidden = set()
     used_row = used_col = 0
     for row_el in _xml_findall(root, ".//sheetData/row", ns):
         row_no = int(row_el.attrib.get("r") or 1)
         used_row = max(used_row, row_no)
-        if row_el.attrib.get("hidden") in ("1", "true"):
-            hidden.add(row_no)
         for cell in _xml_findall(row_el, "c", ns):
             match = re.match(r"^([A-Z]+)", cell.attrib.get("r", ""))
             if not match:
@@ -351,18 +420,34 @@ def _xlsx_parse_sheet_rows(
             if value:
                 values[(row_no, col)] = value
                 used_col = max(used_col, col)
+    hidden_cols = _xml_hidden_columns(root, ns)
     for merged in _xml_findall(root, ".//mergeCell", ns):
         min_col, min_row, max_col, max_row = range_boundaries(merged.attrib["ref"])
         value = values.get((min_row, min_col))
         if value:
+            # a row ends at the last column with a value of its own: a label that shows beyond it stays in its cell
+            shown_col = _shown_column(min_col, max_col, hidden_cols)
+            shown_col = shown_col if shown_col <= used_col else min_col
+            if shown_col != min_col:
+                del values[(min_row, min_col)]           # its own cell is hidden: the value is read where it shows
             for row_no in range(min_row, min(max_row, used_row) + 1):
-                values.setdefault((row_no, min_col), value)
+                values.setdefault((row_no, shown_col), value)
     rows = []
-    for row_no in sorted({r for r, _ in values} - hidden):
+    for row_no in sorted({r for r, _ in values}):
         row = [values.get((row_no, col), "") for col in range(1, used_col + 1)]
         if any(row):
             rows.append((row_no, row))
     return rows
+
+
+def _xml_hidden_columns(root: ET.Element, ns: str | None) -> set[int]:
+    """The numbers of the columns a sheet hides, read from its XML. One record can stand for a run of columns."""
+    hidden: set[int] = set()
+    for col in _xml_findall(root, ".//cols/col", ns):
+        if col.attrib.get("hidden") in ("1", "true"):
+            first = int(col.attrib.get("min") or 0)
+            hidden.update(range(first, int(col.attrib.get("max") or first) + 1))
+    return hidden
 
 
 def _xlsx_cell_value(cell: ET.Element, shared_strings: list[str], ns: str | None) -> str:
@@ -410,26 +495,67 @@ def read_xls_rows(path: Path) -> list[tuple[str, list[tuple[int, list[str]]], di
     except Exception as exc:
         raise RuntimeError("xlrd is required to parse .xls files") from exc
 
-    book = xlrd.open_workbook(str(path))
+    # formatting_info makes xlrd read what a sheet shows beyond the bare values: merged ranges and number
+    # formats. Without it the workbook was read differently from the same workbook saved as .xlsx: a merged
+    # header was one filled cell among blanks (so the second header row became a data row), a label merged down
+    # a column reached only its first row, and 10% came out as 0.1. A file whose formatting records xlrd cannot
+    # read is still read by its values. Hidden sheets, rows and columns are read, as for .xlsx, and a very hidden
+    # sheet is not (see VERY_HIDDEN).
+    try:
+        book = xlrd.open_workbook(str(path), formatting_info=True)
+        formatted = True
+    except Exception as exc:     # noqa: BLE001 - xlrd raises assorted errors on formatting records it does not know
+        print(f"[XLS WARN] formatting records unreadable, values only: {path.name} -> {type(exc).__name__}", flush=True)
+        book = xlrd.open_workbook(str(path))
+        formatted = False
     output: list[tuple[str, list[tuple[int, list[str]]], dict[int, int]]] = []
     for sheet in book.sheets():
+        if getattr(sheet, "visibility", 0) == 2:
+            print(f"[XLS] skip very hidden sheet {path.name}:{sheet.name}", flush=True)
+            continue
+
+        def shown(row: int, col: int, sheet=sheet) -> str:
+            number_format = None
+            if formatted:
+                try:
+                    number_format = book.format_map[book.xf_list[sheet.cell_xf_index(row, col)].format_key].format_str
+                except (AttributeError, IndexError, KeyError):
+                    number_format = None
+            return xls_cell_text(sheet.cell_type(row, col), sheet.cell_value(row, col), book.datemode, number_format)
+
+        merges = [tuple(m) for m in (getattr(sheet, "merged_cells", None) or [])]      # (row, row end, column, column end), ends exclusive
+        merged_values: dict[tuple[int, int], str] = {}
+        moved: set[tuple[int, int]] = set()
+        hidden_cols = {c for c, info in (getattr(sheet, "colinfo_map", None) or {}).items() if getattr(info, "hidden", 0)}
+        for rlo, rhi, clo, chi in merges:
+            if not (rlo < sheet.nrows and clo < sheet.ncols):
+                continue
+            value = shown(rlo, clo)
+            if not value:
+                continue
+            # Down the rows, not across the columns: the same rule as for .xlsx (see read_xlsx_rows)
+            shown_col = _shown_column(clo, chi - 1, hidden_cols)
+            shown_col = shown_col if shown_col < sheet.ncols else clo
+            for row in range(rlo, min(rhi, sheet.nrows)):
+                merged_values[(row, shown_col)] = value
+            if shown_col != clo:
+                moved.add((rlo, clo))                    # its own cell is hidden: the value is read where it shows
         rows: list[tuple[int, list[str]]] = []
         for idx in range(sheet.nrows):
-            values = [
-                xls_cell_text(sheet.cell_type(idx, col), sheet.cell_value(idx, col), book.datemode)
-                for col in range(sheet.ncols)
-            ]
+            values = [("" if (idx, col) in moved else shown(idx, col)) or merged_values.get((idx, col), "") for col in range(sheet.ncols)]
             if any(values):
                 rows.append((idx + 1, values))
         if rows:
-            output.append((sheet.name or "Sheet", rows, vertical_spans((clo + 1, rlo + 1, chi, rhi) for rlo, rhi, clo, chi in getattr(sheet, 'merged_cells', []))))
+            hidden = (r + 1 for r, info in (getattr(sheet, "rowinfo_map", None) or {}).items() if getattr(info, "hidden", 0))
+            output.append((sheet.name or "Sheet", SheetRows.of(rows, hidden, (c + 1 for c in hidden_cols)),
+                           vertical_spans((clo + 1, rlo + 1, chi, rhi) for rlo, rhi, clo, chi in merges)))
     return output
 
 
-def xls_cell_text(ctype: int, value: Any, datemode: int) -> str:
+def xls_cell_text(ctype: int, value: Any, datemode: int, number_format: str | None = None) -> str:
     """xlrd hands dates back as raw serial floats (45123.0) and booleans as
     1/0; without ctype handling every date column indexed as meaningless
-    integers."""
+    integers. number_format: the cell's number format when known (percentages are written as shown)."""
     import xlrd
 
     if ctype == xlrd.XL_CELL_DATE:
@@ -446,7 +572,7 @@ def xls_cell_text(ctype: int, value: Any, datemode: int) -> str:
         return "TRUE" if value else "FALSE"
     if ctype == xlrd.XL_CELL_ERROR:
         return ""
-    return normalize_cell(value)
+    return normalize_cell(value, number_format)
 
 
 def chunk_rows_to_blocks(
@@ -459,7 +585,15 @@ def chunk_rows_to_blocks(
 ) -> list[ParsedBlock]:
     if not rows:
         return []
-    header_rows = detect_header_rows(rows, spans=header_spans)
+    # Which rows are the header is decided on the sheet as it shows: the header is looked for among the rows in
+    # view, with the cells of hidden columns left out. Hidden content is read, but it does not change that choice --
+    # a hidden row of field codes above the header would otherwise head every chunk of the sheet, and a hidden
+    # counter column beside a title row would turn the title into the header. The header rows then carry all
+    # their cells, those of hidden columns included; hidden rows before the header go where title rows go (the
+    # summary chunk), the others are ordinary rows.
+    shown = rows.in_view() if isinstance(rows, SheetRows) else rows
+    header_numbers = {row_no for row_no, _ in detect_header_rows(shown or rows, spans=header_spans)}
+    header_rows = [(row_no, row) for row_no, row in rows if row_no in header_numbers]
     header_row_nos = {row_no for row_no, _ in header_rows}
     # Same-named columns are told apart here, while the column positions are still known: the HEADER line, the
     # Columns line of the summary chunk and rows expanded by column name all use these names. An expanded row
@@ -467,7 +601,8 @@ def chunk_rows_to_blocks(
     # one "Price: 30"; a reader, and the graph's table route numbering by order of appearance, can only take
     # it for the first column (2026-11-20 Codex review: the same row went to the second column at a budget of
     # 400 and to the first at 300)
-    header = distinct_names([flat_cell(name) for name in merge_header_rows([row for _, row in header_rows])])
+    header = distinct_names([flat_cell(name) for name in merge_header_rows([row for _, row in header_rows])],
+                            later=[column - 1 for column in rows.hidden_columns] if isinstance(rows, SheetRows) else ())
     header_line = header_text(header)
     # Title / description rows before the header: not emitted as data rows, written into the summary chunk
     first_header_no = min(header_row_nos) if header_row_nos else None
@@ -669,24 +804,6 @@ def normalize_cell(value: Any, number_format: str | None = None) -> str:
     return clean_text(str(value))
 
 
-_NUMERIC_RE = re.compile(r"^[\d.,%￥$€\-+/:\s]+$")
-# date / version / id shaped values are data even when short (20260122, v7.0.2412a, SP2B09-x86)
-# date-like runs, dotted versions, and CODE-123 / AB1234 style ids. Plain
-# arch/platform words with a short number (arm64, x86_64, IPv6) stay headers.
-_DATAISH_RE = re.compile(r"\d{6,}|\bv?\d+\.\d+(\.\d+)?[a-z]?\b|[A-Z]{2,}-\d{2,}|[A-Z]{2,}\d{3,}", re.I)
-
-
-def _looks_like_header_cell(cell: str) -> bool:
-    cell = (cell or "").strip()
-    if not cell:
-        return True  # blank cells are fine in a header (merged spans)
-    if len(cell) > 40:
-        return False
-    if _NUMERIC_RE.match(cell) or _DATAISH_RE.search(cell):
-        return False
-    return True
-
-
 def detect_header_rows(rows: list[tuple[int, list[str]]], max_header_rows: int = 3,
                        spans: dict[int, int] | None = None) -> list[tuple[int, list[str]]]:
     """Return the leading header rows (1..max_header_rows).
@@ -741,7 +858,7 @@ def _extends_header(prev: list[str], row: list[str]) -> bool:
         b = (row[col] if col < len(row) else "").strip()
         if not b:
             continue
-        if not _looks_like_header_cell(b):
+        if not looks_like_header_cell(b):
             return False
         if a and b == a:
             repeat += 1
@@ -772,24 +889,28 @@ def merge_header_rows(rows: list[list[str]]) -> list[str]:
     return merged
 
 
-def distinct_names(names: list[str]) -> list[str]:
+def distinct_names(names: list[str], later: Iterable[int] = ()) -> list[str]:
     """Tell same-named columns apart: from the second one on they are written "name (2)", "name (3)",
     positions unchanged; empty names stay empty, and a number already used by a real column name is
     skipped. The side that writes a table (chunk_rows_to_blocks) and the side that reads it
-    (graph.tables) use this one rule: names that are already distinct come out unchanged."""
+    (graph.tables) use this one rule: names that are already distinct come out unchanged.
+
+    later: positions that are numbered after all the others -- the columns a sheet hides. A column in view then keeps
+    the name it had while hidden columns were left out, also when a hidden column to its left has the same name."""
     taken = set(names)
     count: dict[str, int] = {}
-    out: list[str] = []
-    for name in names:
+    out = list(names)
+    last = set(later)
+    for i in [i for i in range(len(names)) if i not in last] + [i for i in range(len(names)) if i in last]:
+        name = names[i]
         n = count[name] = count.get(name, 0) + 1
         if not name or n == 1:
-            out.append(name)
             continue
         while f"{name} ({n})" in taken:
             n += 1
         count[name] = n
         taken.add(f"{name} ({n})")
-        out.append(f"{name} ({n})")
+        out[i] = f"{name} ({n})"
     return out
 
 

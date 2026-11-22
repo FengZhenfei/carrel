@@ -1754,18 +1754,6 @@ async function openChunkDrawer(fileId) {
   }
 }
 
-// Merged table cells (F02): table blocks flagged with high confidence; those split after screenshot check
-// show ✓, unverified ones show ⚠ (those values are excluded from trusted parameters)
-function tableFlagsOf(c) { return (c.table_flags || []).filter(f => f.confidence === "high"); }
-function tableBadge(c) {
-  const flags = tableFlagsOf(c);
-  if (!flags.length) return "";
-  const raw = flags.map(f => f.raw).join(", ");
-  if (c.table_repair && c.table_repair.status === "verified")
-    return `<span class="pv-badge ok" title="${t("截图核验后已拆开:")}${esc(raw)}">✓ ${t("截图核验")}</span>`;
-  return `<span class="pv-badge warn" title="${t("未核验的粘连值:")}${esc(raw)}">⚠ ${t("表格粘连")} ${flags.length}</span>`;
-}
-
 // Page label: a table / paragraph merged across pages shows the range "p11–12" (Codex review F09); a
 // single page stays "p11"
 function pageLabel(c) {
@@ -1862,21 +1850,18 @@ function renderChunkPreview() {
   const types = s ? Object.entries(s.by_block_type || {}).map(([k, v]) => [k, v.chunks])
     : Object.entries(r.chunks.reduce((m, c) => { m[c.block_type] = (m[c.block_type] || 0) + 1; return m; }, {}));
   const chip = (key, label, n) => `<span class="chip ${filter === key ? "on" : ""}" data-f="${esc(key)}">${esc(label)}${n != null ? ` ${n}` : ""}</span>`;
-  const ambiguous = r.chunks.filter(c => tableFlagsOf(c).length > 0).length;
   const filters = `<div class="pv-filters">
     ${chip("all", t("全部"), r.chunks.length)}
     ${s ? chip("tiny", t("短文本"), s.tiny_count) : ""}
-    ${ambiguous ? chip("ambiguous", t("表格粘连"), ambiguous) : ""}
     ${types.map(([k, n]) => chip("type:" + k, k, n)).join("")}
     <span class="pv-view"><span class="chip ${view === "md" ? "on" : ""}" data-v="md">${t("渲染")}</span><span class="chip ${view === "raw" ? "on" : ""}" data-v="raw">${t("原文")}</span></span>
   </div>`;
-  const show = r.chunks.filter(c => filter === "all" ? true : filter === "tiny" ? tinyOf(c)
-    : filter === "ambiguous" ? tableFlagsOf(c).length > 0 : c.block_type === filter.slice(5));
+  const show = r.chunks.filter(c => filter === "all" ? true : filter === "tiny" ? tinyOf(c) : c.block_type === filter.slice(5));
   const cards = show.map(c => {
     const tiny = tinyOf(c), over = overOf(c);
     return `<details class="pv-chunk${tiny ? " tiny" : ""}${over ? " over" : ""}">
       <summary><span class="t">#${c.chunk_index}</span><span class="tok">${c.tokens} tok</span>
-        <span class="bt">${esc(c.block_type)}${pageLabel(c)}</span>${tableBadge(c)}
+        <span class="bt">${esc(c.block_type)}${pageLabel(c)}</span>
         <span class="sp" title="${esc(c.block_id)}">${esc((c.section_path || []).join(" › ") || c.block_id)}</span>
         <span class="pv-peek">${esc(c.text.slice(0, 80).replace(/\s+/g, " "))}</span></summary>
       ${view === "raw" ? `<pre>${esc(c.text)}</pre>` : `<div class="pv-md">${chunkHtml(c.text)}</div>`}</details>`;

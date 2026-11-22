@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from ..parsers.errors import ConfigParseError, FAILURE_SCOPE_VISUAL_EMBEDDING
 from ..vision.images import DEFAULT_MAX_PIXELS, file_hash, image_data_url
 
 
@@ -23,6 +24,16 @@ class VisualEmbedContentError(RuntimeError):
     picture itself is the problem, so retrying -- or failing the whole parse
     job over it -- cannot help. Callers skip the visual vector for this one
     image and keep the document."""
+
+
+class VisualEmbedConfigError(ConfigParseError):
+    """Auth/endpoint/dimension configuration error from the visual embedding service."""
+
+    config_error = True
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message, scope=FAILURE_SCOPE_VISUAL_EMBEDDING)
+        self.status_code = status_code
 
 # The model card wraps every input in this system prompt (config_sentence_
 # transformers.json "default"); documents are embedded with it unchanged.
@@ -141,6 +152,11 @@ class VisualEmbeddingClient:
                     f"{self.base_url}/embeddings", json=body, headers=headers, timeout=self.timeout,
                     allow_redirects=False,
                 )
+                if response.status_code in (401, 403, 404, 409):
+                    raise VisualEmbedConfigError(
+                        f"HTTP {response.status_code}: {response.text[:300]}",
+                        status_code=response.status_code,
+                    )
                 if response.status_code in (408, 429):
                     raise RuntimeError(f"HTTP {response.status_code}(暂时性): {response.text[:200]}")
                 if response.status_code in (413, 415) or (
@@ -160,11 +176,15 @@ class VisualEmbeddingClient:
                             or not 0 <= index < len(items) or vectors[index] is not None):
                         raise RuntimeError("visual embedding returned duplicate or invalid indices")
                     vector = item.get("embedding")
+                    if isinstance(vector, list) and len(vector) != self.dim:
+                        raise VisualEmbedConfigError(
+                            f"visual embedding dim mismatch: expected {self.dim}, got {len(vector)}"
+                        )
                     if not self._valid_vector(vector):
-                        raise RuntimeError("visual embedding returned invalid vector dimensions or values")
+                        raise RuntimeError("visual embedding returned invalid vector values")
                     vectors[index] = [float(x) for x in vector]
                 return vectors
-            except VisualEmbedContentError:
+            except (VisualEmbedContentError, VisualEmbedConfigError):
                 raise
             except Exception as exc:
                 last_error = exc

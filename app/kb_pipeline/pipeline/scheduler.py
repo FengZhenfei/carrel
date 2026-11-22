@@ -10,7 +10,14 @@ from pathlib import Path
 from .. import db
 from ..models import SourceFile
 from ..localfs.scanner import inside_boundary
-from ..parsers.errors import FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE, FAILURE_VERDICT_KEY
+from ..parsers.errors import (
+    FAILURE_CONFIG,
+    FAILURE_DETERMINISTIC,
+    FAILURE_FILE_MISSING,
+    FAILURE_RETRYABLE,
+    FAILURE_SCOPE_KEY,
+    FAILURE_VERDICT_KEY,
+)
 from ..parsers.source_guard import is_source_placeholder
 from .detect_changes import detect_change, parser_profile_for
 
@@ -70,6 +77,14 @@ def schedule_file(
     dedupe_key: str | None = None
     if change.job_type == "parse":
         dedupe_key = f"parse:{file_id}:{file.content_version}:{parse_profile}"
+        # Console single-job cancel ("cancelled_by": "user") holds steady-state re-scans back
+        # until file content changes, parser profile changes, or the user manually retries (E7).
+        if change.change_type in {"needs_parse", "parser_changed"}:
+            latest_job = db.latest_job_for_dedupe_key(con, dedupe_key)
+            if latest_job is not None and str(latest_job["status"]) == "cancelled" and _is_user_cancelled(latest_job):
+                if not dry_run:
+                    db.upsert_file(con, file, status=_status_after_scan(old, file))
+                return "cancelled", None
         failed_job = db.failed_job_for_dedupe_key(con, dedupe_key)
         # The dedupe key pins content_version AND parser_profile. Steady-state
         # re-detections of a terminally failed combination stay blocked:
@@ -402,6 +417,92 @@ def requeue_kb_files(con: sqlite3.Connection, *, ingest_run_id: str, kb_id: str,
 FAILED_RETRY_COOLDOWN_SECONDS = int(os.getenv("KB_FAILED_RETRY_COOLDOWN_SECONDS", str(24 * 3600)))
 
 
+def requeue_config_failed_files(
+    con: sqlite3.Connection,
+    *,
+    ingest_run_id: str | None = None,
+    kb_id: str | None = None,
+    scopes: set[str] | frozenset[str] | None = None,
+    reason: str = "config updated",
+) -> int:
+    """Re-enqueue live files whose latest parse job failed with FAILURE_CONFIG (auth/model/KB config error).
+    When ``scopes`` is supplied, jobs whose recorded failure_scope belongs to a different subsystem are left
+    untouched (e.g. saving an embedding endpoint never wakes a MinerU-failed PDF). Legacy unscoped
+    FAILURE_CONFIG jobs remain eligible for parse-affecting callers."""
+    from pathlib import Path as _Path
+    from ..parsers.common import parser_profile_for_path
+
+    if scopes is not None and not scopes:
+        return 0
+    if kb_id is not None:
+        rows = con.execute(
+            """
+            SELECT DISTINCT f.* FROM files f
+            JOIN jobs j ON j.file_id = f.file_id
+            LEFT JOIN kb_sources s ON s.kb_id = f.kb_id
+            WHERE f.kb_id = ? AND j.job_type = 'parse' AND j.status = 'failed'
+              AND f.status NOT IN ('deleted','skipped')
+              AND (s.kb_id IS NULL OR s.status = 'active')
+            ORDER BY f.source_path
+            """,
+            (kb_id,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            """
+            SELECT DISTINCT f.* FROM files f
+            JOIN jobs j ON j.file_id = f.file_id
+            LEFT JOIN kb_sources s ON s.kb_id = f.kb_id
+            WHERE j.job_type = 'parse' AND j.status = 'failed'
+              AND f.status NOT IN ('deleted','skipped')
+              AND (s.kb_id IS NULL OR s.status = 'active')
+            ORDER BY f.kb_id, f.source_path
+            """
+        ).fetchall()
+    requeued = 0
+    for row in rows:
+        profile = parser_profile_for_path(_Path(str(row["filename"])))
+        dedupe_key = f"parse:{row['file_id']}:{row['content_version']}:{profile}"
+        if db.active_job_for_dedupe_key(con, dedupe_key) is not None:
+            continue
+        latest = db.latest_job_for_dedupe_key(con, dedupe_key)
+        if latest is None or str(latest["status"]) != "failed":
+            continue
+        if _stored_failure_verdict(latest) != FAILURE_CONFIG:
+            continue
+        if scopes is not None:
+            job_scope = _stored_failure_scope(latest)
+            if job_scope is not None and job_scope not in scopes:
+                continue
+        job_id = requeue_single_file(
+            con,
+            ingest_run_id=ingest_run_id or "config-requeue",
+            file_row=row,
+            reason=reason,
+            refresh_cache=False,
+        )
+        if job_id is not None:
+            requeued += 1
+    return requeued
+
+
+def _stored_failure_scope(job_row) -> str | None:
+    try:
+        payload = json.loads(job_row["payload_json"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    scope = payload.get(FAILURE_SCOPE_KEY) if isinstance(payload, dict) else None
+    return str(scope) if scope else None
+
+
+def _is_user_cancelled(job_row) -> bool:
+    try:
+        payload = json.loads(job_row["payload_json"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("cancelled_by") == "user"
+
+
 def _stored_failure_verdict(job_row) -> str | None:
     """The failure verdict the worker stored in the job payload (worker._record_failure_verdict). None when
     there is none: jobs that failed before verdicts were recorded, and jobs reclaimed as failed after their
@@ -411,7 +512,7 @@ def _stored_failure_verdict(job_row) -> str | None:
     except (KeyError, IndexError, TypeError, ValueError):
         return None
     verdict = payload.get(FAILURE_VERDICT_KEY) if isinstance(payload, dict) else None
-    return verdict if verdict in (FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE) else None
+    return verdict if verdict in (FAILURE_CONFIG, FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE) else None
 
 
 def _failed_parse_blocks_auto_requeue(job_row, change_type: str = "needs_parse") -> bool:

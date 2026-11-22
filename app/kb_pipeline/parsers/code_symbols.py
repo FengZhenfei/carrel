@@ -581,15 +581,27 @@ def symbol_blocks(source: str, language: str, *, parser_profile: str = PROFILE, 
 
     blocks: list[ParsedBlock] = []
     symbols.sort(key=lambda s: (s[0], s[1]))
+    taken = 0       # the last line already handed to a symbol
     for idx, (start, end, meta, section) in enumerate(symbols, start=1):
-        text = take(start, end)
+        # Several symbols can share a line (minified source puts a whole file on one). A line goes to the first
+        # symbol on it and to no other: every symbol used to take its full lines, so a one-line file with 600
+        # functions was copied 600 times.
+        first = max(start, taken + 1)
+        if first > end:
+            if blocks:
+                shared = blocks[-1].metadata.setdefault("shared_line_symbols", [])
+                if len(shared) < MAX_CALLS:
+                    shared.append(meta["qualname"])
+            continue
+        taken = end
+        text = take(first, end)
         if not text.strip():
             continue
         safe = re.sub(r"[^A-Za-z0-9_.]", "_", meta["qualname"])[:80]
         blocks.append(ParsedBlock(parser="tree-sitter", parser_profile=parser_profile, doc_type=doc_type, block_type="code",
                                   text=text, title=meta["qualname"], block_id=f"sym-{idx:04d}-{safe}",
                                   metadata={"section_path": list(section), "symbol": meta,
-                                            "source_spans": source_text(lines, [(start, end)])[1]}))
+                                            "source_spans": source_text(lines, [(first, end)])[1]}))
     rest_text, rest_spans = module_source(lines, covered)
     module_meta = {"kind": "module", "name": "", "qualname": "", "docstring": file_doc, "imports": imports,
                    "constants": constants[:60], "calls": top_calls[:MAX_CALLS], "language": language, "has_error": bool(root.has_error)}

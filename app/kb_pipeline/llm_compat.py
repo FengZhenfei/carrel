@@ -2,6 +2,10 @@
 
 Model IDs remain free-form. Known families supply defaults; exact deployment
 overrides cover aliases. Only explicit parameter rejections permit a retry.
+The output format is the exception: it steps down (schema, then JSON mode,
+then none) on a refusal that names it in any words, and on a refusal that
+names nothing at all. A thinking control is given up on a refusal that names
+it in any words; the request then runs at the service's own default.
 No prompts, credentials or response text are kept in the capability cache.
 """
 from __future__ import annotations
@@ -24,6 +28,8 @@ _EXTRA_BODY = {"repetition_penalty", "enable_thinking", "thinking", "chat_templa
 _THINKING_FIELDS = {"enable_thinking", "thinking", "reasoning_effort", "chat_template_kwargs"}
 MAX_COMPAT_RETRIES = 4
 _ACCEPTED: dict[tuple[str, str, str, str], tuple[set[str], dict[str, Any]]] = {}
+MAX_FUTILE_GUESSES = 3
+_FUTILE: dict[tuple[str, str, str], int] = {}     # endpoint -> failures in a row that followed a guessed step
 _LOCK = threading.Lock()
 
 
@@ -157,21 +163,33 @@ _UNSUPPORTED = re.compile(
 )
 
 
+def _lesser_format(body: dict[str, Any]) -> dict[str, Any] | None:
+    """The same request one step down the output-format ladder: schema-constrained output, then JSON mode
+    (parseable JSON, no schema), then no output format. None when nothing is left to give up."""
+    if "response_format" not in body:
+        return None
+    result = copy.deepcopy(body)
+    value = result.pop("response_format")
+    if isinstance(value, dict) and value.get("type") == "json_schema":
+        result["response_format"] = {"type": "json_object"}
+    return result
+
+
 def _adjust(body: dict[str, Any], status: int | None, error: str, protocol: str) -> dict[str, Any] | None:
     if status not in (400, 422) or _NON_PARAMETER_ERROR.search(error):
         return None
-    if not _UNSUPPORTED.search(error):
-        return None
     named = {k for k in _MANAGED if re.search(r"(?<![\w])" + re.escape(k) + r"(?![\w])", error, re.I)}
-    # Structured error.param identifies the rejected field more precisely than
-    # a message which may also name its replacement.
-    try:
-        data = json.loads(error)
-        detail = data.get("error", data) if isinstance(data, dict) else {}
-        param = detail.get("param") if isinstance(detail, dict) else None
-    except (ValueError, TypeError):
-        param = None
-    rejected = {param} if isinstance(param, str) and param in _MANAGED else named
+    rejected: set[str] = set()
+    if _UNSUPPORTED.search(error):
+        # Structured error.param identifies the rejected field more precisely than
+        # a message which may also name its replacement.
+        try:
+            data = json.loads(error)
+            detail = data.get("error", data) if isinstance(data, dict) else {}
+            param = detail.get("param") if isinstance(detail, dict) else None
+        except (ValueError, TypeError):
+            param = None
+        rejected = {param} if isinstance(param, str) and param in _MANAGED else named
     result = copy.deepcopy(body)
     for key in _TOKEN_FIELDS & rejected & body.keys():
         other = (_TOKEN_FIELDS - {key}).pop()
@@ -179,8 +197,21 @@ def _adjust(body: dict[str, Any], status: int | None, error: str, protocol: str)
         if protocol == "openai" and other in named and re.search(r"use|instead|replace", error, re.I):
             result[other] = result.pop(key)
             return result
-    for key in _OPTIONAL & rejected & body.keys():
+    for key in (_OPTIONAL - {"response_format"}) & rejected & body.keys():
         result.pop(key, None)
+    # A thinking control is given up on a refusal that names it, whatever the wording: services refuse its value
+    # ("thinking.type: Input should be 'enabled'", "reasoning_effort must be one of low, medium, high") as readily
+    # as the field. Without it the request runs at the service's own default, which is where it stood before the
+    # caller asked; a caller for whom that default is not good enough finds out from the answer, not from a 400.
+    for key in _THINKING_FIELDS & named & body.keys():
+        result.pop(key, None)
+    if "response_format" in named and "response_format" in body:
+        # A refusal that names the output format is read from any wording, because services word it freely
+        # ("This response_format type is unavailable now", "response_format.type: Input should be 'text' or
+        # 'json_object'"), and it costs one step, not the parameter: most services without schema-constrained
+        # output still have JSON mode. Every other parameter keeps the explicit rule above, because
+        # "temperature must be between 0 and 2" is a wrong value, not a refusal.
+        result = _lesser_format(result)
     return result if result != body else None
 
 
@@ -199,6 +230,7 @@ class CompatibleRequest:
                 self.body.pop(key, None)
             self.body.update(copy.deepcopy(changed))
         self._attempts = 0
+        self._guessed = False
 
     def parameters(self) -> dict[str, Any]:
         return {k: copy.deepcopy(v) for k, v in self.body.items() if k in _MANAGED}
@@ -207,14 +239,35 @@ class CompatibleRequest:
         if self._attempts >= MAX_COMPAT_RETRIES:
             return False
         changed = _adjust(self.body, status, error, self.protocol)
+        if changed is None and status in (400, 422) and not _NON_PARAMETER_ERROR.search(error):
+            # The refusal does not say what was refused ("invalid parameter" and nothing more is common). The
+            # output format is the one thing given up on a guess: the answer is parsed and checked whichever
+            # way it was asked for, so a lesser format cannot change what it means. No other parameter is
+            # touched without being named. An endpoint where such guesses keep failing is left alone.
+            with _LOCK:
+                futile = _FUTILE.get(self._key[:3], 0) >= MAX_FUTILE_GUESSES
+            changed = None if futile else _lesser_format(self.body)
+            self._guessed = self._guessed or changed is not None
         if changed is None:
             return False
         self.body = changed
         self._attempts += 1
         return True
 
+    def fail(self) -> None:
+        """Call when the request failed for good. A failure that followed a guess counts against guessing at
+        this endpoint: its refusals have another cause, and every guess costs requests that cannot succeed."""
+        if self._guessed:
+            with _LOCK:
+                if len(_FUTILE) >= 256:
+                    _FUTILE.pop(next(iter(_FUTILE)))
+                _FUTILE[self._key[:3]] = _FUTILE.get(self._key[:3], 0) + 1
+
     def accept(self) -> None:
         """Call only after a valid response, never on a 400 or a failed retry."""
+        if self._guessed:
+            with _LOCK:
+                _FUTILE.pop(self._key[:3], None)     # a guess was right: keep guessing here
         final = self.parameters()
         if final == self._original:
             return

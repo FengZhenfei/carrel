@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import time
+import uuid
 from typing import Any, Iterable
 
 from qdrant_client import QdrantClient
@@ -635,12 +636,60 @@ def reactivate_file_metadata(q: QdrantClient, row, *, point_ids: Iterable[str] |
     )
 
 
-def file_version_point_count(q: QdrantClient, row) -> int:
+def _canonical_qdrant_point_id(raw: Any) -> str | int | None:
+    """Validate and canonicalize a Qdrant point ID (UUID string or non-negative integer).
+    Invalid strings are dropped so q.retrieve() never throws HTTP 400 on malformed legacy IDs."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    try:
+        return str(uuid.UUID(text))
+    except ValueError:
+        return None
+
+
+def file_version_point_count(q: QdrantClient, row, *, point_ids: Iterable[str] | None = None) -> int:
     """How many points of this file's current version remain in Qdrant. A file that returned after deletion
     uses it to decide whether it can be restored directly: inactive points past the retention period are
-    cleared by the GC, and then only a re-parse remains."""
+    cleared by the GC, and then only a re-parse remains. When point_ids is supplied, verify those exact IDs
+    belong to this document and version so partial GC is never mistaken for a complete set."""
     if not collection_exists(q, row["collection"]):
         return 0
+    if point_ids is not None:
+        ids: list[str | int] = []
+        seen_ids: set[str | int] = set()
+        for raw in point_ids:
+            cid = _canonical_qdrant_point_id(raw)
+            if cid is not None and cid not in seen_ids:
+                seen_ids.add(cid)
+                ids.append(cid)
+        if not ids:
+            return 0
+        expected_doc = f"{row['kb_id']}:{int(row['file_key'])}"
+        expected_ver = str(row["content_version"])
+        matched: set[str | int] = set()
+        for start in range(0, len(ids), 200):
+            for point in q.retrieve(
+                collection_name=row["collection"],
+                ids=ids[start : start + 200],
+                with_payload=["doc_id", "content_version"],
+                with_vectors=False,
+            ):
+                payload = point.payload or {}
+                if (
+                    str(payload.get("doc_id") or "") == expected_doc
+                    and str(payload.get("content_version") or "") == expected_ver
+                ):
+                    cid = _canonical_qdrant_point_id(point.id)
+                    if cid is not None:
+                        matched.add(cid)
+        return len(matched)
     selector = doc_version_filter(str(row["kb_id"]), int(row["file_key"]), str(row["content_version"]))
     return int(q.count(collection_name=row["collection"], count_filter=selector, exact=True).count)
 

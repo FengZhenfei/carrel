@@ -33,6 +33,7 @@ from kb_pipeline.limits import (
     validate_graph_unit_config,
 )
 from kb_pipeline.pipeline.scheduler import (
+    requeue_config_failed_files,
     requeue_kb_files,
     requeue_single_file,
     schedule_deletes_for_source,
@@ -1410,6 +1411,20 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
             updates = dict(updates)
             updates["graph_paused"] = None
         saved = discovery.set_config(con, kb_id, updates)
+        from kb_pipeline.parsers.errors import FAILURE_SCOPE_KB_CONFIG, FAILURE_SCOPE_VLM
+        cfg_scopes: set[str] = set()
+        if effective.get("vlm_model") != before.get("vlm_model"):
+            cfg_scopes.add(FAILURE_SCOPE_VLM)
+        if any(
+            not k.startswith("graph_") and k != "parse_paused" and effective.get(k) != before.get(k)
+            for k in updates
+        ):
+            cfg_scopes.add(FAILURE_SCOPE_KB_CONFIG)
+        requeued_cfg = (
+            requeue_config_failed_files(con, kb_id=kb_id, scopes=cfg_scopes, reason="kb config updated")
+            if cfg_scopes
+            else 0
+        )
         if updates.get("graph_schema_active"):
             from kb_pipeline.graph.schema_flow import SUGGEST_TASK_PREFIX
             task = db.get_app_config(con, SUGGEST_TASK_PREFIX + kb_id)
@@ -1434,6 +1449,8 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     # This used to generate "no model selected / no rebuild condition" reminders; removed at the user's
     # request -- a missing model is caught by the "Build now / again" validation and the failed build
     # status, no more nagging.
+    if requeued_cfg:
+        kick_worker()
     return {"config": saved, "warnings": []}
 
 
@@ -1897,12 +1914,15 @@ def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> d
                 "section_path": [str(x) for x in (pl.get("section_path") or [])],
                 "title": pl.get("title"), "caption": pl.get("caption"),
                 "embedding_context": pl.get("embedding_context"),
-                "table_flags": pl.get("table_flags") or None, "table_repair": pl.get("table_repair") or None,
                 "text": payload_text(pl),
                 "code_context_sources": pl.get("code_context_sources"),
                 "source_regions": pl.get("source_regions"),
             })
-    profile = str(row["parser_profile"]) if ("parser_profile" in keys and row["parser_profile"]) else None
+    profile = (
+        str(row["indexed_parser_profile"])
+        if ("indexed_parser_profile" in keys and row["indexed_parser_profile"])
+        else (str(row["parser_profile"]) if ("parser_profile" in keys and row["parser_profile"]) else None)
+    )
     return {
         "file": {"file_id": file_id, "rel_path": str(row["rel_path"]), "parser_profile": profile, "chunks_total": total},
         "max_tokens": int(source.max_tokens) if source is not None else None,
@@ -2282,7 +2302,7 @@ def _synthesize_job_events(job: dict[str, Any]) -> list[dict[str, Any]]:
 def cancel_job(job_id: str) -> dict[str, Any]:
     cfg = settings()
     with db.connect(cfg.state_db) as con:
-        outcome = db.request_job_cancel(con, job_id, "Cancelled from the console")
+        outcome = db.request_job_cancel(con, job_id, "Cancelled from the console", cancelled_by="user")
     return {"job_id": job_id, "outcome": outcome}
 
 
@@ -2516,7 +2536,23 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if clear_key:
             con.execute("UPDATE llm_registry SET api_key='' WHERE name=?", (name,))
-        return _mask(db.get_llm(con, name))
+        from kb_pipeline.parsers.errors import FAILURE_SCOPE_VLM
+        vlm_kb_ids = [
+            str(r["kb_id"])
+            for r in discovery.known_sources(con)
+            if str(r["status"]) == "active"
+            and discovery.get_config(con, str(r["kb_id"])).get("vlm_model") == name
+        ]
+        requeued_cfg = sum(
+            requeue_config_failed_files(
+                con, kb_id=kid, scopes={FAILURE_SCOPE_VLM}, reason=f"llm {name} updated"
+            )
+            for kid in vlm_kb_ids
+        )
+        result = _mask(db.get_llm(con, name))
+    if requeued_cfg:
+        kick_worker()
+    return result
 
 
 def remove_llm(name: str) -> dict[str, Any]:

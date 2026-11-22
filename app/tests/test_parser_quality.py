@@ -27,8 +27,9 @@ def test_pdf_cover_and_body_survive_running_header_filter():
         {"type": "header", "text": "Page 1 of 2", "page_idx": 0},
     ]
     fixed = recover_pdf_items(items, {})
-    assert [x["type"] for x in fixed] == ["title", "header", "header", "text", "footer", "header"]
-    assert items[0]["type"] == "header"  # cached raw payload is not rewritten
+    # the copyright line stands on one page of two: like the unique header, it is content, not page furniture
+    assert [x["type"] for x in fixed] == ["title", "header", "header", "text", "text", "header"]
+    assert items[0]["type"] == "header" and items[4]["type"] == "footer"  # cached raw payload is not rewritten
 
 
 def _html(rows):

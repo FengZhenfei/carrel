@@ -106,8 +106,10 @@ def test_review_skips_report_the_actual_reason_and_keep_source(tmp_path, rows, r
 
 
 def test_failed_request_is_distinct_from_an_unconfirmed_response(tmp_path):
+    # three different things: the request failed, the model sent no rows, the rows it sent cannot be checked
     for response, reason in [(TimeoutError("private endpoint detail"), "request_failed"),
-                             ({}, "verification_incomplete")]:
+                             ({}, "no_model_answer"), ({"rows": []}, "no_model_answer"),
+                             ({"rows": [["Item", "Value", "Extra"], ["Alpha", "17 V", "x"]]}, "verification_incomplete")]:
         block = table(tmp_path, [["Item", "Value"], ["Alpha", "17 V"]])
         options = {"side_effect": response} if isinstance(response, Exception) else {"return_value": response}
         with patch("kb_pipeline.parsers.table_repair.transcribe_table", **options):
@@ -123,6 +125,7 @@ def test_diagnostics_group_outcomes_and_count_each_table_once(tmp_path):
         ("unverified", "missing_model_credentials", "table_review_missing_model"),
         ("unverified", "missing_image", "table_review_missing_image"),
         ("unverified", "request_failed", "table_review_request_failed"),
+        ("unverified", "no_model_answer", "table_review_no_answer"),
         ("unverified", "verification_incomplete", "table_review_unconfirmed"),
         ("partial", "rows_unverified", "table_review_partial"),
         ("partial", "source_text_missing", "table_review_partial"),

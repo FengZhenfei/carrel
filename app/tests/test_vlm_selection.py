@@ -50,7 +50,7 @@ def model_server():
             data = {'kind': 'diagram', 'summary': 'Synthetic device with a blue rectangle.',
                     'text_verbatim': 'Synthetic device', 'confidence': 'high', 'decorative': False,
                     'entities': [], 'facts': [], 'keywords': [],
-                    'rows': [{'key': 'Alpha', 'cells': ['Alpha', '12', '34']}]}
+                    'rows': [['Alpha', '12', '34']]}
             response = json.dumps({'id': 'synthetic', 'object': 'chat.completion', 'created': 0,
                 'model': body['model'], 'choices': [{'index': 0, 'finish_reason': 'stop',
                 'message': {'role': 'assistant', 'content': json.dumps(data)}}]}).encode()
@@ -253,12 +253,11 @@ def test_table_review_uses_same_model_and_endpoint_cache_identity(setup, tmp_pat
     with db.connect(cfg.state_db) as con:
         db.upsert_llm(con, name='vision-a', base_url=url, api_key='review-key', model_id='review-model', multimodal=True)
     endpoint, key, model, concurrency = parse_job._vlm_endpoint(cfg, replace(source, vlm_model='vision-a'))
-    args = dict(image_path=image, base_url=endpoint, api_key=key, model_id=model, row_keys=['Alpha'], cache_json=tmp_path/'rows.json')
-    rows = table_repair.transcribe_rows(**args)
-    assert rows[0]['cells'] == [['Alpha'], ['12'], ['34']]
-    table_repair.transcribe_rows(**args)
+    args = dict(image=image, prompt='Transcribe the table.', base_url=endpoint, api_key=key, model_id=model, cache=tmp_path/'table.json', options={})
+    assert table_repair.transcribe_table(**args)['rows'] == [['Alpha', '12', '34']]
+    table_repair.transcribe_table(**args)
     assert len(calls) == 1
-    table_repair.transcribe_rows(**{**args, 'base_url': endpoint+'/other'})
+    table_repair.transcribe_table(**{**args, 'base_url': endpoint+'/other'})
     assert len(calls) == 2
     assert calls[-1][1] == 'Bearer review-key' and calls[-1][2]['model'] == 'review-model'
 

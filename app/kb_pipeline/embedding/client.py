@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from openai import OpenAI, DefaultHttpxClient, omit
 
+from ..parsers.errors import ConfigParseError, FAILURE_SCOPE_EMBEDDING
+
 
 _CLIENT_LOCK = threading.Lock()
 _CLIENTS: dict[tuple[str, str], OpenAI] = {}
@@ -26,8 +28,22 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
 
 
 class EmbeddingDimensionError(RuntimeError):
-    """The vector dimension returned by the service does not match the configuration. Deterministic error, not
-    retried."""
+    """The vector dimension returned by the service does not match the configuration. Configuration error,
+    not retried immediately; auto-heals when embedding settings are updated."""
+
+    config_error = True
+    config_scope = FAILURE_SCOPE_EMBEDDING
+
+
+class EmbeddingConfigError(ConfigParseError):
+    """Auth/endpoint/model configuration error from the text embedding service (HTTP 401/403/404/409).
+    Skips immediate backoff retries and is auto-requeued when the embedding endpoint is updated."""
+
+    config_error = True
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message, scope=FAILURE_SCOPE_EMBEDDING)
+        self.status_code = status_code
 
 
 class EmbeddingInputRejected(RuntimeError):
@@ -43,6 +59,9 @@ class EmbeddingInputRejected(RuntimeError):
         self.reason = reason
 
 
+_CONFIG_STATUS_CODES = frozenset({401, 403, 404, 409})
+
+
 def _status_of(exc: Exception) -> int | None:
     status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
     try:
@@ -53,8 +72,21 @@ def _status_of(exc: Exception) -> int | None:
 
 def _is_deterministic_client_error(exc: Exception) -> bool:
     status = _status_of(exc)
-    # 408 timeout / 429 rate limit are transient; retrying any other 4xx is pointless
-    return status is not None and 400 <= status < 500 and status not in (408, 409, 429)
+    # 408 timeout / 429 rate limit are transient; 401/403/404/409 are config/auth errors handled separately
+    return status is not None and 400 <= status < 500 and status not in (408, 429) and status not in _CONFIG_STATUS_CODES
+
+
+def _tag_config_error(exc: Exception, status: int) -> None:
+    """Tag an HTTP 401/403/404/409 exception as an embedding configuration/auth failure while preserving
+    its original SDK/HTTP type; raises EmbeddingConfigError if the exception object cannot be mutated."""
+    try:
+        setattr(exc, "config_error", True)
+        setattr(exc, "config_scope", FAILURE_SCOPE_EMBEDDING)
+    except Exception:
+        raise EmbeddingConfigError(
+            f"embedding endpoint configuration/auth error (HTTP {status}): {exc}",
+            status_code=status,
+        ) from exc
 
 
 class EmbeddingClient:
@@ -114,9 +146,13 @@ class EmbeddingClient:
                         )
                     last_error = None
                     break
-                except EmbeddingDimensionError:
-                    raise                      # deterministic error: retrying changes nothing
+                except (EmbeddingDimensionError, EmbeddingConfigError):
+                    raise                      # config/dimension error: retrying changes nothing
                 except Exception as exc:
+                    status = _status_of(exc)
+                    if status in _CONFIG_STATUS_CODES:
+                        _tag_config_error(exc, status)
+                        raise
                     if _is_deterministic_client_error(exc):
                         # A 400 (input too long / invalid) retried 5 times just wastes 20 seconds, and then a
                         # job-level retry round follows anyway.
@@ -174,7 +210,10 @@ class EmbeddingClient:
         try:
             self.client.embeddings.create(model=self.model_id, input=[text], dimensions=self.dim, **self.request_options)
         except Exception as exc:
-            if _status_of(exc) in (400, 422):
+            status = _status_of(exc)
+            if status in (400, 422):
                 return False
+            if status in _CONFIG_STATUS_CODES:
+                _tag_config_error(exc, status)
             raise
         return True

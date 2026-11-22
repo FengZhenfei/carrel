@@ -411,10 +411,6 @@ const ZH_EN = {
 
   // ── chunk preview drawer ──
   "读取切片中…": "Reading chunks…",
-  "截图核验后已拆开:": "Split after screenshot check: ",
-  "截图核验": "screenshot-checked",
-  "未核验的粘连值:": "Unverified merged values: ",
-  "表格粘连": "Merged table cells",
   " · {0} 片": " · {0} chunks",
   "暂无解析诊断记录": "No parsing diagnostics recorded",
   "无解析提示": "No parsing notes",
@@ -781,8 +777,6 @@ const ZH_EN_PATTERNS = [
   [/^文本向量化[(（](\d+) 块[)）]$/, "Text embedding ($1 blocks)"],
   [/^开始解析 size=(\S+) profile=(.+)$/, "Parsing started, size=$1, profile=$2"],
   [/^解析得到 (\d+) 个块$/, "Parsed into $1 blocks"],
-  [/^文字层丢字未补回[,，](\d+) 个块带降级标记$/, "Characters lost from the text layer were not recovered; $1 blocks carry the degraded mark"],
-  [/^表格粘连 (\d+) 张[:：]截图核验拆开 (\d+) 张[,，]未核验 (\d+) 张[(（]未核验的值不进可信参数[)）]$/, "Merged cells in $1 tables: $2 split after screenshot check, $3 unverified (unverified values are excluded from trusted parameters)"],
   [/^切块 (\d+) 片 · 验收通过$/, "$1 chunks · check passed"],
   [/^切块 (\d+) 片 · 切块提示[:：] ?([\s\S]*)$/, (m, n, rest) => `${n} chunks · chunking notes: ${translateSegments(rest)}`],
   [/^文本向量 (\d+) 条$/, "$1 text vectors"],
@@ -916,8 +910,9 @@ const EN_ZH_PATTERNS = [
   [/^Text embedding \((\d+) blocks\)$/, "文本向量化($1 块)"],
   [/^Parsing started, size=(\S+), profile=(.+)$/, "开始解析 size=$1 profile=$2"],
   [/^Parsed into (\d+) blocks$/, "解析得到 $1 个块"],
-  [/^Characters lost from the text layer were not recovered; (\d+) blocks carry the degraded mark$/, "文字层丢字未补回,$1 个块带降级标记"],
-  [/^Merged cells in (\d+) tables: (\d+) split after screenshot check, (\d+) unverified \(unverified values are excluded from trusted parameters\)$/, "表格粘连 $1 张:截图核验拆开 $2 张,未核验 $3 张(未核验的值不进可信参数)"],
+  // The error of a parse stopped by the text-layer check (pdf_enhanced), with or without the exception name around it
+  [/^(\w+\(["'])?text layer lost: the recognition result lacks the Chinese text of pages ([\d, ]+?)( and more)? \(present in the text layer of the PDF\); check the CJK fonts of the recognition service and parse the file again(["']\))?$/,
+    (m, wrap, pages, more, close) => `${wrap || ""}文字层丢字:识别结果里没有第 ${pages} 页${more ? "等" : ""}的中文(PDF 文字层里有);请检查识别服务的中文字体后重新解析${close || ""}`],
   [/^(\d+) chunks · check passed$/, "切块 $1 片 · 验收通过"],
   [/^(\d+) chunks · chunking notes: ([\s\S]*)$/, (m, n, rest) => `切块 ${n} 片 · 切块提示: ${translateSegmentsZh(rest)}`],
   [/^(\d+) text vectors$/, "文本向量 $1 条"],
@@ -1062,11 +1057,14 @@ const DIAGNOSTIC_LABELS = {
   table_review_missing_model: ["{0} 处表格缺少模型凭据，未进行复核；原文已保留", "{0} tables were not reviewed because model credentials are missing; source text retained"],
   table_review_missing_image: ["{0} 处表格缺少原图，未进行复核；原文已保留", "{0} tables were not reviewed because source images are missing; source text retained"],
   table_review_request_failed: ["{0} 处表格复核请求失败，原文已保留", "{0} table review requests failed; source text retained"],
+  table_review_no_answer: ["{0} 处表格复核时模型没有给出可用的回答，原文已保留", "{0} table reviews got no usable answer from the model; source text retained"],
   table_review_partial: ["{0} 处表格仅部分内容通过复核，未确认内容的原文已保留", "{0} tables were partly verified; unverified source text retained"],
   table_review_unconfirmed: ["{0} 处表格复核结果未通过行列与内容校验，原文已保留", "{0} table review results did not pass alignment and content checks; source text retained"],
   visual_output_truncated: ["{0} 处图片识别达到输出上限，已保留可用结果", "{0} visual responses reached the output limit; available results were retained"],
   visual_output_degraded: ["{0} 处图片识别经简化重试恢复，描述已保留，逐字转录可能不完整", "{0} visual responses recovered with reduced retries; descriptions retained, transcription may be incomplete"],
-  visual_output_repetitive: ["{0} 处图片识别重试后仍有重复，已保留可用结果", "{0} visual responses still repeated after retry; available results retained"]
+  visual_output_repetitive: ["{0} 处图片识别重试后仍有重复，已保留可用结果", "{0} visual responses still repeated after retry; available results retained"],
+  visual_output_empty: ["{0} 张图片模型没有给出描述，图片已入库但没有文字说明", "{0} images were left without a description: the model returned no content for them"],
+  outputs_omitted: ["{0} 个已保存的输出没有入库：类型不支持或图片损坏，其余内容已入库", "{0} saved outputs were left out (unsupported type or unreadable image); the rest is indexed"]
 };
 // Length statistics alone do not establish missing or broken meaning.
 function diagnosticTone(reason) {
@@ -1097,11 +1095,14 @@ function diagnosticLabel(reason, compact = false) {
     table_review_missing_model: ["{0} 处表格复核缺少模型凭据", "Missing review credentials: {0}"],
     table_review_missing_image: ["{0} 处表格复核缺少原图", "Missing review images: {0}"],
     table_review_request_failed: ["{0} 处表格复核请求失败", "Table review requests failed: {0}"],
+    table_review_no_answer: ["{0} 处表格复核无回答", "Table reviews without an answer: {0}"],
     table_review_partial: ["{0} 处表格部分确认", "Partly verified tables: {0}"],
     table_review_unconfirmed: ["{0} 处表格复核结果未确认", "Unverified table review results: {0}"]
   };
   if (compact && tableReviewCompact[reason.key]) template = tableReviewCompact[reason.key][en ? 1 : 0];
   if (compact && reason.key === "visual_output_truncated") template = en ? "Visual output limit: {0}" : "{0} 处图片识别达上限";
+  if (compact && reason.key === "visual_output_empty") template = en ? "Images without a description: {0}" : "{0} 张图片无描述";
+  if (compact && reason.key === "outputs_omitted") template = en ? "Outputs left out: {0}" : "{0} 个输出未入库";
   // Unknown old argument layouts fall back to the readable saved message.
   if ([...template.matchAll(/\{(\d+)\}/g)].some(m => args[+m[1]] == null)) return t(reason.message || reason.key);
   return template.replace(/\{(\d+)\}/g, (_, i) => String(args[+i]));

@@ -316,12 +316,11 @@ def _failed_file(tmp_path, error: Exception, *, name: str = "manual.pdf"):
 
 
 @pytest.mark.parametrize("error", [
-    MinerUServiceError("409 Client Error: Conflict for url: http://mineru/file_parse", status_code=409),
     MinerUServiceError("400 Client Error: Bad Request for url: http://mineru/file_parse", status_code=400),
-    EmbeddingDimensionError("expected 1024 dimensions, got 768"),
-], ids=["mineru-409", "mineru-400", "embedding-dimension"])
+    MinerUServiceError("422 Unprocessable Entity for url: http://mineru/file_parse", status_code=422),
+], ids=["mineru-400", "mineru-422"])
 def test_a_failure_the_worker_does_not_retry_is_not_queued_again_by_the_scan(tmp_path, error):
-    """The worker fails these at once (by exception type). The scan used to look for words in the error text, found
+    """The worker fails document rejections at once (by exception type). The scan used to look for words in the error text, found
     none, and queued the unchanged file again after every cool-down."""
     con, file, attempts = _failed_file(tmp_path, error)
     with con:
@@ -330,6 +329,23 @@ def test_a_failure_the_worker_does_not_retry_is_not_queued_again_by_the_scan(tmp
         assert scheduler.schedule_file(con, ingest_run_id="scan-2", file=file) == ("parse_failed", None)
         assert scheduler._failed_parse_blocks_auto_requeue(_failed_job(con), "parser_changed") is False   # a parser change reopens it
         assert scheduler.schedule_file(con, ingest_run_id="scan-3", file=file, requeue_failed=True)[1] is not None   # so does a manual requeue
+
+
+@pytest.mark.parametrize("error", [
+    MinerUServiceError("409 Client Error: Conflict for url: http://mineru/file_parse", status_code=409),
+    MinerUServiceError("401 Unauthorized for url: http://mineru/file_parse", status_code=401),
+    EmbeddingDimensionError("expected 1024 dimensions, got 768"),
+], ids=["mineru-409", "mineru-401", "embedding-dimension"])
+def test_a_config_failure_skips_backoff_and_heals_after_cooldown(tmp_path, error):
+    """Auth/model/dimension errors skip immediate 5-round backoff (1 attempt), hold inside the cooldown,
+    and heal automatically once the cooldown elapses (or immediately on config/LLM save)."""
+    con, file, attempts = _failed_file(tmp_path, error)
+    with con:
+        assert attempts == 1
+        assert scheduler.schedule_file(con, ingest_run_id="scan-2", file=file) == ("parse_failed", None)
+        _a_day_later(con)
+        change, job_id = scheduler.schedule_file(con, ingest_run_id="scan-3", file=file)
+        assert change == "needs_parse" and job_id is not None
 
 
 def test_a_non_retryable_parse_error_stays_held_until_the_parser_changes(tmp_path):
@@ -375,11 +391,13 @@ def test_a_file_that_was_missing_is_queued_as_soon_as_the_scan_sees_it_again(tmp
 
 
 @pytest.mark.parametrize("error, verdict", [
-    (MinerUServiceError("409 Client Error", status_code=409), "deterministic"),
+    (MinerUServiceError("400 Client Error", status_code=400), "deterministic"),
+    (MinerUServiceError("409 Client Error", status_code=409), "config"),
+    (EmbeddingDimensionError("expected 1024, got 768"), "config"),
     (NonRetryableParseError("parser route for .xyz is not enabled in this phase"), "deterministic"),
     (NonRetryableParseError("physical file not found: /kb/manual.pdf"), "file_missing"),
     (RuntimeError(_VLM_GATE), "retryable"),
-], ids=["mineru-409", "non-retryable", "file-missing", "retryable"])
+], ids=["mineru-400", "mineru-409", "embed-dim", "non-retryable", "file-missing", "retryable"])
 def test_the_worker_records_its_verdict_on_the_failed_job(tmp_path, error, verdict):
     con, _, _ = _failed_file(tmp_path, error)
     with con:

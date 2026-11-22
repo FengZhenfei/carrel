@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 from ..models import ParsedBlock
+from .errors import NonRetryableParseError
 
 VERSION = "long-page-v1"
 MIN_ASPECT = 3.0
@@ -90,16 +91,19 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
         return [x0, (seg["y0"] + y0 * tile_height / 1000) / seg["height"] * 1000,
                 x1, (seg["y0"] + y1 * tile_height / 1000) / seg["height"] * 1000]
 
+    # A block or region without a usable tile number cannot be put back on its page. The recogniser's result is
+    # cached, so every retry meets the same block: this is a failure a retry cannot change, not a ValueError that
+    # was retried five times and queued again every day.
     for block in blocks:
         if block.page_idx is None or not 1 <= block.page_idx <= len(segments):
-            raise ValueError("segmented PDF block has no valid source page")
+            raise NonRetryableParseError("segmented PDF block has no valid source page")
         tile_no = block.page_idx
         seg = segments[tile_no - 1]
         block.page_idx = seg["page"]
         end_tile = block.metadata.get("page_end")
         if end_tile is not None:
             if not isinstance(end_tile, int) or not tile_no <= end_tile <= len(segments):
-                raise ValueError("segmented PDF table has no valid ending page")
+                raise NonRetryableParseError("segmented PDF table has no valid ending page")
             block.metadata["page_end"] = segments[end_tile - 1]["page"]
         if seg["tiled"]:
             block.bbox = original_box(block.bbox, seg)
@@ -107,7 +111,7 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
         for region in block.metadata.get("code_context_sources", []):
             tile = region.get("page")
             if not isinstance(tile, int) or not 1 <= tile <= len(segments):
-                raise ValueError("segmented PDF code label has no valid source page")
+                raise NonRetryableParseError("segmented PDF code label has no valid source page")
             label_seg = segments[tile - 1]
             region["bbox"] = original_box(region.get("bbox"), label_seg)
             region["page"] = label_seg["page"]
@@ -116,7 +120,7 @@ def restore_page_coordinates(blocks: list[ParsedBlock], segments: list[dict]) ->
             for region in block.metadata.get(key, []):
                 tile = region.get("page")
                 if not isinstance(tile, int) or not 1 <= tile <= len(segments):
-                    raise ValueError("segmented PDF source region has no valid source page")
+                    raise NonRetryableParseError("segmented PDF source region has no valid source page")
                 region_seg = segments[tile - 1]
                 regions.append({**region, "bbox": original_box(region.get("bbox"), region_seg), "page": region_seg["page"]})
             if regions:

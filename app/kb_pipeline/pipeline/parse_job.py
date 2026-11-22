@@ -31,7 +31,6 @@ from ..parsers.pptx_enhanced import parse_pptx_enhanced
 from ..parsers.router import TEXT_FILENAMES, TEXT_SUFFIXES, parse_native
 from ..parsers.source_guard import MissingSourceContent, require_source_content
 from ..parsers.formats import extensionless_script
-from ..parsers.table_check import table_ambiguity_summary
 from ..parsers.visual_blocks import vlm_failure_summary, went_through_vlm
 from ..utils import count_tokens, detect_lang, dir_ancestors_from_rel_path, infer_doc_type, sha256_file
 from ..vector.layout import TEXT_VECTOR, VISUAL_VECTOR
@@ -44,7 +43,9 @@ TABLE_SUFFIXES = {".xlsx", ".xls", ".csv", ".tsv"}
 
 # The definition moved to parsers.errors (the router raises it too); the name is kept here so the worker and
 # the tests keep importing it from this module
-from ..parsers.errors import JobCancelled, JobPaused, NonRetryableParseError  # noqa: E402,F401
+from ..parsers.errors import (  # noqa: E402,F401
+    ConfigParseError, FAILURE_SCOPE_KB_CONFIG, FAILURE_SCOPE_VLM, JobCancelled, JobPaused, NonRetryableParseError,
+)
 
 
 def process_parse_job(con: sqlite3.Connection, settings: Settings, job: sqlite3.Row) -> str:
@@ -242,12 +243,8 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
             pass
 
     stage("Parsing document", force=True)
-    # A temporary fault in the text-layer repair makes the job retry; on the last attempt the document is stored
-    # with a degraded flag instead, so that a document is not kept out of the index forever
-    last_attempt = int(job["retry_count"] or 0) >= settings.job_max_retries
     try:
-        blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage,
-                               text_layer_repair="final" if last_attempt else "retry")
+        blocks = _parse_blocks(settings, source, path, cache_dir, parser_profile, file_row, stage_cb=stage)
     except MissingSourceContent:
         check_cancelled(force=True)
         outcome = _finish_empty_document(con, settings, job, file_row, content_version, parser_profile,
@@ -257,15 +254,6 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         raise
     print(f"[parse] blocks={len(blocks)} file={file_row['source_path']}", flush=True)
     event(f"Parsed into {len(blocks)} blocks")
-    degraded = sum(1 for block in blocks if block.metadata.get("degraded"))
-    if degraded:
-        event(f"Characters lost from the text layer were not recovered; {degraded} blocks carry the degraded mark")
-    table_stats = table_ambiguity_summary(blocks)
-    if table_stats["flagged"]:
-        print(f"[parse] table_ambiguous={table_stats['flagged']} verified={table_stats['verified']} "
-              f"file={file_row['source_path']}", flush=True)
-        event(f"Merged cells in {table_stats['flagged']} tables: {table_stats['verified']} split after screenshot check, "
-              f"{table_stats['unverified']} unverified (unverified values are excluded from trusted parameters)")
     if not blocks:
         if _is_intentionally_empty(path):
             return _finish_empty_document(con, settings, job, file_row, content_version, parser_profile, source=source)
@@ -688,15 +676,15 @@ def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str, 
     """Resolve once per document so all visual stages share the same model and credentials."""
     name = getattr(source, "vlm_model", None)
     if not name:
-        raise NonRetryableParseError("No multimodal model configured; select a vision model in the console")
+        raise ConfigParseError("No multimodal model configured; select a vision model in the console", scope=FAILURE_SCOPE_VLM)
     with db.connect(settings.state_db) as con:
         row = db.get_llm(con, name)
     if row is None:
-        raise NonRetryableParseError(f"Multimodal model {name!r} is not in the registry")
+        raise ConfigParseError(f"Multimodal model {name!r} is not in the registry", scope=FAILURE_SCOPE_VLM)
     if str(row["protocol"] or "openai") != "openai":
-        raise NonRetryableParseError("Multimodal models require the OpenAI-compatible protocol")
+        raise ConfigParseError("Multimodal models require the OpenAI-compatible protocol", scope=FAILURE_SCOPE_VLM)
     if not row["multimodal"]:
-        raise NonRetryableParseError("Selected model is not marked as multimodal")
+        raise ConfigParseError("Selected model is not marked as multimodal", scope=FAILURE_SCOPE_VLM)
     return str(row["base_url"]), str(row["api_key"] or ""), str(row["model_id"]), int(row["concurrency"])
 
 
@@ -708,11 +696,7 @@ def _parse_blocks(
     parser_profile: str,
     file_row: sqlite3.Row,
     stage_cb=None,
-    *,
-    text_layer_repair: str = "cached",
 ) -> list[ParsedBlock]:
-    """text_layer_repair: see parse_pdf_enhanced. The default uses the cache only: the chunk preview takes the
-    default, so MinerU is never called inside the web process."""
     suffix = path.suffix.lower()
     require_source_content(path)
     # Text-only routes do not depend on the vision model registry.
@@ -769,7 +753,6 @@ def _parse_blocks(
             caption_cache_root=caption_cache_root,
             vlm_prompt=vlm_prompt,
             progress_cb=vlm_progress,
-            text_layer_repair=text_layer_repair,
         )
     if suffix == ".pptx":
         return parse_pptx_enhanced(
@@ -895,7 +878,10 @@ def _source_for_file(settings: Settings, kb_id: str):
         try:
             return discovery.source_from_row(Path(settings.mirror_root), row)
         except Exception as exc:
-            raise NonRetryableParseError(f"The configuration of knowledge base {kb_id} cannot be read; not parsed: {exc!r}") from exc
+            raise ConfigParseError(
+                f"The configuration of knowledge base {kb_id} cannot be read; not parsed: {exc!r}",
+                scope=FAILURE_SCOPE_KB_CONFIG,
+            ) from exc
     for source in (getattr(settings, "sources", None) or {}).values():
         if source.kb_id == kb_id:
             return source
@@ -956,7 +942,6 @@ def _payload_for_chunk(
         "embedding_context": getattr(chunk, "embedding_context", None),
         "title": block.title,
         "caption": block.caption,
-        "visual_value_conflicts": block.metadata.get("visual_value_conflicts") or None,
         # Metadata from structured sources (code symbols / markdown frontmatter), used by rule-based graph
         # extraction and by retrieval
         "symbol": block.metadata.get("symbol"),
@@ -967,11 +952,7 @@ def _payload_for_chunk(
         "code_context": block.metadata.get("code_context"),
         "code_context_sources": block.metadata.get("code_context_sources"),
         "embedded_source": block.metadata.get("embedded_source"),
-        # Table merged-cell flags and screenshot verification result (F02): fact extraction marks facts that took
-        # an unverified merged value as untrusted, and the console shows a badge
-        "table_flags": block.metadata.get("table_flags") or None,
-        "degraded": block.metadata.get("degraded") or None,          # parse-time degradation reason, e.g. lost text layer (pdf_textlayer)
-        "table_repair": block.metadata.get("table_repair") or None,
+        "degraded": block.metadata.get("degraded") or None,          # why a block is incomplete, e.g. an embedded picture in a format that cannot be read (xlsx_images)
         "table_review": block.metadata.get("table_review") or None,
         "vlm_truncated": bool(block.metadata.get("vlm_truncated")),
         "vlm_degraded_retry": bool(block.metadata.get("vlm_degraded_retry")),

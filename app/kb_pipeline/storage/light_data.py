@@ -278,16 +278,31 @@ class LightChunks:
 
     def reactivate(self, row, *, point_ids=None):
         from ..vector.qdrant import metadata_payload_from_file_row
-        where = one_of("id", point_ids) if point_ids is not None else self._file_filter(row) + f" AND content_version = {literal(row['content_version'])}"
         def change(payload):
             payload.update(metadata_payload_from_file_row(row), is_active=True)
             payload.pop("inactive_at", None)
-        self._mutate(row["collection"], where, change)
+        if point_ids is None:
+            where = self._file_filter(row) + f" AND content_version = {literal(row['content_version'])}"
+            self._mutate(row["collection"], where, change)
+            return
+        ids = list(dict.fromkeys(str(p) for p in point_ids if p))
+        for start in range(0, len(ids), 200):
+            self._mutate(row["collection"], one_of("id", ids[start : start + 200]), change)
 
-    def version_count(self, row):
+    def version_count(self, row, *, point_ids=None):
         if not self.exists(row["collection"]):
             return 0
-        return self._table(row["collection"]).count_rows(self._file_filter(row) + f" AND content_version = {literal(row['content_version'])}")
+        base_where = self._file_filter(row) + f" AND content_version = {literal(row['content_version'])}"
+        table = self._table(row["collection"])
+        if point_ids is None:
+            return table.count_rows(base_where)
+        ids = list(dict.fromkeys(str(p) for p in point_ids if p))
+        if not ids:
+            return 0
+        total = 0
+        for start in range(0, len(ids), 200):
+            total += table.count_rows(base_where + " AND " + one_of("id", ids[start : start + 200]))
+        return total
 
     def context(self, collection, *, doc_id, chunk_from, chunk_to, content_version=None):
         where = f"is_active = true AND doc_id = {literal(doc_id)} AND chunk_index >= {int(chunk_from)} AND chunk_index <= {int(chunk_to)}"
@@ -363,9 +378,11 @@ class LightKeywords:
     def sync_document(self, collection, doc_id):
         # Keyword fields are in the same row/commit as vectors: replacements and
         # metadata edits cannot leave stale text in a separate search projection.
+        if not self.chunks.exists(collection):
+            return {"collection": collection, "doc_id": doc_id, "inserted_rows": 0, "deleted_rows": 0}
         self.ensure([collection])
         count = self.chunks._table(collection).count_rows(f"is_active = true AND doc_id = {literal(doc_id)}")
-        return {"doc_id": doc_id, "inserted_rows": count, "deleted_rows": 0}
+        return {"collection": collection, "doc_id": doc_id, "inserted_rows": count, "deleted_rows": 0}
 
     def delete(self, collection):
         # Dropping the derived indexes never deletes primary source chunks.

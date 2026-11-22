@@ -119,9 +119,22 @@ require a completed response containing `OK`; an HTTP 400 is reported as an erro
 
 For a deployment with a different thinking-control format, use
 `"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`.
-These fields replace thinking controls only when the caller requests thinking
-to be disabled, such as graph extraction. Image descriptions and probes keep
-their existing thinking behavior. Use `set` for parameters intended for every call.
+These fields replace thinking controls in the calls that request thinking to be
+disabled: graph extraction and summaries, image descriptions and table review.
+Probes keep their existing thinking behavior. Use `set` for parameters intended
+for every call.
+
+When thinking is to be disabled, the field is chosen by model name: `deepseek`
+and `kimi` send `thinking: {"type": "disabled"}`, `qwen` sends
+`enable_thinking: false`, GPT-5 and the o series send `reasoning_effort`, and
+any other unrecognized name sends the first two together. When an endpoint
+names a thinking field in an error, that field is dropped and the request is
+retried at the service's own default. An endpoint that ignores the field
+without an error (vLLM ignores a top-level `enable_thinking`) keeps thinking:
+give that deployment's spelling in `thinking_parameters` as above, or set the
+server's default to no thinking. The log line of every image description and
+table review carries `reasoning_tokens`; a value above 0 means the switch did
+not take effect.
 
 For hosted text reranking, set `RERANKER_BASE_URL` to the API base or the full
 `/rerank` endpoint, `RERANKER_MODEL_ID` to the provider's model name, and

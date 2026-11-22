@@ -29,13 +29,27 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..parsers.table_check import unrepaired_glued_values
 from ..utils import count_tokens
 from .tabletext import table_render_tag
 
 DEFAULT_UNIT_CHUNKS = 3
 MIN_OVERLAP_CHARS = 12
 TABLE_BLOCK_TYPES = {"table"}
+
+
+def _flagged_table_values(flags: Any, repair: Any) -> list[str]:
+    """Table cells that an earlier parser version marked as several values run together and did not split. The
+    parser no longer writes these marks; chunks indexed before it stopped still carry them, and a fact that took
+    such a value stays untrusted until the file is parsed again."""
+    fixed = {int(r) for r in (repair.get("rows") or [])} if isinstance(repair, dict) and str(repair.get("status")) == "verified" else set()
+    out: list[str] = []
+    for f in (flags or []):
+        if f.get("confidence") == "high" and f.get("kind") == "glued_values" and int(f.get("row", -1)) not in fixed:
+            raw = str(f.get("raw") or "")
+            if raw and raw not in out:
+                out.append(raw)
+    return out
+
 
 # ── Unit kinds: body / listing / boilerplate ──────────────────────────────
 # The "device -> document / template / parameter name" relations extracted from boilerplate pages (table of
@@ -187,8 +201,8 @@ class ChunkRef:
     filename: str = ""
     page_idx: int | None = None
     page_end: int | None = None          # last page of a table / paragraph merged across pages (Codex review F09); equals page_idx for one page
-    # glued raw strings in tables that screenshot verification did not split (757557): facts that take these values
-    # are not trusted parameters (F02)
+    # glued raw strings in tables that an earlier parser version marked and did not split (757557): facts that take
+    # these values are not trusted parameters. Only chunks indexed before the parser stopped marking them have any
     ambiguous_values: list[str] = field(default_factory=list)
     # metrics where the model's estimated reading in an image description conflicts with the text in the image
     # (Codex review F01): {label, text_value, model_value}; the fact layer downgrades such facts
@@ -324,7 +338,7 @@ def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any
                 filename=str(payload.get("filename") or ""),
                 page_idx=payload.get("page_idx"),
                 page_end=payload.get("page_end", payload.get("page_idx")),
-                ambiguous_values=unrepaired_glued_values(payload.get("table_flags"), payload.get("table_repair")),
+                ambiguous_values=_flagged_table_values(payload.get("table_flags"), payload.get("table_repair")),
                 value_conflicts=[dict(x) for x in (payload.get("visual_value_conflicts") or []) if isinstance(x, dict)],
                 source_locator=dict(payload.get("source_locator") or {}),
                 source_regions=list(payload.get("source_regions") or []),

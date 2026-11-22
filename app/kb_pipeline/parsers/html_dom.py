@@ -9,7 +9,10 @@ from pathlib import Path
 from lxml import etree, html
 
 from ..models import ParsedBlock
-from .common import SectionTracker, _span_of, clean_text, decode_text_bytes
+from .common import (
+    SectionTracker, _column_header_role, _span_of, clean_text,
+    decode_text_bytes, first_row_header, grid_to_markdown,
+)
 
 
 PARSER_PROFILE = "html-dom-v2"
@@ -482,6 +485,8 @@ def _table_markdown(table: etree._Element) -> str:
         if str(value).strip():
             extra.append(str(value).strip())
     rows: list[list[str]] = []
+    spans: list[tuple[int, int, int, int]] = []
+    column_headers = False
     carry: dict[int, list] = {}      # column -> [rows still to fill below, value]: placeholders left by a rowspan above
     for tr in table.xpath(".//tr"):
         # Rows of a nested table belong to that table; pulling them up here
@@ -491,6 +496,8 @@ def _table_markdown(table: etree._Element) -> str:
         if nearest_table and nearest_table[0] is not table:
             continue
         cells: list[str] = []
+        row_spans: list[tuple[int, int, int]] = []
+        row_idx = len(rows)
 
         def fill_from_above() -> None:
             while carry.get(len(cells), [0])[0] > 0:
@@ -500,29 +507,28 @@ def _table_markdown(table: etree._Element) -> str:
         for cell in tr.xpath("./th|./td"):
             fill_from_above()
             value = _escape_table_cell(_element_text(cell).replace("\n", " "))
-            down = _span_of(cell.get("rowspan")) - 1
-            # A cell spanning rows / columns fills its value into every position it covers (the same rule as
-            # common._TableReader): a markdown table has no merged cells, and leaving them empty would shift
-            # the columns after them
-            for _ in range(_span_of(cell.get("colspan"))):
+            rspan = _span_of(cell.get("rowspan"))
+            cspan = _span_of(cell.get("colspan"))
+            down = rspan - 1
+            if rspan > 1 or cspan > 1:
+                row_spans.append((len(cells), rspan, cspan))
+            for offset in range(cspan):
                 if down:
-                    carry[len(cells)] = [down, value]
-                cells.append(value)
+                    carry[len(cells)] = [down, value if offset == 0 else ""]
+                cells.append(value if (offset == 0 or row_idx == 0) else "")
         fill_from_above()
         if any(cells):
+            if not rows:
+                roles = {_column_header_role(_tag(cell), cell.get("scope"), _tag(tr.getparent()) == "thead")
+                         for cell in tr.xpath("./th|./td")}
+                column_headers = first_row_header(cells, row_spans, roles)
             rows.append(cells)
+            for col, rs, cs in row_spans:
+                spans.append((row_idx, col, rs, cs))
     if not rows:
         return "\n".join(extra)
-    width = max(len(row) for row in rows)
-    rows = [row + [""] * (width - len(row)) for row in rows]
-    header = rows[0]
-    body = rows[1:]
-    output = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join("---" for _ in header) + " |",
-    ]
-    output.extend("| " + " | ".join(row) + " |" for row in body)
-    return "\n".join(output + (["", *extra] if extra else []))
+    md = grid_to_markdown(rows, spans=spans, column_headers=column_headers) or ""
+    return "\n".join([md, "", *extra] if extra else [md])
 
 
 def _escape_table_cell(text: str) -> str:

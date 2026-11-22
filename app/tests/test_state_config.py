@@ -320,7 +320,7 @@ class PayloadVisualRefTests(unittest.TestCase):
     def test_payload_carries_the_page_range_of_merged_blocks(self) -> None:
         """Codex review F09: a table merged across pages only recorded its first page, so a value on page 12
         pointed to page 11 as its source. page_start / page_end from metadata go into the payload; for a single
-        page both equal page_idx; the estimated-reading conflict records are carried along too."""
+        page both equal page_idx."""
         from kb_pipeline.models import ParsedBlock, UnifiedChunk
         from kb_pipeline.pipeline.parse_job import _payload_for_chunk
 
@@ -331,11 +331,9 @@ class PayloadVisualRefTests(unittest.TestCase):
                              page_idx=11, metadata={"page_start": 11, "page_end": 12})
         p = _payload_for_chunk(settings, row, UnifiedChunk(chunk_uid="u", chunk_index=0, text="t", block=merged, token_count=1), 1)
         self.assertEqual((p["page_idx"], p["page_start"], p["page_end"]), (11, 11, 12))
-        single = ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type="text", text="x", block_id="s", page_idx=3,
-                             metadata={"visual_value_conflicts": [{"label": "综合风险指数", "text_value": "34", "model_value": "31"}]})
+        single = ParsedBlock(parser="mineru", parser_profile="p", doc_type="pdf", block_type="text", text="x", block_id="s", page_idx=3)
         p2 = _payload_for_chunk(settings, row, UnifiedChunk(chunk_uid="u2", chunk_index=1, text="t", block=single, token_count=1), 2)
         self.assertEqual((p2["page_idx"], p2["page_start"], p2["page_end"]), (3, 3, 3))
-        self.assertEqual(p2["visual_value_conflicts"][0]["text_value"], "34")
         svc = _repo_file("app/kb_server/service.py")
         self.assertEqual(svc.count('"page_end": pl.get("page_end", pl.get("page_idx"))'), 1)
         js = _repo_file("app/kb_server/static/app.js")
@@ -817,6 +815,7 @@ class RestoreProjectionTests(unittest.TestCase):
                 con.commit()
 
                 with mock.patch("kb_pipeline.storage.standard.vector_client"), \
+                        mock.patch("kb_pipeline.storage.standard.qdrant.file_version_point_count", return_value=1), \
                         mock.patch("kb_pipeline.storage.standard.qdrant.reactivate_file_metadata") as reactivated, \
                         mock.patch.object(worker_mod, "_sync_fts_doc"):
                     result = worker_mod.run_once(con, settings=settings)

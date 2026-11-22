@@ -2,21 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..headings import recoverable_chapter_lines
 from ..models import ParsedBlock
-from .table_check import table_ambiguity_flags
 from .common import HeadingResolver, SectionTracker, bbox, caption_of, clean_heading_text, footnote_of, heading_level, item_text, label_of, markdown_to_blocks, page_idx
 from .mineru_pdf import MinerUServiceError, resolve_image_path, save_mineru_images
 from .service_clients import call_mineru_sync, extract_content_list, extract_images, extract_markdown, mineru_parser_profile
-
-def _table_meta(item: dict, block_type: str) -> dict:
-    """Table blocks: rows whose stacked lines MinerU concatenated into one string are flagged first
-    (F02); the enhancement layer then verifies them against the screenshot."""
-    if block_type != "table":
-        return {}
-    flags = table_ambiguity_flags(str(item.get("table_body") or item.get("html") or ""))
-    return {"table_flags": flags} if flags else {}
-
-
 
 def mineru_docx_blocks(
     *,
@@ -56,18 +46,28 @@ def mineru_docx_blocks(
     image_map = save_mineru_images(extract_images(payload), cache_dir / "mineru" / "images")
     blocks: list[ParsedBlock] = []
     sections = SectionTracker()
-    # Document-level heading correction (recurring labels and list items are not headings); the levels come
-    # from Word styles, so unnumbered headings are not pushed one level down, see headings.HeadingResolver
+    # Document-level heading correction (list items are not headings); the levels come from Word styles, so
+    # unnumbered headings are not pushed one level down and recurring titles keep theirs, see
+    # headings.HeadingResolver
     resolver = HeadingResolver((item_text(i) for i in content if heading_level(i) and label_of(i) in ("text", "title")),
                                trust_parser_levels=True)
+    # Chapters typed without a heading style ("第一章 总则" as an ordinary paragraph) carry no mark: they are found
+    # by looking at the whole document, see headings.recoverable_chapter_lines
+    recovered = recoverable_chapter_lines(
+        (i, item_text(item) if label_of(item) in ("text", "title") else None,
+         label_of(item) in ("text", "title") and bool(heading_level(item)))
+        for i, item in enumerate(content) if label_of(item) not in {"page_footnote", "footer", "header"})
     count = 0
-    for item in content:
+    for item_index, item in enumerate(content):
         raw_type = label_of(item)
         if raw_type in {"page_footnote", "footer", "header"}:
             continue
         image_path = resolve_image_path(item, image_map, allowed_root=cache_dir / "mineru")
         text = item_text(item)
-        level, inferred = resolver.resolve(heading_level(item), text) if raw_type in ("text", "title") else (None, False)
+        if item_index in recovered:
+            level, inferred = resolver.recover(recovered[item_index])
+        else:
+            level, inferred = resolver.resolve(heading_level(item), text) if raw_type in ("text", "title") else (None, False)
         sections.observe(level, text)
         footnote = footnote_of(item)
         if footnote:
@@ -117,7 +117,6 @@ def mineru_docx_blocks(
                     "source_type": raw_type,
                     "source_item": {k: v for k, v in item.items() if k not in {"text", "content", "html", "latex"}},
                     **({"heading_level": level, "heading_inferred": inferred} if block_type == "title" else {}),
-                    **_table_meta(item, block_type),
                 },
             )
         )

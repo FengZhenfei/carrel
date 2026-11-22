@@ -16,12 +16,17 @@ from kb_pipeline.pipeline import parse_job
 from kb_pipeline.parsers import visual_blocks
 
 
-def book(tmp_path, drawing=True):
+def book(tmp_path, drawing=True, archive=True):
     p=tmp_path/'diagram.png';Image.new('RGB',(120,60),'blue').save(p)
     wb=Workbook();ws=wb.active;ws.title='Measurements';ws.append(['Item','Value']);ws.append(['Gate',17])
     if drawing:ws.add_image(SheetImage(p),'C2')
-    hidden=wb.create_sheet('Archive');hidden.sheet_state='hidden';hidden.add_image(SheetImage(p),'A1')
+    if archive:      # a hidden sheet with a picture: hidden content is indexed like the rest
+        hidden=wb.create_sheet('Archive');hidden.sheet_state='hidden';hidden.add_image(SheetImage(p),'A1')
     dest=tmp_path/'sample.xlsx';wb.save(dest);return dest
+
+
+def shown(blocks):
+    return [b for b in blocks if b.sheet_name=='Measurements']
 
 
 def rewrite(p,changes):
@@ -31,9 +36,10 @@ def rewrite(p,changes):
         for n,v in parts.items():z.writestr(n,v)
 
 
-def test_standard_drawing_keeps_sheet_row_pixels_and_ignores_hidden_sheet(tmp_path):
+def test_standard_drawing_keeps_sheet_row_pixels_and_reads_the_hidden_sheet_too(tmp_path):
     path=book(tmp_path);bs=extract_xlsx_images(path,tmp_path/'cache')
-    assert len(bs)==1
+    assert [(b.sheet_name,b.metadata['source_locator']['range']) for b in bs]==[('Measurements','C2'),('Archive','A1')]
+    assert len({b.block_id for b in bs})==2
     b=bs[0];assert b.sheet_name=='Measurements' and b.row_start==b.row_end==2
     assert b.metadata['source_locator']['range']=='C2'
     assert Path(b.visual_ref).read_bytes()==(tmp_path/'diagram.png').read_bytes()
@@ -47,7 +53,7 @@ def test_wps_cell_image_formula_is_read_without_execution(tmp_path):
     xml='''<etc:cellImages xmlns:etc="http://www.wps.cn/officeDocument/2017/etCustomData" xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><etc:cellImage><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="picture-a"/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rImage"/></xdr:blipFill></xdr:pic></etc:cellImage></etc:cellImages>'''
     rel='''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rImage" Target="media/image1.png" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"/></Relationships>'''
     rewrite(path,{'xl/worksheets/sheet1.xml':sheet,'xl/cellimages.xml':xml,'xl/_rels/cellimages.xml.rels':rel})
-    bs=extract_xlsx_images(path,tmp_path/'cache');assert len(bs)==1
+    bs=shown(extract_xlsx_images(path,tmp_path/'cache'));assert len(bs)==1
     assert bs[0].metadata['source_locator']['range']=='C2'
     assert bs[0].row_start==2
 
@@ -70,11 +76,11 @@ def test_repeated_picture_occurrences_keep_separate_source_identity(tmp_path, ab
         second.find(f'{{{XDR}}}pos').set('x','1000000')
     tree.append(second)
     rewrite(path, {'xl/drawings/drawing1.xml':ET.tostring(tree)})
-    blocks=extract_xlsx_images(path,tmp_path/'cache')
+    blocks=shown(extract_xlsx_images(path,tmp_path/'cache'))
     assert len(blocks)==2
     assert len({b.block_id for b in blocks})==2
     assert len({b.visual_ref for b in blocks})==1
-    assert [b.block_id for b in extract_xlsx_images(path,tmp_path/'cache')]==[b.block_id for b in blocks]
+    assert [b.block_id for b in shown(extract_xlsx_images(path,tmp_path/'cache'))]==[b.block_id for b in blocks]
     assert all(b.metadata['source_locator']['kind']==('drawing' if absolute else 'cells') for b in blocks)
 
 
@@ -86,11 +92,11 @@ def test_external_and_escaping_relationships_are_never_followed(tmp_path,target,
     import re
     rel=re.sub(r'Target="[^"]+"',f'Target="{target}" TargetMode="{mode}"',rel)
     rewrite(path,{'xl/drawings/_rels/drawing1.xml.rels':rel})
-    assert extract_xlsx_images(path,tmp_path/'cache')==[]
+    assert shown(extract_xlsx_images(path,tmp_path/'cache'))==[]
 
 
 def test_plain_workbook_does_not_require_model_registry(tmp_path):
-    path=book(tmp_path,False)
+    path=book(tmp_path,False,archive=False)
     cfg=SimpleNamespace(cache_dir=tmp_path/'cache',vlm_temperature=.1,vlm_top_p=.8,vlm_max_tokens=4096,
                         vlm_structured_output=True,image_max_pixels=10000)
     source=SimpleNamespace(max_tokens=400,overlap_tokens=80,vlm_prompt=None,graph_language='en')

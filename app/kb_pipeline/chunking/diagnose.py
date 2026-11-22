@@ -155,6 +155,7 @@ def chunk_diagnostics(
         "missing_model_credentials": ("table_review_missing_model", "tables could not be reviewed: model credentials are missing"),
         "missing_image": ("table_review_missing_image", "tables could not be reviewed: source images are missing"),
         "request_failed": ("table_review_request_failed", "table review requests failed; source text retained"),
+        "no_model_answer": ("table_review_no_answer", "table reviews got no usable answer from the model; source text retained"),
         "partial": ("table_review_partial", "tables were partly verified; unverified source text retained"),
         "verification_incomplete": ("table_review_unconfirmed", "table review results could not be verified; source text retained"),
     }
@@ -182,8 +183,22 @@ def chunk_diagnostics(
                     for b in evidence_blocks)
     if recovered:
         flag("visual_output_degraded", f"{recovered} visual responses used reduced retries; descriptions retained, transcription may be incomplete", recovered)
+    # The model answered in full and had nothing to say, without calling the picture a decoration. It is not
+    # a failure (an answer that was cut off or unreadable is one, and never gets this far), but the picture is
+    # in the index with no description, and nothing else tells the user so.
+    undescribed = sum(bool(b.visual_ref) and b.metadata.get("vlm_status") == "empty" and not b.metadata.get("decorative")
+                      for b in evidence_blocks)
+    stats["visual_outputs_empty"] = undescribed
+    if undescribed:
+        flag("visual_output_empty", f"{undescribed} images were left without a description: the model returned no content for them", undescribed)
     if runaway:
         flag("visual_output_repetitive", f"{runaway} visual responses still repeated after retry; available results retained", runaway)
+    # Saved notebook outputs the parser could not read (a form it does not know, a damaged picture). The rest of
+    # the notebook is in the index; these are not, and only this line says so.
+    omitted = sum(bool(b.metadata.get("output_omitted")) for b in evidence_blocks)
+    stats["outputs_omitted"] = omitted
+    if omitted:
+        flag("outputs_omitted", f"{omitted} saved outputs were left out: unsupported type or unreadable image", omitted)
     return {"ok": not reasons, "reasons": reasons, "stats": stats}
 
 
@@ -194,7 +209,11 @@ def _heading_only(text: str, block: ParsedBlock | None = None) -> bool:
     if len(lines) != 1:
         return False
     line = lines[0]
-    explicit = _NOTE_RE.match(line) is not None or infer_heading_level(line) is not None
+    explicit = _NOTE_RE.match(line) is not None or (
+        infer_heading_level(line) is not None if block is None else (
+            block.block_type == "title" or line in (block.metadata.get("heading_lines") or [])
+        )
+    )
     if explicit:
         return True
     # A short description under its own TITLE is still body text. Do not let

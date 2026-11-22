@@ -1,13 +1,9 @@
-"""Tables flagged as ambiguous: give the VLM the table screenshot MinerU left behind and have it
-transcribe only those rows; the result is adopted only when the concatenation matches (Codex review
-F02).
+"""Review of PDF tables whose own text layer holds text that the recognised table lacks (pdf_evidence marks them).
 
-Safety boundary: the split the model gives must, with whitespace removed, concatenate back to the
-merged raw string (75 + 75 + 57 = 757557, mA x 3 = mAmAmA), and every merged cell in a row must have
-the same number of segments; condition cells (t_RC = 20 ns ...) are not compared by concatenation and
-are split along only when the segment count matches and every segment can be found in the raw
-string. On a mismatch the original text and the flags are kept; nothing is guessed. Results are
-cached by screenshot fingerprint + prompt.
+The image model transcribes the table from a crop of the page, with the text layer's text as evidence. A row of
+its answer is adopted only when it agrees with the text layer; what cannot be confirmed stays as recognised, and
+the text the table lacks is appended as "SOURCE TEXT (cell alignment unverified)". Answers are cached by crop,
+prompt and request.
 """
 from __future__ import annotations
 
@@ -16,25 +12,15 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable
 
 from ..parse_cache import reusable_in_run, write_cache
 from ..models import ParsedBlock
-from ..vision.vlm import DEFAULT_MAX_PIXELS, _client_for, image_data_url
+from ..llm_compat import CompatibleRequest, generation_parameters
+from ..vision.vlm import DEFAULT_MAX_PIXELS, _client_for, _compatible_completion, _log_caption_usage, image_data_url
 from ..vision.images import file_hash
-from .common import grid_to_markdown, html_table_to_grid, html_table_spans
-from .table_check import GLUED_KINDS, expand_glued_rows, high_confidence
+from .common import _parse_html_table, grid_to_markdown, strip_colspan_prefixes
 from .errors import JobCancelled
 from .pdf_evidence import normalize_ranges, normalize_table_presentation, _span_present, source_span_present, table_evidence_text
-
-TABLE_ROWS_PROMPT = """This image is a table cropped from a document. Some cells contain several lines stacked vertically (one line per test condition), and an OCR pass merged those lines into one string.
-The table has {width} columns; its header row reads: {header}.
-Transcribe ONLY the table rows whose first cell is one of: {keys}.
-For every one of the {width} cells of each such row, in column order, give its lines top-to-bottom as a JSON array of strings: a single-line cell is a one-element array, an empty cell is an empty array. Copy numbers and units exactly as printed; do not compute, convert or normalise anything.
-Return JSON only, in this exact shape:
-{{"rows": [{{"key": "<first cell text>", "cells": [["line 1", "line 2"], ["only line"], []]}}]}}
-"""
-REPAIR_CONTRACT_VERSION = 2
 
 TABLE_EVIDENCE_PROMPT = """Transcribe the supplied document table and its visible legend faithfully.
 Return only JSON: {"rows": [["cell", "cell"], ["cell", "cell"]], "legend": ["symbol mapping"]}.
@@ -51,9 +37,14 @@ It can help read printed text but may have a broken reading order or font mappin
 
 def transcribe_table(image: Path, *, prompt: str, base_url: str, api_key: str, model_id: str,
                      cache: Path, options: dict) -> dict:
+    budget = options.get("max_tokens", 4096)
+    # Through the shared parameter layer like every other model call, and with thinking off: copying a table is
+    # reading, and thoughts would share the output limit with the rows.
+    params = generation_parameters(model_id, base_url=base_url, max_tokens=budget, temperature=options.get("temperature", .1),
+                                   top_p=options.get("top_p", .8), disable_thinking=True)
     identity = {"version": 1, "image": file_hash(image), "prompt": hashlib.sha256(prompt.encode()).hexdigest(),
                 "endpoint": hashlib.sha256(base_url.rstrip("/").encode()).hexdigest(), "model": model_id,
-                "options": options}
+                "options": options, "request_parameters": params}
     if cache.exists():
         try:
             saved = json.loads(cache.read_text())
@@ -61,11 +52,11 @@ def transcribe_table(image: Path, *, prompt: str, base_url: str, api_key: str, m
             saved = {}
         if isinstance(saved, dict) and reusable_in_run(saved) and saved.get("_cache") == identity:
             return saved["data"]
-    response = _client_for(base_url, api_key).chat.completions.create(model=model_id,
-        messages=[{"role": "user", "content": [{"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_data_url(image, options.get("max_pixels", DEFAULT_MAX_PIXELS))}}]}],
-        temperature=options.get("temperature", .1), top_p=options.get("top_p", .8),
-        max_tokens=options.get("max_tokens", 4096))
+    request = CompatibleRequest(base_url, model_id, "openai", {"model": model_id, **params,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data_url(image, options.get("max_pixels", DEFAULT_MAX_PIXELS))}}]}]})
+    response = _compatible_completion(_client_for(base_url, api_key), request, api_key=api_key, caption_contract=False)
+    _log_caption_usage(response, budget, "table-review")
     content = str(response.choices[0].message.content or "")
     try:
         result = json.loads(content[content.index("{"):content.rindex("}") + 1])
@@ -73,6 +64,7 @@ def transcribe_table(image: Path, *, prompt: str, base_url: str, api_key: str, m
         return {}
     if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
         return {}
+    request.accept()
     if result["rows"]:
         cache.parent.mkdir(parents=True, exist_ok=True)
         write_cache(cache, {"_cache": identity, "data": result})
@@ -216,18 +208,41 @@ def _identity_columns(rows: list[list[str]]) -> tuple[int, ...]:
 
 
 def _expand_review_spans(old, new, html):
-    """Apply only source-declared merged positions; never infer spans from the VLM."""
+    """Apply only source-declared merged positions following merge direction; never infer spans from the VLM.
+
+    Header row (row 0) horizontal spans fill across covered header columns; body rows expand vertical
+    rowspans into the anchor column only and collapse VLM-duplicated horizontal colspan siblings back to ''.
+    """
     out = [list(row) for row in new]
     if len(old) != len(out) or any(len(a) != len(b) for a,b in zip(old,out)):
         return out
-    for row, col, height, width in html_table_spans(html):
+    parsed = _parse_html_table(html) if html else None
+    if not parsed:
+        return out
+    raw_grid, spans = parsed.rows, parsed.spans
+    if len(raw_grid) != len(out) or any(len(a) != len(b) for a, b in zip(raw_grid, out)):
+        return out
+    for row, col, height, width in spans:
         if row + height > len(out) or any(col + width > len(out[r]) for r in range(row, row+height)):
             continue
         value = out[row][col]
-        positions = [(r,c) for r in range(row,row+height) for c in range(col,col+width)]
-        if value and all(not out[r][c] or _norm(out[r][c]) == _norm(value) for r,c in positions):
-            for r,c in positions:
+        if not value:
+            continue
+        positions = (
+            [(0, c) for c in range(col, col + width)] if row == 0 and parsed.column_headers else []
+        ) + [
+            (r, col) for r in range(max(int(parsed.column_headers), row), row + height)
+        ]
+        if positions and all(not out[r][c] or _norm(out[r][c]) == _norm(value) for r, c in positions):
+            for r, c in positions:
                 out[r][c] = value
+        if width > 1:
+            for r in range(max(int(parsed.column_headers), row), row + height):
+                if _norm(out[r][col]) == _norm(value) and all(
+                    not out[r][c] or _norm(out[r][c]) == _norm(value) for c in range(col + 1, col + width)
+                ):
+                    for c in range(col + 1, col + width):
+                        out[r][c] = ""
     return out
 
 
@@ -499,17 +514,30 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
         accepted = False
         block.metadata.pop("table_review_error", None)
         block.metadata.pop("table_review", None)
-        old_grid = _pipe_grid(original)
+        raw_html = str((block.metadata.get("source_item") or {}).get("table_body") or "")
+        raw_parsed = _parse_html_table(raw_html) if raw_html else None
+        raw_grid_orig = _pipe_grid(original)
+        html_shape_matches = bool(
+            raw_parsed
+            and raw_grid_orig
+            and not block.metadata.get("inherited_table_header")
+            and not block.metadata.get("restored_empty_columns")
+            and len(raw_parsed.rows) == len(raw_grid_orig)
+            and len(raw_parsed.rows[0]) == len(raw_grid_orig[0])
+        )
+        declared_spans = raw_parsed.spans if html_shape_matches else []
+        column_headers = bool(html_shape_matches and raw_parsed.column_headers)
+        old_grid = strip_colspan_prefixes(raw_grid_orig, declared_spans or None)
         old_grid, recovered = _recover_native_row_keys(old_grid, block.metadata.get("table_native_grid") or [],
                                                       block.metadata.get("table_native_spans") or [])
         if recovered:
             notes = [s for s in original.splitlines() if s.strip() and not s.strip().startswith("|")]
-            original = "\n".join(notes + [grid_to_markdown(old_grid) or ""])
+            original = "\n".join(notes + [grid_to_markdown(old_grid, spans=declared_spans, column_headers=column_headers) or ""])
             block.text = block.table_markdown = original
             block.metadata["table_row_key_recoveries"] = recovered
         identity_columns = _identity_columns(old_grid)
         alignable = bool(identity_columns)
-        reason = ("missing_model_credentials" if not api_key else "missing_image" if not image.is_file()
+        reason = ("missing_image" if not image.is_file()
                   else "missing_table_body" if not old_grid else "ambiguous_row_keys" if not alignable
                   else "verification_incomplete")
         native_grid = block.metadata.get("table_native_grid") or []
@@ -519,7 +547,7 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 or any(_row_key(a, identity_columns) != _row_key(b, identity_columns)
                        for a,b in zip(old_grid,native_grid))):
             native_grid = []
-        if api_key and image.is_file() and (alignable or source_cells):
+        if image.is_file() and (alignable or source_cells):       # an endpoint without a key is asked like any other
             stats["requested"] += 1
             prompt = TABLE_EVIDENCE_PROMPT + "\n" + json.dumps({"text": native, "legend": legend}, ensure_ascii=False)
             cache = cache_dir / "table-review" / (file_hash(image) + "-" + hashlib.sha256(prompt.encode()).hexdigest()[:16] + ".json")
@@ -535,11 +563,15 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
             new_grid = data.get("rows") or []
             if not all(isinstance(row, list) and all(isinstance(c, str) for c in row) for row in new_grid):
                 new_grid = []
+            if not new_grid and reason != "request_failed":
+                # Asked, and no rows came back (empty, cut off or unreadable answer). Not the same as an answer
+                # that failed the checks: this says nothing about the table.
+                reason = "no_model_answer"
             source_verified = (not data.get("error") and _matches_source_cells(source_cells, new_grid)
                                and _preserves_populated_cells(old_grid, new_grid))
             if not source_verified:
                 new_grid = _restore_review_empty_columns(old_grid, new_grid)
-                new_grid = _expand_review_spans(old_grid, new_grid, str((block.metadata.get("source_item") or {}).get("table_body") or ""))
+                new_grid = _expand_review_spans(old_grid, new_grid, raw_html if html_shape_matches else "")
             verified = []
             if source_verified:
                 verified = [True] * len(new_grid)
@@ -561,7 +593,15 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 # Keep source caption/footnotes outside the actual grid.
                 outside = re.sub(r"<table\b[^>]*>.*?</table>", "", original, flags=re.I | re.S)
                 notes = [s for s in outside.splitlines() if s.strip() and not s.strip().startswith("|")]
-                body = grid_to_markdown(new_grid) or ""
+                spans_for_new = (
+                    declared_spans
+                    if declared_spans
+                    and len(new_grid) == len(old_grid)
+                    and new_grid
+                    and len(new_grid[0]) == len(old_grid[0])
+                    else None
+                )
+                body = grid_to_markdown(new_grid, spans=spans_for_new, column_headers=column_headers) or ""
                 raw_legend = data.get("legend")
                 facts = [f for f in raw_legend if isinstance(f, str)] if all(verified) and isinstance(raw_legend, list) else []
                 existing = "\n".join(notes + [body])
@@ -601,248 +641,13 @@ def review_pdf_tables(blocks: list[ParsedBlock], *, base_url: str, api_key: str,
                 block.table_markdown = original + "\nSOURCE TEXT (cell alignment unverified):\n" + evidence
                 block.text = block.table_markdown
     return stats
+
+
 _TAG_RE = re.compile(r"<[^>]{1,20}>")
 _NORM_RE = re.compile(r"[\s$\\{}_^]+")
-
-
-_SUB_RE = re.compile(r"<sub>(.*?)</sub>", re.IGNORECASE | re.DOTALL)
-_SUP_RE = re.compile(r"<sup>(.*?)</sup>", re.IGNORECASE | re.DOTALL)
-
-
-def clean_part(text: str) -> str:
-    """HTML markup from the VLM transcription stays out of the body: <sub>RC</sub> -> _RC (the manual's
-    own notation), <sup>2</sup> -> ^2, other tags are removed."""
-    out = _SUB_RE.sub(lambda m: "_" + m.group(1).strip(), str(text or ""))
-    out = _SUP_RE.sub(lambda m: "^" + m.group(1).strip(), out)
-    return re.sub(r"\s+", " ", _TAG_RE.sub("", out)).strip()
 
 
 def _norm(text: str) -> str:
     """Normalised form for comparison: strip HTML tags (the VLM likes to write <sub>), LaTeX markup
     ($ { } \\ _ ^) and whitespace, case-insensitive."""
     return _NORM_RE.sub("", _TAG_RE.sub("", unicodedata.normalize("NFKC", str(text or "")))).casefold()
-
-
-def verify_split(raw: str, parts: list[str]) -> bool:
-    """Trust a split only when the segments, with whitespace removed, concatenate back to the raw string."""
-    parts = [str(p) for p in parts]
-    return len(parts) >= 2 and all(p.strip() for p in parts) and _norm("".join(parts)) == _norm(raw)
-
-
-def _parse_rows(content: str) -> list[dict[str, Any]]:
-    body = str(content or "")
-    start, end = body.find("{"), body.rfind("}")
-    if start < 0 or end <= start:
-        return []
-    try:
-        data = json.loads(body[start:end + 1])
-    except ValueError:
-        try:
-            data = json.loads(re.sub(r",\s*([}\]])", r"\1", body[start:end + 1]))
-        except ValueError:
-            return []
-    rows = data.get("rows") if isinstance(data, dict) else None
-    out: list[dict[str, Any]] = []
-    for r in rows or []:
-        if not isinstance(r, dict) or not isinstance(r.get("cells"), list):
-            continue
-        cells = [[str(x) for x in c] if isinstance(c, list) else [str(c)] for c in r["cells"]]
-        out.append({"key": str(r.get("key") or ""), "cells": cells})
-    return out
-
-
-def transcribe_rows(image_path: Path, *, base_url: str, api_key: str, model_id: str, row_keys: list[str],
-                    header: list[str] | None = None, width: int = 0,
-                    cache_json: Path | None = None, temperature: float = 0.1, top_p: float = 0.8,
-                    max_tokens: int = 1500, max_pixels: int | None = DEFAULT_MAX_PIXELS) -> list[dict[str, Any]]:
-    prompt = TABLE_ROWS_PROMPT.format(keys="; ".join(f'"{k}"' for k in row_keys), width=width or len(header or []) or "?",
-                                      header=" | ".join(header or []) or "(unknown)")
-    identity = {"contract_version": REPAIR_CONTRACT_VERSION, "model_id": model_id,
-                "endpoint_sha256": hashlib.sha256(base_url.rstrip("/").encode("utf-8")).hexdigest(),
-                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-                "temperature": temperature, "top_p": top_p, "max_pixels": max_pixels}
-    if cache_json and cache_json.exists():
-        try:
-            cached = json.loads(cache_json.read_text(encoding="utf-8"))
-        except Exception:
-            cached = None
-        if isinstance(cached, dict) and reusable_in_run(cached) and cached.get("_cache") == identity:
-            return _parse_rows(json.dumps(cached.get("data") or {}))
-    client = _client_for(base_url, api_key)
-    resp = client.chat.completions.create(
-        model=model_id, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_data_url(image_path, max_pixels)}},
-        ]}],
-    )
-    content = resp.choices[0].message.content or ""
-    rows = _parse_rows(content)
-    if cache_json and rows:
-        cache_json.parent.mkdir(parents=True, exist_ok=True)
-        write_cache(cache_json, {"data": {"rows": rows}, "_cache": identity})
-    return rows
-
-
-def _find_rebuild(cells: list[list[str]], raw: str) -> list[str] | None:
-    """Find, in any cell of the transcription, a run of consecutive lines (>= 2) that concatenate, with
-    whitespace removed, to exactly the merged raw string. Does not rely on column alignment: the VLM
-    often merges blanks / "-" into a neighbouring cell, or skips the first cell."""
-    target = _norm(raw)
-    if not target:
-        return None
-    for parts in cells:
-        parts = [str(p) for p in parts]
-        for i in range(len(parts)):
-            acc = ""
-            for j in range(i, len(parts)):
-                acc += _norm(parts[j])
-                if acc == target and j - i + 1 >= 2 and all(p.strip() for p in parts[i:j + 1]):
-                    return [clean_part(p) for p in parts[i:j + 1]]
-                if len(acc) >= len(target):
-                    break
-    return None
-
-
-def _find_lines(cells: list[list[str]], raw: str, n: int) -> list[str] | None:
-    """Condition cells: find a run of n consecutive lines, each of which after normalisation occurs in
-    the raw string and all distinct from each other -- the condition text is wrapped in LaTeX markup
-    and cannot be concatenated back to the raw string, so this is the only way to match it."""
-    target = _norm(raw)
-    for parts in cells:
-        parts = [str(p) for p in parts]
-        for i in range(0, len(parts) - n + 1):
-            seg = [p.strip() for p in parts[i:i + n]]
-            norms = [_norm(p) for p in seg]
-            if all(norms) and all(x in target for x in norms) and len(set(norms)) == n:
-                return [clean_part(p) for p in seg]
-    return None
-
-
-def plan_repairs(grid: list[list[str]], flags: list[dict[str, Any]],
-                 transcribed: list[dict[str, Any]]) -> tuple[dict[int, dict[int, list[str]]], list[str]]:
-    """Verification: for every flagged row, every merged cell must have a run of lines in the
-    transcription that rebuilds the raw string (with a consistent segment count); a multi-condition
-    cell is split along only when n lines all present in the raw string are found. Returns
-    ({row index: {column index: lines}}, reasons for failures)."""
-    rows_flags: dict[int, list[dict[str, Any]]] = {}
-    for f in high_confidence(flags):
-        rows_flags.setdefault(int(f["row"]), []).append(f)
-    repairs: dict[int, dict[int, list[str]]] = {}
-    reasons: list[str] = []
-    for i, row_flags in sorted(rows_flags.items()):
-        row = grid[i] if i < len(grid) else []
-        key = _norm(row[0] if row else "")
-        matched = [r for r in transcribed if r.get("key") and (_norm(r["key"]) == key or (key and (key in _norm(r["key"]) or _norm(r["key"]) in key)))]
-        if not matched and len(rows_flags) == 1 and len(transcribed) == 1:
-            matched = list(transcribed)                 # asked for one row, got one row back: match by position
-        if not matched:
-            matched = list(transcribed)                 # keys do not match: search all results (content matching is strict enough by itself)
-        if not matched:
-            reasons.append(f"row {i}: nothing transcribed")
-            continue
-        cells = [c for r in matched for c in r.get("cells") or []]
-        plan: dict[int, list[str]] = {}
-        n = 0
-        ok = True
-        for f in row_flags:
-            if f.get("kind") not in GLUED_KINDS:
-                continue
-            j = int(f["col"])
-            parts = _find_rebuild(cells, row[j] if j < len(row) else "")
-            if parts is None:
-                reasons.append(f"row {i} col {j}: no transcribed lines rebuild {row[j]!r}")
-                ok = False
-                break
-            if n and len(parts) != n:
-                reasons.append(f"row {i}: inconsistent line counts ({n} vs {len(parts)})")
-                ok = False
-                break
-            n = len(parts)
-            plan[j] = parts
-        if not ok or not plan:
-            continue
-        for j, cell in enumerate(row):
-            if j in plan or not cell.strip():
-                continue
-            lines = _find_lines(cells, cell, n)
-            if lines is not None:
-                plan[j] = lines
-        repairs[i] = plan
-    return repairs, reasons
-
-
-def repair_ambiguous_tables(
-    blocks: list[ParsedBlock],
-    *,
-    base_url: str,
-    api_key: str,
-    model_id: str,
-    cache_dir: Path,
-    vlm_options: dict[str, Any] | None = None,
-    caption_cache_root: Path | None = None,
-    transcribe: Callable[..., list[dict[str, Any]]] = transcribe_rows,
-) -> dict[str, int]:
-    """Run screenshot verification on table blocks with high-confidence table_flags; on success the
-    merged rows are expanded and text / table_markdown rewritten, with the result recorded in
-    metadata.table_repair. A failure on any table never affects the parse itself."""
-    stats = {"flagged": 0, "verified": 0, "unverified": 0, "failed": 0}
-    opts = dict(vlm_options or {})
-    kwargs = {k: opts[k] for k in ("temperature", "top_p", "max_pixels") if k in opts}
-    for block in blocks:
-        flags = high_confidence(block.metadata.get("table_flags"))
-        if block.block_type != "table" or not flags:
-            continue
-        stats["flagged"] += 1
-        html = str((block.metadata.get("source_item") or {}).get("table_body") or "")
-        grid = html_table_to_grid(html)
-        image = Path(block.visual_ref) if block.visual_ref else None
-        if not grid:
-            block.metadata["table_repair"] = {"status": "unverified", "reason": "no table grid"}
-            stats["unverified"] += 1
-            continue
-        if image is None or not image.exists():
-            block.metadata["table_repair"] = {"status": "unverified", "reason": "no table crop"}
-            stats["unverified"] += 1
-            continue
-        if not api_key:
-            block.metadata["table_repair"] = {"status": "unverified", "reason": "missing_api_key"}
-            stats["unverified"] += 1
-            continue
-        keys = list(dict.fromkeys(str(f.get("key") or "") for f in flags if str(f.get("key") or "").strip()))
-        image_hash = hashlib.sha256(image.read_bytes()).hexdigest()
-        block.metadata["visual_sha256"] = block.metadata.get("visual_sha256") or image_hash
-        keys_sha = hashlib.sha256("|".join(keys).encode("utf-8")).hexdigest()[:8]
-        root = caption_cache_root if caption_cache_root is not None else cache_dir / "visual"
-        cache_json = root / "table-repair" / image_hash[:2] / f"{image_hash}-{keys_sha}.json"
-        try:
-            transcribed = transcribe(image, base_url=base_url, api_key=api_key, model_id=model_id,
-                                     row_keys=keys, header=[c.strip() for c in grid[0]], width=len(grid[0]),
-                                     cache_json=cache_json, **kwargs)
-        except Exception as exc:      # noqa: BLE001 - a verification failure must not fail the whole parse
-            print(f"[table-repair] {block.block_id} transcription failed: {exc!r}", flush=True)
-            block.metadata["table_repair"] = {"status": "failed", "reason": repr(exc)[:300]}
-            stats["failed"] += 1
-            continue
-        repairs, reasons = plan_repairs(grid, flags, transcribed)
-        if not repairs:
-            block.metadata["table_repair"] = {"status": "unverified", "reason": "; ".join(reasons)[:500] or "no verified split"}
-            stats["unverified"] += 1
-            continue
-        old_md = grid_to_markdown(grid) or ""
-        new_md = grid_to_markdown(expand_glued_rows(grid, repairs)) or old_md
-        if old_md and old_md in (block.text or ""):
-            block.text = block.text.replace(old_md, new_md, 1)
-        else:
-            block.text = new_md
-        block.table_markdown = block.text
-        rows = sorted(repairs)
-        n = max(len(p) for plan in repairs.values() for p in plan.values())
-        block.metadata["table_repair"] = {"status": "verified", "rows": rows, "n": n,
-                                          **({"partial": "; ".join(reasons)[:300]} if reasons else {})}
-        for f in block.metadata.get("table_flags") or []:
-            if int(f.get("row", -1)) in repairs:
-                f["repaired"] = True
-        stats["verified"] += 1
-        print(f"[table-repair] {block.block_id} rows={rows} expanded x{n}", flush=True)
-    return stats

@@ -52,7 +52,9 @@ KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://mo
 
 `max_tokens_field` 选择输出上限字段，`omit` 移除可选生成参数，`set` 指定参数值，例如 `{"reasoning_effort":"low"}` 或 `{"thinking":{"type":"disabled"}}`。匹配条目按顺序应用。修改后重启应用进程。纯文本连通性检查需要收到完整且包含 `OK` 的回复；HTTP 400 会显示为错误。
 
-部署端使用不同的思考控制格式时，可配置 `"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`。它只在图谱抽取等明确要求关闭思考的调用中替换思考参数，图片描述和连通性检查保留原有思考行为。需要对所有调用生效的参数使用 `set`。
+部署端使用不同的思考控制格式时，可配置 `"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`。它在要求关闭思考的调用中替换思考参数：图谱抽取与摘要、图片描述、表格复核。连通性检查保留原有思考行为。需要对所有调用生效的参数使用 `set`。
+
+要求关闭思考时，按模型名选择字段：`deepseek`、`kimi` 发送 `thinking: {"type": "disabled"}`，`qwen` 发送 `enable_thinking: false`，GPT-5 与 o 系列发送 `reasoning_effort`，其他未识别的模型名同时发送前两个字段。接口在报错里点名某个思考字段时，去掉这个字段后重试，请求按服务端的默认行为执行。接口不报错而直接忽略字段时（例如 vLLM 忽略顶层的 `enable_thinking`），思考仍会开启：请用上面的 `thinking_parameters` 指定该部署认识的写法，或把服务端的默认值设为不思考。图片描述和表格复核的日志行里有 `reasoning_tokens`，大于 0 说明开关没有生效。
 
 使用公网文本重排时，`RERANKER_BASE_URL` 填 API 基础地址或完整的 `/rerank` 地址，`RERANKER_MODEL_ID` 填供应商的模型名，`RERANKER_API_KEY` 填 Bearer 密钥。请求包含 `model`、`query` 和 `documents`，响应包含带 `index`、`relevance_score` 的 `results`。模型名留空时通过 `/models` 自动发现，密钥留空时沿用本地无认证访问。
 

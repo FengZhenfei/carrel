@@ -12,8 +12,8 @@ import traceback
 from .. import db
 from ..storage import get_storage
 from ..config import Settings
-from ..parsers.errors import (FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING, FAILURE_RETRYABLE, FAILURE_VERDICT_KEY,
-                              JobPaused, service_unreachable)
+from ..parsers.errors import (ConfigParseError, FAILURE_CONFIG, FAILURE_DETERMINISTIC, FAILURE_FILE_MISSING,
+                              FAILURE_RETRYABLE, FAILURE_SCOPE_KEY, FAILURE_VERDICT_KEY, JobPaused, service_unreachable)
 from ..parsers.source_guard import MissingSourceContent
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
@@ -84,41 +84,70 @@ def run_once(
                     payload = json.loads(str(job["payload_json"] or "{}"))
                     store = get_storage(settings)
                     if payload.get("reactivate"):
-                        # A file that returned after deletion is restored through this path without re-parsing.
-                        # Once the Qdrant points are flipped back to active, the SQLite chunk ledger must follow,
-                        # otherwise the file is searchable but never enters the graph -- and since the ledger
-                        # did not change, the rebuild policy cannot notice either.
-                        remaining = store.chunks.version_count(file_row)
                         # Only flip back the points (by id) that were active at the moment of deletion / KB close:
                         # old chunks replaced within the same version stay inactive. Flipping a whole version
                         # would revive every chunking ever done (2026-09-06 close-and-reopen: the chunk ledger
                         # grew 6x and the automatic rebuild was triggered by a phantom increment).
-                        restore_ids = db.chunk_point_ids_to_restore(
-                            con, str(file_row["file_id"]), str(file_row["content_version"])
+                        # Verify that EVERY expected point ID still exists for this document and version:
+                        # if even one point was GC'd, restoring would mark the full ledger active while only
+                        # partial chunks are readable.
+                        restore_ids = list(dict.fromkeys(
+                            db.chunk_point_ids_to_restore(
+                                con, str(file_row["file_id"]), str(file_row["content_version"])
+                            )
+                        ))
+                        remaining = (
+                            store.chunks.version_count(file_row, point_ids=restore_ids)
+                            if restore_ids
+                            else 0
                         )
-                        if remaining > 0 and restore_ids:
+                        if restore_ids and remaining == len(restore_ids):
                             store.chunks.reactivate(file_row, point_ids=restore_ids)
                             db.mark_chunks_active(
                                 con, str(file_row["file_id"]), str(file_row["content_version"])
                             )
                             print(f"[restore] points reactivated={len(restore_ids)} file={file_row['rel_path']}", flush=True)
                         else:
-                            # The inactive points were GC'd after the retention period, or the ledger has no
-                            # deleted chunks to bring back (old data deleted before the fix): the restore does not
-                            # hold, fall back to a re-parse to realign both sides; chunks stay as they are until
-                            # then.
+                            # All or some inactive points were GC'd after the retention period, or the ledger has
+                            # no deleted chunks to bring back: re-read the row after the store check so we never
+                            # overwrite a newer version or enqueue a parse for a file deleted concurrently; clear
+                            # indexed_version and stale chunk ledger state, enqueue re-parse, and return early
+                            # without syncing FTS or marking indexed (B11).
                             from .scheduler import requeue_single_file
 
-                            requeued = requeue_single_file(
-                                con,
-                                ingest_run_id=str(job["ingest_run_id"] or "") or "restore",
-                                file_row=file_row,
-                            )
-                            print(
-                                f"[restore] points gone, re-parse queued={requeued} "
-                                f"file={file_row['rel_path']}",
-                                flush=True,
-                            )
+                            fresh = db.get_file_by_id(con, str(file_row["file_id"]))
+                            if (
+                                fresh is not None
+                                and str(fresh["status"]) not in {"deleted", "skipped"}
+                                and str(fresh["content_version"]) == str(file_row["content_version"])
+                            ):
+                                con.execute(
+                                    """
+                                    UPDATE files
+                                    SET indexed_version = NULL,
+                                        indexed_parser_profile = NULL,
+                                        status = 'seen'
+                                    WHERE file_id = ? AND content_version = ?
+                                      AND status NOT IN ('deleted', 'skipped')
+                                    """,
+                                    (str(fresh["file_id"]), str(fresh["content_version"])),
+                                )
+                                if remaining > 0 and hasattr(store.chunks, "deactivate"):
+                                    store.chunks.deactivate(fresh)
+                                    _sync_fts_doc(store, fresh)
+                                db.mark_chunks_inactive(con, str(fresh["file_id"]))
+                                requeued = requeue_single_file(
+                                    con,
+                                    ingest_run_id=str(job["ingest_run_id"] or "") or "restore",
+                                    file_row=fresh,
+                                )
+                                print(
+                                    f"[restore] points incomplete ({remaining}/{len(restore_ids)}), "
+                                    f"re-parse queued={requeued} file={fresh['rel_path']}",
+                                    flush=True,
+                                )
+                            db.mark_job_done(con, job["job_id"], current_worker_id)
+                            return f"metadata-done:{job['job_id']}"
                     else:
                         store.chunks.update_metadata(file_row)
                     _sync_fts_doc(store, file_row)
@@ -240,7 +269,13 @@ def run_once(
         failed = db.mark_job_failed(con, job["job_id"], repr(exc), retry=should_retry, retry_delay_seconds=retry_delay,
                                     worker_id=current_worker_id)
         if failed and not should_retry and job_type == "parse":
-            _record_failure_verdict(con, str(job["job_id"]), _failure_verdict(exc))
+            verdict = _failure_verdict(exc)
+            _record_failure_verdict(
+                con,
+                str(job["job_id"]),
+                verdict,
+                scope=_failure_scope(exc) if verdict == FAILURE_CONFIG else None,
+            )
         if should_retry:
             return f"retry:{job['job_id']}:delay={retry_delay}s:{exc!r}"
         return f"failed:{job['job_id']}:{exc!r}"
@@ -273,20 +308,30 @@ def _rerun_if_asked(con: sqlite3.Connection, job: sqlite3.Row) -> None:
 
 
 def _failure_verdict(exc: Exception) -> str:
-    """The verdict on this failure (the three values in parsers.errors). A deterministic failure (unsupported
-    format, over the size limit, vector dimension mismatch) comes out the same no matter how often it is
-    retried; it is recognised by exception type, not by the error string. Only "the file is not on disk" still
-    goes by the string, because old paths raise a generic exception for it."""
+    """The verdict on this failure (the values in parsers.errors). A deterministic failure (unsupported
+    format, over the size limit, corrupt document 400/422) comes out the same no matter how often it is
+    retried; a configuration/auth/model error (missing/invalid VLM, dimension mismatch, 401/403/404/409)
+    also skips immediate backoff retries but recovers after cooldown or config save. Both are recognised by
+    exception type, not by the error string. Only "the file is not on disk" still goes by the string,
+    because old paths raise a generic exception for it."""
     from .parse_job import NonRetryableParseError
     from ..embedding.client import EmbeddingDimensionError
 
     if "physical file not found" in str(exc).lower():   # missing file; also the generic exception raised by old paths
         return FAILURE_FILE_MISSING
-    if isinstance(exc, (NonRetryableParseError, EmbeddingDimensionError)):
+    if isinstance(exc, (ConfigParseError, EmbeddingDimensionError)) or getattr(exc, "config_error", False):
+        return FAILURE_CONFIG
+    if isinstance(exc, NonRetryableParseError):
         return FAILURE_DETERMINISTIC
-    if getattr(exc, "deterministic", False):   # MinerU 4xx: the document itself is broken
+    if getattr(exc, "deterministic", False):   # MinerU 400/413/415/422: the document itself is rejected
         return FAILURE_DETERMINISTIC
     return FAILURE_RETRYABLE
+
+
+def _failure_scope(exc: Exception) -> str | None:
+    """The subsystem scope for a FAILURE_CONFIG exception, if known (e.g. 'mineru', 'embedding', 'vlm')."""
+    scope = getattr(exc, "config_scope", None)
+    return str(scope) if scope else None
 
 
 def _should_retry(job: sqlite3.Row, settings: Settings | None, exc: Exception) -> bool:
@@ -297,9 +342,9 @@ def _should_retry(job: sqlite3.Row, settings: Settings | None, exc: Exception) -
     return int(job["retry_count"] or 0) < settings.job_max_retries
 
 
-def _record_failure_verdict(con: sqlite3.Connection, job_id: str, verdict: str) -> None:
-    """A parse job that failed for good: store the verdict in the job payload; the scan uses it to decide
-    whether the file is queued again (scheduler._failed_parse_blocks_auto_requeue)."""
+def _record_failure_verdict(con: sqlite3.Connection, job_id: str, verdict: str, *, scope: str | None = None) -> None:
+    """A parse job that failed for good: store the verdict (and optional config failure scope) in the job
+    payload; the scan uses it to decide whether the file is queued again (scheduler._failed_parse_blocks_auto_requeue)."""
     row = con.execute("SELECT payload_json FROM jobs WHERE job_id = ? AND status = 'failed'", (job_id,)).fetchone()
     if row is None:
         return
@@ -310,6 +355,10 @@ def _record_failure_verdict(con: sqlite3.Connection, job_id: str, verdict: str) 
     if not isinstance(payload, dict):
         payload = {}
     payload[FAILURE_VERDICT_KEY] = verdict
+    if scope:
+        payload[FAILURE_SCOPE_KEY] = scope
+    else:
+        payload.pop(FAILURE_SCOPE_KEY, None)
     con.execute("UPDATE jobs SET payload_json = ? WHERE job_id = ? AND status = 'failed'",
                 (json.dumps(payload, ensure_ascii=False), job_id))
 
@@ -328,8 +377,8 @@ def _sync_fts_doc(store, file_row: sqlite3.Row) -> None:
         doc_id=f"{file_row['kb_id']}:{file_row['file_key']}",
     )
     print(
-        f"[fts] sync-doc collection={result['collection']} doc_id={result['doc_id']} "
-        f"deleted={result['deleted_rows']} inserted={result['inserted_rows']}",
+        f"[fts] sync-doc collection={result.get('collection', file_row['collection'])} doc_id={result.get('doc_id')} "
+        f"deleted={result.get('deleted_rows', 0)} inserted={result.get('inserted_rows', 0)}",
         flush=True,
     )
 

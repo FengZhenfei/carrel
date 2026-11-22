@@ -438,10 +438,12 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         from kb_pipeline.chunking.chunker import chunk_text
 
         text = self._para(250) + "\n\n1.2 Second Section\n\n" + self._para(100, "next")
-        chunks = chunk_text(text, 400, 80)
+        chunks = chunk_text(text, 400, 80, headings=frozenset({"1.2 Second Section"}))
         self.assertEqual(len(chunks), 2)
         self.assertTrue(chunks[1].startswith("1.2 Second Section\n"), chunks[1][:60])
         self.assertNotIn("word", chunks[1])          # no tail of the previous section leaked in
+        # Without parser-supplied headings, a numbered body line must not trigger a premature split (B14)
+        self.assertEqual(len(chunk_text(text, 400, 80)), 1)
 
     def test_small_sections_are_packed_together(self) -> None:
         from kb_pipeline.chunking.chunker import chunk_text
@@ -478,7 +480,7 @@ class HeadingAwareChunkingTests(unittest.TestCase):
 
         long_sentence = "没有句读的长段落" * 400
         fence = "```yaml\n" + "\n".join(f"key{i}: value{i}" for i in range(400)) + "\n```"
-        for heading, unit, known in (("第3章 部署说明", long_sentence, ()), ("配置示例", fence, ("配置示例",))):
+        for heading, unit, known in (("第3章 部署说明", long_sentence, ("第3章 部署说明",)), ("配置示例", fence, ("配置示例",))):
             text = f"正文第一句。正文第二句。\n\n{heading}\n\n{unit}"
             for overlap in (0, 80):
                 parts = chunk_text(text, 600, overlap, headings=frozenset(known))
@@ -503,8 +505,8 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         from kb_pipeline.chunking.chunker import blocks_to_chunks, chunk_text
 
         text = "正文第一句。正文第二句。\n\n第3章 部署说明"
-        self.assertEqual(chunk_text(text, 600, 80), ["正文第一句。\n正文第二句。", "第3章 部署说明"])
-        self.assertEqual(chunk_text("第3章 部署说明", 600, 80), ["第3章 部署说明"])
+        self.assertEqual(chunk_text(text, 600, 80, headings=frozenset({"第3章 部署说明"})), ["正文第一句。\n正文第二句。", "第3章 部署说明"])
+        self.assertEqual(chunk_text("第3章 部署说明", 600, 80, headings=frozenset({"第3章 部署说明"})), ["第3章 部署说明"])
         long_text = self._para(350) + "\n\n" + self._para(300, "more") + "\n\n功能描述"
         parts = chunk_text(long_text, 400, 80, headings=frozenset({"功能描述"}))
         self.assertEqual(parts[-1], "功能描述")
@@ -513,7 +515,8 @@ class HeadingAwareChunkingTests(unittest.TestCase):
         # TITLE; an unowned title stays separate rather than returning to earlier prose.
         body, grid = self._para(200), "| a | b |\n| --- | --- |\n| 1 | 2 |"
         tail = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text",
-                           text=f"{body}\n\n第3章 部署说明", block_id="b1")
+                           text=f"{body}\n\n第3章 部署说明", block_id="b1",
+                           metadata={"heading_lines": ["第3章 部署说明"]})
         table = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="table", text=grid,
                             table_markdown=grid, block_id="t1")
         other = ParsedBlock(parser="m", parser_profile="p", doc_type="pdf", block_type="text", text=self._para(200, "next"),
@@ -525,13 +528,15 @@ class HeadingAwareChunkingTests(unittest.TestCase):
 
 
 class HeadingRuleTests(unittest.TestCase):
-    def test_dashed_numbering_is_a_level_two_heading(self) -> None:
+    def test_dashed_numbering_is_not_inferred_as_heading(self) -> None:
         from kb_pipeline.headings import infer_heading_level
 
-        self.assertEqual(infer_heading_level("1-3 SQL概要"), 2)
-        self.assertEqual(infer_heading_level("2-1 数据库的种类"), 2)
+        # F13 removed: dashed numbers like "15-20 日内交付" collide with numeric ranges; dotted numbering remains level 2
+        self.assertIsNone(infer_heading_level("1-3 SQL概要"))
+        self.assertIsNone(infer_heading_level("15-20 日内完成交付"))
         self.assertIsNone(infer_heading_level("3-2 V 供电"))                    # number + unit
         self.assertIsNone(infer_heading_level("1-2 月完成安装,3 月验收。"))     # a sentence
+        self.assertEqual(infer_heading_level("1.3 SQL概要"), 2)
 
     def test_clean_heading_text_strips_markup(self) -> None:
         from kb_pipeline.headings import clean_heading_text
@@ -540,14 +545,17 @@ class HeadingRuleTests(unittest.TestCase):
         self.assertEqual(clean_heading_text("==📅 2026-01-15== 周会"), "📅 2026-01-15 周会")
         self.assertEqual(clean_heading_text("`config.yaml` 说明:"), "config.yaml 说明")
 
-    def test_resolver_demotes_labels_and_list_items_and_inherits_levels(self) -> None:
+    def test_resolver_places_recurring_titles_drops_list_items_and_inherits_levels(self) -> None:
         from kb_pipeline.headings import HeadingResolver
 
-        titles = ["KEYWORD", "1-3 SQL概要", "标准SQL", "KEYWORD", "- 加粗的列表项", "KEYWORD", "注释:"]
+        titles = ["KEYWORD", "1.3 SQL概要", "标准SQL", "KEYWORD", "- 加粗的列表项", "KEYWORD", "注释:"]
         r = HeadingResolver(titles)
-        self.assertEqual(r.resolve(1, "KEYWORD"), (None, False))          # a sidebar label that appears 3 times
-        self.assertEqual(r.resolve(1, "1-3 SQL概要")[0], 2)                # inferred from the numbering
+        # A title that appears 3 times used to become body text. It is a heading below the nearest heading that
+        # does not recur: here nothing stands above it yet
+        self.assertEqual(r.resolve(1, "KEYWORD"), (1, False))
+        self.assertEqual(r.resolve(1, "1.3 SQL概要")[0], 2)                # inferred from the numbering
         self.assertEqual(r.resolve(1, "标准SQL")[0], 3)                    # hangs one level below the numbered heading
+        self.assertEqual(r.resolve(1, "KEYWORD"), (4, False))             # and the recurring title one below that
         self.assertEqual(r.resolve(1, "- 加粗的列表项"), (None, False))
         self.assertEqual(r.resolve(1, "注释:"), (None, False))
         self.assertEqual(r.resolve(None, "普通正文一句话。"), (None, False))
@@ -1178,7 +1186,7 @@ class DiagnosisRuleTests(unittest.TestCase):
 
         chunks = [mk(0, "x" * 400, "text", 380), mk(1, "图片识读", "image", 1100),
                   mk(2, "| a | b |\n| 1 | 2 |", "table", 30), mk(3, "| c | d |\n| 3 | 4 |", "table", 30),
-                  mk(4, "第一章 绪论", "text", 3), mk(5, "1.2 概述", "text", 5), mk(6, "学习要点", "title", 4)]
+                  mk(4, "第一章 绪论", "title", 3), mk(5, "1.2 概述", "title", 5), mk(6, "学习要点", "title", 4)]
         diag = chunk_diagnostics(chunks, max_tokens=400)
         keys = {r["key"] for r in diag["reasons"]}
         self.assertTrue({"long_visual", "headerless_tables", "orphan_headings"} <= keys, keys)
@@ -1332,9 +1340,10 @@ class TocPageTests(unittest.TestCase):
     def test_toc_pages_are_detected_by_short_line_density_or_leaders(self) -> None:
         from kb_pipeline.headings import detect_toc_pages
 
-        entries = [(3, f"{i}-1 第{i}节的标题") for i in range(25)]                       # book TOC page: a whole page of short lines
+        entries = [(3, f"{i}.1 第{i}节的标题 {i + 10}") for i in range(25)]               # book TOC page: dense short lines with page numbers
         entries += [(4, "本书面向完全没有编程和系统开发经验的读者,循序渐进地讲解。" * 2)] * 5 + [(4, "前言"), (4, "关于本书"), (4, "读者对象")]
         entries += [(5, f"第 {i} 节 …… {i + 3}") for i in range(10)] + [(5, "目录")]      # datasheet TOC page: dot leaders with page numbers
+        entries += [(6, f"短特性项 {i}") for i in range(25)]                              # dense short lines WITHOUT TOC title or page numbers: not TOC
         entries += [(None, "无页码的项")]
         self.assertEqual(detect_toc_pages(entries), {3, 5})
 
@@ -1359,7 +1368,7 @@ class TocPageTests(unittest.TestCase):
 
         from kb_pipeline.parsers import mineru_pdf
 
-        toc = [{"type": "text", "text": f"{i}.1 第{i}节的标题", "text_level": 1, "page_idx": 2} for i in range(1, 26)]
+        toc = [{"type": "text", "text": f"{i}.1 第{i}节的标题 {i + 10}", "text_level": 1, "page_idx": 2} for i in range(1, 26)]
         body = [{"type": "text", "text": "1.1 第1节的标题", "text_level": 1, "page_idx": 3},
                 {"type": "text", "text": "正文从这里开始,讲第一节的内容。", "page_idx": 3}]
         out = io.StringIO()
